@@ -30,7 +30,7 @@ The following changes are effective as of v13:
    `b`. Callers push arguments before `_call`; structured ops pass values
    implicitly. `^name!` binds a global, `_!` discards. Arity = number of
    declared bindings; labels with no bindings have arity 0 (v12-compatible).
-   Missing args bind `null`; excess cells are discarded.
+   **Missing args are a compile error** (v13.1; formerly they bound `null`). Excess cells are discarded.
 
 2. **Explicit `ret` with stack draining.** Every code path through a label body
    must end with `ret` (compile error otherwise; bodies ending in
@@ -190,8 +190,11 @@ the first non-binding token ends the parameter list.
 
 - **Arity** = the number of declared bindings. Labels with no bindings have
   arity 0 — all caller cells are discarded on entry, preserving v12 behavior.
-- **Best-effort binding**: too few arguments → missing bindings receive `null`;
-  excess cells are silently discarded after the bindings are satisfied.
+- **Strict binding (v13.1)**: too few arguments at a call site → **compile error** when the
+  stack depth is statically known (`label 'x' declares N parameter(s) but the call site
+  leaves only M value(s)`), and a descriptive runtime error otherwise. Excess cells are
+  silently discarded after the bindings are satisfied. Destructuring binds after
+  multi-value returns may still receive `null` for excess slots (a different mechanism).
 - Structured ops pass values implicitly: `5 'body for` pushes the loop index,
   and a `body: i!` binding consumes it.
 
@@ -1086,3 +1089,149 @@ executors; MSP/mobile targets.
 encoding). Bootstrapped via `gen_trans.py`. Supported subset, libc IMPORT
 preamble, and coreutils test adaptations (`true`, `false`, `echo`, `yes`, `wc`)
 are documented in `trans/README.md`.
+
+---
+
+# v13.1 addenda
+
+## Strict label-call arity
+
+Missing call arguments no longer bind `null`. The compiler tracks a static
+stack depth per label body (an effects table over all ops; dynamic regions are
+poisoned conservatively) and rejects `_call`s whose site leaves fewer values
+than the callee declares. Dynamically-shaped sites fall back to a runtime
+check that dies with a message naming the label, parameter, and declared arity.
+
+## Sandboxing and capabilities
+
+`uf` compiles unrestricted. `ufsb` — built by default alongside `uf`
+(`cargo build --release` produces both; `UF_SANDBOX_CONFIG=<file.ufs>` at build
+time bakes a config into **both** binaries) — always bakes a capability
+config: the repo default `comp/sandbox.ufs` unless overridden.
+
+**Capabilities** (gated ops): `fs.read` (read_file, mmap,
+file_each_line/fold_lines/split_lines/match_lines), `fs.write` (write_file,
+file_emit; mmap needs both), `proc` (shell, shell_stream, execute), `ffi.use`
+(`USE"..."`, plus per-module allow/deny), `ffi.import` (`import c"..."`,
+`extern`), `raw.syscall` (`_syscall`), `raw.mem` (malloc, free, buffer,
+copy_memory, load, store), `host.argv` (argv, has_args, arg_index).
+Print/scan, time ops, threads, GPU compute, and all pure compute (including
+matrix arithmetic) are always allowed.
+
+**Config format (`.ufs`)** — line-based, `;` comments, `[policy NAME]`
+sections; keys `deny`/`allow` (capability patterns; `*` and `prefix.*`
+wildcards; a more specific allow beats a deny), `workspace` (fs roots),
+`allow-module`/`deny-module`, and `name` (names the top-level policy):
+
+```
+deny  proc ffi.import raw.* host.argv
+allow fs.read fs.write
+workspace .
+allow-module m curl
+
+[policy pure]
+deny fs.* proc ffi.* raw.* host.argv
+```
+
+Default policies baked into `ufsb`: **pure** (computation only), **data**
+(default — sandboxed filesystem, no network, no subprocesses), **web** (adds
+HTTPS modules curl/ssl, denies subprocesses/raw FFI), **build** (broader fs
+`~ /tmp`, subprocesses, still no raw host access).
+
+**CLI** (both binaries): `--policy NAME` (select among baked policies),
+`--sandbox FILE` (tighten with a `.ufs`; repeatable; may only restrict —
+denies union, workspace roots and module allowlists intersect; runtime files
+cannot define policies), `--workspace DIR` (add/intersect a root),
+`--caps` (print the effective capability report and exit).
+
+**Workspace**: when `fs.*` is allowed and a workspace is configured, every
+file open resolves via realpath (parent for not-yet-existing write targets)
+and must fall under a root, else the program dies with
+`sandbox: path '<p>' is outside the workspace roots [...] (policy '<name>')`.
+Default roots: the main program's directory and `$TMPDIR/uflux`. Best-effort
+(realpath prefix check; symlink escapes caught, TOCTOU not).
+
+Denied ops are **compile errors** naming the op, capability, policy, and
+remedy.
+
+## Capability discovery: `cap` / `caps`
+
+- `"<name>" cap → 0/1` — query any capability name above, plus pseudo-caps
+  `fs.workspace` (a workspace restriction is active) and `compute` (GPU
+  offload permitted). Never sandbox-gated itself.
+- `caps → dict` — `{"policy" ..., "<cap>" 0/1 ..., "fs.workspace" 0/1,
+  "workspace" [roots...], "modules" [...|"*"], "device" "auto"}`.
+- CLI: `uf --caps` prints the effective report.
+
+## Polymorphic matrices and arithmetic
+
+Matrices are 2-D tensors: `[rows cols] type tensor` builds a zeroed matrix
+(tag `matrix`, `type_of` → 20; row-major flat storage, `length` =
+rows·cols, `get`/`set` index flat). `[rows cols v0 v1 …] type tensor` builds
+one from flat row-major data (len = rows·cols+2). The 1-D tensor form is
+unchanged.
+
+The core arithmetic ops are polymorphic by operand type:
+
+| op | scalar×scalar | array×array / matrix×matrix | array/matrix × scalar | matrix×vector / vector×matrix |
+|----|---------------|------------------------------|-----------------------|-------------------------------|
+| `mul` | numeric | elementwise (shape-checked) | broadcast | **matmul** / **matvec / vecmat** |
+| `add` `sub` `div` | numeric | elementwise (shape-checked) | broadcast | n/a |
+
+Shape/dim mismatches die with the dims in the message. `sum`/`mean`/`min`/
+`max` reduce matrices flat; `sqrt` applies elementwise to arrays/tensors.
+New opcode **`transpose`**: `mat → mat'` (swaps rows/cols; dies on non-matrix).
+`scalar_add/sub/mul/div` and `array_add/sub/mul/div` are deprecated aliases of
+the core ops (kept parseable). `mul` on two equal-length 1-D arrays is
+elementwise, **not** a dot product (use `mul` then `sum`).
+
+## GPU compute offloading (Vulkan)
+
+No opt-in flag. When a Vulkan shader toolchain (`glslc` or
+`glslangValidator`) is present, the device mode is not `cpu`, and the program
+contains at least one GPU-eligible op, the compiler compiles its **static
+shader library** (float64 elementwise/broadcast add/sub/mul/div, matmul,
+matvec, reductions sum/min/max, sqrt, transpose) to SPIR-V, embeds the blobs
+in the generated C (`#define UF_GPU`), and links `-lvulkan`. Kernels are only
+ever **launched**, never generated from user code.
+
+**Devices**: default `auto` enumerates Vulkan devices and picks, hardware
+first (discrete > integrated > software), the one with the most free VRAM
+(`VK_EXT_memory_budget` when available). `--device cpu` compiles GPU code out
+entirely (v13 behavior). `--device vk<N>` pins a device (descriptive error
+listing what exists if unavailable). Zero devices → silent CPU.
+
+**Eligibility & threshold**: eligible ops are add/sub/mul/div (all polymorphic
+forms), sqrt, sum/mean/min/max, transpose. A launch happens only when the
+element/work count clears `UF_GPU_MIN` (env, default 65536); otherwise the CPU
+implementation runs. Any Vulkan failure degrades permanently to CPU — the GPU
+is a fast path, never a correctness dependency.
+
+**Weave-task compilation**: a weave task whose body (after its input binds,
+before `ret`) is a straight-line chain of elementwise arithmetic
+(add/sub/mul/div/sqrt) over its inputs — every intermediate explicitly bound
+with `x!` — is compiled into ONE fused float64 kernel: inputs staged in once,
+every op executed on-device, result staged out once. Tasks containing anything
+else (tensor construction, control flow, calls, non-eligible ops, global
+reads) decline fusion and run on CPU unchanged. Fused-task output is
+bit-identical to the CPU body. Concurrent tasks serialize their GPU work on an
+internal mutex. Reference: `comp/tests/t14_task_gpu.uft` (black-scholes chain:
+~60 per-op launches collapse to 4 fused kernels; 7.3s → 0.42s at N=2M).
+
+**Determinism**: elementwise/broadcast results are bit-identical to the CPU;
+reductions and matmul may reassociate (benchmarks compare within tolerance;
+`div` on the GPU yields inf/nan for zero divisors where the CPU dies —
+documented divergence). Sandboxing: GPU compute is pure compute — allowed
+under every policy.
+
+**Backend abstraction**: `comp/src/compute.rs` — `ComputeBackend` trait with
+the Vulkan implementation first (CUDA/HIP can sit behind the same interface).
+
+## New opcodes (v13.1)
+
+| # | glyph | mnemonic | stack effect / notes |
+|---|-------|----------|----------------------|
+| 86 | 🤡 | `cap` | `name → 0/1` — sandbox capability query |
+| 87 | 🌔 | `caps` | `→ dict` — full capability report |
+| 214 | 🔀 | `transpose` | `mat → mat'` — swap rows/cols |
+

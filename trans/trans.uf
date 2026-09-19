@@ -1,5 +1,4 @@
-; trans.uf — C subset -> uFlux v11 text-encoding transpiler, written in uFlux
-; v11: all variables are global (^name); no jmp/jz/je; emits if/ifelse/while + native comparison opcodes
+; trans.uf — C subset -> µFlux v13.1 transpiler, written in µFlux
 import c"printf"(ptr,...)->int
 import c"malloc"(int)->ptr
 import c"fopen"(ptr,ptr)->ptr
@@ -16,331 +15,384 @@ import c"strcpy"(ptr,ptr)->ptr
 ; ---- macros (must precede first use) ----
 macro em { _call emit }
 macro emn { _call emitn }
-macro psh { ^ps@ swp push ^ps! }
-macro spop { ^ps@ pop }
-macro speek { ^ps@ dup len 1 - get }
+macro psh { _call pshL }
+macro spop { _call spopL }
+macro speek { _call speekL }
 macro expect { e! _call tk e@ _call streq not 'exf if _call adv }
 
 ; ---- output buffering (macros) ----
-macro lpush { ^ls@ swp push ^ls! }
-macro lpop { ^ls@ pop }
+macro lpush { _call lpushL }
+macro lpop { _call lpopL }
 ; ---- output buffering ----
+pshL: ^zt! ^ps@ ^zt@ append ^ps! ret 0
+speekL: ^ps@ ^zs! ^zs@ length 1 sub ^sp2! ^zs@ ^sp2@ get ^rr! ret ^rr@
+lpushL: ^zt! ^ls@ ^zt@ append ^ls! ret 0
+lpopL: ^ls@ pop ^rr! ret ^rr@
+spopL: ^ps@ pop ^rr! ret ^rr@
 emit: ^s!
-  ^inq@ 'em_q 'em_o ifelse
+  ^emode@ 2 eq 'em_d 'em_e if_else
   ret
-em_o: ^s@ "%s" print drop 0 ret
-em_q: ^qout@ ^s@ cat ^qout! 0 ret
+em_e:
+  ^inq@ 'em_q 'em_o if_else
+  ret
+em_o: ^s@ "%s" format print ret 0
+em_q: ^qout@ ^s@ concat ^qout! ret 0
+em_d: ^douts@ length 1 sub ^di! ^douts@ ^di@ get ^old! ^old@ ^s@ concat ^nv! ^douts@ ^di@ ^nv@ set ret 0
 emitn: ^n!
-  ^n@ "%d" fmt ^sn!
-  ^inq@ 'en_q 'en_o ifelse
+  ^n@ "%d" format ^sn!
+  ^sn@ _call emit
   ret
-en_o: ^sn@ "%s" print drop 0 ret
-en_q: ^qout@ ^sn@ cat ^qout! 0 ret
 
 ; ---- leaf utilities ----
-streq: ^b2! ^a2! ^a2@ ^b2@ _call strcmp not ret
+streq: ^b2! ^a2! ^a2@ ^b2@ _call strcmp not ^rr! ret ^rr@
 die: _call puts 1 _call exit ret
-tk: ^toks@ ^pi@ get ret
-tk1: ^toks@ ^pi@ 1 + get ret
-adv: ^pi@ 1 + ^pi! ret
-newlbl: ^lbl@ 1 + ^lbl! ^lbl@ ret
-exf: "parse error: expected " e@ cat " got " cat _call tk cat "\n" cat _call die
+tk: ^toks@ ^pi@ get ^rr! ret ^rr@
+tk1: ^toks@ ^pi@ 1 add get ^rr! ret ^rr@
+adv: ^pi@ 1 add ^pi! ^rr! ret ^rr@
+newlbl: ^lbl@ 1 add ^lbl! ^lbl@ ^rr! ret ^rr@
+exf: "parse error: expected " e@ concat " got " concat _call tk concat "\n" concat _call die ret
 
 istype: ^it!
-  ^it@ "int" _call streq ^it@ "char" _call streq + ^it@ "void" _call streq +
-  ^it@ "long" _call streq + ^it@ "short" _call streq + ^it@ "unsigned" _call streq +
-  ^it@ "signed" _call streq + ^it@ "const" _call streq + ^it@ "static" _call streq +
-  ret
+  ^it@ "int" _call streq ^it@ "char" _call streq add ^it@ "void" _call streq add
+  ^it@ "long" _call streq add ^it@ "short" _call streq add ^it@ "unsigned" _call streq add
+  ^it@ "signed" _call streq add ^it@ "const" _call streq add ^it@ "static" _call streq add
+  ^its! ret ^its@
 
 ptype: 'ptc 'ptb while ret
-ptc: _call tk _call istype _call tk "*" _call streq + ret
-ptb: _call adv 0 ret
+ptc: _call tk _call istype _call tk "*" _call streq add ^rr! ret ^rr@
+ptb: _call adv 0 ^rr! ret ^rr@
 
 newvar: ^nv!
-  "v" ^fid@ "%d" fmt cat ^nv2!
-  ^fid@ 1 + ^fid!
+  "v" ^fid@ "%d" format concat ^nv2!
+  ^fid@ 1 add ^fid!
   ^vars@ ^nv@ ^nv2@ set
-  ^nv2@ ret
+  ret ^nv2@
 
 findvar: ^nv!
-  ^vars@ ^nv@ getq dup not 'fvno if ret
-fvno: drop "undefined variable: " ^nv@ cat "\n" cat _call die
+  ^vars@ ^nv@ get_or_zero not 'fvno if ret
+fvno: "undefined variable: " ^nv@ concat "\n" concat _call die ret
 
 ; trymatch: pat -> match length at pos, or -1
 trymatch: ^tm_pat!
-  ^src@ ^pos@ ^srclen@ slice ^tm_pat@ match 'tm_yes 'tm_no ifelse
-  ^tmr@ ret
-tm_yes: 0 get _call strlen ^tmr! 0 ret
-tm_no: drop -1 ^tmr! 0 ret
+  ^src@ ^pos@ ^srclen@ slice ^tm_pat@ regex_match ^tmm!
+  ^tmm@ length 0 gt 'tm_yes 'tm_no if_else
+  ret
+tm_yes: ^tmm@ 0 get _call strlen ^rr! ret ^rr@
+tm_no: -1 ^rr! ret ^rr@
 
 ; ---- lexer ----
 lexl_c:
   'skp_c 'skp_b while
-  ^pos@ ^srclen@ lt ret
+  ret ^pos@ ^srclen@ lt
 lexl_b:
   ^src@ ^pos@ ^srclen@ slice ^rest!
-  ^rest@ "^\"([^\"\\\\]|\\\\.)*\"" _call trymatch dup -1 eq not 'lex_str 'lex_n1 ifelse
-  0 ret
-lex_str: ^ln! _call lput 0 ret
-lex_n1: drop
-  ^rest@ "^'([^'\\\\]|\\\\.)*'" _call trymatch dup -1 eq not 'lex_chr 'lex_n2 ifelse
-  0 ret
-lex_chr: ^ln! _call lput 0 ret
-lex_n2: drop
-  ^rest@ "^(0[xX][0-9a-fA-F]+|[0-9]+)" _call trymatch dup -1 eq not 'lex_num 'lex_n3 ifelse
-  0 ret
-lex_num: ^ln! _call lput 0 ret
-lex_n3: drop
-  ^rest@ "^[A-Za-z_][A-Za-z0-9_]*" _call trymatch dup -1 eq not 'lex_id 'lex_n4 ifelse
-  0 ret
-lex_id: ^ln! _call lput 0 ret
-lex_n4: drop
-  ^rest@ "^(<<=|>>=|==|!=|<=|>=|&&|\\|\\||\\+\\+|--|\\+=|-=|\\*=|/=|%=|<<|>>)" _call trymatch dup -1 eq not 'lex_mop 'lex_n5 ifelse
-  0 ret
-lex_mop: ^ln! _call lput 0 ret
-lex_n5: drop 1 ^ln! _call lput 0 ret
-lput: ^src@ ^pos@ ^pos@ ^ln@ + slice ^toks@ swp push ^toks! ^pos@ ^ln@ + ^pos! ret
+  ^rest@ "^\"([^\"\\\\]|\\\\.)*\"" _call trymatch ^ln! ^ln@ -1 eq not 'lex_str 'lex_n1 if_else
+  ret
+lex_str: ^ln! _call lput 0 ^rr! ret ^rr@
+lex_n1: 
+  ^rest@ "^'([^'\\\\]|\\\\.)*'" _call trymatch ^ln! ^ln@ -1 eq not 'lex_chr 'lex_n2 if_else
+  ret
+lex_chr: ^ln! _call lput 0 ^rr! ret ^rr@
+lex_n2: 
+  ^rest@ "^(0[xX][0-9a-fA-F]+|[0-9]+)" _call trymatch ^ln! ^ln@ -1 eq not 'lex_num 'lex_n3 if_else
+  ret
+lex_num: ^ln! _call lput 0 ^rr! ret ^rr@
+lex_n3: 
+  ^rest@ "^[A-Za-z_][A-Za-z0-9_]*" _call trymatch ^ln! ^ln@ -1 eq not 'lex_id 'lex_n4 if_else
+  ret
+lex_id: ^ln! _call lput 0 ^rr! ret ^rr@
+lex_n4: 
+  ^rest@ "^(<<=|>>=|==|!=|<=|>=|&&|\\|\\||\\+\\+|--|\\+=|-=|\\*=|/=|%=|<<|>>)" _call trymatch ^ln! ^ln@ -1 eq not 'lex_mop 'lex_n5 if_else
+  ret
+lex_mop: ^ln! _call lput 0 ^rr! ret ^rr@
+lex_n5: 1 ^ln! _call lput ret 0
+lput: ^src@ ^pos@ ^pos@ ^ln@ add slice ^zs! ^toks@ ^zs@ append ^toks! ^pos@ ^ln@ add ^pos! ^rr! ret ^rr@
 
 ; skip phase
 skp_c:
   ^src@ ^pos@ ^srclen@ slice ^rest!
   ^rest@ "^[\t\n\r ]+" _call trymatch -1 eq not
-  ^rest@ "//" starts +
-  ^rest@ "/*" starts +
-  ^rest@ "#" starts +
+  ^rest@ "//" starts_with add
+  ^rest@ "/*" starts_with add
+  ^rest@ "#" starts_with add
   ret
 skp_b:
-  ^rest@ "^[\t\n\r ]+" _call trymatch dup -1 eq not 'sb_ws 'sb_n1 ifelse 0 ret
-sb_ws: ^pos@ + ^pos! 0 ret
-sb_n1: drop ^rest@ "//" starts 'sb_lc 'sb_n2 ifelse 0 ret
-sb_lc: ^rest@ "\n" find dup -1 eq 'sb_lc_eof 'sb_lc_nl ifelse 0 ret
-sb_lc_nl: ^pos@ + 1 + ^pos! 0 ret
-sb_lc_eof: drop ^srclen@ ^pos! 0 ret
-sb_n2: drop ^rest@ "/*" starts 'sb_bc 'sb_n3 ifelse 0 ret
-sb_bc: ^rest@ "*/" find dup -1 eq 'sb_bc_eof 'sb_bc_end ifelse 0 ret
-sb_bc_end: ^pos@ + 2 + ^pos! 0 ret
-sb_bc_eof: drop ^srclen@ ^pos! 0 ret
-sb_n3: drop ^rest@ "#" starts 'sb_pp 'sb_done ifelse 0 ret
-sb_pp: ^rest@ "\n" find dup -1 eq 'sb_pp_eof 'sb_pp_nl ifelse 0 ret
-sb_pp_nl: ^pos@ + 1 + ^pos! 0 ret
-sb_pp_eof: drop ^srclen@ ^pos! 0 ret
-sb_done: 0 ret
+  ^rest@ "^[\t\n\r ]+" _call trymatch ^ln!
+  ^ln@ -1 eq not 'sb_ws 'sb_n1 if_else
+  ret
+sb_ws: ^pos@ add ^pos! ret 0
+sb_n1: ^rest@ "//" starts_with 'sb_lc 'sb_n2 if_else ret 0
+sb_lc: ^rest@ "\n" find ^fi! ^fi@ -1 eq 'sb_lc_eof 'sb_lc_nl if_else ret 0
+sb_lc_nl: ^pos@ add 1 add ^pos! ret 0
+sb_lc_eof: ^srclen@ ^pos! ret 0
+sb_n2: ^rest@ "/*" starts_with 'sb_bc 'sb_n3 if_else ret 0
+sb_bc: ^rest@ "*/" find ^fi! ^fi@ -1 eq 'sb_bc_eof 'sb_bc_end if_else ret 0
+sb_bc_end: ^pos@ add 2 add ^pos! ret 0
+sb_bc_eof: ^srclen@ ^pos! ret 0
+sb_n3: ^rest@ "#" starts_with 'sb_pp 'sb_done if_else ret 0
+sb_pp: ^rest@ "\n" find ^fi! ^fi@ -1 eq 'sb_pp_eof 'sb_pp_nl if_else ret 0
+sb_pp_nl: ^pos@ add 1 add ^pos! ret 0
+sb_pp_eof: ^srclen@ ^pos! ret 0
+sb_done: 0 ^rr! ret ^rr@
 
 ; ---- expression parser ----
-pexpr: _call passign ret
+pexpr: _call passign ^rr! ret ^rr@
 
 passign:
-  ^vars@ _call tk getq dup not 'pa_plor 'pa_cdr ifelse ret
-pa_plor: drop _call plor 0 ret
+  ^vars@ _call tk get_or_zero ^lv!
+  ^lv@ not 'pa_plor 'pa_cdr if_else ret
+pa_plor: _call plor ret 0
 pa_cdr:
   psh _call tk1 psh
-  speek "=" _call streq speek "+=" _call streq + speek "-=" _call streq +
-  speek "*=" _call streq + speek "/=" _call streq + speek "%=" _call streq +
-  not 'pa_na 'pa_as ifelse 0 ret
-pa_na: spop drop spop drop _call plor 0 ret
+  speek "=" _call streq speek "+=" _call streq add speek "-=" _call streq add
+  speek "*=" _call streq add speek "/=" _call streq add speek "%=" _call streq add
+  not 'pa_na 'pa_as if_else ret 0
+pa_na: spop spop _call plor 0 ^rr! ret ^rr@
 pa_as:
-  speek "/=" _call streq speek "%=" _call streq + 'pa_die if
-  speek "=" _call streq 'pa_simple 'pa_compound ifelse 0 ret
+  speek "/=" _call streq speek "%=" _call streq add 'pa_die if
+  speek "=" _call streq 'pa_simple 'pa_compound if_else ret 0
 pa_simple:
-  _call adv _call adv _call passign "dup " _call emit
-  spop drop spop "^%s!\n" fmt _call emit 0 ret
+  _call adv _call adv _call passign spop spop "^%s!\n" format _call emit ret 0
 pa_compound:
-  _call adv _call adv ^ps@ dup len 2 - get "^%s@ " fmt _call emit _call passign
-  speek 0 1 slice _call emit " dup " _call emit spop drop
-  spop "^%s!\n" fmt _call emit 0 ret
-pa_die: "no division in subset" _call die
+  spop ^pc_op!
+  spop ^pc_slot!
+  _call adv _call adv
+  ^pc_slot@ "^%s@ " format _call emit
+  _call passign
+  ^pc_op@ 0 1 slice ^pc_o!
+  ^pc_o@ "+" _call streq 'pc_add 'pc_n1 if_else ret
+pc_n1: ^pc_o@ "-" _call streq 'pc_sub 'pc_mul if_else ret
+pc_add: "add " _call emit ^pc_slot@ "^%s!\n" format _call emit ret 0
+pc_sub: "sub " _call emit ^pc_slot@ "^%s!\n" format _call emit ret 0
+pc_mul: "mul " _call emit ^pc_slot@ "^%s!\n" format _call emit ret 0
+pa_die: "no division in subset" _call die ret
 
 plor: _call pland 'plo_c 'plo_b while ret
-plo_c: _call tk "||" _call streq ret
-plo_b: _call adv _call pland "not not swp not not or " _call emit 0 ret
+plo_c: _call tk "||" _call streq ^rr! ret ^rr@
+plo_b: _call adv _call pland "or not not " _call emit ret 0
 
 pland: _call peq 'pla_c 'pla_b while ret
-pla_c: _call tk "&&" _call streq ret
-pla_b: _call adv _call peq "not not swp not not and " _call emit 0 ret
+pla_c: _call tk "&&" _call streq ^rr! ret ^rr@
+pla_b: _call adv _call peq "mul not not " _call emit ret 0
 
 peq: _call prel 'peq_c 'peq_b while ret
-peq_c: _call tk "==" _call streq _call tk "!=" _call streq + ret
-peq_b: _call tk "==" _call streq 'peq_eq 'peq_ne ifelse 0 ret
-peq_eq: _call adv _call prel "eq " _call emit 0 ret
-peq_ne: _call adv _call prel "eq not " _call emit 0 ret
+peq_c: _call tk "==" _call streq _call tk "!=" _call streq add ^rr! ret ^rr@
+peq_b: _call tk "==" _call streq 'peq_eq 'peq_ne if_else ret 0
+peq_eq: _call adv _call prel "eq " _call emit 0 ^rr! ret ^rr@
+peq_ne: _call adv _call prel "eq not " _call emit 0 ^rr! ret ^rr@
 
 prel: _call padd 'prl_c 'prl_b while ret
-prl_c: _call tk "<" _call streq _call tk "<=" _call streq + _call tk ">" _call streq + _call tk ">=" _call streq + ret
-prl_b: _call tk "<" _call streq 'prl_lt 'prl_n1 ifelse 0 ret
-prl_lt: _call adv _call padd "lt " _call emit 0 ret
-prl_n1: _call tk "<=" _call streq 'prl_le 'prl_n2 ifelse 0 ret
-prl_le: _call adv _call padd "gt not " _call emit 0 ret
-prl_n2: _call tk ">" _call streq 'prl_gt 'prl_ge ifelse 0 ret
-prl_gt: _call adv _call padd "gt " _call emit 0 ret
-prl_ge: _call adv _call padd "lt not " _call emit 0 ret
+prl_c: _call tk "<" _call streq _call tk "<=" _call streq add _call tk ">" _call streq add _call tk ">=" _call streq add ^rr! ret ^rr@
+prl_b: _call tk "<" _call streq 'prl_lt 'prl_n1 if_else ret 0
+prl_lt: _call adv _call padd "lt " _call emit 0 ^rr! ret ^rr@
+prl_n1: _call tk "<=" _call streq 'prl_le 'prl_n2 if_else ret 0
+prl_le: _call adv _call padd "gt not " _call emit 0 ^rr! ret ^rr@
+prl_n2: _call tk ">" _call streq 'prl_gt 'prl_ge if_else ret 0
+prl_gt: _call adv _call padd "gt " _call emit 0 ^rr! ret ^rr@
+prl_ge: _call adv _call padd "lt not " _call emit 0 ^rr! ret ^rr@
 
 padd: _call pmul 'pad_c 'pad_b while ret
-pad_c: _call tk "+" _call streq _call tk "-" _call streq + ret
-pad_b: _call tk "+" _call streq 'pad_plus 'pad_minus ifelse 0 ret
-pad_plus: _call adv _call pmul "+ " _call emit 0 ret
-pad_minus: _call adv _call pmul "- " _call emit 0 ret
+pad_c: _call tk "+" _call streq _call tk "-" _call streq add ^rr! ret ^rr@
+pad_b: _call tk "+" _call streq 'pad_plus 'pad_minus if_else ret 0
+pad_plus: _call adv _call pmul "add " _call emit 0 ^rr! ret ^rr@
+pad_minus: _call adv _call pmul "sub " _call emit 0 ^rr! ret ^rr@
 
 pmul: _call punary 'pm_c 'pm_b while
-  _call tk "/" _call streq _call tk "%" _call streq + 'pm_die if
+  _call tk "/" _call streq _call tk "%" _call streq add 'pm_die if
   ret
-pm_c: _call tk "*" _call streq ret
-pm_b: _call adv _call punary "* " _call emit 0 ret
-pm_die: "no division in subset" _call die
+pm_c: _call tk "*" _call streq ^rr! ret ^rr@
+pm_b: _call adv _call punary "mul " _call emit 0 ^rr! ret ^rr@
+pm_die: "no division in subset" _call die ret
 
 punary:
-  _call tk "-" _call streq 'pu_neg 'pu_c1 ifelse ret
-pu_c1: _call tk "!" _call streq 'pu_not 'pu_c2 ifelse 0 ret
-pu_c2: _call tk "~" _call streq 'pu_bnot 'pu_c3 ifelse 0 ret
-pu_c3: _call tk "+" _call streq 'pu_pos 'pu_c4 ifelse 0 ret
-pu_c4: _call tk "++" _call streq 'pu_inc 'pu_c5 ifelse 0 ret
-pu_c5: _call tk "--" _call streq 'pu_dec 'pu_post ifelse 0 ret
-pu_neg: _call adv "0 " _call emit _call punary "- " _call emit 0 ret
-pu_not: _call adv _call punary "not " _call emit 0 ret
-pu_bnot: _call adv _call punary "-1 swp - " _call emit 0 ret
-pu_pos: _call adv _call punary 0 ret
+  _call tk "-" _call streq 'pu_neg 'pu_c1 if_else ret
+pu_c1: _call tk "!" _call streq 'pu_not 'pu_c2 if_else ret 0
+pu_c2: _call tk "~" _call streq 'pu_bnot 'pu_c3 if_else ret 0
+pu_c3: _call tk "+" _call streq 'pu_pos 'pu_c4 if_else ret 0
+pu_c4: _call tk "++" _call streq 'pu_inc 'pu_c5 if_else ret 0
+pu_c5: _call tk "--" _call streq 'pu_dec 'pu_post if_else ret 0
+pu_neg: _call adv "0 " _call emit _call punary "sub " _call emit 0 ^rr! ret ^rr@
+pu_not: _call adv _call punary "not " _call emit 0 ^rr! ret ^rr@
+pu_bnot: _call adv "-1 " _call emit _call punary "sub " _call emit ret 0
+pu_pos: _call adv _call punary 0 ^rr! ret ^rr@
 pu_inc:
-  _call adv ^vars@ _call tk getq dup not 'pu_inc_e if
-  _call adv dup "^%s@ 1 + dup ^%s! " fmt _call emit 0 ret
+  _call adv ^vars@ _call tk get_or_zero not 'pu_inc_e if
+  ^vars@ _call tk get_or_zero ^lasts!
+  ^lasts@ ^lasts@ "^%s@ 1 add ^%s! " format _call emit _call adv ret 0
 pu_inc_e: "++ needs a variable" _call die
+  ret
 pu_dec:
-  _call adv ^vars@ _call tk getq dup not 'pu_dec_e if
-  _call adv dup "^%s@ 1 - dup ^%s! " fmt _call emit 0 ret
+  _call adv ^vars@ _call tk get_or_zero not 'pu_dec_e if
+  ^vars@ _call tk get_or_zero ^lasts!
+  ^lasts@ ^lasts@ "^%s@ 1 sub ^%s! " format _call emit _call adv ret 0
 pu_dec_e: "-- needs a variable" _call die
 ; postfix ++/--: use if instead of while to avoid nested while issues
-pu_post: "" ^lasts! _call pprim _call tk "++" _call streq 'pun_inc 'pun_chk2 ifelse 0 ret
-pun_chk2: _call tk "--" _call streq 'pun_dec 'pun_done ifelse 0 ret
+  ret
+pu_post: "" ^lasts! _call pprim _call tk "++" _call streq 'pun_inc 'pun_chk2 if_else ret 0
+pun_chk2: _call tk "--" _call streq 'pun_dec 'pun_done if_else ret 0
 pun_inc:
   ^lasts@ "" _call streq 'pp_inc_err if
-  _call adv ^lasts@ dup "^%s@ 1 + ^%s! " fmt _call emit 0 ret
+  _call adv ^lasts@ ^lasts@ "^%s@ 1 add ^%s! " format _call emit ret 0
 pp_inc_err: "postfix ++ needs a variable" _call die
+  ret
 pun_dec:
   ^lasts@ "" _call streq 'pp_dec_err if
-  _call adv ^lasts@ dup "^%s@ 1 - ^%s! " fmt _call emit 0 ret
+  _call adv ^lasts@ ^lasts@ "^%s@ 1 sub ^%s! " format _call emit ret 0
 pp_dec_err: "postfix -- needs a variable" _call die
-pun_done: 0 ret
+  ret
+pun_done: 0 ^rr! ret ^rr@
 
 pprim: _call tk ^ptk!
-  ^ptk@ "[0-9]*" glob 'pp_num 'pp_n1 ifelse ret
-pp_n1: ^ptk@ "'" starts 'pp_char 'pp_n2 ifelse 0 ret
-pp_n2: ^ptk@ "\"" starts 'pp_str 'pp_n3 ifelse 0 ret
-pp_n3: ^ptk@ "(" _call streq 'pp_paren 'pp_n4 ifelse 0 ret
-pp_n4: ^ptk@ "argc" _call streq 'pp_argc 'pp_n5 ifelse 0 ret
-pp_n5: ^ptk@ "argv" _call streq 'pp_argv 'pp_n6 ifelse 0 ret
-pp_n6: ^ptk@ "__byte" _call streq 'pp_byte 'pp_n7 ifelse 0 ret
-pp_n7: ^ptk@ "NULL" _call streq 'pp_null 'pp_n8 ifelse 0 ret
-pp_n8: ^ptk@ "EOF" _call streq 'pp_eof 'pp_n9 ifelse 0 ret
-pp_n9: _call tk1 "(" _call streq 'pp_func 'pp_var ifelse 0 ret
+  ^ptk@ "[0-9]*" glob_match 'pp_num 'pp_n1 if_else ret
+pp_n1: ^ptk@ "'" starts_with 'pp_char 'pp_n2 if_else ret 0
+pp_n2: ^ptk@ "\"" starts_with 'pp_str 'pp_n3 if_else ret 0
+pp_n3: ^ptk@ "(" _call streq 'pp_paren 'pp_n4 if_else ret 0
+pp_n4: ^ptk@ "argc" _call streq 'pp_argc 'pp_n5 if_else ret 0
+pp_n5: ^ptk@ "argv" _call streq 'pp_argv 'pp_n6 if_else ret 0
+pp_n6: ^ptk@ "__byte" _call streq 'pp_byte 'pp_n7 if_else ret 0
+pp_n7: ^ptk@ "NULL" _call streq 'pp_null 'pp_n8 if_else ret 0
+pp_n8: ^ptk@ "EOF" _call streq 'pp_eof 'pp_n9 if_else ret 0
+pp_n9: _call tk1 "(" _call streq 'pp_func 'pp_var if_else ret 0
 
 pp_num:
-  ^ptk@ "^(0[xX][0-9a-fA-F]+|[0-9]+)" match drop 0 get _call emit " " _call emit _call adv 0 ret
-pp_str: ^ptk@ _call emit " " _call emit _call adv "" ^lasts! 0 ret
-pp_paren: _call adv _call pexpr ")" expect "" ^lasts! 0 ret
-pp_argc: _call adv "extern \"uf_argc\" loadx " _call emit "" ^lasts! 0 ret
+  ^ptk@ "^(0[xX][0-9a-fA-F]+|[0-9]+)" regex_match ^zm! ^zm@ 0 get _call emit " " _call emit _call adv ret 0
+pp_str: ^ptk@ _call emit " " _call emit _call adv "" ^lasts! 0 ^rr! ret ^rr@
+pp_paren: _call adv _call pexpr ")" expect "" ^lasts! 0 ^rr! ret ^rr@
+pp_argc: _call adv "extern \"uf_argc\" load " _call emit "" ^lasts! 0 ^rr! ret ^rr@
 pp_argv: _call adv "[" expect _call pexpr "]" expect
-  "extern \"uf_argv\" loadx swp 8 * + loadx " _call emit "" ^lasts! 0 ret
-pp_byte: _call adv "(" expect _call pexpr ")" expect "loadx 255 and " _call emit "" ^lasts! 0 ret
-pp_null: _call adv "0 " _call emit "" ^lasts! 0 ret
-pp_eof: _call adv "-1 " _call emit "" ^lasts! 0 ret
+  "8 mul extern \"uf_argv\" load add load " _call emit "" ^lasts! 0 ^rr! ret ^rr@
+pp_byte: _call adv "(" expect _call pexpr ")" expect "load 255 and " _call emit "" ^lasts! 0 ^rr! ret ^rr@
+pp_null: _call adv "0 " _call emit "" ^lasts! 0 ^rr! ret ^rr@
+pp_eof: _call adv "-1 " _call emit "" ^lasts! 0 ^rr! ret ^rr@
 
 pp_char:
-  ^ptk@ 1 ^ptk@ _call strlen 1 - slice ^ci!
-  ^ci@ "\\" starts 'pp_esc 'pp_charlit ifelse 0 ret
-pp_charlit: ^ci@ loadx 255 and _call emitn " " _call emit _call adv 0 ret
+  ^ptk@ 1 ^ptk@ _call strlen 1 sub slice ^ci!
+  ^ci@ "\\" starts_with 'pp_esc 'pp_charlit if_else ret 0
+pp_charlit: ^ci@ load 255 and _call emitn " " _call emit _call adv 0 ^rr! ret ^rr@
 pp_esc:
-  ^ci@ "\\n" _call streq 'pe_n 'pe_t1 ifelse 0 ret
-pe_n: 10 _call emitn " " _call emit _call adv 0 ret
-pe_t1: ^ci@ "\\t" _call streq 'pe_t 'pe_r1 ifelse 0 ret
-pe_t: 9 _call emitn " " _call emit _call adv 0 ret
-pe_r1: ^ci@ "\\r" _call streq 'pe_r 'pe_01 ifelse 0 ret
-pe_r: 13 _call emitn " " _call emit _call adv 0 ret
-pe_01: ^ci@ "\\0" _call streq 'pe_0 'pe_bs1 ifelse 0 ret
-pe_0: 0 _call emitn " " _call emit _call adv 0 ret
-pe_bs1: ^ci@ "\\\\" _call streq 'pe_bs 'pe_sq1 ifelse 0 ret
-pe_bs: 92 _call emitn " " _call emit _call adv 0 ret
-pe_sq1: ^ci@ "\\'" _call streq 'pe_sq 'pe_bad ifelse 0 ret
-pe_sq: 39 _call emitn " " _call emit _call adv 0 ret
+  ^ci@ "\\n" _call streq 'pe_n 'pe_t1 if_else ret 0
+pe_n: 10 _call emitn " " _call emit _call adv 0 ^rr! ret ^rr@
+pe_t1: ^ci@ "\\t" _call streq 'pe_t 'pe_r1 if_else ret 0
+pe_t: 9 _call emitn " " _call emit _call adv 0 ^rr! ret ^rr@
+pe_r1: ^ci@ "\\r" _call streq 'pe_r 'pe_01 if_else ret 0
+pe_r: 13 _call emitn " " _call emit _call adv 0 ^rr! ret ^rr@
+pe_01: ^ci@ "\\0" _call streq 'pe_0 'pe_bs1 if_else ret 0
+pe_0: 0 _call emitn " " _call emit _call adv 0 ^rr! ret ^rr@
+pe_bs1: ^ci@ "\\\\" _call streq 'pe_bs 'pe_sq1 if_else ret 0
+pe_bs: 92 _call emitn " " _call emit _call adv 0 ^rr! ret ^rr@
+pe_sq1: ^ci@ "\\'" _call streq 'pe_sq 'pe_bad if_else ret 0
+pe_sq: 39 _call emitn " " _call emit _call adv 0 ^rr! ret ^rr@
 pe_bad: "bad char escape" _call die
+  ret
 
 pp_func:
   ^ptk@ psh _call adv _call adv
-  _call tk ")" _call streq 'ppf_noargs 'ppf_args ifelse
-  ")" expect spop "_call %s " fmt _call emit "" ^lasts! 0 ret
-ppf_noargs: 0 ret
-ppf_args: _call pexpr 'ppf_c 'ppf_b while 0 ret
-ppf_c: _call tk "," _call streq ret
-ppf_b: _call adv _call pexpr 0 ret
+  _call tk ")" _call streq 'ppf_noargs 'ppf_args if_else
+  ")" expect spop "_call %s " format _call emit "" ^lasts! 0 ^rr! ret ^rr@
+ppf_noargs: 0 ^rr! ret ^rr@
+ppf_args: _call pexpr 'ppf_c 'ppf_b while ret 0
+ppf_c: _call tk "," _call streq ^rr! ret ^rr@
+ppf_b: _call adv _call pexpr 0 ^rr! ret ^rr@
 
-pp_var: _call tk1 "[" _call streq 'pp_arr 'pp_vr ifelse 0 ret
+pp_var: _call tk1 "[" _call streq 'pp_arr 'pp_vr if_else ret 0
 pp_arr:
-  ^vars@ ^ptk@ getq dup not 'puvv if
-  psh _call adv _call adv _call pexpr "]" expect
-  spop "^%s@ + loadx 255 and " fmt _call emit "" ^lasts! 0 ret
+  ^vars@ ^ptk@ get_or_zero ^lv!
+  ^lv@ not 'puvv if
+  ^lv@ psh _call adv _call adv _call pexpr "]" expect
+  ret spop "^%s@ \"\" _call strstr add load 255 and " format _call emit "" ^lasts! 0
 pp_vr:
-  ^vars@ ^ptk@ getq dup not 'puvv2 if
-  dup ^lasts! "^%s@ " fmt _call emit _call adv 0 ret
+  ^vars@ ^ptk@ get_or_zero ^lv!
+  ^lv@ not 'puvv2 if
+  ^lv@ ^lasts! "^%s@ " format _call emit _call adv ret 0
 puvv: "unknown array variable" _call die
-puvv2: drop "undefined variable: " ^ptk@ cat "\n" cat _call die
+  ret
+puvv2: "undefined variable: " ^ptk@ concat "\n" concat _call die ret
 
 ; ---- statement parser ----
 pstmt:
-  _call tk _call istype 'p_decl 'ps_0 ifelse ret
-ps_0: _call tk "return" _call streq 'p_return 'ps_1 ifelse 0 ret
-ps_1: _call tk "if" _call streq 'p_if 'ps_2 ifelse 0 ret
-ps_2: _call tk "while" _call streq 'p_while 'ps_3 ifelse 0 ret
-ps_3: _call tk "for" _call streq 'p_for 'ps_4 ifelse 0 ret
-ps_4: _call tk "do" _call streq 'p_do 'ps_5 ifelse 0 ret
-ps_5: _call tk "break" _call streq 'p_break 'ps_6 ifelse 0 ret
-ps_6: _call tk "continue" _call streq 'p_continue 'ps_7 ifelse 0 ret
-ps_7: _call tk "{" _call streq 'p_block 'ps_8 ifelse 0 ret
-ps_8: _call tk ";" _call streq 'p_empty 'p_exprstmt ifelse 0 ret
+  0 ^didret!
+  _call tk _call istype 'p_decl 'ps_0 if_else ret
+ps_0: _call tk "return" _call streq 'p_return 'ps_1 if_else ret 0
+ps_1: _call tk "if" _call streq 'p_if 'ps_2 if_else ret 0
+ps_2: _call tk "while" _call streq 'p_while 'ps_3 if_else ret 0
+ps_3: _call tk "for" _call streq 'p_for 'ps_4 if_else ret 0
+ps_4: _call tk "do" _call streq 'p_do 'ps_5 if_else ret 0
+ps_5: _call tk "break" _call streq 'p_break 'ps_6 if_else ret 0
+ps_6: _call tk "continue" _call streq 'p_continue 'ps_7 if_else ret 0
+ps_7: _call tk "{" _call streq 'p_block 'ps_8 if_else ret 0
+ps_8: _call tk ";" _call streq 'p_empty 'p_exprstmt if_else ret 0
 
 ; declaration
 p_decl:
   _call ptype
   _call pd_var
   'pdc_c 'pdc_b while
-  ";" expect 0 ret
-pdc_c: _call tk "," _call streq ret
-pdc_b: _call adv _call pd_var 0 ret
+  ret ";" expect 0
+pdc_c: _call tk "," _call streq ^rr! ret ^rr@
+pdc_b: _call adv _call pd_var 0 ^rr! ret ^rr@
 pd_var:
   _call tk ^nv! _call adv ^nv@ _call newvar ^slot!
-  _call tk "=" _call streq 'pdv_init 'pdv_done ifelse ret
-pdv_init: _call adv ^slot@ psh _call passign spop ^slot2! ^slot2@ "^%s!\n" fmt _call emit 0 ret
-pdv_done: 0 ret
+  _call tk "=" _call streq 'pdv_init 'pdv_done if_else ret
+pdv_init: _call adv ^slot@ psh _call passign spop ^slot2! ^slot2@ "^%s!\n" format _call emit ret 0
+pdv_done: 0 ^rr! ret ^rr@
 
 ; return
 p_return:
-  _call adv _call pexpr ";" expect
-  ^inmain@ 'pr_main 'pr_func ifelse 0 ret
-pr_main: "_call exit\n" _call emit 0 ret
-pr_func: "ret\n" _call emit 0 ret
+  _call adv
+  ^inmain@ 'pr_main 'pr_func if_else ret 0
+pr_main: _call pexpr ";" expect "_call exit\n" _call emit 0 ^didret! 0 ^rr! ret ^rr@
+pr_func: ^inq@ 'prf_nest 'prf_top if_else ret 0
+prf_top: _call pexpr ";" expect " ^rv! 1 ^fr! ret ^rv@\n" _call emit 2 ^didret! 0 ^rr! ret ^rr@
+prf_nest: _call pexpr ";" expect " ^rv!\n1 ^fr! 0 ret\n" _call emit 1 ^cret! 2 ^didret! 0 ^rr! ret ^rr@
 
 ; if / if-else
+dpop: ^douts@ pop ^dchunk! ^dchunk@ ^pends@ concat ^cp! ^psnaps@ pop ^sv! ^sv@ ^cp@ concat ^pends@ concat ^pends! ret 0
+emit0ret: ^didret@ 2 eq 'e0r_skip0 'e0r_emit0 if_else ret 0
+e0r_emit0: "0 ret\n" _call emit ^pends@ "" _call streq not 'e0r_go 'e0r_done if_else ret 0
+e0r_go: ^pends@ _call emit "" ^pends! ret 0
+e0r_done: ret 0
+e0r_skip0: ^pends@ "" _call streq not 'e0r_go2 'e0r_done2 if_else ret 0
+e0r_go2: ^pends@ _call emit "" ^pends! ret 0
+e0r_done2: ret 0
 p_if:
   _call adv "(" expect _call pexpr ")" expect
   _call newlbl ^tlbl!
   ^inq@ lpush
+  ^emode@ lpush
   ^tlbl@ lpush
+  ^inq@ 1 eq 'md2 'md0 if_else
+  ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
+  ^douts@ "" append ^douts!
   1 ^inq!
-  "i" ^tlbl@ "%d" fmt cat ":\n" cat _call emit
+  "i" ^tlbl@ "%d" format concat ":\n" concat _call emit
   _call pstmt
-  "0 ret\n" _call emit
-  _call tk "else" _call streq 'pif_else 'pif_noelse ifelse 0 ret
+  _call emit0ret
+  _call tk "else" _call streq 'pif_else 'pif_noelse if_else ret 0
+md2: 2 ^emode! ret 0
+md0: 0 ^emode! ret 0
 pif_else:
   _call newlbl ^elbl!
   ^elbl@ lpush
-  "e" ^elbl@ "%d" fmt cat ":\n" cat _call emit
-  _call adv _call pstmt "0 ret\n" _call emit
-  lpop ^elbl!
-  lpop ^tlbl!
-  lpop ^inq!
-  "'i" ^tlbl@ "%d" fmt cat " 'e" cat ^elbl@ "%d" fmt cat " ifelse\n" cat cat _call emit
-  0 ret
+  "e" ^elbl@ "%d" format concat ":\n" concat _call emit
+  _call adv _call pstmt _call emit0ret
+  _call lpopL ^elbl!
+  _call lpopL ^tlbl!
+  _call lpopL ^emode!
+  _call dpop
+  _call lpopL ^inq!
+  ^tlbl@ ^elbl@ "'i%d 'e%d if_else\n" format _call emit
+  0 ^didret!
+  ^cret@ 'wraprest 'nowrap if_else
+  ret 0
 pif_noelse:
-  lpop ^tlbl!
-  lpop ^inq!
-  "'i" ^tlbl@ "%d" fmt cat " if\n" cat _call emit
-  0 ret
+  _call lpopL ^tlbl!
+  _call lpopL ^emode!
+  _call dpop
+  _call lpopL ^inq!
+  ^tlbl@ "'i%d if\n" format _call emit
+  0 ^didret!
+  ^cret@ 'wraprest 'nowrap if_else
+  ret 0
 
 ; while
 p_while:
@@ -348,35 +400,47 @@ p_while:
   _call newlbl ^clbl!
   _call newlbl ^blbl!
   ^inq@ lpush
+  ^emode@ lpush
   ^clbl@ lpush
   ^blbl@ lpush
+  ^inq@ 1 eq 'md2 'md0 if_else
+  ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
+  ^douts@ "" append ^douts!
   1 ^inq!
-  "c" ^clbl@ "%d" fmt cat ":\n" cat _call emit
+  "c" ^clbl@ "%d" format concat ":\n^fr@ not " concat _call emit
   "(" expect _call pexpr ")" expect
-  "ret\n" _call emit
-  "b" ^blbl@ "%d" fmt cat ":\n" cat _call emit
+  " and ret\n" _call emit
+  "b" ^blbl@ "%d" format concat ":\n" concat _call emit
   _call pstmt
-  "0 ret\n" _call emit
-  lpop ^blbl!
-  lpop ^clbl!
-  lpop ^inq!
-  "'c" ^clbl@ "%d" fmt cat " 'b" ^blbl@ "%d" fmt cat " while\n" cat cat _call emit
-  0 ret
+  _call emit0ret
+  _call lpopL ^blbl!
+  _call lpopL ^clbl!
+  _call lpopL ^emode!
+  _call dpop
+  _call lpopL ^inq!
+  ^clbl@ ^blbl@ "'c%d 'b%d while\n" format _call emit
+  0 ^didret!
+  ^cret@ 'wraprest 'nowrap if_else
+  ret 0
 
 ; for
 p_for:
   _call adv "(" expect
   _call newlbl ^fclbl!
   _call newlbl ^fblbl!
-  _call tk ";" _call streq 'pfi_skip 'pfi_check ifelse
+  _call tk ";" _call streq 'pfi_skip 'pfi_check if_else
   ^inq@ lpush
+  ^emode@ lpush
   ^fclbl@ lpush
   ^fblbl@ lpush
+  ^inq@ 1 eq 'md2 'md0 if_else
+  ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
+  ^douts@ "" append ^douts!
   1 ^inq!
-  "c" ^fclbl@ "%d" fmt cat ":\n" cat _call emit
-  _call tk ";" _call streq 'pfc_skip 'pfc_do ifelse
+  "c" ^fclbl@ "%d" format concat ":\n^fr@ not " concat _call emit
+  _call tk ";" _call streq 'pfc_skip 'pfc_do if_else
   "ret\n" _call emit
-  "b" ^fblbl@ "%d" fmt cat ":\n" cat _call emit
+  "b" ^fblbl@ "%d" format concat ":\n" concat _call emit
   ^pi@ ^pfpi!
   1 ^pfd!
   'pfs_c 'pfs_b while
@@ -384,33 +448,37 @@ p_for:
   _call pstmt
   ^pi@ ^pfpi2!
   ^pfpi@ ^pi!
-  _call tk ")" _call streq 'pfp_none 'pfp_do ifelse
+  _call tk ")" _call streq 'pfp_none 'pfp_do if_else
   ^pfpi2@ ^pi!
-  "0 ret\n" _call emit
-  lpop ^fblbl!
-  lpop ^fclbl!
-  lpop ^inq!
-  "'c" ^fclbl@ "%d" fmt cat " 'b" ^fblbl@ "%d" fmt cat " while\n" cat cat _call emit
-  0 ret
-pfi_skip: _call adv 0 ret
-pfi_check: _call tk _call istype 'pfi_decl 'pfi_expr ifelse 0 ret
+  _call emit0ret
+  _call lpopL ^fblbl!
+  _call lpopL ^fclbl!
+  _call lpopL ^emode!
+  _call dpop
+  _call lpopL ^inq!
+  ^fclbl@ ^fblbl@ "'c%d 'b%d while\n" format _call emit
+  0 ^didret!
+  ^cret@ 'wraprest 'nowrap if_else
+  ret 0
+pfi_skip: _call adv 0 ^rr! ret ^rr@
+pfi_check: _call tk _call istype 'pfi_decl 'pfi_expr if_else ret 0
 pfi_decl:
   _call ptype _call tk ^nv! _call adv ^nv@ _call newvar ^slot!
-  "=" expect ^slot@ psh _call passign spop ^slot2! ^slot2@ "^%s!\n" fmt _call emit
-  ";" expect 0 ret
-pfi_expr: _call pexpr "drop\n" _call emit ";" expect 0 ret
-pfc_skip: _call adv "1 " _call emit 0 ret
-pfc_do: _call pexpr ";" expect 0 ret
-pfs_c: ^pfd@ ret
-pfs_b: _call tk "(" _call streq 'pfs_lp 'pfs_n1 ifelse 0 ret
-pfs_lp: ^pfd@ 1 + ^pfd! _call adv 0 ret
-pfs_n1: _call tk ")" _call streq 'pfs_rp 'pfs_adv ifelse 0 ret
-pfs_rp: ^pfd@ 1 - ^pfd! ^pfd@ 'pfs_adv2 'pfs_stop ifelse 0 ret
-pfs_stop: 0 ret
-pfs_adv2: _call adv 0 ret
-pfs_adv: _call adv 0 ret
-pfp_none: 0 ret
-pfp_do: _call pexpr "drop\n" _call emit 0 ret
+  "=" expect ^slot@ psh _call passign spop ^slot2! ^slot2@ "^%s!\n" format _call emit
+  ";" expect 0 ^rr! ret ^rr@
+pfi_expr: _call pexpr ";" expect 0 ^rr! ret ^rr@
+pfc_skip: _call adv "1 " _call emit " and " _call emit 0 ^rr! ret ^rr@
+pfc_do: _call pexpr ";" expect 0 ^rr! ret ^rr@
+pfs_c: ^pfd@ ^rr! ret ^rr@
+pfs_b: _call tk "(" _call streq 'pfs_lp 'pfs_n1 if_else ret 0
+pfs_lp: ^pfd@ 1 add ^pfd! _call adv 0 ^rr! ret ^rr@
+pfs_n1: _call tk ")" _call streq 'pfs_rp 'pfs_adv if_else ret 0
+pfs_rp: ^pfd@ 1 sub ^pfd! ^pfd@ 'pfs_adv2 'pfs_stop if_else ret 0
+pfs_stop: 0 ^rr! ret ^rr@
+pfs_adv2: _call adv 0 ^rr! ret ^rr@
+pfs_adv: _call adv 0 ^rr! ret ^rr@
+pfp_none: 0 ^rr! ret ^rr@
+pfp_do: _call pexpr 0 ^rr! ret ^rr@
 
 ; do-while
 p_do:
@@ -418,41 +486,77 @@ p_do:
   _call newlbl ^dflbl!
   _call newlbl ^clbl!
   _call newlbl ^blbl!
-  "1 df" ^dflbl@ "%d" fmt cat cat "!\n" cat _call emit
+  "1 df" ^dflbl@ "%d" format concat "!\n" concat _call emit
   ^inq@ lpush
+  ^emode@ lpush
   ^dflbl@ lpush
   ^clbl@ lpush
   ^blbl@ lpush
+  ^inq@ 1 eq 'md2 'md0 if_else
+  ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
+  ^douts@ "" append ^douts!
   1 ^inq!
-  "b" ^blbl@ "%d" fmt cat ":\n" cat _call emit
-  "0 df" ^dflbl@ "%d" fmt cat cat "!\n" cat _call emit
+  "b" ^blbl@ "%d" format concat ":\n" concat _call emit
+  "0 df" ^dflbl@ "%d" format concat "!\n" concat _call emit
   _call pstmt
-  "0 ret\n" _call emit
+  _call emit0ret
   "while" expect "(" expect
-  "c" ^clbl@ "%d" fmt cat ":\n" cat _call emit
-  "df" ^dflbl@ "%d" fmt cat "@ " cat _call emit
+  "c" ^clbl@ "%d" format concat ":\n^fr@ not df" concat _call emit
+  ^dflbl@ "%d" format concat "@ " concat _call emit
   _call pexpr
-  " or ret\n" _call emit
+  " or and ret\n" _call emit
   ")" expect ";" expect
-  lpop ^blbl!
-  lpop ^clbl!
-  lpop ^dflbl!
-  lpop ^inq!
-  "'c" ^clbl@ "%d" fmt cat " 'b" ^blbl@ "%d" fmt cat " while\n" cat cat _call emit
-  0 ret
+  _call lpopL ^blbl!
+  _call lpopL ^clbl!
+  _call lpopL ^dflbl!
+  _call lpopL ^emode!
+  _call dpop
+  _call lpopL ^inq!
+  ^clbl@ ^blbl@ "'c%d 'b%d while\n" format _call emit
+  0 ^didret!
+  ^cret@ 'wraprest 'nowrap if_else
+  ret 0
+
+; wrap remaining block statements behind the early-return flag
+nowrap: ret 0
+wraprest:
+  _call newlbl ^wclbl!
+  _call newlbl ^wblbl!
+  ^wclbl@ ^wblbl@ "^fr@ ^wdone@ or not 'c%d 'b%d while\n0 ^wdone!\n" format _call emit
+  ^wclbl@ lpush
+  ^wblbl@ lpush
+  ^emode@ lpush
+  ^inq@ lpush
+  2 ^emode!
+  ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
+  ^douts@ "" append ^douts!
+  'wbl_c 'wbl_b while
+  ^douts@ pop ^wchunk!
+  ^psnaps@ pop ^wsv!
+  ^wsv@ ^pends@ concat ^pends!
+  _call lpopL ^inq!
+  _call lpopL ^emode!
+  _call lpopL ^wblbl!
+  _call lpopL ^wclbl!
+  ^wblbl@ "b%d:\n" format ^wb!
+  ^wchunk@ "" _call streq not 'wfull 'wempty if_else
+wfull: ^flabels@ ^wb@ concat ^wchunk@ concat "1 ^wdone! 0 ret\n" concat ^wclbl@ "c%d:\n^fr@ ^wdone@ or not ret\n" format concat ^flabels! 0 ^didret! ret 0
+wempty: ^flabels@ ^wb@ concat "1 ^wdone! 0 ret\n" concat ^wclbl@ "c%d:\n^fr@ ^wdone@ or not ret\n" format concat ^flabels! 0 ^didret! ret 0
+wbl_c: _call tk "}" _call streq not ^rr! ret ^rr@
+wbl_b: _call pstmt 0 ^rr! ret ^rr@
 
 ; break / continue
-p_break: _call adv ";" expect "break\n" _call emit 0 ret
-p_continue: _call adv ";" expect "cont\n" _call emit 0 ret
+p_break: _call adv ";" expect "break\n" _call emit 0 ^rr! ret ^rr@
+p_continue: _call adv ";" expect "cont\n" _call emit 0 ^rr! ret ^rr@
 
 ; block
-p_block: _call adv 'pbl_c 'pbl_b while _call adv 0 ret
-pbl_c: _call tk "}" _call streq not ret
-pbl_b: _call pstmt 0 ret
+p_block: _call adv 'pbl_c 'pbl_b while _call adv ret 0
+pbl_c: _call tk "}" _call streq not ^rr! ret ^rr@
+pbl_b: _call pstmt 0 ^rr! ret ^rr@
 
 ; empty / expression statement
-p_empty: _call adv 0 ret
-p_exprstmt: _call pexpr "drop\n" _call emit ";" expect 0 ret
+p_empty: _call adv 0 ^rr! ret ^rr@
+p_exprstmt: _call pexpr ";" expect 0 ^rr! ret ^rr@
 
 ; ---- function / program parser ----
 pfunc:
@@ -463,55 +567,62 @@ pfunc:
   'pfp_c 'pfp_b while
   _call adv
   dict ^vars!
+  0 ^cret!
   "" ^qout!
-  ^fname@ "main" _call streq 'pf_entry 'pf_noentry ifelse
-  ^fname@ "%s:\n" fmt _call emit
+  ^fname@ "main" _call streq 'pf_entry 'pf_noentry if_else
   ^fname@ "main" _call streq ^inmain!
-  ^pl@ len 1 - ^pfi!
-  'pfp2_c 'pfp2_b while
+  ^pl@ length 1 sub ^pfi!
+  ^inmain@ not 'pfp2_c 'pfp2_b while
   "{" expect
   'pfb_c 'pfb_b while
   _call adv
-  ^inmain@ 'pf_main_ep 'pf_func_ep ifelse
-  ^qout@ "%s" print drop
+  ^didret@ 2 eq 'pf_noep 'pf_doep if_else
+  ^qout@ "%s" format print
   "" ^qout!
+  ^pends@ "%s" format print
+  "" ^pends!
+  ^flabels@ "%s" format print
+  "" ^flabels!
   ret
-pf_entry: "entry:\n" _call emit 0 ret
-pf_noentry: 0 ret
-pfp_c: _call tk ")" _call streq not ret
-pfp_b: _call tk "," _call streq 'pfp_cma 'pfp_n1 ifelse 0 ret
-pfp_cma: _call adv 0 ret
-pfp_n1: _call tk _call istype _call tk "*" _call streq + 'pfp_type 'pfp_name ifelse 0 ret
-pfp_type: _call adv 0 ret
-pfp_name: ^pl@ _call tk push ^pl! _call adv 0 ret
-pfp2_c: ^pfi@ -1 eq not ret
-pfp2_b: ^pl@ ^pfi@ get ^nv! ^nv@ _call newvar "^%s!\n" fmt _call emit ^pfi@ 1 - ^pfi! 0 ret
-pfb_c: _call tk "}" _call streq not ret
-pfb_b: _call pstmt 0 ret
-pf_main_ep: "0 _call exit\n" _call emit 0 ret
-pf_func_ep: "0 ret\n" _call emit 0 ret
+pf_noep: ret 0
+pf_doep: ^inmain@ 'pf_main_ep 'pf_func_ep if_else ret 0
+pf_entry: "entry:\n" _call emit ret 0
+pf_noentry: ^fname@ "%s:\n" format _call emit ret 0
+pfp_c: _call tk ")" _call streq not ^rr! ret ^rr@
+pfp_b: _call tk "," _call streq 'pfp_cma 'pfp_n1 if_else ret 0
+pfp_cma: _call adv 0 ^rr! ret ^rr@
+pfp_n1: _call tk _call istype _call tk "*" _call streq add 'pfp_type 'pfp_name if_else ret 0
+pfp_type: _call adv 0 ^rr! ret ^rr@
+pfp_name: ^pl@ _call tk append ^pl! _call adv 0 ^rr! ret ^rr@
+pfp2_c: ^pfi@ -1 eq not ^rr! ret ^rr@
+pfp2_b: ^pl@ ^pfi@ get ^nv! ^nv@ _call newvar "^%s!\n" format _call emit ^pfi@ 1 sub ^pfi! 0 ^rr! ret ^rr@
+pfb_c: _call tk "}" _call streq not ^rr! ret ^rr@
+pfb_b: _call pstmt 0 ^rr! ret ^rr@
+pf_main_ep: "0 _call exit\nret\n" _call emit 0 ^rr! ret ^rr@
+pf_func_ep: "^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@\n" _call emit 0 ^rr! ret ^rr@
 
 pprog: 'pp_c 'pp_b while ret
-pp_c: ^pi@ ^nt@ eq not ret
-pp_b: _call pfunc 0 ret
+pp_c: ^pi@ ^nt@ eq not ^rr! ret ^rr@
+pp_b: _call pfunc 0 ^rr! ret ^rr@
 
 ; ---- entry point ----
 entry:
-  0 ^inq!
-  extern "uf_argc" loadx 2 eq not 'arg_bad if
-  extern "uf_argv" loadx 8 + loadx ^path!
+  0 ^inq! 0 ^emode! 0 ^didret! 0 ^cret!
+  list ^douts! "" ^pends! list ^psnaps! "" ^flabels!
+  extern "uf_argc" load 2 eq not 'arg_bad if
+  extern "uf_argv" load 8 add load ^path!
   ^path@ "r" _call fopen ^f!
   ^f@ not 'ffail if
-  ^f@ 0 2 _call fseek drop
+  ^f@ 0 2 _call fseek
   ^f@ _call ftell ^srclen!
-  ^f@ 0 0 _call fseek drop
-  ^srclen@ 16 + buf ^src!
-  ^src@ 1 ^srclen@ ^f@ _call fread drop
-  ^f@ _call fclose drop
+  ^f@ 0 0 _call fseek
+  ^srclen@ 16 add buffer ^src!
+  ^src@ 1 ^srclen@ ^f@ _call fread
+  ^f@ _call fclose
   list ^toks!
   0 ^pos!
   'lexl_c 'lexl_b while
-  ^toks@ len ^nt!
+  ^toks@ length ^nt!
   0 ^pi! 0 ^lbl! 0 ^fid! 0 ^inmain!
   list ^ps! list ^ls!
   "import c\"printf\"(ptr,...)->int\n" _call emit
@@ -531,8 +642,12 @@ entry:
   "import c\"fopen\"(ptr,ptr)->ptr\n" _call emit
   "import c\"fclose\"(ptr)->int\n" _call emit
   "import c\"fgetc\"(ptr)->int\n" _call emit
+  "import c\"strstr\"(ptr,ptr)->ptr\n" _call emit
   "extern \"stdout\"\n" _call emit
   _call pprog
   0 _call exit
+  ret
 arg_bad: "usage: trans file.c" _call die
+  ret
 ffail: "cannot open input" _call die
+  ret

@@ -44,7 +44,7 @@ pub fn emit_text(toks: &[Tok]) -> String {
             Tok::IncGlobal(n) => o.push_str(&format!("^{}++ ", n)),
             Tok::AddGlobal(n) => o.push_str(&format!("^{}+= ", n)),
             Tok::Discard => o.push_str("_! "),
-            Tok::Import(im) => o.push_str(&format!("import c\"{}\"({})->{} ", im.name, im.params.join(","), im.ret)),
+            Tok::Import(im) | Tok::ManifestImport(im) => o.push_str(&format!("import c\"{}\"({})->{} ", im.name, im.params.join(","), im.ret)),
             Tok::Export(n) => o.push_str(&format!("export \"{}\" ", escape_str(n))),
             Tok::Extern(n) => o.push_str(&format!("extern \"{}\" ", escape_str(n))),
             Tok::Use(n) => o.push_str(&format!("use \"{}\" ", escape_str(n))),
@@ -181,7 +181,7 @@ pub fn emit_dense(toks: &[Tok]) -> String {
                 Tok::IncGlobal(n) => { sep_v(o); o.push_str(&format!("^{}++", nm(n, names, next))); }
                 Tok::AddGlobal(n) => { sep_v(o); o.push_str(&format!("^{}+=", nm(n, names, next))); }
                 Tok::Discard => { /* _! has no dense representation */ }
-                Tok::Import(im) => o.push_str(&format!("{}c\"{}\"({})->{}", glyph_of(51), im.name, im.params.join(","), im.ret)),
+                Tok::Import(im) | Tok::ManifestImport(im) => o.push_str(&format!("{}c\"{}\"({})->{}", glyph_of(51), im.name, im.params.join(","), im.ret)),
                 Tok::Export(n) => o.push_str(&format!("{}\"{}\"", glyph_of(52), escape_str(n))),
                 Tok::Extern(n) => o.push_str(&format!("{}\"{}\"", glyph_of(53), escape_str(n))),
                 Tok::Use(n) => o.push_str(&format!("{}\"{}\"", glyph_of(78), escape_str(n))),

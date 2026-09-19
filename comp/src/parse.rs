@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::lex::*;
+use crate::sandbox::Caps;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 // FNV-1a 64 over bytes (matches uf_fnv in the C prelude)
@@ -35,7 +36,41 @@ pub fn method_typekey(name: &str, structs: &StructMap) -> Option<i64> {
     }
 }
 
-pub fn parse(toks: Vec<Tok>, structs: &mut StructMap) -> Parsed {
+// sandbox: compile-time capability gate for opcodes. Panics with the op,
+// capability, active policy, and remedy when a gated op is denied.
+fn gate_op(name: &str, caps: &Caps) {
+    let (cap, need, mnem): (&str, &str, &str) = match name {
+        "SH" => ("proc", "proc", "shell"),
+        "SHP" => ("proc", "proc", "shell_stream"),
+        "EXEC" => ("proc", "proc", "execute"),
+        "SLURP" => ("fs.read", "fs.read", "read_file"),
+        "SPIT" => ("fs.write", "fs.write", "write_file"),
+        "MMAP" => ("fs.mmap", "fs.read + fs.write", "mmap"),
+        "FEACH" => ("fs.read", "fs.read", "file_each_line"),
+        "FFOLD" => ("fs.read", "fs.read", "file_fold_lines"),
+        "FSPLIT" => ("fs.read", "fs.read", "file_split_lines"),
+        "FMATCH" => ("fs.read", "fs.read", "file_match_lines"),
+        "FEMIT" => ("fs.write", "fs.write", "file_emit"),
+        "MALLOC" => ("raw.mem", "raw.mem", "malloc"),
+        "FREE" => ("raw.mem", "raw.mem", "free"),
+        "BUF" => ("raw.mem", "raw.mem", "buffer"),
+        "BUFCOPY" => ("raw.mem", "raw.mem", "copy_memory"),
+        "LOADX" => ("raw.mem", "raw.mem", "load"),
+        "STOREX" => ("raw.mem", "raw.mem", "store"),
+        "ARGV" => ("host.argv", "host.argv", "argv"),
+        "HASARGS" => ("host.argv", "host.argv", "has_args"),
+        "ARGI" => ("host.argv", "host.argv", "arg_index"),
+        _ => return,
+    };
+    if !caps.cap(cap) {
+        panic!(
+            "sandbox: `{}` is disabled — capability `{}` is denied by policy '{}' ({}); allow it in a sandbox config, or run under a broader policy (e.g. `ufsb --policy build`)",
+            mnem, need, caps.policy_name, caps.origin
+        );
+    }
+}
+
+pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
     let mut macros: HashMap<String, Vec<Tok>> = HashMap::new();
     let imports: Vec<Import> = Vec::new();
     // v12: destructuring bind helpers
@@ -191,7 +226,10 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap) -> Parsed {
                 };
                 panic!("'{}' is retired in v12 — use named variables instead", retired_name)
             }
-            Tok::Op(name) => p.ins.push(simple_ins(name)),
+            Tok::Op(name) => {
+                gate_op(name, caps);
+                p.ins.push(simple_ins(name))
+            }
             Tok::PushI(v) => p.ins.push(Ins::PushI(v)),
             Tok::PushF(v) => p.ins.push(Ins::PushF(v)),
             Tok::PushS(s) => {
@@ -275,12 +313,35 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap) -> Parsed {
                 p.ins.push(Ins::SetV(n));
             }
             Tok::Import(im) => {
+                if !caps.cap("ffi.import") {
+                    panic!(
+                        "sandbox: `import c\"{}\"(...)` is disabled — capability `ffi.import` is denied by policy '{}' ({}); raw FFI declarations are only available under a policy that allows them",
+                        im.name, caps.policy_name, caps.origin
+                    );
+                }
+                if !p.imports.iter().any(|x| x.name == im.name) {
+                    p.imports.push(im);
+                }
+            }
+            Tok::ManifestImport(im) => {
+                // imports inside an allowed module's .ufm manifest: loading the
+                // module was already gated by the ffi.use module policy
                 if !p.imports.iter().any(|x| x.name == im.name) {
                     p.imports.push(im);
                 }
             }
             Tok::Export(n) => pending_export = Some(n),
             Tok::Use(n) => {
+                if !caps.module_allowed(&n) {
+                    let list = match &caps.module_allow {
+                        Some(l) if !l.is_empty() => format!("; allowed modules: {}", l.join(", ")),
+                        _ => String::new(),
+                    };
+                    panic!(
+                        "sandbox: module `use \"{}\"` is denied by policy '{}' ({}){} — add it with `allow-module {}` in an allowed sandbox config, or run under a policy that permits it",
+                        n, caps.policy_name, caps.origin, list, n
+                    );
+                }
                 if !p.uses.contains(&n) {
                     p.uses.push(n);
                 }
@@ -288,6 +349,12 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap) -> Parsed {
             Tok::Mod(n) => p.modname = Some(n),
             Tok::Pub => pending_pub = true,
             Tok::Extern(n) => {
+                if !caps.cap("ffi.import") {
+                    panic!(
+                        "sandbox: `extern \"{}\"` is disabled — capability `ffi.import` is denied by policy '{}' ({}); extern symbols are only available under a policy that allows them",
+                        n, caps.policy_name, caps.origin
+                    );
+                }
                 if !p.externs.contains(&n) {
                     p.externs.push(n.clone());
                 }
@@ -319,7 +386,15 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap) -> Parsed {
                 structs.insert(n, (fs, off, sid));
             }
             Tok::Method(tname) => pending_method = Some(tname),
-            Tok::Sys(n) => p.ins.push(Ins::Sys(n)),
+            Tok::Sys(n) => {
+                if !caps.cap("raw.syscall") {
+                    panic!(
+                        "sandbox: `_syscall {}` is disabled — capability `raw.syscall` is denied by policy '{}' ({}); syscalls are never available in sandboxed policies",
+                        n, caps.policy_name, caps.origin
+                    );
+                }
+                p.ins.push(Ins::Sys(n))
+            }
             Tok::Task { name, count, body } => {
                 // v10 fanout: count literal 1..64; count > 1 requires exactly
                 // one input (checked at RUN where the input is resolved)
@@ -810,31 +885,65 @@ pub fn resolve_locals(p: &mut Parsed) {
     }
 
     // Step 2: Propagate body ownership through PushAddr references.
-    // For each label's instruction range, find PushAddr instructions and
-    // reassign their target labels to the same body.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        // Build (label_pc, next_label_pc) ranges
-        let mut ranges: Vec<(usize, usize)> = all_label_pcs.iter().copied().zip({
+    // A PushAddr target (continuation label) belongs to the same body as the
+    // label whose range contains the reference. Continuation labels can be
+    // mutually referenced (if/else webs), so this is a union-find merge over
+    // labels — a naive "reassign until stable" loop oscillates forever on
+    // such cycles. Each component takes the earliest positional body among
+    // its members (a component spanning call entries shares the outermost
+    // frame; locals resolution then treats those labels as one frame).
+    {
+        // union-find over label pcs
+        let mut parent: HashMap<usize, usize> = HashMap::new();
+        for &pc in &all_label_pcs {
+            parent.insert(pc, pc);
+        }
+        fn find(parent: &mut HashMap<usize, usize>, x: usize) -> usize {
+            let mut root = x;
+            loop {
+                let p = *parent.get(&root).unwrap_or(&root);
+                if p == root { break; }
+                root = p;
+            }
+            // path compression
+            let mut cur = x;
+            while cur != root {
+                let next = *parent.get(&cur).unwrap_or(&root);
+                parent.insert(cur, root);
+                cur = next;
+            }
+            root
+        }
+        let ranges: Vec<(usize, usize)> = all_label_pcs.iter().copied().zip({
             let mut nexts = all_label_pcs.iter().copied().skip(1).collect::<Vec<_>>();
             nexts.push(p.ins.len());
             nexts.into_iter()
         }).collect();
-        ranges.sort();
         for &(lpc, end) in &ranges {
-            let body = *label_body.get(&lpc).unwrap_or(&0);
-            for i in lpc..end {
-                if i >= p.ins.len() { break; }
+            let lroot = find(&mut parent, lpc);
+            for i in lpc..end.min(p.ins.len()) {
                 if let Ins::PushAddr(target) = &p.ins[i] {
                     if let Some(&target_pc) = p.labels.get(target) {
-                        let target_body = *label_body.get(&target_pc).unwrap_or(&0);
-                        if target_body != body {
-                            label_body.insert(target_pc, body);
-                            changed = true;
+                        let troot = find(&mut parent, target_pc);
+                        if troot != lroot {
+                            parent.insert(troot, lroot);
                         }
                     }
                 }
+            }
+        }
+        // component body = min positional body among members
+        let mut comp_body: HashMap<usize, usize> = HashMap::new();
+        for &pc in &all_label_pcs {
+            let root = find(&mut parent, pc);
+            let pos = *label_body.get(&pc).unwrap_or(&0);
+            let e = comp_body.entry(root).or_insert(pos);
+            if pos < *e { *e = pos; }
+        }
+        for &pc in &all_label_pcs {
+            let root = find(&mut parent, pc);
+            if let Some(&b) = comp_body.get(&root) {
+                label_body.insert(pc, b);
             }
         }
     }
@@ -1099,6 +1208,8 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "SH" => "op_sh",
         "SHP" => "op_shp",
         "EXEC" => "op_exec",
+        "CAP" => "op_cap",
+        "CAPS" => "op_caps",
         "MATCH" => "op_match",
         "REPLACE" => "op_replace",
         "RSPLIT" => "op_rsplit",
@@ -1138,14 +1249,14 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "SOME" => "op_some",
         "EVERY" => "op_every",
         // v10: vector ops
-        "VADD" => "op_vadd",
-        "VSUB" => "op_vsub",
-        "VMUL" => "op_vmul",
-        "VDIV" => "op_vdiv",
-        "VEADD" => "op_veadd",
-        "VESUB" => "op_vesub",
-        "VEMUL" => "op_vemul",
-        "VEDIV" => "op_vediv",
+        "VADD" => "op_add",
+        "VSUB" => "op_sub",
+        "VMUL" => "op_mul",
+        "VDIV" => "op_div",
+        "VEADD" => "op_add",
+        "VESUB" => "op_sub",
+        "VEMUL" => "op_mul",
+        "VEDIV" => "op_div",
         "VEMAX" => "op_vemax",
         "VEMIN" => "op_vemin",
         "VEQ" => "op_veq",
@@ -1224,7 +1335,231 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "SORTKEYS" => "op_sortkeys",
         "TOPN" => "op_topn",
         "RANGEFOLD" => "op_rangefold",
+        "TRANSPOSE" => "op_transpose",
+
         other => panic!("no helper for {}", other),
     };
     Ins::Simple(helper)
+}
+
+// ---------------- strict label-call arity (v13.1) ----------------
+// Fixed-effect table for the ops the macro above can't express cleanly.
+pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
+    Some(match h {
+        // arithmetic / logic
+        "op_add" | "op_sub" | "op_mul" | "op_and" | "op_pow" | "op_div" | "op_rem"
+        | "op_eq" | "op_seq" | "op_sne" | "op_lt" | "op_gt" | "op_lte" | "op_gte"
+        | "op_or" | "op_xor" | "op_shl" => (2, 1),
+        "op_sqrt" | "op_shr" | "op_inc" | "op_dec" | "op_not" | "op_bnot" => (1, 1),
+        // containers
+        "op_get" | "op_getq" | "op_orelse" | "op_has" | "op_contains" => (2, 1),
+        "op_set" => (3, 0),
+        "op_append" | "op_push" => (2, 1),
+        "op_lpop" => (1, 1),
+        "op_del" => (2, 0),
+        "op_len" | "op_typeof" | "op_clone" | "op_keys" | "op_sort" | "op_unique" | "op_flat" => (1, 1),
+        "op_range" | "op_filter" | "op_some" | "op_every" | "op_chunk" => (2, 1),
+        "op_dict" | "op_list" | "op_caps" => (0, 1),
+        "op_arr" | "op_tensor" => (2, 1),
+        "op_cast" => (2, 1),
+        // vector
+        "op_vadd" | "op_vsub" | "op_vmul" | "op_vdiv" => (2, 1),
+        "op_veadd" | "op_vesub" | "op_vemul" | "op_vediv" | "op_vemax" | "op_vemin" => (2, 1),
+        "op_veq" | "op_vlt" | "op_vgt" | "op_vge" | "op_vle" => (2, 1),
+        "op_vand" | "op_vor" => (2, 1),
+        "op_vnot" | "op_vcount" | "op_vsum" | "op_vmean" | "op_vmin" | "op_vmax" | "op_vargsort" => (1, 1),
+        "op_vgather" | "op_vwhere" | "op_vsearchsorted" => (2, 1),
+        "op_vmap" | "op_vfold" => (3, 1),
+        "op_vget" => (2, 1),
+        "op_vset" => (3, 0),
+        // strings
+        "op_cat" | "op_join" | "op_slice" | "op_starts" | "op_ends" | "op_find" | "op_rsplit" => (2, 1),
+        "op_replace" | "op_repl" => (3, 1),
+        "op_trim" | "op_up" | "op_down" => (1, 1),
+        "op_glob" => (2, 1),
+        // script I/O
+        "op_slurp" | "op_mmap" => (1, 1),
+        "op_spit" => (2, 0),
+        "op_femit" => (2, 1),
+        "op_feach" => (2, 0),
+        "op_ffold" | "op_fmatch" => return Some((3, 1)).filter(|_| h == "op_ffold"),
+        "op_fsplit" => (4, 1),
+        "op_fget" | "op_fatoi" | "op_fatof" | "op_fbyte" => (1, 1),
+        "op_fsget" => (2, 1),
+        "op_addto" => (3, 0),
+        "op_faddto" | "op_finc" => (2, 0),
+        "op_count" => (1, 1),
+        "op_argv" | "op_hasargs" | "op_now" => (0, 1),
+        "op_argi" => (1, 1),
+        // shell
+        "op_sh" => (1, 3),
+        "op_shp" | "op_exec" => (1, 1),
+        // time / bloom
+        "op_time" | "op_timef" => (2, 1),
+        "op_bloom" => (1, 1),
+        "op_badd" => (2, 0),
+        "op_btest" => (2, 1),
+        // JSON / iterators
+        "op_json" | "op_unjson" | "op_iter" | "op_next" | "op_collect" => (1, 1),
+        "op_imap" | "op_ifilter" => (2, 1),
+        // conversion
+        "op_atoi" | "op_atof" | "op_itoa" | "op_ftoa" => (1, 1),
+        // threads / channels / atomics
+        "op_chan" | "op_atom" | "op_aget" | "op_deq" | "op_spawn" => (1, 1),
+        "op_enq" => (2, 0),
+        "op_close" => (1, 0),
+        "op_aset" | "op_aadd" => (2, 0),
+        "op_cas" => (3, 1),
+        // memory
+        "op_buf" | "op_malloc" | "op_sizeof" => (1, 1),
+        "op_free" => (1, 0),
+        "op_bufcopy" | "op_storex" => (3, 0),
+        "op_loadx" => (1, 1),
+        // misc
+        "op_print" => (1, 0),
+        "op_scan" => (1, 1),
+        "op_cap" | "op_transpose" => (1, 1),
+        "op_shutdown" => (0, 0),
+        "op_drop" => (1, 0),
+        "op_sortkeys" | "op_topn" => return None,
+        "op_wfind" | "op_bfs" | "op_dfs" => (2, 1),
+        "op_rangefold" => (3, 1),
+        _ => return None,
+    })
+}
+
+/// Post-merge pass: at every `_call`, verify the statically-known stack depth
+/// covers the callee's declared arity. Unknown (poisoned) depths defer to the
+/// runtime backstop. Missing arguments are a compile error (null-fill removed).
+pub fn check_label_arity(p: &Parsed) {
+    let arity_at = |pc: usize| -> usize {
+        // nearest label at or before pc that declares params
+        let mut best: Option<(usize, usize)> = None;
+        for (&lpc, params) in &p.label_params {
+            if lpc <= pc && best.map_or(true, |(b, _)| lpc > b) {
+                best = Some((lpc, params.len()));
+            }
+        }
+        best.map(|(_, n)| n).unwrap_or(0)
+    };
+    let label_name_at = |pc: usize| -> String {
+        let mut best: Option<(usize, String)> = None;
+        for (name, &lpc) in &p.labels {
+            if lpc <= pc && best.as_ref().map_or(true, |(b, _)| lpc > *b) {
+                best = Some((lpc, name.clone()));
+            }
+        }
+        best.map(|(_, n)| n).unwrap_or_else(|| "<top>".to_string())
+    };
+    let mut depth: Option<i64> = Some(0);
+    let mut list_marks: Vec<i64> = Vec::new();
+    for (i, ins) in p.ins.iter().enumerate() {
+        // label boundary: a new body begins (params are the incoming cells)
+        let is_label_entry = p.labels.values().any(|&lpc| lpc == i) || i == 0;
+        if is_label_entry {
+            depth = Some(arity_at(i) as i64);
+            list_marks.clear();
+        }
+        match ins {
+            Ins::PushI(_) | Ins::PushF(_) | Ins::PushS(_) | Ins::PushAddr(_) => {
+                depth = depth.map(|d| d + 1);
+            }
+            Ins::Simple(h) => {
+                if p.param_pcs.contains_key(&i) {
+                    // guarded param pop at body start: consumes one arg cell
+                    depth = depth.map(|d| d - 1);
+                } else {
+                    depth = match (depth, helper_effect(h)) {
+                        (Some(d), Some((pops, pushes))) => Some(d - pops + pushes),
+                        _ => None,
+                    };
+                }
+            }
+            Ins::Call(l) => {
+                match p.labels.get(l.as_str()).copied() {
+                    Some(tp) => {
+                        let arity = p.label_params.get(&tp).map(|v| v.len()).unwrap_or(0);
+                        if let Some(d) = depth {
+                            if d < arity as i64 {
+                                let params = p.label_params.get(&tp).cloned().unwrap_or_default();
+                                let pnames: Vec<String> = params
+                                    .iter()
+                                    .map(|pr| match pr {
+                                        Param::Local(n) | Param::Global(n) => n.clone(),
+                                        Param::Discard => "_!".to_string(),
+                                    })
+                                    .collect();
+                                let missing = arity as i64 - if d > 0 { d } else { 0 };
+                                panic!(
+                                    "label '{}' declares {} parameter(s) ({}) but the call site leaves only {} value(s) on the stack (missing {}) — missing arguments are no longer filled with null; provide all arguments or declare fewer bindings",
+                                    l, arity, pnames.join(" "), d, missing
+                                );
+                            }
+                            depth = Some(d - arity as i64 + 1);
+                        } else {
+                            depth = None;
+                        }
+                    }
+                    None => depth = None,
+                }
+            }
+            Ins::CallExt(ii) => {
+                let im = &p.imports[*ii];
+                if im.params.iter().any(|x| x == "...") || im.ret == "..." {
+                    depth = None;
+                } else {
+                    let n = im.params.len() as i64;
+                    depth = depth.map(|d| d - n + if im.ret == "void" { 0 } else { 1 });
+                }
+            }
+            Ins::For | Ins::While => {
+                depth = depth.map(|d| d - 2);
+            }
+            Ins::If => {
+                depth = depth.map(|d| d - 2);
+            }
+            Ins::IfElse => {
+                depth = depth.map(|d| d - 3);
+            }
+            Ins::Sys(n) => {
+                depth = depth.map(|d| d - *n as i64 - 1 + 1);
+            }
+            Ins::Send => {
+                depth = depth.map(|d| d - 2);
+            }
+            Ins::ListStart | Ins::DictStart => {
+                if let Some(d) = depth {
+                    list_marks.push(d);
+                } else {
+                    list_marks.push(-1);
+                }
+            }
+            Ins::ListLit | Ins::DictLit => {
+                depth = match (list_marks.pop(), depth) {
+                    (Some(-1), _) => None,
+                    (Some(m), _) => Some(m + 1),
+                    (None, d) => d, // malformed; leave as-is
+                };
+            }
+            Ins::Ret => {
+                // body ends; the next label entry resets depth
+                depth = None;
+            }
+            Ins::Break | Ins::Cont | Ins::Goto(_) | Ins::Weave(_) | Ins::Extern(_) | Ins::Flush => {
+                depth = None;
+            }
+            Ins::SetV(_) | Ins::GetV(_) | Ins::LocalSet(_) | Ins::LocalGet(_)
+            | Ins::LocalSetI(_) | Ins::LocalGetI(_) => {
+                if p.param_pcs.contains_key(&i) {
+                    depth = depth.map(|d| d - 1);
+                } else {
+                    let net = match ins {
+                        Ins::SetV(_) | Ins::LocalSet(_) | Ins::LocalSetI(_) => 0, // pass-through
+                        _ => 1,
+                    };
+                    depth = depth.map(|d| d + net);
+                }
+            }
+        }
+    }
 }

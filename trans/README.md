@@ -5,10 +5,16 @@ lexer (the `match` op) plus a hand-rolled recursive-descent parser that reads a
 C source file and prints **v11 text-encoding** µFlux source (per
 `../SPEC.md`) to stdout.
 
-> **v13 status:** `trans/trans.uf` is still written in µFlux v11 syntax and
-> uses removed opcodes (`dup`, `drop`, `swp`, `call`) plus v11 text mnemonics.
-> It cannot be compiled by the v13 compiler until it is ported. The rest of the
-> repository (compiler, runtime, examples, modules) is v13.
+> **v13.1 status:** `trans/trans.uf` has been ported to v13.1 (no
+> `dup`/`swp`/`drop` — bind-and-leave with per-body draining; `add/sub/mul`
+> mnemonics; `if_else`; `ret <value>` form; label bodies end with `ret`).
+> Compiler bugs the port exposed were fixed (oscillating label-body
+> propagation in `resolve_locals`/`compute_local_types` — now union-find;
+> untracked-pointer truthiness). Round-trips passing: declarations,
+> assignments, `while`, `for`, functions/params/calls, simple `if`
+> (`trans/run_tests.sh`; `true`/`false`/`mini_gen` pass). `echo`/`wc`/`yes`/
+> `hello` hit a transpiler-side segfault in if/else emission (`pif_else`
+> stack management) — in progress.
 
 ## Usage
 

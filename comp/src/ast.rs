@@ -33,6 +33,7 @@ pub enum Tok {
     AddGlobal(String),            // ^x+= — global accumulate from stack
     Discard,                      // _! — discard one slot in destructuring bind
     Import(Import),
+    ManifestImport(Import), // import from a loaded .ufm manifest (exempt from ffi.import gating)
     Export(String),
     Extern(String),
     Use(String),                 // USE"name" — link -lname + load mods/<name>.ufm

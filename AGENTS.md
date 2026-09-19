@@ -5,7 +5,7 @@
 ## Repository Layout
 
 ```
-comp/      Rust compiler (→ C → native). 7 std-only modules in src/, no external crates.
+comp/      Rust compiler (→ C → native). Std-only modules in src/ (11 files), no external crates.
 trans/     C→µFlux transpiler, self-hosted in µFlux (text encoding).
 examples/  Sample programs in both encodings.
 mods/      FFI binding manifests (.ufm).
@@ -15,14 +15,22 @@ README.md  Quickstart and project intro.
 SPEC_V11_PROPOSAL.md, WEAVE_SPEC_PROPOSAL.md  Design proposals.
 ```
 
-Compiler source map: `main.rs` (CLI/cache/cc), `lex.rs` (lexers + glyph/mnemonic tables), `parse.rs` (parser, label resolution, WEAVE DAG, v13 label parameters/destructuring), `ast.rs` (types), `gen.rs` (C codegen + optimizations), `emit.rs` (encoding conversion), `prelude.rs` (embedded C runtime: GC, containers, opcodes, threading, coercion, smart print).
+Compiler source map: `main.rs`/`ufsb.rs` (thin bin roots), `driver.rs` (CLI/cache/cc + sandbox/compute wiring), `lex.rs` (lexers + glyph/mnemonic tables), `parse.rs` (parser, label resolution, WEAVE DAG, v13 label parameters/destructuring, strict arity check), `ast.rs` (types), `gen.rs` (C codegen + optimizations), `emit.rs` (encoding conversion), `prelude.rs` (embedded C runtime: GC, containers, opcodes, threading, coercion, smart print, sandbox gates, Vulkan offload), `sandbox.rs` (capability configs/policies), `compute.rs` (Vulkan compute backend + static shader library), `build.rs` (bakes UF_SANDBOX_CONFIG).
 
 ## Build
 
 ```sh
-cd comp && cargo build --release      # binary at comp/target/release/uf
-cargo install --path comp             # install uf to ~/.cargo/bin (on PATH via rustup)
+cd comp && cargo build --release      # binaries at comp/target/release/uf and ufsb
+cargo install --path comp             # install uf + ufsb to ~/.cargo/bin (on PATH via rustup)
 ```
+
+`uf` is the unrestricted compiler. `ufsb` is the sandboxed build: it always
+bakes a capability config (repo default `comp/sandbox.ufs`; override both
+binaries with `UF_SANDBOX_CONFIG=<file.ufs>` at build time). See SPEC.md
+"Sandboxing and capabilities" for policies (`pure`/`data`/`web`/`build`),
+`.ufs` config files, `--policy/--sandbox/--workspace/--caps`, and the
+filesystem workspace. GPU compute offloading (Vulkan) is automatic when glslc
+is present; `--device cpu` disables it (SPEC.md "GPU compute offloading").
 
 No external Rust crates. Edition 2021, release profile `opt-level = 2`. Debug build: `cargo build` → `comp/target/debug/uf`.
 
@@ -36,9 +44,9 @@ Runtime flags: `--gc-threshold N`, `--gc-off`, `--mt`.
 
 **No automated test runner, no Rust unit tests.** All tests are manual — compile and run, verify output by eye.
 
-- **Integration tests**: `comp/tests/t01_basic.uft` … `t09_weave.uft`. One per feature area. Run: `uf comp/tests/tNN_*.uft`
-- **Transpiler tests**: `trans/tests/*.c` — round-trip C→µFlux, compare against system binaries. See `trans/README.md`.
-- **Benchmarks**: `cd bench && python3 run.py` (needs `.bench-venv/` with `transformers`; data in `bench/data/` is gitignored).
+- **Integration tests**: `comp/tests/t01_basic.uft` … `t09_weave.uft`, plus `t12_matrix.uft` (polymorphic matrices), `t13_compute.uft` (GPU offloading; run with `--gc-threshold 200000000`) and `t14_task_gpu.uft` (fused weave-task GPU kernels). One per feature area. Run: `uf comp/tests/tNN_*.uft`
+- **Transpiler tests**: `trans/run_tests.sh` — round-trip C→µFlux (`trans/trans`) → `uf` → compare against system binaries. Ported to v13.1; if/else emission path still buggy (see `trans/README.md`).
+- **Benchmarks**: `cd bench && python3 run.py` (needs `.bench-venv/` with `transformers`; data in `bench/data/` is gitignored). Six benchmarks × 5 languages: logextract, analytics, mandelbrot, spectralnorm (all CPU-only; µFlux pinned with `--device cpu`) plus the GPU-oriented matmul and blackscholes with a GPU-on column (µFlux auto device; see `bench/SPEC.md`).
 
 ## Language & FFI Reference
 

@@ -81,13 +81,40 @@ def compile_all():
     sn_cpp_bin=BENCH/"src"/"spectralnorm"/"spectralnorm_cpp"
     rc,t,out,err=run_cmd(["g++","-std=c++17","-O2","-o",str(sn_cpp_bin),str(sn_cpp_src)])
     print(f"  C++ spectralnorm: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+    # ---- v13.1 GPU-oriented benchmarks (matmul, blackscholes) ----
+    for bn in ("matmul","blackscholes"):
+        d=BENCH/"src"/bn
+        rc,t,out,err=run_cmd(["g++","-std=c++17","-O2","-o",str(d/f"{bn}_cpp"),str(d/f"{bn}.cpp")])
+        results[f"cpp_{bn}"]=(rc==0,t)
+        print(f"  C++ {bn}: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+        rc,t,out,err=run_cmd(["rustc","-O","-o",str(d/f"{bn}_rs"),str(d/f"{bn}.rs")])
+        results[f"rs_{bn}"]=(rc==0,t)
+        print(f"  Rust {bn}: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+    # shared Vulkan launcher artifacts (Python ctypes lib + Node addon; the
+    # C++/Rust GPU binaries stay disabled pending the launcher fix — see SPEC)
+    gpu=BENCH/"src"/"_gpu"
+    for sh in (gpu/"matmul.spv",gpu/"bs.spv"):
+        spv=sh.with_suffix(".comp")
+        rc,t,out,err=run_cmd(["glslc","-O","--target-env=vulkan1.2","-o",str(sh),str(spv)])
+        results[f"spv_{sh.stem}"]=(rc==0,t)
+        print(f"  shader {sh.stem}: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+    rc,t,out,err=run_cmd(["cc","-O2","-shared","-fPIC",str(gpu/"gpucomp.c"),"-o",str(gpu/"libgpucomp.so"),"-lvulkan"])
+    results["gpucomp_so"]=(rc==0,t)
+    print(f"  gpucomp.so: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+    node_inc="/usr/include/node"
+    if (Path(node_inc)/"node_api.h").exists():
+        rc,t,out,err=run_cmd(["cc","-O2","-shared","-fPIC",f"-I{node_inc}",str(gpu/"gpucomp_node.c"),str(gpu/"gpucomp.c"),"-o",str(gpu/"gpucomp_node.node"),"-lvulkan"])
+        results["gpucomp_node"]=(rc==0,t)
+        print(f"  gpucomp.node: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
     sn_rs_src=BENCH/"src"/"spectralnorm"/"spectralnorm.rs"
     sn_rs_bin=BENCH/"src"/"spectralnorm"/"spectralnorm_rs"
     rc,t,out,err=run_cmd(["rustc","-O","-o",str(sn_rs_bin),str(sn_rs_src)])
     print(f"  Rust spectralnorm: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
     return results
-def run_benchmark(name,cmd,cwd=PROJ,timeout=120):
+def run_benchmark(name,cmd,cwd=PROJ,timeout=120,env=False):
     print(f"  Running {name}...",end="",flush=True)
+    if env:
+        cmd=["env"]+cmd
     rc,t,out,err=run_cmd(cmd,cwd=cwd,timeout=timeout)
     status="OK" if rc==0 else("TIMEOUT" if rc==-1 else f"FAIL({rc})")
     print(f" {status} {t:.2f}s")
@@ -97,7 +124,7 @@ def main():
     print("=== Token Counting (Qwen3-0.6B tokenizer) ===\n")
     # Generate dense .uf files from .uft for µFlux token counting
     print("=== Generating dense .uf files ===\n")
-    bench_names=["logextract","analytics","mandelbrot","spectralnorm"]
+    bench_names=["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes"]
     uf_paths={}
     for bn in bench_names:
         uft=BENCH/"src"/bn/f"{bn}.uft"
@@ -137,6 +164,9 @@ def main():
         },
         "µFlux":{bn:uf_paths[bn] for bn in bench_names if bn in uf_paths},
     }
+    for lang in ("Python","Node.js","C++","Rust"):
+        sources[lang]["matmul"]=BENCH/"src"/"matmul"/("matmul."+{"Python":"py","Node.js":"js","C++":"cpp","Rust":"rs"}[lang])
+        sources[lang]["blackscholes"]=BENCH/"src"/"blackscholes"/("blackscholes."+{"Python":"py","Node.js":"js","C++":"cpp","Rust":"rs"}[lang])
     print("=== Token Counting (Qwen3-0.6B tokenizer) ===\n")
     token_data={}
     for lang,files in sources.items():
@@ -157,8 +187,11 @@ def main():
     le_results.append(run_benchmark("Rust",[str(le_bin),log_path]))
     le_results.append(run_benchmark("Python",["python3",str(BENCH/"src"/"logextract"/"logextract.py"),log_path]))
     le_results.append(run_benchmark("Node.js",["node",str(BENCH/"src"/"logextract"/"logextract.js"),log_path]))
-    le_uf_bin=BENCH/"src"/"logextract"/"logextract_uf"
-    le_results.append(run_benchmark("µFlux",[str(le_uf_bin),log_path],timeout=60))
+    le_uf_src=BENCH/"src"/"logextract"/"logextract.uft"
+    rc,t,out,err=run_cmd([str(UF),"--device","cpu","--gc-threshold","1000000000","-c",str(le_uf_src),"-o",str(BENCH/"src"/"logextract"/"logextract_uf")])
+    le_results.append(run_benchmark("µFlux",[str(BENCH/"src"/"logextract"/"logextract_uf"),log_path],timeout=60))
+    le_gpu=run_benchmark("µFlux(GPU-on)",[str(UF),"--gc-threshold","1000000000",str(le_uf_src),"--",log_path],timeout=60)
+    le_results.append(le_gpu)
     print("\n=== Performance: Data Analytics (500MB sales.csv) ===\n")
     an_results=[]
     an_bin=BENCH/"src"/"analytics"/"analytics_cpp"
@@ -167,8 +200,9 @@ def main():
     an_results.append(run_benchmark("Rust",[str(an_bin),csv_path]))
     an_results.append(run_benchmark("Python",["python3",str(BENCH/"src"/"analytics"/"analytics.py"),csv_path]))
     an_results.append(run_benchmark("Node.js",["node",str(BENCH/"src"/"analytics"/"analytics.js"),csv_path]))
-    an_uf_bin=BENCH/"src"/"analytics"/"analytics_uf"
-    an_results.append(run_benchmark("µFlux",[str(an_uf_bin),csv_path],timeout=60))
+    an_uf_src=BENCH/"src"/"analytics"/"analytics.uft"
+    an_results.append(run_benchmark("µFlux",[str(UF),"--device","cpu","--gc-threshold","1000000000",str(an_uf_src),"--",csv_path],timeout=60))
+    an_results.append(run_benchmark("µFlux(GPU-on)",[str(UF),"--gc-threshold","1000000000",str(an_uf_src),"--",csv_path],timeout=60))
 
     # Compute-only benchmarks (no data files; n passed as argv[1])
     N_MANDEL=1000
@@ -181,8 +215,9 @@ def main():
     mb_results.append(run_benchmark("Rust",[str(mb_rs_bin),str(N_MANDEL)]))
     mb_results.append(run_benchmark("Python",["python3",str(BENCH/"src"/"mandelbrot"/"mandelbrot.py"),str(N_MANDEL)],timeout=120))
     mb_results.append(run_benchmark("Node.js",["node",str(BENCH/"src"/"mandelbrot"/"mandelbrot.js"),str(N_MANDEL)],timeout=120))
-    mb_uf_bin=BENCH/"src"/"mandelbrot"/"mandelbrot_uf"
-    mb_results.append(run_benchmark("µFlux",[str(mb_uf_bin),str(N_MANDEL)],timeout=120))
+    mb_uf_src=BENCH/"src"/"mandelbrot"/"mandelbrot.uft"
+    mb_results.append(run_benchmark("µFlux",[str(UF),"--device","cpu","--gc-threshold","1000000000",str(mb_uf_src),"--",str(N_MANDEL)],timeout=120))
+    mb_results.append(run_benchmark("µFlux(GPU-on)",[str(UF),"--gc-threshold","1000000000",str(mb_uf_src),"--",str(N_MANDEL)],timeout=120))
 
     print(f"\n=== Performance: Spectral Norm (n={N_SPECTRAL}) ===\n")
     sn_results=[]
@@ -192,8 +227,39 @@ def main():
     sn_results.append(run_benchmark("Rust",[str(sn_rs_bin),str(N_SPECTRAL)]))
     sn_results.append(run_benchmark("Python",["python3",str(BENCH/"src"/"spectralnorm"/"spectralnorm.py"),str(N_SPECTRAL)],timeout=300))
     sn_results.append(run_benchmark("Node.js",["node",str(BENCH/"src"/"spectralnorm"/"spectralnorm.js"),str(N_SPECTRAL)],timeout=300))
-    sn_uf_bin=BENCH/"src"/"spectralnorm"/"spectralnorm_uf"
-    sn_results.append(run_benchmark("µFlux",[str(sn_uf_bin),str(N_SPECTRAL)],timeout=300))
+    sn_uf_src=BENCH/"src"/"spectralnorm"/"spectralnorm.uft"
+    sn_results.append(run_benchmark("µFlux",[str(UF),"--device","cpu","--gc-threshold","1000000000",str(sn_uf_src),"--",str(N_SPECTRAL)],timeout=300))
+    sn_results.append(run_benchmark("µFlux(GPU-on)",[str(UF),"--gc-threshold","1000000000",str(sn_uf_src),"--",str(N_SPECTRAL)],timeout=300))
+
+    # ---- GPU-oriented benchmarks (v13.1): CPU column + GPU-on column ----
+    # µFlux GPU-on = default auto device (Vulkan). The non-µFlux GPU variants
+    # use the shared launcher in src/_gpu (see bench/SPEC.md; when its binaries
+    # are absent their GPU-on entries are skipped).
+    N_MATMUL=512
+    N_BS=2000000
+    print(f"\n=== Performance: Matmul N={N_MATMUL} (double, GPU-oriented) ===\n")
+    mm_results=[]
+    mm=BENCH/"src"/"matmul"
+    mm_results.append(run_benchmark("C++",[str(mm/"matmul_cpp"),str(N_MATMUL)]))
+    mm_results.append(run_benchmark("Rust",[str(mm/"matmul_rs"),str(N_MATMUL)]))
+    mm_results.append(run_benchmark("Python",["python3",str(mm/"matmul.py"),str(N_MATMUL)]))
+    mm_results.append(run_benchmark("Node.js",["node",str(mm/"matmul.js"),str(N_MATMUL)]))
+    mm_results.append(run_benchmark("µFlux",[str(UF),"--device","cpu","--gc-threshold","500000000",str(mm/"matmul.uft"),"--",str(N_MATMUL)],timeout=120))
+    mm_results.append(run_benchmark("µFlux(GPU-on)",[str(UF),"--gc-threshold","500000000",str(mm/"matmul.uft"),"--",str(N_MATMUL)],timeout=120))
+    if (mm/"matmul_cpp_gpu").exists():
+        mm_results.append(run_benchmark("C++(GPU-on)",[f"UF_SPV_DIR={BENCH/'src'/'_gpu'}",str(mm/"matmul_cpp_gpu"),str(N_MATMUL)],timeout=60,env=True))
+
+    print(f"\n=== Performance: Black-Scholes N={N_BS} (double, GPU-oriented) ===\n")
+    bs_results=[]
+    bs=BENCH/"src"/"blackscholes"
+    bs_results.append(run_benchmark("C++",[str(bs/"blackscholes_cpp"),str(N_BS)]))
+    bs_results.append(run_benchmark("Rust",[str(bs/"blackscholes_rs"),str(N_BS)]))
+    bs_results.append(run_benchmark("Python",["python3",str(bs/"blackscholes.py"),str(N_BS)],timeout=120))
+    bs_results.append(run_benchmark("Node.js",["node",str(bs/"blackscholes.js"),str(N_BS)],timeout=120))
+    bs_results.append(run_benchmark("µFlux",[str(UF),"--device","cpu","--gc-threshold","2000000000",str(bs/"blackscholes.uft"),"--",str(N_BS)],timeout=240))
+    bs_results.append(run_benchmark("µFlux(GPU-on)",[str(UF),"--gc-threshold","2000000000",str(bs/"blackscholes.uft"),"--",str(N_BS)],timeout=240))
+    if (bs/"blackscholes_cpp_gpu").exists():
+        bs_results.append(run_benchmark("C++(GPU-on)",[f"UF_SPV_DIR={BENCH/'src'/'_gpu'}",str(bs/"blackscholes_cpp_gpu"),str(N_BS)],timeout=60,env=True))
 
     report={
         "date":time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -204,7 +270,8 @@ def main():
         "tokenizer":"Qwen/Qwen3-0.6B (vocab=151643)",
         "tokens":token_data,
         "performance":{"logextract":le_results,"analytics":an_results,
-                        "mandelbrot":mb_results,"spectralnorm":sn_results},
+                        "mandelbrot":mb_results,"spectralnorm":sn_results,
+                        "matmul":mm_results,"blackscholes":bs_results},
     }
     with open(RESULTS/"benchmark.json","w") as f:
         json.dump(report,f,indent=2)
@@ -212,27 +279,29 @@ def main():
     print("\n=== SUMMARY ===\n")
     perf_mb={r["name"]:r for r in mb_results}
     perf_sn={r["name"]:r for r in sn_results}
-    print(f"{'Language':<10} {'LogExtract':>12} {'Analytics':>12} {'Mandelbrot':>12} {'SpectralNorm':>14}")
-    print("-"*64)
+    print(f"{'Language':<10} {'LogExtract':>11} {'Analytics':>11} {'Mandelbrot':>11} {'SpectralNorm':>13} {'Matmul':>11} {'BlackSch':>11}")
+    print("-"*82)
     perf_le={r["name"]:r for r in le_results}
     perf_an={r["name"]:r for r in an_results}
+    perf_mm={r["name"]:r for r in mm_results}
+    perf_bs={r["name"]:r for r in bs_results}
+    def fmt(d,k):
+        t=d.get(k,{}).get("time_sec","—")
+        return f"{t:.3f}s" if isinstance(t,float) else str(t)
     for lang in["µFlux","Rust","C++","Python","Node.js"]:
-        le_t=perf_le.get(lang,{}).get("time_sec","N/A")
-        an_t=perf_an.get(lang,{}).get("time_sec","N/A")
-        mb_t=perf_mb.get(lang,{}).get("time_sec","N/A")
-        sn_t=perf_sn.get(lang,{}).get("time_sec","N/A")
-        le_s=f"{le_t:.3f}s" if isinstance(le_t,float) else le_t
-        an_s=f"{an_t:.3f}s" if isinstance(an_t,float) else an_t
-        mb_s=f"{mb_t:.3f}s" if isinstance(mb_t,float) else mb_t
-        sn_s=f"{sn_t:.3f}s" if isinstance(sn_t,float) else sn_t
-        print(f"{lang:<10} {le_s:>12} {an_s:>12} {mb_s:>12} {sn_s:>14}")
-    print(f"\n{'Token counts':<10} {'LogExtract':>12} {'Analytics':>12} {'Mandelbrot':>12} {'SpectralNorm':>14}")
-    print("-"*64)
+        print(f"{lang:<10} {fmt(perf_le,lang):>11} {fmt(perf_an,lang):>11} {fmt(perf_mb,lang):>11} {fmt(perf_sn,lang):>13} {fmt(perf_mm,lang):>11} {fmt(perf_bs,lang):>11}")
+    print()
+    print(f"{'GPU-on':<10} {'LogExtract':>11} {'Analytics':>11} {'Mandelbrot':>11} {'SpectralNorm':>13} {'Matmul':>11} {'BlackSch':>11}")
+    print("-"*82)
+    print(f"{'µFlux':<10} {fmt(perf_le,'µFlux(GPU-on)'):>11} {fmt(perf_an,'µFlux(GPU-on)'):>11} {fmt(perf_mb,'µFlux(GPU-on)'):>11} {fmt(perf_sn,'µFlux(GPU-on)'):>13} {fmt(perf_mm,'µFlux(GPU-on)'):>11} {fmt(perf_bs,'µFlux(GPU-on)'):>11}")
+    print(f"{'C++':<10} {'—':>11} {'—':>11} {'—':>11} {'—':>13} {fmt(perf_mm,'C++(GPU-on)'):>11} {fmt(perf_bs,'C++(GPU-on)'):>11}")
+    print(f"\n{'Token counts':<10} {'LogExtract':>12} {'Analytics':>12} {'Mandelbrot':>12} {'SpectralNorm':>14} {'Matmul':>12} {'BlackSch':>12}")
+    print("-"*88)
     for lang in["µFlux","Rust","C++","Python","Node.js"]:
         vals=[]
-        for bn in["logextract","analytics","mandelbrot","spectralnorm"]:
+        for bn in["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes"]:
             t=token_data.get(lang,{}).get(bn,{}).get("tokens")
             vals.append(f"{t:>12}" if t else f"{'—':>12}")
-        print(f"{lang:<10} {vals[0]} {vals[1]} {vals[2]} {vals[3]:>14}")
+        print(f"{lang:<10} {vals[0]} {vals[1]} {vals[2]} {vals[3]:>14} {vals[4]} {vals[5]}")
 if __name__=="__main__":
     main()

@@ -6,6 +6,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // Set by gen() when --debug is active; read by emit_range() to skip register caching.
 static UF_DEBUG: AtomicBool = AtomicBool::new(false);
 
+// v13.1 strict arity: describe the guarded param pop at instruction pc as
+// (label name, declared arity, param name) for the runtime die message.
+fn sb_param_info(p: &Parsed, pc: usize) -> Option<(String, usize, String)> {
+    let off = *p.param_pcs.get(&pc)?;
+    let mut best_lpc = None;
+    for (&lpc, _) in &p.label_params {
+        if lpc <= pc && best_lpc.map_or(true, |b: usize| lpc > b) {
+            best_lpc = Some(lpc);
+        }
+    }
+    let lpc = best_lpc?;
+    let params = p.label_params.get(&lpc)?;
+    let name = params.get(off).map(|pr| match pr {
+        Param::Local(n) | Param::Global(n) => n.clone(),
+        Param::Discard => "_!".to_string(),
+    })?;
+    let label = p.labels.iter().find(|(_, &v)| v == lpc).map(|(k, _)| k.clone())?;
+    Some((label, params.len(), name))
+}
+
+fn sb_die_expr(p: &Parsed, pc: usize) -> String {
+    match sb_param_info(p, pc) {
+        Some((label, arity, name)) => format!(
+            "die(\"label '{}': missing parameter '{}' ({} parameter(s) declared, fewer present at runtime — null-fill was removed)\")",
+            label, name, arity
+        ),
+        None => "die(\"missing label parameter at runtime — null-fill was removed\")".to_string(),
+    }
+}
+
 // ---------------- codegen ----------------
 pub fn c_type(t: &str) -> &'static str {
     match t {
@@ -189,7 +219,10 @@ fn infer_bin_type(h: &str, a: VType, b: VType) -> VType {
             if a == VType::Int && b == VType::Int { VType::Int } else { VType::Unknown }
         }
         _ => match (a, b) {
-            (VType::Float, _) | (_, VType::Float) => VType::Float,
+            // v13.1: arithmetic is polymorphic (arrays/matrices dispatch at
+            // runtime), so an Unknown operand forces an Unknown result —
+            // typing it Float would miscompile the handle as a double.
+            (VType::Float, VType::Float) | (VType::Float, VType::Int) | (VType::Int, VType::Float) => VType::Float,
             (VType::Int, VType::Int) => VType::Int,
             _ => VType::Unknown,
         },
@@ -341,6 +374,17 @@ pub fn emit_range(
             o.push_str(&e);
             continue;
         }
+        // v13.1: fused weave-task GPU dispatch. At a compilable task's entry,
+        // try one kernel launch over the task's inputs (peeked from the ds);
+        // on success perform the ret epilogue (drain to the caller's saved
+        // sp, jump back), on decline fall through to the CPU body below.
+        if let Some((kidx, nin)) = crate::compute::task_kernel_at(i) {
+            vflush(&mut e, &mut vstack, &mut vcache);
+            e.push_str(&format!(
+                "{{uf_cur_op=\"task_gpu\";Cell _g=uf_gpu_task(cx,{},{});if(!(_g.tag==T_INT&&!_g.i)){{{{if(cx->csp==0){{pushc(cx,_g);return;}}cx->csp--;const void* _gr=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_g);if(!_gr)return;goto *_gr;}}}}}}\n",
+                kidx, nin
+            ));
+        }
         match ins {
             Ins::PushI(v) => {
                 // Push literal directly: no C temp. This lets cc see constants
@@ -407,8 +451,12 @@ pub fn emit_range(
                     let rt = result_type(a.ty, b.ty);
                     let is_arith = matches!(*h, "op_add"|"op_sub"|"op_mul"|"op_div"|"op_rem");
                     let is_cmp = matches!(*h, "op_lt"|"op_gt"|"op_lte"|"op_gte"|"op_eq");
+                    // v13.1: raw-double fusion requires BOTH operand types known.
+                    // An Unknown operand may be an array/matrix handle whose
+                    // polymorphic dispatch lives in the uf_c* helpers.
                     if (is_arith || is_cmp)
                         && (a.ty == VType::Float || b.ty == VType::Float)
+                        && a.ty != VType::Unknown && b.ty != VType::Unknown
                         && a.ty != VType::FloatArr && b.ty != VType::FloatArr
                     {
                         // Float-dominant: a known float operand forces float
@@ -599,14 +647,14 @@ pub fn emit_range(
                                     vflush(&mut e, &mut vstack, &mut vcache);
                                     if *h == "op_ffold" {
                                         /* inlined FFOLD: getline loop + line string + callback */
-                                        e.push_str("{Cell _ff_acc=pop(cx),_ff_p=pop(cx);FILE*_fp=fopen(uf_sptr(_ff_p),\"r\");if(!_fp)die(\"FFOLD: cannot open file\");char*_line=0;size_t _ncap=0;ssize_t m;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FF_C_");
+                                        e.push_str("{Cell _ff_acc=pop(cx),_ff_p=pop(cx);uf_fs_gate(uf_sptr(_ff_p),0);FILE*_fp=fopen(uf_sptr(_ff_p),\"r\");if(!_fp)die(\"FFOLD: cannot open file\");char*_line=0;size_t _ncap=0;ssize_t m;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FF_C_");
                                         e.push_str(&format!("{}{};cx->loops[fr].end=&&K_FF_E_{}{};long _ff_base=cx->sp;while((m=getline(&_line,&_ncap,_fp))>=0){{while(m>0&&(_line[m-1]=='\\n'||_line[m-1]=='\\r'))_line[--m]=0;Cell _ls=uf_str_new(_line,(size_t)m);pushc(cx,_ff_acc);pushc(cx,_ls);\n", prefix, i, prefix, i));
                                         let inner = format!("{}FF{}_", prefix, i);
                                         emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), false);
                                         e.push_str(&format!("K_FF_C_{}{}:;_ff_acc=pop(cx);cx->sp=_ff_base+1;}}K_FF_E_{}{}:;cx->lsp=fr;free(_line);fclose(_fp);pushc(cx,_ff_acc);}}\n", prefix, i, prefix, i));
                                     } else if *h == "op_fsplit" {
                                         /* inlined FSPLIT: getline loop + in-place split + field offsets + callback */
-                                        e.push_str("{Cell _ff_acc=pop(cx),_ff_sep=pop(cx),_ff_p=pop(cx);const char*_E=uf_sptr(_ff_sep);if(!*_E)die(\"FSPLIT: empty separator\");size_t _el=strlen(_E);FILE*_fp=fopen(uf_sptr(_ff_p),\"r\");if(!_fp)die(\"FSPLIT: cannot open file\");char*_line=0;size_t _ncap=0;ssize_t m;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FF_C_");
+                                        e.push_str("{Cell _ff_acc=pop(cx),_ff_sep=pop(cx),_ff_p=pop(cx);const char*_E=uf_sptr(_ff_sep);if(!*_E)die(\"FSPLIT: empty separator\");size_t _el=strlen(_E);uf_fs_gate(uf_sptr(_ff_p),0);FILE*_fp=fopen(uf_sptr(_ff_p),\"r\");if(!_fp)die(\"FSPLIT: cannot open file\");char*_line=0;size_t _ncap=0;ssize_t m;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FF_C_");
                                         e.push_str(&format!("{}{};cx->loops[fr].end=&&K_FF_E_{}{};long _ff_base=cx->sp;while((m=getline(&_line,&_ncap,_fp))>=0){{\n", prefix, i, prefix, i));
                                         /* set up fsplit thread-locals for fget/fatoi/fsget/fbyte */
                                         e.push_str("while(m>0&&(_line[m-1]=='\\n'||_line[m-1]=='\\r'))_line[--m]=0;\n");
@@ -628,10 +676,11 @@ pub fn emit_range(
                             } else {
                                 if *h == "op_drop" {
                                     if let Some(off) = p.param_pcs.get(&i).copied() {
-                                        // v13: `_!` parameter — discard the cell
-                                        // with a null-fallback guard
+                                        // v13.1: `_!` parameter — pop the cell or
+                                        // die (null-fill removed)
                                         let base = param_base(prefix);
-                                        e.push_str(&format!("if(cx->sp>{}&&cx->sp>0){{pop(cx);}}\n", base_off(base, off)));
+                                        let diee = sb_die_expr(p, i);
+                                        e.push_str(&format!("if(cx->sp>{}&&cx->sp>0){{pop(cx);}}else{{{}}}\n", base_off(base, off), diee));
                                         o.push_str(&e);
                                         continue;
                                     }
@@ -1214,9 +1263,7 @@ pub fn emit_range(
                     let base = param_base(prefix);
                     let tmp = format!("_pp{}", vtmp);
                     vtmp += 1;
-                    e.push_str(&format!("Cell {}=(cx->sp>{}&&cx->sp>0)?pop(cx):uf_mki(0);", tmp, base_off(base, off)));
-                    // the k-th pop (reversed order) fires only when the caller
-                    // left (arity - k) cells above the base
+                    e.push_str(&format!("Cell {}=(cx->sp>{}&&cx->sp>0)?pop(cx):({},uf_mki(0));", tmp, base_off(base, off), sb_die_expr(p, i)));
                     VEntry { expr: tmp.clone(), ty: VType::Unknown }
                 } else {
                     vpop(&mut e, &mut vstack, &mut vtmp)
@@ -1259,9 +1306,7 @@ pub fn emit_range(
                     let base = param_base(prefix);
                     let tmp = format!("_pp{}", vtmp);
                     vtmp += 1;
-                    e.push_str(&format!("Cell {}=(cx->sp>{}&&cx->sp>0)?pop(cx):uf_mki(0);", tmp, base_off(base, off)));
-                    // the k-th pop (reversed order) fires only when the caller
-                    // left (arity - k) cells above the base
+                    e.push_str(&format!("Cell {}=(cx->sp>{}&&cx->sp>0)?pop(cx):({},uf_mki(0));", tmp, base_off(base, off), sb_die_expr(p, i)));
                     VEntry { expr: tmp.clone(), ty: VType::Unknown }
                 } else {
                     vpop(&mut e, &mut vstack, &mut vtmp)
@@ -1513,26 +1558,44 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
             label_body.insert(pc, cur_body);
         }
     }
-    // Propagate through PushAddr
-    let mut changed = true;
-    while changed {
-        changed = false;
+    // Propagate through PushAddr — union-find merge (a naive reassign loop
+    // oscillates forever on mutually-referenced continuation labels)
+    {
+        let mut parent: HashMap<usize, usize> = HashMap::new();
+        for &pc in &all_label_pcs { parent.insert(pc, pc); }
+        fn ufind(parent: &mut HashMap<usize, usize>, x: usize) -> usize {
+            let mut root = x;
+            loop { let p = *parent.get(&root).unwrap_or(&root); if p == root { break; } root = p; }
+            let mut cur = x;
+            while cur != root { let next = *parent.get(&cur).unwrap_or(&root); parent.insert(cur, root); cur = next; }
+            root
+        }
         let ranges: Vec<(usize, usize)> = all_label_pcs.iter().copied().zip({
             let mut nexts = all_label_pcs.iter().copied().skip(1).collect::<Vec<_>>();
             nexts.push(p.ins.len());
             nexts.into_iter()
         }).collect();
         for &(lpc, end) in &ranges {
-            let body = *label_body.get(&lpc).unwrap_or(&0);
-            for i in lpc..end {
-                if i >= p.ins.len() { break; }
+            let lroot = ufind(&mut parent, lpc);
+            for i in lpc..end.min(p.ins.len()) {
                 if let Ins::PushAddr(target) = &p.ins[i] {
                     if let Some(&target_pc) = p.labels.get(target) {
-                        let target_body = *label_body.get(&target_pc).unwrap_or(&0);
-                        if target_body != body { label_body.insert(target_pc, body); changed = true; }
+                        let troot = ufind(&mut parent, target_pc);
+                        if troot != lroot { parent.insert(troot, lroot); }
                     }
                 }
             }
+        }
+        let mut comp_body: HashMap<usize, usize> = HashMap::new();
+        for &pc in &all_label_pcs {
+            let root = ufind(&mut parent, pc);
+            let pos = *label_body.get(&pc).unwrap_or(&0);
+            let e = comp_body.entry(root).or_insert(pos);
+            if pos < *e { *e = pos; }
+        }
+        for &pc in &all_label_pcs {
+            let root = ufind(&mut parent, pc);
+            if let Some(&b) = comp_body.get(&root) { label_body.insert(pc, b); }
         }
     }
 
@@ -1756,9 +1819,14 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                         Some((t, opq)) => {
                             if t != VType::Unknown {
                                 records.entry(*id).or_default().push(t);
-                            } else if opq {
+                            } else {
+                                // v13.1: an Unknown-typed store must block
+                                // committing a concrete type to this slot —
+                                // polymorphic arithmetic may store array or
+                                // matrix handles where a scalar was inferred.
                                 poisoned.insert(*id);
                             }
+                            let _ = opq;
                         }
                     }
                 }
@@ -2356,7 +2424,7 @@ pub fn gen_call_ext(im: &Import, sym: &str) -> String {
     let mut o = String::from("{");
     if vararg {
         // printf-style: format string is fixed param 0 (ptr); count % directives
-        o.push_str("int c=uf_vargc(cx);Cell ex[8];if(c>8)die(\"vararg: too many args\");for(int k=c-1;k>=0;k--)ex[k]=pop(cx);");
+        o.push_str("int c=uf_vargc(cx);Cell ex[8];if(c>8)die(\"vararg: too many args\");for(int k=c-1;k>=0;k--){ex[k]=pop(cx);if(ex[k].tag==2&&ex[k].i&&uf_is_str(ex[k]))ex[k].i=(int64_t)uf_sptr(ex[k]);}");
         for (k, _) in fixed.iter().enumerate().rev() {
             o.push_str(&format!("Cell a{}=pop(cx);", k));
         }

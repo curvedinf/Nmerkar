@@ -1,0 +1,32 @@
+; sandbox.ufs — default capability config baked into `ufsb` at build time.
+; Top-level rules are the default policy (data). The [policy NAME] sections
+; are selectable at run time with `ufsb --policy NAME`.
+;
+; pure  : computation only — no filesystem, no network, no processes
+; data  : sandbox filesystem, JSON/CSV etc., no network           (default)
+; web   : sandbox filesystem, HTTPS (curl/ssl modules), no subprocesses/FFI
+; build : broader filesystem, subprocess execution, still no raw host access
+
+name data
+deny  proc ffi.import raw.* host.argv
+allow fs.read fs.write
+workspace .
+
+[policy pure]
+deny fs.* proc ffi.* raw.* host.argv
+
+[policy data]
+deny proc ffi.* raw.* host.argv
+allow fs.read fs.write
+workspace .
+
+[policy web]
+deny proc ffi.import raw.* host.argv
+allow fs.read fs.write
+workspace .
+allow-module m curl ssl
+
+[policy build]
+deny ffi.import raw.*
+allow fs.read fs.write proc host.argv
+workspace ~ /tmp

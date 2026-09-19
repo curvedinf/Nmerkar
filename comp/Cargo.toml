@@ -2,10 +2,15 @@
 name = "uf"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [[bin]]
 name = "uf"
 path = "src/main.rs"
+
+[[bin]]
+name = "ufsb"
+path = "src/ufsb.rs"
 
 [profile.release]
 opt-level = 2

@@ -1,0 +1,46 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x=256) in;
+layout(push_constant) uniform PC { int64_t n0, n1, n2, n3; float64_t s; int64_t rev; } pc;
+layout(std430, binding=0) buffer A { float64_t a[]; };  /* interleaved S,K,sigT (3 doubles per option) */
+layout(std430, binding=2) buffer R { float64_t r[]; };  /* price per option */
+/* pinned N(x) = 0.5 + x*S(x^2); S coefficients per bench/SPEC.md */
+const float64_t S0 = 0.39894225252808718;
+const float64_t S1 = -0.066489940262615232;
+const float64_t S2 = 0.009972402563565597;
+const float64_t S3 = -0.0011861254737728477;
+const float64_t S4 = 0.00011477352256159136;
+const float64_t S5 = -0.0000092236015244880478;
+const float64_t S6 = 0.00000061709290701241611;
+const float64_t S7 = -0.000000033683815695296368;
+const float64_t S8 = 0.0000000014305101232167135;
+const float64_t S9 = -0.0000000000429103246845425126;
+const float64_t S10 = 0.00000000000067639314645906401;
+const float64_t S11 = 0.0000000000000067395099116704979;
+const float64_t S12 = -0.00000000000000059769612419950018;
+const float64_t S13 = 0.0000000000000000083488823309250727;
+const float64_t S14 = 0.00000000000000000025294417305671556;
+const float64_t S15 = -0.0000000000000000000130500997464350326;
+const float64_t S16 = 0.00000000000000000000025200131520055619;
+const float64_t S17 = -0.0000000000000000000000024409281764270801;
+const float64_t S18 = 0.0000000000000000000000000098374183081777466;
+const float64_t DISC = 0.98511193960306265;
+float64_t ncdf(float64_t x){
+  float64_t w = x*x;
+  float64_t p = S18;
+  p = p*w + S17; p = p*w + S16; p = p*w + S15; p = p*w + S14; p = p*w + S13;
+  p = p*w + S12; p = p*w + S11; p = p*w + S10; p = p*w + S9;  p = p*w + S8;
+  p = p*w + S7;  p = p*w + S6;  p = p*w + S5;  p = p*w + S4;  p = p*w + S3;
+  p = p*w + S2;  p = p*w + S1;  p = p*w + S0;
+  return 0.5LF + x*p;
+}
+void main() {
+  int64_t i = int64_t(gl_GlobalInvocationID.x);
+  if (i >= pc.n0) return;
+  int t = int(i)*3;
+  float64_t S = a[t], K = a[t+1], st = a[t+2];
+  float64_t d1 = ((S/K) - 1.0LF + 0.5LF*st*st) / st;
+  float64_t d2 = d1 - st;
+  r[int(i)] = S*ncdf(d1) - K*DISC*ncdf(d2);
+}

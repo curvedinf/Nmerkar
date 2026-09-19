@@ -9,7 +9,7 @@ pub const TYPE_BASE: u32 = 0x13110;
 
 // Opcode glyphs (192 live ops). Index = OP_NAMES array position.
 // All colored emoji (U+1F300+), each exactly one Qwen3 token.
-pub const OP_GLYPHS: [u32; 214] = [
+pub const OP_GLYPHS: [u32; 215] = [
     0x1F300, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1F682, 0x1F910,
     0x1F302, 0x1F602, 0x1F683, 0x1F911, 0x1F303, 0x1FA94, 0x1FA91, 0x1FA92,
     0x1F603, 0x1F684, 0x1F912, 0x1F304, 0x1F604, 0x1F685, 0x1FA90, 0x1F913,
@@ -38,6 +38,7 @@ pub const OP_GLYPHS: [u32; 214] = [
     0x1F333, 0x1F62D, 0x1F6CD, 0x1F940, 0x1F334, 0x1F62E, 0x1F6CE,
     0x1F95B, 0x1F95C, 0x1F95D, 0x1F95E,
     0x1F958, 0x1F959, 0x1F95A,
+    0x1F500,
 ];
 
 // v-space: base-64 digits for variable/label name atoms (colored emoji).
@@ -114,7 +115,7 @@ pub fn glyph_type_id(c: char) -> Option<i64> {
 // 196 opcode slots (0..=195). Retired indices use "~NN" placeholders: they
 // have no glyph, no text mnemonic, and no runtime helper — any use is a
 // compile error (unassigned glyph / unknown identifier).
-pub const OP_NAMES: [&str; 214] = [
+pub const OP_NAMES: [&str; 215] = [
     "LIT", "~1", "~2", "~3", "~4", "~5", "ADD", "SUB", "MUL", "AND", "SHR", "INC", "DEC",
     "POW", "SQRT", "LTE", "FOR", "CALL", "RET", "OBJ", "GET", "SET", "GTE", "ARR", "SHUTDOWN", "~25",
     "CLONE", "CAST", "MACRO", "TENSOR", "~30", "~31", "~32", "SETV", "GETV", "STR", "CAT", "FMT",
@@ -125,7 +126,7 @@ pub const OP_NAMES: [&str; 214] = [
     "ENQ", "DEQ", "CLOSE", "ATOM", "AGET", "ASET", "AADD", "CAS", "TYPEOF", "LEN", "~76",
     "~77", "USE", "MOD", "PUB", "WEAVE", "TASK", "ENDT", "WRUN",
     // shell + strings
-    "SH", "~86", "~87", "SHP", "EXEC",
+    "SH", "CAP", "CAPS", "SHP", "EXEC",
     "MATCH", "REPLACE", "RSPLIT", "GLOB", "SPLIT", "JOIN", "SLICE", "FIND", "REPL",
     "TRIM", "UP", "DOWN", "STARTS", "ENDS",
     // v10: arithmetic & logic
@@ -154,6 +155,7 @@ pub const OP_NAMES: [&str; 214] = [
     "HASARGS", "ARGI", "SORTKEYS", "TOPN",
     "RANGEFOLD",
     "SEQ", "SNE",
+    "TRANSPOSE",
 ];
 
 pub fn op_index(name: &str) -> Option<usize> {
@@ -235,6 +237,8 @@ pub fn op_usage(name: &str) -> &'static str {
         "SH" => "cmd → stdout stderr status | /bin/sh -c",
         "SHP" => "cmd → chan | stream stdout line-by-line",
         "EXEC" => "list → status | no shell, argv list",
+        "CAP" => "name → 0/1 | sandbox capability query (fs.read, proc, compute, ...)",
+        "CAPS" => "→ dict | full capability report (policy, caps, workspace, modules, device)",
         "MATCH" => "str pat → list found | regex, group strings",
         "REPLACE" => "str pat repl → str' | regex replace all",
         "RSPLIT" => "str pat → list | regex split",
@@ -356,6 +360,7 @@ pub fn op_usage(name: &str) -> &'static str {
         "SORTKEYS" => "dict → key_list | keys + sort fused",
         "TOPN" => "dict n → list | top-n [key value] pairs",
         "SEQ" => "a b → 0/1 | strict equality (===)",
+        "TRANSPOSE" => "mat → mat2 | transpose rows/cols (2-D tensor)",
         "SNE" => "a b → 0/1 | strict inequality (!==)",
         _ => "",
     }
@@ -1183,6 +1188,7 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "USE" => "use", "MOD" => "mod", "PUB" => "pub", "WEAVE" => "weave", "TASK" => "task",
         "ENDT" => "~retired", "WRUN" => "run",
         "SH" => "shell", "SHP" => "shell_stream", "EXEC" => "execute",
+        "CAP" => "cap", "CAPS" => "caps",
         "MATCH" => "regex_match", "REPLACE" => "regex_replace", "RSPLIT" => "regex_split", "GLOB" => "glob_match",
         "SPLIT" => "split", "JOIN" => "join", "SLICE" => "slice", "FIND" => "find",
         "REPL" => "replace_all", "TRIM" => "trim", "UP" => "uppercase", "DOWN" => "lowercase",
@@ -1222,6 +1228,8 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "ENTRY" => "entry",
         "HASARGS" => "has_args", "ARGI" => "arg_index", "SORTKEYS" => "sort_keys", "TOPN" => "top_n",
         "RANGEFOLD" => "range_reduce",
+        "TRANSPOSE" => "transpose",
+        "TRANSPOSE" => "transpose",
         "SEQ" => "structural_equal", "SNE" => "structural_not_equal",
         other => other, // "~NN" retired placeholders: never a valid source token
     }

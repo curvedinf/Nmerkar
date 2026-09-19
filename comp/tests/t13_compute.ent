@@ -1,9 +1,9 @@
-; t13_compute.uft — automatic GPU offloading (Vulkan compute, v13.1)
+; t13_compute.ent — automatic GPU offloading (Vulkan compute, v13.1)
 ; Eligible ops at scale (>= UF_GPU_MIN, default 65536 elements): add/sub/mul/div
 ; (elementwise, broadcast, matmul, matvec), sum/mean/min/max, transpose.
-; Run under:  uf t13_compute.uft                (auto: GPU when available)
-;             uf --device cpu t13_compute.uft   (force CPU)
-;             uf --device vk0 t13_compute.uft   (pin device 0)
+; Run under:  nkr t13_compute.ent                (auto: GPU when available)
+;             nkr --device cpu t13_compute.ent   (force CPU)
+;             nkr --device vk0 t13_compute.ent   (pin device 0)
 ; Elementwise results are bit-exact CPU vs GPU; integer-valued double sums are
 ; exact in both reduction orders. Compare outputs across modes.
 ; NOTE: run with --gc-threshold 200000000 — multi-MB arrays trip a pre-existing

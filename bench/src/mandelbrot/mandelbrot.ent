@@ -1,4 +1,4 @@
-; mandelbrot.uft — v13: mandelbrot escape count (bench/SPEC.md).
+; mandelbrot.ent — v13: mandelbrot escape count (bench/SPEC.md).
 ; esc(cx,cy) runs the iteration with zr/zi in register-cached locals inside
 ; an outlined function — no array traffic, tight loop.
 1000 n!

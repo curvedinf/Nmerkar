@@ -1,4 +1,4 @@
-; matmul.uft — v12 text encoding: 128x128 C=A*B, checksum=2863136768
+; matmul.ent — v12 text encoding: 128x128 C=A*B, checksum=2863136768
 
 fi:
   row! 128 'fe for ret

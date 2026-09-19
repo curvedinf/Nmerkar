@@ -1,4 +1,4 @@
-; t12_matrix.uft — polymorphic matrices (v13.1)
+; t12_matrix.ent — polymorphic matrices (v13.1)
 ; matrices: [rows cols] type tensor  (HT_MAT=20, type_of -> 20)
 ; mul: matrix x matrix = matmul; matrix x vector = matvec; elementwise/broadcast otherwise
 

@@ -1,4 +1,4 @@
-; matmul.uft — GPU-oriented matmul benchmark (bench/SPEC.md)
+; matmul.ent — GPU-oriented matmul benchmark (bench/SPEC.md)
 ; C = A*B, N x N double matrices, row-major, N from argv[1] (default 512).
 ;   A[k] = 1.0 + 1e-6*k   (k = row*N + col)
 ;   B[k] = 1.0 - 1e-6*k

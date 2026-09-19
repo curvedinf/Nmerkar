@@ -90,6 +90,7 @@ int wcstdin() {
   }
   /* GNU coreutils 9.4 uses dynamic width on stdin too — do NOT "fix" this to 7 */
   int w = ndigits(b);
+  if (w < 7) w = 7;
   printf("%*d %*d %*d\n", w, l, w, d, w, b);
   return 0;
 }
@@ -105,6 +106,7 @@ int main() {
     tb += fbytes(argv[i]);
   }
   int w = ndigits(tb);
+  if (w < 7) w = 7;
   int tl = 0;
   int tw = 0;
   int tbb = 0;

@@ -1,6 +1,6 @@
-; chat.uft — persistent multi-user chat over HTTP (text encoding, v13)
+; chat.ent — persistent multi-user chat over HTTP (text encoding, v13)
 ;
-; Run:  uf -c examples/text/chat.uft -o chat && ./chat        (port 8080)
+; Run:  nkr -c examples/text/chat.ent -o chat && ./chat        (port 8080)
 ;       ./chat 9000                                           (custom port)
 ; Then open http://localhost:8080 in two or more browser tabs and chat.
 ;
@@ -15,7 +15,7 @@
 ;
 ; The accept loop handshake chan `hs` keeps at most one connection handler
 ; in flight, so the handlers' global vars (f, req, done, ...) are never
-; touched concurrently — the documented µFlux rule that shared-variable
+; touched concurrently — the documented Enmerkar rule that shared-variable
 ; races are the script's own problem is side-stepped structurally here.
 ;
 ; Endpoints:
@@ -223,7 +223,7 @@ entry:
 argv length 1 gt 'parg if
 
 ; chat page (no % chars — string ops never see a format string here)
-"<!doctype html><meta charset=utf-8><title>uflux chat</title><style>body{font-family:sans-serif;max-width:42em;margin:2em auto}#log{white-space:pre-wrap;border:1px solid #bbb;padding:1em;min-height:14em}</style><h3>µFlux chat</h3><div id=log></div><p><input id=u placeholder=name size=10> <input id=m placeholder=message size=32 onkeydown=\"if(event.key=='Enter')go()\"> <button onclick=go()>send</button><script>var L=document.getElementById('log');new EventSource('/events').onmessage=function(e){L.textContent+=e.data+'\\n'};function go(){var m=document.getElementById('m');fetch('/send',{method:'POST',body:'u='+encodeURIComponent(document.getElementById('u').value)+'&m='+encodeURIComponent(m.value)});m.value=''}</script>" page!
+"<!doctype html><meta charset=utf-8><title>enmerkar chat</title><style>body{font-family:sans-serif;max-width:42em;margin:2em auto}#log{white-space:pre-wrap;border:1px solid #bbb;padding:1em;min-height:14em}</style><h3>Enmerkar chat</h3><div id=log></div><p><input id=u placeholder=name size=10> <input id=m placeholder=message size=32 onkeydown=\"if(event.key=='Enter')go()\"> <button onclick=go()>send</button><script>var L=document.getElementById('log');new EventSource('/events').onmessage=function(e){L.textContent+=e.data+'\\n'};function go(){var m=document.getElementById('m');fetch('/send',{method:'POST',body:'u='+encodeURIComponent(document.getElementById('u').value)+'&m='+encodeURIComponent(m.value)});m.value=''}</script>" page!
 
 ; precomputed responses (string handles; FFI sees char* via uf_sptr)
 page@ length "%d" format plen!
@@ -244,7 +244,7 @@ sa@ 3 port@ 256 rem set
 lfd@ sa@ 16 _call bind 0 lt 'bfail if
 lfd@ 64 _call listen
 
-port@ "uflux chat on :%d — open it in two browser tabs\n" format print
+port@ "enmerkar chat on :%d — open it in two browser tabs\n" format print
 
 64 channel ^ev!                           ; broker event queue
 1 channel ^hs!                            ; accept<->handler handshake

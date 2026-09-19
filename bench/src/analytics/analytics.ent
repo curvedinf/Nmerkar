@@ -1,4 +1,4 @@
-; analytics.uft — v13: sales CSV analytics (bench/SPEC.md)
+; analytics.ent — v13: sales CSV analytics (bench/SPEC.md)
 ; Columns: [2] region, [3] country, [4] product, [7] units, [10] total
 0 ^rows! 0.0 ^rev! 0 ^units!
 dict ^region_d! dict ^prod_d! dict ^country_d!

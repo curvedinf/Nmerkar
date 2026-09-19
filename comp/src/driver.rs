@@ -1,4 +1,4 @@
-// driver.rs — shared CLI/compile/run driver for the `uf` and `ufsb` binaries.
+// driver.rs — shared CLI/compile/run driver for the `nkr` and `nkrsb` binaries.
 // The only per-binary difference is the baked sandbox config passed to run().
 
 use crate::ast::*;
@@ -18,7 +18,7 @@ include!(concat!(env!("OUT_DIR"), "/baked_sb.rs"));
 
 // ---------------- directory discovery ----------------
 
-/// Collect all .uf/.uft files in dir, sorted for deterministic compilation order.
+/// Collect all .en/.ent files in dir, sorted for deterministic compilation order.
 fn collect_uf_files(dir: &std::path::Path) -> Vec<String> {
     let mut files: Vec<String> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("cannot read dir {}: {}", dir.display(), e))
@@ -27,7 +27,7 @@ fn collect_uf_files(dir: &std::path::Path) -> Vec<String> {
             let p = e.path();
             if p.is_file() {
                 if let Some(ext) = p.extension() {
-                    if ext == "uf" || ext == "uft" {
+                    if ext == "en" || ext == "ent" {
                         return Some(p.to_string_lossy().to_string());
                     }
                 }
@@ -39,32 +39,32 @@ fn collect_uf_files(dir: &std::path::Path) -> Vec<String> {
     files
 }
 
-/// Check if dir contains init.uf or init.uft
+/// Check if dir contains init.en or init.ent
 fn has_init(dir: &std::path::Path) -> bool {
-    dir.join("init.uf").exists() || dir.join("init.uft").exists()
+    dir.join("init.en").exists() || dir.join("init.ent").exists()
 }
 
-/// Recursively collect files from an init-directory: init.uf first, then other
-/// .uf/.uft, then recurse into nested init subdirs.
+/// Recursively collect files from an init-directory: init.en first, then other
+/// .en/.ent, then recurse into nested init subdirs.
 fn collect_init_dir(
     dir: &std::path::Path,
     files: &mut Vec<String>,
     init_flags: &mut Vec<bool>,
 ) {
-    // init.uf (or init.uft) first — it's the thread entry point
-    let init_file = if dir.join("init.uf").exists() {
-        dir.join("init.uf").to_string_lossy().to_string()
+    // init.en (or init.ent) first — it's the thread entry point
+    let init_file = if dir.join("init.en").exists() {
+        dir.join("init.en").to_string_lossy().to_string()
     } else {
-        dir.join("init.uft").to_string_lossy().to_string()
+        dir.join("init.ent").to_string_lossy().to_string()
     };
     files.push(init_file);
     init_flags.push(true);
 
-    // other .uf/.uft in this dir (not init)
+    // other .en/.ent in this dir (not init)
     let mut others = collect_uf_files(dir);
     others.retain(|f| {
         let p = std::path::Path::new(f);
-        p.file_name().map(|n| n != "init.uf" && n != "init.uft").unwrap_or(true)
+        p.file_name().map(|n| n != "init.en" && n != "init.ent").unwrap_or(true)
     });
     for f in others {
         files.push(f);
@@ -92,29 +92,29 @@ fn discover_directory(root: &str) -> (Vec<String>, Vec<bool>) {
     let mut files: Vec<String> = Vec::new();
     let mut init_flags: Vec<bool> = Vec::new();
 
-    // main.uf (or main.uft) is the entry point — must exist
-    let main_file = if rootpath.join("main.uf").exists() {
-        rootpath.join("main.uf").to_string_lossy().to_string()
-    } else if rootpath.join("main.uft").exists() {
-        rootpath.join("main.uft").to_string_lossy().to_string()
+    // main.en (or main.ent) is the entry point — must exist
+    let main_file = if rootpath.join("main.en").exists() {
+        rootpath.join("main.en").to_string_lossy().to_string()
+    } else if rootpath.join("main.ent").exists() {
+        rootpath.join("main.ent").to_string_lossy().to_string()
     } else {
-        panic!("uf: no main.uf found in {}", root);
+        panic!("nkr: no main.en found in {}", root);
     };
     files.push(main_file);
     init_flags.push(false);
 
-    // other .uf/.uft in root (not main)
+    // other .en/.ent in root (not main)
     let mut others = collect_uf_files(rootpath);
     others.retain(|f| {
         let p = std::path::Path::new(f);
-        p.file_name().map(|n| n != "main.uf" && n != "main.uft").unwrap_or(true)
+        p.file_name().map(|n| n != "main.en" && n != "main.ent").unwrap_or(true)
     });
     for f in others {
         files.push(f);
         init_flags.push(false);
     }
 
-    // subdirs with init.uf
+    // subdirs with init.en
     let subdirs: Vec<std::path::PathBuf> = fs::read_dir(rootpath)
         .unwrap_or_else(|e| panic!("cannot read dir {}: {}", rootpath.display(), e))
         .filter_map(|e| e.ok())
@@ -131,7 +131,7 @@ fn discover_directory(root: &str) -> (Vec<String>, Vec<bool>) {
 }
 
 // locate mods/<name>.ufm by walking up from the input's directory, then CWD,
-// ~/.uflux/mods, and finally each $UFMODPATH dir.
+// ~/.nkr/mods, and finally each $NKRMODPATH dir.
 fn find_manifest(name: &str, base: Option<&std::path::Path>) -> Option<String> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(b) = base {
@@ -143,9 +143,9 @@ fn find_manifest(name: &str, base: Option<&std::path::Path>) -> Option<String> {
     }
     candidates.push(std::path::PathBuf::from(format!("mods/{}.ufm", name)));
     if let Ok(home) = env::var("HOME") {
-        candidates.push(std::path::PathBuf::from(format!("{}/.uflux/mods/{}.ufm", home, name)));
+        candidates.push(std::path::PathBuf::from(format!("{}/.nkr/mods/{}.ufm", home, name)));
     }
-    if let Ok(paths) = env::var("UFMODPATH") {
+    if let Ok(paths) = env::var("NKRMODPATH") {
         for dir in paths.split(':').filter(|d| !d.is_empty()) {
             candidates.push(std::path::PathBuf::from(format!("{}/{}.ufm", dir, name)));
         }
@@ -180,38 +180,38 @@ fn skill_template() -> String {
 
     format!(
 r#"---
-name: uflux
+name: enmerkar
 description: |
-  Use µFlux (`uf`) for all inline custom tools — counting lines, transforming data, inspecting files, quick scripts. µFlux is based on a managed hidden stack, compiled to C then native via `cc`, designed for LLM-authored scripts (low token count, fast, reliable). Use dense mode (glyph, `.uf`) for one-off tools; use text mode (mnemonic, `.uft`) for saved programs. Invoke inline with `uf "<code here>"` (last positional arg is treated as source if no file matches), or pipe stdin with `uf -`.
+  Use Enmerkar (`nkr`) for all inline custom tools — counting lines, transforming data, inspecting files, quick scripts. Enmerkar is based on a managed hidden stack, compiled to C then native via `cc`, designed for LLM-authored scripts (low token count, fast, reliable). Use dense mode (glyph, `.en`) for one-off tools; use text mode (mnemonic, `.ent`) for saved programs. Invoke inline with `nkr "<code here>"` (last positional arg is treated as source if no file matches), or pipe stdin with `nkr -`.
 ---
 
-# µFlux (uf) Agent Skill
+# Enmerkar (nkr) Agent Skill
 
-µFlux is a dynamically typed, weakly typed language based on a **managed hidden stack**, compiled to C then native via `cc`.
+Enmerkar is a dynamically typed, weakly typed language based on a **managed hidden stack**, compiled to C then native via `cc`.
 Programs are terse (low token count), fast, and reliable — designed for LLM-authored scripts.
 Cells are untyped 64-bit values at runtime — ints, floats, and pointers freely interconvert.
 Type inference happens at compile time where possible, but types are not enforced at the language level.
 
 The data stack is an implementation detail. Source code reasons about **named local/global variables**, **literal constants**, and **the return value of the immediately preceding op**. There are no stack-manipulation primitives (`dup`, `drop`, `swp`, `ovr`, `pick`) in v13.
 
-> **Maintenance:** When `uf` is updated, regenerate this file with `uf --skill` to refresh the opcode list.
+> **Maintenance:** When `nkr` is updated, regenerate this file with `nkr --skill` to refresh the opcode list.
 
 ## Inline usage
 
 Run code inline without saving a file:
 ```
-uf '"hello" print'
-uf '1 2 add print'
+nkr '"hello" print'
+nkr '1 2 add print'
 ```
-Or pipe via stdin with `echo '...' | uf -`
+Or pipe via stdin with `echo '...' | nkr -`
 
 ## Encoding
 
-µFlux has two encodings:
+Enmerkar has two encodings:
 
-- **Dense** (glyph mode, `.uf`): single-token emoji glyphs, optimized for LLM token efficiency.
+- **Dense** (glyph mode, `.en`): single-token emoji glyphs, optimized for LLM token efficiency.
   Use for **one-off tools** and inline scripts where token count matters.
-- **Text** (mnemonic mode, `.uft`): human-readable ASCII mnemonics like `add`, `if`, `get`.
+- **Text** (mnemonic mode, `.ent`): human-readable ASCII mnemonics like `add`, `if`, `get`.
   Use for **saved programs** that humans will read, edit, and maintain.
 
 The compiler auto-detects the encoding per file: any character at or above U+13000 = dense.
@@ -320,7 +320,7 @@ Common ops with non-obvious stack signatures:
 
 ### Count lines in all .rs files (inline)
 ```
-uf '"find . -name "*.rs" | sort" sh out! _! _! "\n" split len print'
+nkr '"find . -name "*.rs" | sort" sh out! _! _! "\n" split len print'
 ```
 
 ### ffold to count lines in a file
@@ -386,7 +386,7 @@ ucase:
 - Prefer structured ops (`filter`, `sort`, `vmap`, `vfold`) over manual loops.
 - Use `slurp`/`spit` for file I/O, `sh` for shell commands, `json`/`unjson` for structured data.
 - Dense mode for inline/one-shot scripts; text mode for anything you'll save or share.
-- Test with: `uf program.uft` (compiles, caches, and runs in one step).
+- Test with: `nkr program.ent` (compiles, caches, and runs in one step).
 
 ## Opcode list ({count} live opcodes)
 
@@ -397,7 +397,7 @@ ucase:
     )
 }
 
-pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
+pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
     let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
     let mut emit_c = false;
@@ -474,11 +474,11 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
                 device = Some(d);
             }
             "-h" | "--help" => {
-                eprintln!("usage: uf [directory]                   compile+run directory (auto-discovers)");
-                eprintln!("       uf input.uf... ['inline source'|-]        compile+run (cached in TMPDIR)");
-                eprintln!("       uf -c input.uf... [-o output] [--emit-c|--emit-text|--emit-dense]");
-                eprintln!("       uf --to-text prog.uf | --to-dense prog.uft   convert encodings (writes prog.uft/.uf)");
-                eprintln!("       uf -s | --skill                    print agent SKILL.md template");
+                eprintln!("usage: nkr [directory]                   compile+run directory (auto-discovers)");
+                eprintln!("       nkr input.en... ['inline source'|-]        compile+run (cached in TMPDIR)");
+                eprintln!("       nkr -c input.en... [-o output] [--emit-c|--emit-text|--emit-dense]");
+                eprintln!("       nkr --to-text prog.en | --to-dense prog.ent   convert encodings (writes prog.ent/.en)");
+                eprintln!("       nkr -s | --skill                    print agent SKILL.md template");
                 eprintln!("");
                 eprintln!("  runtime flags (baked into compiled binary):");
                 eprintln!("       --gc-threshold N   GC collection threshold in bytes (default: 1MB)");
@@ -488,7 +488,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
                 eprintln!("       --                  pass remaining args to the program");
                 eprintln!("");
                 eprintln!("  sandbox flags (see SPEC.md — Sandboxing and capabilities):");
-                eprintln!("       --policy NAME       select a capability policy baked into this build (ufsb: pure|data|web|build)");
+                eprintln!("       --policy NAME       select a capability policy baked into this build (nkrsb: pure|data|web|build)");
                 eprintln!("       --sandbox FILE      tighten capabilities with a .ufs config (repeatable, tighten-only)");
                 eprintln!("       --workspace DIR     add/intersect a filesystem workspace root (repeatable)");
                 eprintln!("       --caps              print this build's effective capabilities and exit");
@@ -507,7 +507,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
         }
         i += 1;
     }
-    // Directory mode: bare `uf` or `uf somedir/` discovers files automatically.
+    // Directory mode: bare `nkr` or `nkr somedir/` discovers files automatically.
     // (--caps never requires a program to be present.)
     let init_flags: Vec<bool>;
     if inputs.is_empty() && !show_caps {
@@ -527,10 +527,10 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
     let baked_parsed: Option<(SandboxFile, String)> = if baked_sb.trim().is_empty() {
         None
     } else {
-        let origin = if bin_is_ufsb {
-            "baked into ufsb at build (comp/sandbox.ufs or UF_SANDBOX_CONFIG)".to_string()
+        let origin = if bin_is_nkrsb {
+            "baked into nkrsb at build (comp/sandbox.ufs or NKR_SANDBOX_CONFIG)".to_string()
         } else {
-            "baked into uf at build (UF_SANDBOX_CONFIG)".to_string()
+            "baked into nkr at build (NKR_SANDBOX_CONFIG)".to_string()
         };
         Some((parse_ufs(baked_sb, "<build-baked sandbox>"), origin))
     };
@@ -612,7 +612,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
                         .collect();
                     (s, clean)
                 }
-                Err(_) if last && !input.ends_with(".uf") && !input.ends_with(".uft") => {
+                Err(_) if last && !input.ends_with(".en") && !input.ends_with(".ent") => {
                     (input.clone(), "main".to_string())
                 }
                 Err(e) => panic!("cannot read {}: {}", input, e),
@@ -634,13 +634,13 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
             })
             .collect();
         let is_path = input != "-"
-            && (input.ends_with(".uf") || input.ends_with(".uft") || std::path::Path::new(input).exists());
+            && (input.ends_with(".en") || input.ends_with(".ent") || std::path::Path::new(input).exists());
         let canon_base = is_path.then(|| std::path::Path::new(input).canonicalize().ok()).flatten();
         let base_path = canon_base.as_deref();
         let mut manifest_toks = Vec::new();
         for u in &uses {
             let msrc = find_manifest(u, base_path)
-                .unwrap_or_else(|| panic!("USE\"{}\": no mods/{}.ufm found (searched near input, CWD/mods, ~/.uflux/mods, UFMODPATH)", u, u));
+                .unwrap_or_else(|| panic!("USE\"{}\": no mods/{}.ufm found (searched near input, CWD/mods, ~/.nkr/mods, NKRMODPATH)", u, u));
             hash_src.push_str(&msrc);
             let mut mt = lex_source(&msrc);
             // manifest imports are exempt from ffi.import gating: loading the
@@ -667,8 +667,8 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
             if inp == "-" || !std::path::Path::new(inp).exists() {
                 panic!("--to-text/--to-dense need a file input (or use -o with inline source)");
             }
-            let stem = inp.strip_suffix(".uf").or_else(|| inp.strip_suffix(".uft")).unwrap_or(inp);
-            Some(format!("{}.{}", stem, if emit_text_f { "uft" } else { "uf" }))
+            let stem = inp.strip_suffix(".en").or_else(|| inp.strip_suffix(".ent")).unwrap_or(inp);
+            Some(format!("{}.{}", stem, if emit_text_f { "ent" } else { "en" }))
         } else {
             None
         };
@@ -681,11 +681,11 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
         }
         return;
     }
-    if std::env::var("UF_DEBUG_PARSE").is_ok() {
+    if std::env::var("NKR_DEBUG_PARSE").is_ok() {
         for (i, t) in tus.iter().enumerate() { eprintln!("[tu{}] ins={}", i, t.ins.len()); }
     }
     let parsed = merge_tus(tus, mods, &init_flags);
-    if std::env::var("UF_DEBUG_PARSE").is_ok() { eprintln!("[merged] ins={}", parsed.ins.len()); }
+    if std::env::var("NKR_DEBUG_PARSE").is_ok() { eprintln!("[merged] ins={}", parsed.ins.len()); }
     check_label_arity(&parsed);
     // ---- automatic GPU offloading (no opt-in): compile the static shader
     // library (plus any fused weave-task kernels) and embed it when a Vulkan
@@ -713,7 +713,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
     // bake runtime config into the generated binary
     let mut config_lines = c_bake(&caps, device.as_deref().unwrap_or("auto"));
     if let Some(t) = gc_threshold {
-        config_lines.push_str(&format!("  setenv(\"UF_GC_THRESHOLD\",\"{}\",1);\n", t));
+        config_lines.push_str(&format!("  setenv(\"NKR_GC_THRESHOLD\",\"{}\",1);\n", t));
     }
     if gc_off {
         config_lines.push_str("  uf_gc_on=0;\n");
@@ -767,7 +767,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
         h = h.wrapping_mul(0x100000001b3);
     }
     let dir = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let cdir = std::path::Path::new(&dir).join("uflux-cache");
+    let cdir = std::path::Path::new(&dir).join("nkr-cache");
     fs::create_dir_all(&cdir).unwrap_or_else(|e| panic!("cannot create {}: {}", cdir.display(), e));
     let bin = cdir.join(format!("{:016x}", h));
     let bins = bin.to_string_lossy().to_string();
@@ -792,5 +792,12 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_ufsb: bool) {
         .args(&run_args)
         .status()
         .unwrap_or_else(|e| panic!("failed to run {}: {}", bins, e));
+    if status.code().is_none() {
+        use std::os::unix::process::ExitStatusExt;
+        eprintln!(
+            "uf: program killed by signal {} (possible runtime crash)",
+            status.signal().unwrap_or(0)
+        );
+    }
     std::process::exit(status.code().unwrap_or(1));
 }

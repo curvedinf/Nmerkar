@@ -1,7 +1,7 @@
 # Rust build artifacts
 comp/target/
 
-# uflux compiler cache
+# nkr compiler cache
 /tmp/uflux-cache/
 
 # benchmark data and artifacts

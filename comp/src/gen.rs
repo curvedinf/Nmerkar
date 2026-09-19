@@ -49,7 +49,7 @@ pub fn c_type(t: &str) -> &'static str {
 }
 
 // Return type used in the generated extern function-pointer declaration.
-// µFlux cells are 64-bit, but a libc function declared `->int` returns a C
+// Enmerkar cells are 64-bit, but a libc function declared `->int` returns a C
 // int (32-bit) in eax; declaring the pointer with C `int` makes the call
 // site sign-extend the result into the 64-bit cell (e.g. fgetc's EOF).
 pub fn c_retty(t: &str) -> &'static str {
@@ -537,7 +537,13 @@ pub fn emit_range(
                             }
                         }
                     } else {
-                        // Fallback: unknown types, use Cell helpers
+                        // Fallback: unknown types, use Cell helpers. These are
+                        // the polymorphic paths (array/matrix dispatch inside
+                        // uf_cadd/csub/mul/div) and can allocate. Pending vstack
+                        // temps live only in C variables of nkr_run, invisible
+                        // to the GC — materialize them onto the rooted ds first
+                        // or a collection inside the helper can sweep them (v13.2).
+                        vflush(&mut e, &mut vstack, &mut vcache);
                         vpush_cell(&mut e, &mut vstack, &mut vtmp,
                             &format!("{}({},{})", f, cell_of(&a), cell_of(&b)));
                     }
@@ -1268,11 +1274,22 @@ pub fn emit_range(
                 } else {
                     vpop(&mut e, &mut vstack, &mut vtmp)
                 };
-                // Wrap typed values into Cell for global storage
-                let cell_expr = match t.ty {
-                    VType::Unknown | VType::FloatArr => t.expr.clone(),
-                    VType::Float => format!("uf_mkf({})", t.expr),
-                    VType::Int => format!("uf_mki({})", t.expr),
+                // Wrap typed values into Cell for global storage. A bare
+                // var-read operand must be snapshotted into a C temp before
+                // caching: caching the variable reference would alias it, and
+                // a later rebind of that variable would silently change this
+                // one through the cache.
+                let cell_expr = if t.ty == VType::Unknown && t.expr.starts_with("var_") {
+                    let tmp = format!("t{}", vtmp);
+                    vtmp += 1;
+                    e.push_str(&format!("Cell {}={};", tmp, t.expr));
+                    tmp
+                } else {
+                    match t.ty {
+                        VType::Unknown | VType::FloatArr => t.expr.clone(),
+                        VType::Float => format!("uf_mkf({})", t.expr),
+                        VType::Int => format!("uf_mki({})", t.expr),
+                    }
                 };
                 if let Some(ent) = vcache.iter_mut().find(|(n, _, _)| n == v) {
                     ent.1 = cell_expr;
@@ -1495,7 +1512,7 @@ pub fn emit_range(
                         t.count
                     ));
                 }
-                e.push_str(&format!("uf_weave(cx,uf_wt,{},uflux_run);\n", n));
+                e.push_str(&format!("uf_weave(cx,uf_wt,{},nkr_run);\n", n));
                 for (k, t) in tasks.iter().enumerate() {
                     e.push_str(&format!("var_{}=uf_wt[{}].result;\n", t.name, k));
                 }
@@ -2167,7 +2184,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
     let resolve = |name: &str| -> usize {
         *p.labels.get(name).unwrap_or_else(|| panic!("undefined label {}", name))
     };
-    o.push_str("\nstatic void uflux_run(Ctx*cx, long pc){\n  uf_current_ctx=cx;\n  if(pc<0){ goto *(void*)uf_entry_addr; }\n  /* v11: set up the entry label's local frame (v13: capacity-checked) */\n  cx->local_frames[cx->local_fsp++]=cx->local_base; cx->local_base+=uf_lc(pc); if(cx->local_base>cx->local_cap)die(\"local frame overflow\");\n");
+    o.push_str("\nstatic void nkr_run(Ctx*cx, long pc){\n  uf_current_ctx=cx;\n  if(pc<0){ goto *(void*)uf_entry_addr; }\n  /* v11: set up the entry label's local frame (v13: capacity-checked) */\n  cx->local_frames[cx->local_fsp++]=cx->local_base; cx->local_base+=uf_lc(pc); if(cx->local_base>cx->local_cap)die(\"local frame overflow\");\n");
     let n = p.ins.len();
     // Only labels that can be entered dynamically (initial pc, FOR bodies via
     // PushAddr, weave task entries, SEND methods, exports) go into labtab.
@@ -2208,7 +2225,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         o.push_str("[0]=&&L_0,");
     }
     o.push_str("};\n");
-    // init-TU spawns: each init.uf entry point gets a detached pthread,
+    // init-TU spawns: each init.en entry point gets a detached pthread,
     // spawned exactly once when main_cx enters at pc 0. We run this before
     // the labtab dispatch so it executes on the initial call with pc=0.
     if !p.init_pcs.is_empty() {
@@ -2355,13 +2372,13 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
             if has_pushaddr { continue; }
             // Outline EVERY call site of the label (not just the first): the
             // threaded `goto L_` fallback runs the loop inside the monolithic
-            // uflux_run where GCC's register allocator degrades, so any
+            // nkr_run where GCC's register allocator degrades, so any
             // additional call site must also go through the small function.
             outlined_bodies.insert(j, (bs, be));
         }
     }
 
-    // Emit outlined body functions BEFORE uflux_run (one per body_start, even
+    // Emit outlined body functions BEFORE nkr_run (one per body_start, even
     // if multiple call sites share it)
     let mut outlined_fns = String::new();
     let mut outlined_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new(); // body_starts already emitted
@@ -2386,15 +2403,15 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         // be safe), restore the frame.
         outlined_fns.push_str(&format!("cx->local_base=cx->local_frames[--cx->local_fsp];{}}}\n", if UF_DEBUG.load(Ordering::Relaxed) { "cx->call_csp--;" } else { "" }));
     }
-    // Insert outlined functions after uf_lc but before uflux_run's body
+    // Insert outlined functions after uf_lc but before nkr_run's body
     if !outlined_fns.is_empty() {
-        // Find the uflux_run function definition (not the forward declaration).
-        // The forward declaration is "static void uflux_run(Ctx*cx, long pc);"
-        // while the definition is "static void uflux_run(Ctx*cx, long pc){".
-        let search = "static void uflux_run(Ctx*cx, long pc){";
+        // Find the nkr_run function definition (not the forward declaration).
+        // The forward declaration is "static void nkr_run(Ctx*cx, long pc);"
+        // while the definition is "static void nkr_run(Ctx*cx, long pc){".
+        let search = "static void nkr_run(Ctx*cx, long pc){";
         let insert_pos = o.find(search).unwrap_or_else(|| {
-            // Fallback: find the last occurrence of uflux_run
-            o.rfind("static void uflux_run").unwrap_or(o.len())
+            // Fallback: find the last occurrence of nkr_run
+            o.rfind("static void nkr_run").unwrap_or(o.len())
         });
         o.insert_str(insert_pos, &outlined_fns);
     }
@@ -2405,7 +2422,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
     for (cname, label) in &p.exports {
         let lidx = resolve(label);
         o.push_str(&format!(
-            "uint64_t {}(uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3){{Ctx*cx=main_cx;long base=cx->sp;long _lb=cx->local_base;pushp(cx,(void*)a0);pushp(cx,(void*)a1);pushp(cx,(void*)a2);pushp(cx,(void*)a3);uflux_run(cx,{});uint64_t r=(cx->sp>base)?(uint64_t)pop(cx).i:0;cx->sp=base;cx->local_base=_lb;return r;}}\n",
+            "uint64_t {}(uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3){{Ctx*cx=main_cx;long base=cx->sp;long _lb=cx->local_base;pushp(cx,(void*)a0);pushp(cx,(void*)a1);pushp(cx,(void*)a2);pushp(cx,(void*)a3);nkr_run(cx,{});uint64_t r=(cx->sp>base)?(uint64_t)pop(cx).i:0;cx->sp=base;cx->local_base=_lb;return r;}}\n",
             cname, lidx
         ));
     }
@@ -2414,7 +2431,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
     let dbg_init = if debug {
         "uf_debug_mode=1;uf_vnames=uf_vnames_v;uf_init_labnames();uf_init_local_names();"
     } else { "" };
-    o.push_str(&format!("int main(int argc,char**argv){{uf_argc=argc;uf_argv=(void*)argv;uf_init_reflection();uf_init_locals();{}uf_init_lits({});uf_gc_setroots({});uf_gc_init();uflux_run(main_cx,0);return 0;}}\n", dbg_init, lits_arg, roots_arg));
+    o.push_str(&format!("int main(int argc,char**argv){{nkr_argc=argc;nkr_argv=(void*)argv;uf_init_reflection();uf_init_locals();{}uf_init_lits({});uf_gc_setroots({});uf_gc_init();nkr_run(main_cx,0);return 0;}}\n", dbg_init, lits_arg, roots_arg));
     o
 }
 

@@ -406,11 +406,11 @@ pub fn effective(
     }
 
     // default workspace when fs is allowed but no roots were configured:
-    // the program's directory plus $TMPDIR/uflux
+    // the program's directory plus $TMPDIR/nkr
     if caps.workspace.is_none() && (caps.cap("fs.read") || caps.cap("fs.write")) && caps.is_sandboxed {
         let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
         let mut roots = vec![base_dir.to_path_buf()];
-        let t = PathBuf::from(tmp).join("uflux");
+        let t = PathBuf::from(tmp).join("nkr");
         let _ = std::fs::create_dir_all(&t);
         roots.push(t);
         caps.workspace = Some(roots);

@@ -1,11 +1,11 @@
-; bg/init.uft — auto-spawned as a thread before main starts
+; bg/init.ent — auto-spawned as a thread before main starts
 ; Creates a channel, publishes it so main can find it, then loops.
 16 channel ^cq!
 'cond 'body while
 "bg exiting" print
 0 ret
 
-; publish the channel handle so main.uft can _call bg_chan to get it
+; publish the channel handle so main.ent can _call bg_chan to get it
 pub bg_chan:
   ^cq@ ret
 

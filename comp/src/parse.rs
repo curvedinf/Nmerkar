@@ -64,7 +64,7 @@ fn gate_op(name: &str, caps: &Caps) {
     };
     if !caps.cap(cap) {
         panic!(
-            "sandbox: `{}` is disabled — capability `{}` is denied by policy '{}' ({}); allow it in a sandbox config, or run under a broader policy (e.g. `ufsb --policy build`)",
+            "sandbox: `{}` is disabled — capability `{}` is denied by policy '{}' ({}); allow it in a sandbox config, or run under a broader policy (e.g. `nkrsb --policy build`)",
             mnem, need, caps.policy_name, caps.origin
         );
     }

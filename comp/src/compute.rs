@@ -3,10 +3,10 @@
 // There is no opt-in flag: when a Vulkan shader toolchain (glslc) is present
 // and the device mode is not `--device cpu`, the compiler compiles the STATIC
 // shader library below to SPIR-V, embeds the blobs into the generated C
-// (`#define UF_GPU`), and links -lvulkan. The runtime shims in the prelude
+// (`#define NKR_GPU`), and links -lvulkan. The runtime shims in the prelude
 // pick the device (auto = most free VRAM via VK_EXT_memory_budget; pinned via
 // the baked --device string) and launch prebuilt kernels for eligible ops
-// when the element count clears UF_GPU_MIN; otherwise they fall back to the
+// when the element count clears NKR_GPU_MIN; otherwise they fall back to the
 // CPU implementation. Kernels are only ever *launched*, never generated from
 // user code.
 //
@@ -146,14 +146,14 @@ pub fn gpu_enablement(device: &str, extra_kernels: &[(String, String)]) -> Optio
 
     // cache dir
     let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let cdir = std::path::Path::new(&dir).join("uflux-spirv");
+    let cdir = std::path::Path::new(&dir).join("nkr-spirv");
     let _ = std::fs::create_dir_all(&cdir);
 
     let lib = backend.shader_library();
     let mut all: Vec<(String, String)> = lib.into_iter().map(|(n, s)| (n.to_string(), s)).collect();
     all.extend(extra_kernels.iter().cloned());
     let lib = all;
-    let mut c = String::from("#define UF_GPU 1\n");
+    let mut c = String::from("#define NKR_GPU 1\n");
     for (name, src) in &lib {
         let spv_path = cdir.join(format!("{}_{:016x}.spv", name, fnv(src)));
         let spv = if spv_path.exists() {

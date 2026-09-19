@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Generates trans/trans.uf (µFlux hieroglyph source). Convenience only —
-# the artifact is hand-authored µFlux; this just avoids glyph-counting typos.
+# Generates trans/trans.ent (Enmerkar hieroglyph source). Convenience only —
+# the artifact is hand-authored Enmerkar; this just avoids glyph-counting typos.
 #
 # NOTE: This generator is outdated. It targets v9 dense encoding with removed
 # opcodes (JMP/JZ/JE/IDX/SETI). The hand-written trans/trans.uf is the
@@ -46,7 +46,7 @@ for sig in ['c"fopen"(ptr,ptr)->ptr','c"fseek"(ptr,int,int)->int','c"ftell"(ptr)
             'c"fputs"(ptr,ptr)->int','c"puts"(ptr)->int','c"strncmp"(ptr,ptr,int)->int',
             'c"exit"(int)->void']:
     w(O(IMPORT)+sig)
-for x in ['"stdout"','"uf_argc"','"uf_argv"']:
+for x in ['"stdout"','"nkr_argc"','"nkr_argv"']:
     w(O(EXTERN)+x)
 w('\n')
 
@@ -354,9 +354,9 @@ w('ppad:'+lit(41)+O(CALL)+'exp'+lit(CALL)+O(CALL)+'eg'+O(CALL)+'lpop'+O(DUP)+O(C
 # ---------- main ----------
 w('main:')
 # argc >= 2
-w(O(EXTERN)+'"uf_argc"'+O(LOADX)+lit(2)+O(CALL)+'zlt'+O(JZ)+'mok'
+w(O(EXTERN)+'"nkr_argc"'+O(LOADX)+lit(2)+O(CALL)+'zlt'+O(JZ)+'mok'
   +O(STR)+'"usage: trans file.c"'+O(CALL)+'die'+'\n')
-w('mok:'+O(EXTERN)+'"uf_argv"'+O(LOADX)+lit(8)+O(ADD)+O(LOADX)
+w('mok:'+O(EXTERN)+'"nkr_argv"'+O(LOADX)+lit(8)+O(ADD)+O(LOADX)
   +O(STR)+'"r"'+O(CALL)+'fopen'+sv(SCR)
   +gv(SCR)+lit(0)+lit(2)+O(CALL)+'fseek'+O(DRP)
   +gv(SCR)+O(CALL)+'ftell'+sv(N)

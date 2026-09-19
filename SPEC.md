@@ -1,13 +1,13 @@
-# µFlux Specification v13
+# Enmerkar Specification v13
 
-Normative for `comp/` (the `uf` compiler). The `trans/` transpiler targets the
+Normative for `comp/` (the `nkr` compiler). The `trans/` transpiler targets the
 text encoding (see final section).
 
 **v13 is not backward compatible with v12**. See the v13 changelog section
 below for the full list of breaking changes. The project is
 undeployed/developmental.
 
-µFlux is a language based on a **managed hidden stack**, compiled to C then native
+Enmerkar is a language based on a **managed hidden stack**, compiled to C then native
 via `cc`, designed for LLM-authored one-off scripts (low token count, fast,
 reliable). Values flow through named local/global variables, literal constants,
 and the return value of the immediately preceding op. The data stack still exists
@@ -75,12 +75,12 @@ The following changes are effective as of v13:
 
 Two encodings, identical semantics, auto-detected:
 
-- **Dense** (`.uf`) — single-token emoji glyphs, one glyph per op. Optimized
+- **Dense** (`.en`) — single-token emoji glyphs, one glyph per op. Optimized
   for the Qwen3-0.6B tokenizer (every opcode glyph, v-space atom, and l-space
   atom is a single token).
-- **Text** (`.uft`) — lowercase ASCII mnemonics, whitespace-delimited.
+- **Text** (`.ent`) — lowercase ASCII mnemonics, whitespace-delimited.
 
-**Detection:** any char ≥ U+13000 → dense; else text. `.uft` extension is
+**Detection:** any char ≥ U+13000 → dense; else text. `.ent` extension is
 conventional, not required. Inline source and stdin use the same detection.
 MTU files may mix encodings freely (per-TU auto-detection).
 
@@ -399,7 +399,7 @@ and final in `comp/src/lex.rs`.
 | 38 | 😇 | `buffer` | size → ptr | raw (untracked) buffer (was `buf`) |
 | 40 | 🚉 | `copy_memory` | dst src n → | (was `bufcopy`) |
 | 41 | 🤖 | `_addr` | → code address | `'label` |
-| 42 | 🌈 | `load` | addr → value | raw memory read (was `loadx`) |
+| 42 | 🌈 | `load` | addr → value | raw memory read (was `loadx`); a string operand reads its first byte (unsigned) |
 | 43 | 😈 | `store` | value addr → | raw memory write (was `storex`) |
 | 44 | 🚊 | `_size_of` | type → n | (was `_sizeof`) |
 | 45 | 🤗 | `_offset` | → n | compile-time `Struct.field` |
@@ -694,8 +694,8 @@ removed.
 ## Modules: USE and binding manifests
 
 `use"name"`: links `-l<name>` and loads the binding manifest `<name>.ufm`,
-searched in `./mods`, `~/.uflux/mods`, then `$UFMODPATH` dirs. A manifest is a
-µFlux file containing IMPORT/EXTERN/STRUCT lines; compiled as part of the
+searched in `./mods`, `~/.nkr/mods`, then `$NKRMODPATH` dirs. A manifest is a
+Enmerkar file containing IMPORT/EXTERN/STRUCT lines; compiled as part of the
 USEing TU. Ships: `m.ufm`, `c.ufm`, `pthread.ufm`, `curl.ufm`, `sdl2.ufm`,
 `ssl.ufm`. `-lpthread -lm` always linked; additional `-l<name>` per USE.
 
@@ -708,12 +708,12 @@ USEing TU. Ships: `m.ufm`, `c.ufm`, `pthread.ufm`, `curl.ufm`, `sdl2.ufm`,
   deepest, varargs above. `->int` is C `int` (32-bit), sign-extended into the
   64-bit cell.
 - `extern "symbol"` — pushes the address of a global C symbol for use with
-  `load`/`store`. Runtime exposes `uf_argc` and `uf_argv` this way (though
+  `load`/`store`. Runtime exposes `nkr_argc` and `nkr_argv` this way (though
   `argv` op 163 is preferred).
 
 ## Multiple translation units (MTU)
 
-`uf main.uf lib.uf ...`: first input is the main TU (execution starts at its pc
+`nkr main.en lib.en ...`: first input is the main TU (execution starts at its pc
 0; a TU's top-level flow never falls into the next TU). Per-TU:
 
 - Optional `MOD"name"` header; default is filename stem. Glyph v-names, ASCII
@@ -727,11 +727,11 @@ USEing TU. Ships: `m.ufm`, `c.ufm`, `pthread.ufm`, `curl.ufm`, `sdl2.ufm`,
 
 ## Directory mode and init threads
 
-Bare `uf` (or `uf somedir/`) discovers source files:
+Bare `nkr` (or `nkr somedir/`) discovers source files:
 
-- **Root**: `main.uf`/`main.uft` is the entry point (first TU, pc 0). Error if
-  not found. Other `*.uf`/`*.uft` in root are additional TUs.
-- **Subdirectory with `init.uf`/`init.uft`**: compiled as TUs; the init file is
+- **Root**: `main.en`/`main.ent` is the entry point (first TU, pc 0). Error if
+  not found. Other `*.en`/`*.ent` in root are additional TUs.
+- **Subdirectory with `init.en`/`init.ent`**: compiled as TUs; the init file is
   flagged as an init TU — its top-level code runs in a separate thread,
   automatically spawned before main starts. Recurses into nested init subdirs.
 - **Subdirectory without init**: ignored. `mods/` is never scanned.
@@ -756,7 +756,7 @@ results trivially safe.
 - **Untagged pointers** (`malloc`, `buffer`): never traced, never freed by GC.
 - **Trigger**: bytes allocated since last collection exceeds threshold (default:
   max(1 MiB, 2× live bytes)), and explicit `gc` op (50). Adjustable via
-  `UF_GC_THRESHOLD` env var or `--gc-threshold` runtime flag.
+  `NKR_GC_THRESHOLD` env var or `--gc-threshold` runtime flag.
 - **Concurrency**: stop-the-world via global GC mutex; weave workers park at
   allocation safepoints. Collections never start mid-weave join.
 - **Non-goals**: compaction, generations, incremental/concurrent marking.
@@ -848,7 +848,7 @@ run
   the calling thread. Each task runs with fresh data and call stacks; inputs
   are copied in as the initial stack in declared order. `spawn` target labels
   are ordinary labels subject to the same mandatory-`ret` rule.
-- **Timing**: `UF_WEAVE_DEBUG` env var prints per-task wall time, declared
+- **Timing**: `NKR_WEAVE_DEBUG` env var prints per-task wall time, declared
   workers, items processed, retries, tolerated failures to stderr.
 
 `spawn` (200): run the target label on a detached thread with a fresh `Ctx`;
@@ -871,7 +871,7 @@ Lowercase ASCII mnemonics, whitespace-delimited. Same Tok AST as dense.
 - v13 mnemonics are full English words or `snake_case` phrases; the complete
   mapping is in the opcode reference tables above.
 - `--emit-text` / `--emit-dense` round-trip between encodings. `--to-text` /
-  `--to-dense` convert (writes `<stem>.uft` / `<stem>.uf`, `-o` overrides).
+  `--to-dense` convert (writes `<stem>.ent` / `<stem>.en`, `-o` overrides).
 
 ## PRINT and SCAN
 
@@ -880,6 +880,12 @@ Lowercase ASCII mnemonics, whitespace-delimited. Same Tok AST as dense.
   quotes); nested strings and non-string values are rendered with unambiguous
   formatting. For formatted output, build a string with `format` and then
   `print` it.
+- **format** (37): printf-style directives. `%d/%i/%u/%x/%X/%o` take i64,
+  `%f/%e/%g` f64, `%s` a string, `%c` a code point, `%p` a pointer, `%%` a
+  literal percent. A `*` width consumes an int argument (C semantics):
+  `w 7 "%*d" format`. When an imported C variadic (e.g. `printf`) receives a
+  Enmerkar string as a vararg, the ABI passes its character-data pointer, so
+  `%s` prints the contents.
 - **SCAN** (55): `fmt → list`. Each conversion reads stdin via fscanf:
   `%d/%i/%u/%x/%o` → i64, `%f/%e/%g` → f64, `%s` → fresh string handle. The
   returned list holds the converted values followed by the count. Input error
@@ -894,7 +900,11 @@ for every op; there are no per-op exceptions.
 ### Numeric context
 
 `add`, `sub`, `mul`, `div`, `rem`, comparisons, and vector ops coerce operands
-to numbers:
+to numbers. Exception: a **raw pointer** (an untracked ptr — from `malloc`,
+`buffer` data, FFI returns, or `strstr`-style interior pointers into string
+data) combined with an int under `add`/`sub` performs pointer arithmetic and
+yields a raw pointer (`p 8 add load` reads the next 8 bytes). Tracked handles
+(strings, lists, dicts) are unaffected: they coerce by content as before:
 
 | Input | Result |
 |-------|--------|
@@ -1039,8 +1049,8 @@ so no prefix is needed (or possible) there.
 Pipeline: tokens → parser (labels/macros/structs/imports/v13 locals) → C with
 computed-goto threaded interpreter → `cc -O2 -w`.
 
-CLI modes: `uf prog.uf` (compile + run, cached binary in `$TMPDIR/uflux-cache/`);
-`uf -c prog.uf -o bin` (compile only); `uf --emit-c prog.uf` (dump C); `--emit-text`/
+CLI modes: `nkr prog.en` (compile + run, cached binary in `$TMPDIR/nkr-cache/`);
+`nkr -c prog.en -o bin` (compile only); `nkr --emit-c prog.en` (dump C); `--emit-text`/
 `--emit-dense` (encoding conversion); `--to-text`/`--to-dense` (convert). First
 positional arg is a file if it exists, otherwise inline source. Everything after
 `--` is forwarded as program argv.
@@ -1083,9 +1093,9 @@ generational/incremental/compacting GC; async I/O; object-file linking;
 pkg-config probing; hand-written SIMD (autovectorization first); remote weave
 executors; MSP/mobile targets.
 
-## C → µFlux transpiler (trans/)
+## C → Enmerkar transpiler (trans/)
 
-`trans/trans.uf` is a C-subset → µFlux transpiler, self-hosted in µFlux (text
+`trans/trans.en` is a C-subset → Enmerkar transpiler, self-hosted in Enmerkar (text
 encoding). Bootstrapped via `gen_trans.py`. Supported subset, libc IMPORT
 preamble, and coreutils test adaptations (`true`, `false`, `echo`, `yes`, `wc`)
 are documented in `trans/README.md`.
@@ -1104,8 +1114,8 @@ check that dies with a message naming the label, parameter, and declared arity.
 
 ## Sandboxing and capabilities
 
-`uf` compiles unrestricted. `ufsb` — built by default alongside `uf`
-(`cargo build --release` produces both; `UF_SANDBOX_CONFIG=<file.ufs>` at build
+`nkr` compiles unrestricted. `nkrsb` — built by default alongside `nkr`
+(`cargo build --release` produces both; `NKR_SANDBOX_CONFIG=<file.ufs>` at build
 time bakes a config into **both** binaries) — always bakes a capability
 config: the repo default `comp/sandbox.ufs` unless overridden.
 
@@ -1133,7 +1143,7 @@ allow-module m curl
 deny fs.* proc ffi.* raw.* host.argv
 ```
 
-Default policies baked into `ufsb`: **pure** (computation only), **data**
+Default policies baked into `nkrsb`: **pure** (computation only), **data**
 (default — sandboxed filesystem, no network, no subprocesses), **web** (adds
 HTTPS modules curl/ssl, denies subprocesses/raw FFI), **build** (broader fs
 `~ /tmp`, subprocesses, still no raw host access).
@@ -1148,7 +1158,7 @@ cannot define policies), `--workspace DIR` (add/intersect a root),
 file open resolves via realpath (parent for not-yet-existing write targets)
 and must fall under a root, else the program dies with
 `sandbox: path '<p>' is outside the workspace roots [...] (policy '<name>')`.
-Default roots: the main program's directory and `$TMPDIR/uflux`. Best-effort
+Default roots: the main program's directory and `$TMPDIR/nkr`. Best-effort
 (realpath prefix check; symlink escapes caught, TOCTOU not).
 
 Denied ops are **compile errors** naming the op, capability, policy, and
@@ -1192,7 +1202,7 @@ No opt-in flag. When a Vulkan shader toolchain (`glslc` or
 contains at least one GPU-eligible op, the compiler compiles its **static
 shader library** (float64 elementwise/broadcast add/sub/mul/div, matmul,
 matvec, reductions sum/min/max, sqrt, transpose) to SPIR-V, embeds the blobs
-in the generated C (`#define UF_GPU`), and links `-lvulkan`. Kernels are only
+in the generated C (`#define NKR_GPU`), and links `-lvulkan`. Kernels are only
 ever **launched**, never generated from user code.
 
 **Devices**: default `auto` enumerates Vulkan devices and picks, hardware
@@ -1203,7 +1213,7 @@ listing what exists if unavailable). Zero devices → silent CPU.
 
 **Eligibility & threshold**: eligible ops are add/sub/mul/div (all polymorphic
 forms), sqrt, sum/mean/min/max, transpose. A launch happens only when the
-element/work count clears `UF_GPU_MIN` (env, default 65536); otherwise the CPU
+element/work count clears `NKR_GPU_MIN` (env, default 65536); otherwise the CPU
 implementation runs. Any Vulkan failure degrades permanently to CPU — the GPU
 is a fast path, never a correctness dependency.
 
@@ -1215,7 +1225,7 @@ every op executed on-device, result staged out once. Tasks containing anything
 else (tensor construction, control flow, calls, non-eligible ops, global
 reads) decline fusion and run on CPU unchanged. Fused-task output is
 bit-identical to the CPU body. Concurrent tasks serialize their GPU work on an
-internal mutex. Reference: `comp/tests/t14_task_gpu.uft` (black-scholes chain:
+internal mutex. Reference: `comp/tests/t14_task_gpu.ent` (black-scholes chain:
 ~60 per-op launches collapse to 4 fused kernels; 7.3s → 0.42s at N=2M).
 
 **Determinism**: elementwise/broadcast results are bit-identical to the CPU;

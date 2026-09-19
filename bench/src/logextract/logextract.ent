@@ -1,4 +1,4 @@
-; logextract.uft — v13: access-log analytics (bench/SPEC.md)
+; logextract.ent — v13: access-log analytics (bench/SPEC.md)
 ; Tokens: [0] IP, [3] timestamp (hour at bytes 13-14), [8] status, [9] bytes
 0 ^lines! 0 ^bytes!
 24 int array hour_a!

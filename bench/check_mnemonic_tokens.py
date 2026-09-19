@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Check which µFlux text op mnemonics are single Qwen3-0.6B tokens, in both
+"""Check which Enmerkar text op mnemonics are single Qwen3-0.6B tokens, in both
 the trailing-space form ('lit ') and the leading-space form (' lit') that the
 GPT-2-style BPE actually uses to represent a word mid-document.
 
 The leading-space form ('Ġlit') is the token that actually appears when the
-benchmark tokenizes a .uft source, because in this BPE scheme a space attaches
+benchmark tokenizes a .ent source, because in this BPE scheme a space attaches
 to the FOLLOWING token as a leading marker."""
 from transformers import AutoTokenizer
 
@@ -46,7 +46,7 @@ print("(GPT-2-style BPE: the space is always a separate id 220 trailing the word
 print(" so the trailing-space form can essentially never be a single token.)\n")
 
 # --- Leading-space form: " " + mnemonic ---  (how it appears mid-document)
-print("=== Form 2: leading space + mnemonic (' lit')  [how it appears in a .uft] ===")
+print("=== Form 2: leading space + mnemonic (' lit')  [how it appears in a .ent] ===")
 lead_fail = []
 for m in MNEMONICS:
     ids = ntok(" " + m)

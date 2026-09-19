@@ -1,0 +1,3 @@
+; bg/helpers.ent — shared code for the bg module
+pub format_msg:
+  concat ret

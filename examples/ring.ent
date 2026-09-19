@@ -1,4 +1,4 @@
-; ring.uft — v13: spawn + channel, and a weave DAG
+; ring.ent — v13: spawn + channel, and a weave DAG
 ; (the channel is a global: locals are frame-scoped and the post-weave
 ;  code runs in its own body frame)
 'sender spawn ^ch!

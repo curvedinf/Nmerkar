@@ -1,7 +1,7 @@
-; main.uft — directory mode test entry point
+; main.ent — directory mode test entry point
 import c"usleep"(int)->int
 
-; use a shared helper from util.uft
+; use a shared helper from util.ent
 42 _call double "%d" format print
 
 ; get the background service's channel (retry until bg thread has created it)

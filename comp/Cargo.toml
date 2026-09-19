@@ -1,16 +1,16 @@
 [package]
-name = "uf"
+name = "nkr"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
 [[bin]]
-name = "uf"
+name = "nkr"
 path = "src/main.rs"
 
 [[bin]]
-name = "ufsb"
-path = "src/ufsb.rs"
+name = "nkrsb"
+path = "src/nkrsb.rs"
 
 [profile.release]
 opt-level = 2

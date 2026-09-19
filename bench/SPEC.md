@@ -181,18 +181,18 @@ Sequential CPU implementations are bit-identical; GPU columns may differ on
 ### CPU-only policy and GPU-on column (v13.1)
 
 The four legacy benchmarks (logextract, analytics, mandelbrot, spectralnorm)
-run **CPU-only**: µFlux entries are compiled with `--device cpu` so automatic
+run **CPU-only**: Enmerkar entries are compiled with `--device cpu` so automatic
 GPU offloading never contaminates the historical numbers. The **GPU-on column**
-shows the same µFlux source under the default `auto` device; other languages
+shows the same Enmerkar source under the default `auto` device; other languages
 show `—` (no GPU builds of those programs).
 
-µFlux GPU-on entries also pass `--gc-threshold` — multi-MB arrays trip a
+Enmerkar GPU-on entries also pass `--gc-threshold` — multi-MB arrays trip a
 pre-existing GC issue at the default 1MB threshold (present at v13 HEAD,
 unrelated to GPU offloading).
 
-The non-µFlux GPU variants (`*_gpu.{cpp,rs,py,js}`) share `src/_gpu/gpucomp.c`,
-a Vulkan launcher mirroring the uf runtime (auto device = hardware-first, most
+The non-Enmerkar GPU variants (`*_gpu.{cpp,rs,py,js}`) share `src/_gpu/gpucomp.c`,
+a Vulkan launcher mirroring the nkr runtime (auto device = hardware-first, most
 free VRAM). **Status: pending** — the launcher currently hangs on pipeline
 setup outside gdb and its binaries are disabled (`.broken`); sources are kept
-and the µFlux GPU-on columns (which exercise the same shaders through the
+and the Enmerkar GPU-on columns (which exercise the same shaders through the
 compiler's own runtime) are fully functional.

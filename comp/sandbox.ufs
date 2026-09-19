@@ -1,6 +1,6 @@
-; sandbox.ufs — default capability config baked into `ufsb` at build time.
+; sandbox.ufs — default capability config baked into `nkrsb` at build time.
 ; Top-level rules are the default policy (data). The [policy NAME] sections
-; are selectable at run time with `ufsb --policy NAME`.
+; are selectable at run time with `nkrsb --policy NAME`.
 ;
 ; pure  : computation only — no filesystem, no network, no processes
 ; data  : sandbox filesystem, JSON/CSV etc., no network           (default)

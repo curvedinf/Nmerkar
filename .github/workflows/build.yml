@@ -12,7 +12,7 @@ env:
 
 jobs:
   # Native builds: compile directly on the matching runner.
-  # Produces a binary named `uf` (uf.exe on Windows) for every major OS.
+  # Produces a binary named `nkr` (nkr.exe on Windows) for every major OS.
   native:
     name: Native ${{ matrix.artifact }}
     strategy:
@@ -20,17 +20,17 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: uf-linux-x86_64
-            bin: uf
+            artifact: nkr-linux-x86_64
+            bin: nkr
           - os: macos-13
-            artifact: uf-macos-x86_64
-            bin: uf
+            artifact: nkr-macos-x86_64
+            bin: nkr
           - os: macos-14
-            artifact: uf-macos-arm64
-            bin: uf
+            artifact: nkr-macos-arm64
+            bin: nkr
           - os: windows-latest
-            artifact: uf-windows-x86_64
-            bin: uf.exe
+            artifact: nkr-windows-x86_64
+            bin: nkr.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,12 +51,12 @@ jobs:
         working-directory: comp
         run: ./target/release/${{ matrix.bin }} --help
 
-      # Rename to `uf` (Windows already produces uf.exe)
+      # Rename to `nkr` (Windows already produces nkr.exe)
       - name: Stage binary
         shell: bash
         run: |
           mkdir -p staging
-          cp comp/target/release/${{ matrix.bin }} staging/uf${{ matrix.bin == 'uf.exe' && '.exe' || '' }}
+          cp comp/target/release/${{ matrix.bin }} staging/nkr${{ matrix.bin == 'nkr.exe' && '.exe' || '' }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -66,7 +66,7 @@ jobs:
           if-no-files-found: error
 
   # Cross-compiled Linux builds using `cross` (Docker-based, handles the
-  # linker/sysroot automatically). All produce a binary named `uf`.
+  # linker/sysroot automatically). All produce a binary named `nkr`.
   cross-linux:
     name: Cross ${{ matrix.artifact }}
     runs-on: ubuntu-latest
@@ -75,13 +75,13 @@ jobs:
       matrix:
         include:
           - target: aarch64-unknown-linux-gnu
-            artifact: uf-linux-arm64
+            artifact: nkr-linux-arm64
           - target: armv7-unknown-linux-gnueabihf
-            artifact: uf-linux-armv7
+            artifact: nkr-linux-armv7
           - target: x86_64-unknown-linux-musl
-            artifact: uf-linux-x86_64-musl
+            artifact: nkr-linux-x86_64-musl
           - target: aarch64-unknown-linux-musl
-            artifact: uf-linux-arm64-musl
+            artifact: nkr-linux-arm64-musl
     steps:
       - uses: actions/checkout@v4
 
@@ -105,11 +105,11 @@ jobs:
       - name: Stage binary
         run: |
           mkdir -p staging
-          cp comp/target/${{ matrix.target }}/release/uf staging/uf
+          cp comp/target/${{ matrix.target }}/release/nkr staging/nkr
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: staging/uf
+          path: staging/nkr
           if-no-files-found: error

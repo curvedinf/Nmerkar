@@ -1,11 +1,16 @@
-; t14_task_gpu.uft — weave tasks compiled to fused GPU kernels (v13.1)
+; t14_task_gpu.ent — weave tasks compiled to fused GPU kernels (v13.1)
 ; The `price` task is a straight-line elementwise chain over its inputs;
 ; the compiler fuses it into ONE kernel (inputs staged in once, every op
 ; on-device, result staged out once). Producer tasks with non-eligible ops
 ; (tensor construction from a global) decline fusion and run on CPU.
 ; NOTE: task bodies bind every intermediate explicitly (`x!`) — unbound
 ; cross-line stack values do not survive task frames (v13).
-; Run: uf --device cpu ... / uf ... (auto GPU); outputs must match.
+; Run: nkr --device cpu ... / uf ... (auto GPU); outputs must match.
+; KNOWN FLAKY: depends on binary layout — a compiler rebuild can flip it
+; between passing and a SIGSEGV inside uf_gc_alloc from a weave worker
+; (pre-existing at v13 HEAD, reproduced with unmodified sources; same
+; layout-sensitivity class as the t13 GC note). A crash here is not
+; necessarily a regression.
 2000000 n!
 0 n@ range lst!
 lst@ ^lst!

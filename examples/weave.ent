@@ -1,4 +1,4 @@
-; weave.uft — v13: task DAG with input bindings
+; weave.ent — v13: task DAG with input bindings
 weave
   task a:
     ret 21

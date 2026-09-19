@@ -1,4 +1,4 @@
-; trans.uf — C subset -> µFlux v13.1 transpiler, written in µFlux
+; trans.ent — C subset -> Enmerkar v13.1 transpiler, written in Enmerkar
 import c"printf"(ptr,...)->int
 import c"malloc"(int)->ptr
 import c"fopen"(ptr,ptr)->ptr
@@ -232,12 +232,12 @@ pu_post: "" ^lasts! _call pprim _call tk "++" _call streq 'pun_inc 'pun_chk2 if_
 pun_chk2: _call tk "--" _call streq 'pun_dec 'pun_done if_else ret 0
 pun_inc:
   ^lasts@ "" _call streq 'pp_inc_err if
-  _call adv ^lasts@ ^lasts@ "^%s@ 1 add ^%s! " format _call emit ret 0
+  _call adv ^lasts@ ^lasts@ ^lasts@ "^%s@ ^pt! ^%s@ 1 add ^%s! ^pt@ " format _call emit ret 0
 pp_inc_err: "postfix ++ needs a variable" _call die
   ret
 pun_dec:
   ^lasts@ "" _call streq 'pp_dec_err if
-  _call adv ^lasts@ ^lasts@ "^%s@ 1 sub ^%s! " format _call emit ret 0
+  _call adv ^lasts@ ^lasts@ ^lasts@ "^%s@ ^pt! ^%s@ 1 sub ^%s! ^pt@ " format _call emit ret 0
 pp_dec_err: "postfix -- needs a variable" _call die
   ret
 pun_done: 0 ^rr! ret ^rr@
@@ -258,9 +258,9 @@ pp_num:
   ^ptk@ "^(0[xX][0-9a-fA-F]+|[0-9]+)" regex_match ^zm! ^zm@ 0 get _call emit " " _call emit _call adv ret 0
 pp_str: ^ptk@ _call emit " " _call emit _call adv "" ^lasts! 0 ^rr! ret ^rr@
 pp_paren: _call adv _call pexpr ")" expect "" ^lasts! 0 ^rr! ret ^rr@
-pp_argc: _call adv "extern \"uf_argc\" load " _call emit "" ^lasts! 0 ^rr! ret ^rr@
+pp_argc: _call adv "extern \"nkr_argc\" load " _call emit "" ^lasts! 0 ^rr! ret ^rr@
 pp_argv: _call adv "[" expect _call pexpr "]" expect
-  "8 mul extern \"uf_argv\" load add load " _call emit "" ^lasts! 0 ^rr! ret ^rr@
+  "8 mul extern \"nkr_argv\" load add load " _call emit "" ^lasts! 0 ^rr! ret ^rr@
 pp_byte: _call adv "(" expect _call pexpr ")" expect "load 255 and " _call emit "" ^lasts! 0 ^rr! ret ^rr@
 pp_null: _call adv "0 " _call emit "" ^lasts! 0 ^rr! ret ^rr@
 pp_eof: _call adv "-1 " _call emit "" ^lasts! 0 ^rr! ret ^rr@
@@ -287,8 +287,34 @@ pe_bad: "bad char escape" _call die
 
 pp_func:
   ^ptk@ psh _call adv _call adv
+  _call newlbl ^ckl!
+  ^ckl@ lpush
+  ^emode@ lpush
+  ^inq@ lpush
+  ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
+  ^douts@ "" append ^douts!
+  2 ^emode!
   _call tk ")" _call streq 'ppf_noargs 'ppf_args if_else
-  ")" expect spop "_call %s " format _call emit "" ^lasts! 0 ^rr! ret ^rr@
+  ")" expect
+  ^douts@ pop ^ckargs!
+  ^psnaps@ pop ^cksv!
+  ^cksv@ ^pends@ concat ^pends!
+  _call lpopL ^inq!
+  _call lpopL ^emode!
+  _call lpopL ^ckl!
+  ^ckl@ "_call k%d " format _call emit
+  "" ^svpre!
+  "" ^svpost!
+  ^pparams@ length ^pni!
+  'pps_c 'pps_b while
+  spop ^ckfn!
+  ^flabels@ ^ckl@ ^svpre@ ^ckargs@ ^ckfn@ ^svpost@ "k%d: %s%s_call %s ^pt! %sret ^pt@\n" format concat ^flabels!
+  "" ^lasts! 0 ^rr! ret ^rr@
+pps_c: ^pni@ 0 gt ^rr! ret ^rr@
+pps_b: ^pni@ 1 sub ^pni! ^pparams@ ^pni@ get ^psl!
+  ^svpre@ "^svst@ ^" concat ^psl@ concat "@ append ^svst! " concat ^svpre!
+  "" "^svst@ pop ^" concat ^psl@ concat "! " concat ^svpost@ concat ^svpost!
+  ret 0
 ppf_noargs: 0 ^rr! ret ^rr@
 ppf_args: _call pexpr 'ppf_c 'ppf_b while ret 0
 ppf_c: _call tk "," _call streq ^rr! ret ^rr@
@@ -342,7 +368,7 @@ p_return:
   ^inmain@ 'pr_main 'pr_func if_else ret 0
 pr_main: _call pexpr ";" expect "_call exit\n" _call emit 0 ^didret! 0 ^rr! ret ^rr@
 pr_func: ^inq@ 'prf_nest 'prf_top if_else ret 0
-prf_top: _call pexpr ";" expect " ^rv! 1 ^fr! ret ^rv@\n" _call emit 2 ^didret! 0 ^rr! ret ^rr@
+prf_top: _call pexpr ";" expect " ^rv!\n1 ^fr!\n" _call emit 2 ^didret! 0 ^rr! ret ^rr@
 prf_nest: _call pexpr ";" expect " ^rv!\n1 ^fr! 0 ret\n" _call emit 1 ^cret! 2 ^didret! 0 ^rr! ret ^rr@
 
 ; if / if-else
@@ -407,6 +433,7 @@ p_while:
   ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
   ^douts@ "" append ^douts!
   1 ^inq!
+  ^lstack@ "" append ^lstack!
   "c" ^clbl@ "%d" format concat ":\n^fr@ not " concat _call emit
   "(" expect _call pexpr ")" expect
   " and ret\n" _call emit
@@ -419,6 +446,7 @@ p_while:
   _call dpop
   _call lpopL ^inq!
   ^clbl@ ^blbl@ "'c%d 'b%d while\n" format _call emit
+  ^lstack@ pop
   0 ^didret!
   ^cret@ 'wraprest 'nowrap if_else
   ret 0
@@ -428,6 +456,7 @@ p_for:
   _call adv "(" expect
   _call newlbl ^fclbl!
   _call newlbl ^fblbl!
+  _call newlbl ^filbl!
   _call tk ";" _call streq 'pfi_skip 'pfi_check if_else
   ^inq@ lpush
   ^emode@ lpush
@@ -437,18 +466,43 @@ p_for:
   ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
   ^douts@ "" append ^douts!
   1 ^inq!
+  ^lstack@ ^filbl@ "n%d" format append ^lstack!
   "c" ^fclbl@ "%d" format concat ":\n^fr@ not " concat _call emit
   _call tk ";" _call streq 'pfc_skip 'pfc_do if_else
-  "ret\n" _call emit
+  " and ret\n" _call emit
   "b" ^fblbl@ "%d" format concat ":\n" concat _call emit
   ^pi@ ^pfpi!
   1 ^pfd!
   'pfs_c 'pfs_b while
   ")" expect
+  ^pfpi@ lpush
+  ^emode@ lpush
+  ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
+  ^douts@ "" append ^douts!
+  2 ^emode!
   _call pstmt
+  _call lpopL ^emode!
+  _call lpopL ^pfpi!
+  ^douts@ pop ^fchunk!
+  ^psnaps@ pop ^pfsv!
+  ^pfsv@ ^pends@ concat ^pends!
+  ^fchunk@ _call emit
   ^pi@ ^pfpi2!
   ^pfpi@ ^pi!
+  ^emode@ lpush
+  ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
+  ^douts@ "" append ^douts!
+  2 ^emode!
   _call tk ")" _call streq 'pfp_none 'pfp_do if_else
+  _call lpopL ^emode!
+  ^douts@ pop ^finc!
+  ^finc@ lpush
+  ^psnaps@ pop ^pfsv2!
+  ^pfsv2@ ^pends@ concat ^pends!
+  _call lpopL ^finc!
+  ^lstack@ ^lstack@ length 1 sub get ^finm!
+  "^fr@ not '" ^finm@ concat " if\n" concat _call emit
+  ^flabels@ ^finm@ ":\n" concat ^finc@ concat "0 ret\n" concat concat ^flabels!
   ^pfpi2@ ^pi!
   _call emit0ret
   _call lpopL ^fblbl!
@@ -457,6 +511,7 @@ p_for:
   _call dpop
   _call lpopL ^inq!
   ^fclbl@ ^fblbl@ "'c%d 'b%d while\n" format _call emit
+  ^lstack@ pop
   0 ^didret!
   ^cret@ 'wraprest 'nowrap if_else
   ret 0
@@ -467,7 +522,7 @@ pfi_decl:
   "=" expect ^slot@ psh _call passign spop ^slot2! ^slot2@ "^%s!\n" format _call emit
   ";" expect 0 ^rr! ret ^rr@
 pfi_expr: _call pexpr ";" expect 0 ^rr! ret ^rr@
-pfc_skip: _call adv "1 " _call emit " and " _call emit 0 ^rr! ret ^rr@
+pfc_skip: _call adv "1 " _call emit 0 ^rr! ret ^rr@
 pfc_do: _call pexpr ";" expect 0 ^rr! ret ^rr@
 pfs_c: ^pfd@ ^rr! ret ^rr@
 pfs_b: _call tk "(" _call streq 'pfs_lp 'pfs_n1 if_else ret 0
@@ -496,13 +551,14 @@ p_do:
   ^psnaps@ ^pends@ append ^psnaps! "" ^pends!
   ^douts@ "" append ^douts!
   1 ^inq!
+  ^lstack@ "" append ^lstack!
   "b" ^blbl@ "%d" format concat ":\n" concat _call emit
   "0 df" ^dflbl@ "%d" format concat "!\n" concat _call emit
   _call pstmt
   _call emit0ret
   "while" expect "(" expect
-  "c" ^clbl@ "%d" format concat ":\n^fr@ not df" concat _call emit
-  ^dflbl@ "%d" format concat "@ " concat _call emit
+  ^clbl@ "c%d:\n^fr@ not df" format _call emit
+  ^dflbl@ "%d@ " format _call emit
   _call pexpr
   " or and ret\n" _call emit
   ")" expect ";" expect
@@ -513,6 +569,7 @@ p_do:
   _call dpop
   _call lpopL ^inq!
   ^clbl@ ^blbl@ "'c%d 'b%d while\n" format _call emit
+  ^lstack@ pop
   0 ^didret!
   ^cret@ 'wraprest 'nowrap if_else
   ret 0
@@ -522,7 +579,7 @@ nowrap: ret 0
 wraprest:
   _call newlbl ^wclbl!
   _call newlbl ^wblbl!
-  ^wclbl@ ^wblbl@ "^fr@ ^wdone@ or not 'c%d 'b%d while\n0 ^wdone!\n" format _call emit
+  ^wclbl@ ^wblbl@ "^fr@ 'c%d 'b%d if_else\n" format _call emit
   ^wclbl@ lpush
   ^wblbl@ lpush
   ^emode@ lpush
@@ -540,14 +597,19 @@ wraprest:
   _call lpopL ^wclbl!
   ^wblbl@ "b%d:\n" format ^wb!
   ^wchunk@ "" _call streq not 'wfull 'wempty if_else
-wfull: ^flabels@ ^wb@ concat ^wchunk@ concat "1 ^wdone! 0 ret\n" concat ^wclbl@ "c%d:\n^fr@ ^wdone@ or not ret\n" format concat ^flabels! 0 ^didret! ret 0
-wempty: ^flabels@ ^wb@ concat "1 ^wdone! 0 ret\n" concat ^wclbl@ "c%d:\n^fr@ ^wdone@ or not ret\n" format concat ^flabels! 0 ^didret! ret 0
+wfull: ^flabels@ ^wb@ concat ^wchunk@ concat "0 ret\n" concat ^wclbl@ "c%d:\n0 ret\n" format concat ^flabels! 0 ^didret! ret 0
+wempty: ^flabels@ ^wb@ concat "0 ret\n" concat ^wclbl@ "c%d:\n0 ret\n" format concat ^flabels! 0 ^didret! ret 0
 wbl_c: _call tk "}" _call streq not ^rr! ret ^rr@
 wbl_b: _call pstmt 0 ^rr! ret ^rr@
 
 ; break / continue
 p_break: _call adv ";" expect "break\n" _call emit 0 ^rr! ret ^rr@
-p_continue: _call adv ";" expect "cont\n" _call emit 0 ^rr! ret ^rr@
+p_continue: _call adv ";" expect
+  ^lstack@ length not 'pc_plain 'pc_check if_else ret 0
+pc_plain: "continue\n" _call emit 0 ^rr! ret ^rr@
+pc_check: ^lstack@ ^lstack@ length 1 sub get ^pctop!
+  ^pctop@ "" _call streq 'pc_plain 'pc_for if_else ret 0
+pc_for: "_call " ^pctop@ concat " continue\n" concat _call emit 0 ^rr! ret ^rr@
 
 ; block
 p_block: _call adv 'pbl_c 'pbl_b while _call adv ret 0
@@ -567,16 +629,17 @@ pfunc:
   'pfp_c 'pfp_b while
   _call adv
   dict ^vars!
+  list ^pparams!
   0 ^cret!
   "" ^qout!
   ^fname@ "main" _call streq 'pf_entry 'pf_noentry if_else
   ^fname@ "main" _call streq ^inmain!
-  ^pl@ length 1 sub ^pfi!
+  0 ^pfi!
   ^inmain@ not 'pfp2_c 'pfp2_b while
   "{" expect
   'pfb_c 'pfb_b while
   _call adv
-  ^didret@ 2 eq 'pf_noep 'pf_doep if_else
+  'pf_doep if
   ^qout@ "%s" format print
   "" ^qout!
   ^pends@ "%s" format print
@@ -586,7 +649,7 @@ pfunc:
   ret
 pf_noep: ret 0
 pf_doep: ^inmain@ 'pf_main_ep 'pf_func_ep if_else ret 0
-pf_entry: "entry:\n" _call emit ret 0
+pf_entry: "entry:\nlist ^svst!\n" _call emit ret 0
 pf_noentry: ^fname@ "%s:\n" format _call emit ret 0
 pfp_c: _call tk ")" _call streq not ^rr! ret ^rr@
 pfp_b: _call tk "," _call streq 'pfp_cma 'pfp_n1 if_else ret 0
@@ -594,8 +657,8 @@ pfp_cma: _call adv 0 ^rr! ret ^rr@
 pfp_n1: _call tk _call istype _call tk "*" _call streq add 'pfp_type 'pfp_name if_else ret 0
 pfp_type: _call adv 0 ^rr! ret ^rr@
 pfp_name: ^pl@ _call tk append ^pl! _call adv 0 ^rr! ret ^rr@
-pfp2_c: ^pfi@ -1 eq not ^rr! ret ^rr@
-pfp2_b: ^pl@ ^pfi@ get ^nv! ^nv@ _call newvar "^%s!\n" format _call emit ^pfi@ 1 sub ^pfi! 0 ^rr! ret ^rr@
+pfp2_c: ^pfi@ ^pl@ length lt ^rr! ret ^rr@
+pfp2_b: ^pl@ ^pfi@ get ^nv! ^nv@ _call newvar ^slot! ^pparams@ ^slot@ append ^pparams! ^slot@ "^%s!\n" format _call emit ^pfi@ 1 add ^pfi! 0 ^rr! ret ^rr@
 pfb_c: _call tk "}" _call streq not ^rr! ret ^rr@
 pfb_b: _call pstmt 0 ^rr! ret ^rr@
 pf_main_ep: "0 _call exit\nret\n" _call emit 0 ^rr! ret ^rr@
@@ -608,9 +671,9 @@ pp_b: _call pfunc 0 ^rr! ret ^rr@
 ; ---- entry point ----
 entry:
   0 ^inq! 0 ^emode! 0 ^didret! 0 ^cret!
-  list ^douts! "" ^pends! list ^psnaps! "" ^flabels!
-  extern "uf_argc" load 2 eq not 'arg_bad if
-  extern "uf_argv" load 8 add load ^path!
+  list ^douts! "" ^pends! list ^psnaps! "" ^flabels! list ^lstack! list ^svst!
+  extern "nkr_argc" load 2 eq not 'arg_bad if
+  extern "nkr_argv" load 8 add load ^path!
   ^path@ "r" _call fopen ^f!
   ^f@ not 'ffail if
   ^f@ 0 2 _call fseek

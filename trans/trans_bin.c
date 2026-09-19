@@ -1,6 +1,7 @@
 // link: cc <this-file>.c -lpthread -lm
 
 #include <stdint.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,14 +81,14 @@ typedef struct WeaveJobS { WeaveTask* ts; int n; UfRun run; _Atomic int shutdown
 
 static void die(const char*m);
 static _Thread_local const char* uf_cur_op;
-static void uflux_run(Ctx*cx, long pc);
+static void nkr_run(Ctx*cx, long pc);
 static _Thread_local const void* uf_entry_addr;
 static void uf_call_addr(Ctx*cx, const void* a, long frame, long entry_pc, long nargs){
   if(cx->csp>=cx->ccap){char _b[128];snprintf(_b,sizeof(_b),"call stack overflow in %s (csp=%ld, cap=%ld)",uf_cur_op,cx->csp,cx->ccap);die(_b);}
   /* save the pre-argument data-stack pointer: the callee's param pops guard
      against it, and its RET drains back to it */
   long _sp0 = cx->sp - nargs; if(_sp0 < 0) _sp0 = 0;
-  cx->rsps[cx->csp]=_sp0; cx->cs[cx->csp++]=0; cx->local_frames[cx->local_fsp++]=cx->local_base; cx->call_pcs[cx->call_csp++]=entry_pc; cx->local_base+=frame; uf_entry_addr=a; uflux_run(cx,-1); cx->local_base=cx->local_frames[--cx->local_fsp]; cx->call_csp--; }
+  cx->rsps[cx->csp]=_sp0; cx->cs[cx->csp++]=0; cx->local_frames[cx->local_fsp++]=cx->local_base; cx->call_pcs[cx->call_csp++]=entry_pc; cx->local_base+=frame; uf_entry_addr=a; nkr_run(cx,-1); cx->local_base=cx->local_frames[--cx->local_fsp]; cx->call_csp--; }
 /* push a continuation with its saved caller-sp; checked against cs capacity */
 static inline void uf_cspush(Ctx*cx, const void* k, long sp0){
   if(cx->csp>=cx->ccap){char _b[128];snprintf(_b,sizeof(_b),"call stack overflow in %s (csp=%ld, cap=%ld)",uf_cur_op,cx->csp,cx->ccap);die(_b);}
@@ -120,7 +121,7 @@ static void uf_dump_cell(Cell c){
 }
 
 static void uf_crash_dump(Ctx*cx){
-  fprintf(stderr,"\n--- uflux crash dump ---\n");
+  fprintf(stderr,"\n--- nkr crash dump ---\n");
   fprintf(stderr,"  call stack:\n");
   for(long i=cx->call_csp-1;i>=0;i--){
     long pc=cx->call_pcs[i];
@@ -130,7 +131,7 @@ static void uf_crash_dump(Ctx*cx){
   fprintf(stderr,"  locals:\n");
   for(long i=cx->call_csp-1;i>=0;i--){
     long pc=cx->call_pcs[i];
-    /* local_frames has one extra entry (the uflux_run entry frame) that
+    /* local_frames has one extra entry (the nkr_run entry frame) that
        has no corresponding call_pcs entry, so call_pcs[i] maps to
        local_frames[i+1] as the saved local_base before this frame's bump.
        The frame's actual locals start at saved_base + frame_size. */
@@ -156,7 +157,7 @@ static void uf_crash_dump(Ctx*cx){
 static void die(const char*m){
   if(uf_try_top){ UfTry*t=uf_try_top; longjmp(t->jb,1); }
   if(uf_debug_mode && uf_current_ctx) uf_crash_dump(uf_current_ctx);
-  fprintf(stderr,"uflux: %s\n",m); exit(1);
+  fprintf(stderr,"nkr: %s\n",m); exit(1);
 }
 
 /* ================= sandbox capability state =================
@@ -266,11 +267,28 @@ static void ctx_register(Ctx*c){ pthread_mutex_lock(&uf_gc_mu); int i=uf_nctxs; 
 static void ctx_unregister(Ctx*c){ pthread_mutex_lock(&uf_gc_mu); for(int i=0;i<uf_nctxs;i++) if(uf_ctxs[i]==c){ uf_ctxs[i]=uf_ctxs[uf_nctxs-1]; uf_nctxs--; break; } pthread_mutex_unlock(&uf_gc_mu); }
 /* variable roots, registered by generated code */
 static void uf_gc_setroots(Cell** r, long n){ uf_var_roots=r; uf_nvar_roots=n; }
-/* tmp roots for builder ops (in-progress containers while they grow) */
+/* tmp roots for builder ops (in-progress containers while they grow).
+   v13.2: PER-THREAD stacks. The old shared counter broke two ways under
+   weave workers: (a) a thread's publish window (counter bumped before the
+   slot write) let a concurrent collect miss a just-protected operand and
+   sweep it mid-loop; (b) cross-thread unprotects popped OTHER threads'
+   entries (LIFO only holds per-thread). Each thread now owns a fixed slot
+   array published with release stores; collectors acquire-load the count.
+   Slots are zeroed on pop so a concurrent marker never marks stale values. */
 #define UF_MAXTMP 1024
-static void*** uf_tmp_roots = 0; static _Atomic int uf_ntmp;
-#define UF_PROTECT(pp) do{ int _i=atomic_fetch_add(&uf_ntmp,1); if(_i<UF_MAXTMP)uf_tmp_roots[_i]=(void**)(pp); }while(0)
-#define UF_UNPROTECT() atomic_fetch_sub(&uf_ntmp,1)
+typedef struct UF_TR { struct UF_TR* next; pthread_t tid; void*** slots; _Atomic int n; } UF_TR;
+static UF_TR* uf_trs; static pthread_mutex_t uf_tr_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local UF_TR* uf_tr_mine;
+static void uf_tr_init(void){
+  if(uf_tr_mine) return;
+  UF_TR* t=(UF_TR*)calloc(1,sizeof(UF_TR)); t->slots=(void***)calloc(UF_MAXTMP,sizeof(void**)); t->tid=pthread_self();
+  pthread_mutex_lock(&uf_tr_mu); t->next=uf_trs; uf_trs=t; pthread_mutex_unlock(&uf_tr_mu);
+  uf_tr_mine=t;
+}
+#define UF_PROTECT(pp) do{ uf_tr_init(); UF_TR* _t=uf_tr_mine; int _i=atomic_load_explicit(&_t->n,memory_order_relaxed); \
+  if(_i<UF_MAXTMP){ _t->slots[_i]=(void**)(pp); atomic_store_explicit(&_t->n,_i+1,memory_order_release); } }while(0)
+#define UF_UNPROTECT() do{ UF_TR* _t=uf_tr_mine; if(_t){ int _i=atomic_load_explicit(&_t->n,memory_order_relaxed); \
+  if(_i>0){ atomic_store_explicit(&_t->n,_i-1,memory_order_release); _t->slots[_i-1]=0; } } }while(0)
 static void uf_mark_cell(Cell c);
 static void uf_mark_obj(Hdr* h);
 static void uf_mark_ptr(void* p){
@@ -310,11 +328,21 @@ static void uf_gc_collect(void){
   for(long i=0;i<uf_nvar_roots;i++) uf_mark_cell(*uf_var_roots[i]);
   int nc = uf_nctxs;
   for(int i=0;i<nc;i++){ Ctx* c=uf_ctxs[i]; for(long s=0;s<c->sp;s++) uf_mark_cell(c->ds[s]);
-    /* v11: mark active local-variable frame */
-    for(long s=0;s<c->local_base;s++) uf_mark_cell(c->locals[s]);
+    /* v13.2: mark the full locals array, not just [0,local_base). local_base
+       is the START of the innermost frame, so the old scan skipped every live
+       local of the running frame (invisible only because runners pinned
+       --gc-threshold above total allocation). Slots above the live frames
+       hold stale Cells; marking them is safe (freed objects are absent from
+       uf_gc_set) and only over-retains until the slot is reused. */
+    for(long s=0;s<c->local_cap;s++) uf_mark_cell(c->locals[s]);
   }
-  int nt = uf_ntmp; if(nt>UF_MAXTMP)nt=UF_MAXTMP;
-  for(int i=0;i<nt;i++){ void** pp=uf_tmp_roots[i]; if(pp&&*pp) uf_mark_ptr(*pp); }
+  pthread_mutex_lock(&uf_tr_mu);
+  for(UF_TR* t=uf_trs;t;t=t->next){
+    if(!pthread_equal(t->tid,pthread_self()) && pthread_kill(t->tid,0)==ESRCH) continue; /* dead thread: its slots are moot */
+    int nt=atomic_load_explicit(&t->n,memory_order_acquire); if(nt>UF_MAXTMP)nt=UF_MAXTMP;
+    for(int i=0;i<nt;i++){ void** pp=t->slots[i]; if(pp&&*pp) uf_mark_ptr(*pp); }
+  }
+  pthread_mutex_unlock(&uf_tr_mu);
   if(uf_active_job) uf_weave_mark(uf_active_job);
   /* sweep gc_list: free unmarked, unpinned objects with seq < start_seq */
   void** pp = &uf_gc_list;
@@ -352,6 +380,25 @@ static void* uf_gc_alloc(size_t sz, int align){
   else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
   return p;
 }
+/* v13.2: allocation whose data region the caller fully overwrites (e.g.
+   elementwise tensor results). Skips the whole-block memset — for a 16MB
+   tensor result that halves write traffic and the faults it causes. The
+   Hdr itself is still zeroed (gc_parent etc.). */
+static void* uf_gc_alloc_nz(size_t sz, int align){
+  sz = sz ? sz : 1;
+  if(uf_gc_on && uf_gc_bytes_since + sz > uf_gc_threshold) uf_gc_collect();
+  void* p = NULL;
+  if(align>0){ if(posix_memalign(&p,(size_t)align,sz))die("alloc failed"); }
+  else { p=malloc(sz); }
+  if(!p)die("out of memory");
+  memset(p,0,sizeof(Hdr));
+  Hdr* h=(Hdr*)p;
+  h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
+  uf_gc_bytes_since += sz;
+  if(atomic_load(&uf_gc_mt)){ pthread_mutex_lock(&uf_gc_mu); h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); pthread_mutex_unlock(&uf_gc_mu); }
+  else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
+  return p;
+}
 /* register a static object (string literal): linked, pinned, never swept */
 static void uf_gc_register_static(void* p){
   pthread_mutex_lock(&uf_gc_mu);
@@ -362,9 +409,9 @@ static void uf_gc_register_static(void* p){
 }
 static void uf_init_lits(void** lits, long n){ for(long i=0;i<n;i++) uf_gc_register_static(lits[i]); }
 static void uf_gc_init(void){
-  const char* e=getenv("UF_GC_THRESHOLD");
+  const char* e=getenv("NKR_GC_THRESHOLD");
   if(e&&*e){ uint64_t v=strtoull(e,0,0); if(v) uf_gc_threshold=v; }
-  uf_tmp_roots=(void***)calloc(UF_MAXTMP,sizeof(void**));
+  (void)UF_MAXTMP;
   ctx_register(&main_cx_store);
 }
 static void op_gc(Ctx*cx){ (void)cx; uf_gc_collect(); }
@@ -377,7 +424,7 @@ static Cell main_locals[65536]; static long main_local_frames[65536];
 static long main_call_pcs[1<<16];
 static Ctx main_cx_store = { main_ds, 0, 1<<20, main_cs, 0, 1<<16, main_rsps, {{0,0,0}}, 0, main_locals, 0, 65536, main_local_frames, 0, 65536, main_call_pcs, 0, 1<<16, 0 };
 static Ctx* main_cx = &main_cx_store;
-int64_t uf_argc=0; void* uf_argv=0; /* program args, reachable via EXTERN "uf_argc"/"uf_argv" + LOADX, or ARGV */
+int64_t nkr_argc=0; void* nkr_argv=0; /* program args, reachable via EXTERN "nkr_argc"/"nkr_argv" + LOADX, or ARGV */
 
 static inline void pushc(Ctx*cx,Cell c){ if(cx->sp>=cx->dcap){char _b[128];snprintf(_b,sizeof(_b),"stack overflow in %s (sp=%ld, cap=%ld)",uf_cur_op,cx->sp,cx->dcap);die(_b);} cx->ds[cx->sp++]=c; }
 static inline Cell uf_mki(int64_t v){ Cell c; c.tag=T_INT; c.i=v; return c; }
@@ -459,7 +506,7 @@ static Hdr* uf_arr_like(Hdr*a,uint64_t n);
 static double uf_el(Hdr*a,uint64_t i);
 static void uf_put_el(Hdr*a,uint64_t i,double d);
 static int uf_is_arrish(Hdr*a){ return a->tag==HT_ARR||a->tag==HT_TENSOR||a->tag==HT_MAT; }
-#ifdef UF_GPU
+#ifdef NKR_GPU
 struct UFPC { int64_t n0,n1,n2,n3; double s; int64_t rev; };
 static long uf_gpu_min(void);
 static int uf_spv_index(const char*name);
@@ -467,7 +514,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
 #endif
 static inline int uf_rawptr(Cell c){ return c.tag==T_PTR&&c.i&&!uf_gc_find((void*)c.i); }
 static inline Cell uf_cadd(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,0,"add"); if(a.tag==T_INT&&uf_rawptr(b))return uf_mkp((void*)(a.i+b.i)); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i+b.i)); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i+b.i); return uf_mkf(x+y); }
-static inline Cell uf_csub(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,1,"sub"); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i-b.i)); if(a.tag==T_PTR&&b.tag==T_PTR&&uf_rawptr(a)&&uf_rawptr(b))return uf_mki(a.i-b.i); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i-b.i); return uf_mkf(x-y); }
+static inline Cell uf_csub(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,1,"sub"); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i-b.i)); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i-b.i); return uf_mkf(x-y); }
 static inline Cell uf_cmul(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,2,"mul"); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i*b.i); return uf_mkf(x*y); }
 static inline Cell uf_cand(Cell a,Cell b){ return uf_mki(uf_i(a)&uf_i(b)); }
 static inline Cell uf_cshr(Cell a){ return uf_mki((int64_t)((uint64_t)uf_i(a)>>1)); }
@@ -552,7 +599,8 @@ static void op_mul(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_numarr(a)||uf_numarr
 static void op_and(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_cand(a,b)); }
 static void op_pow(Ctx*cx){ Cell b=pop(cx),a=pop(cx); double x=uf_to_number(a),y=uf_to_number(b); pushc(cx,uf_mkf(pow(x,y))); }
 static void op_sqrt(Ctx*cx){ Cell a=pop(cx);
-#ifdef UF_GPU
+  UF_PROTECT((void**)(void*)&a.i);
+#ifdef NKR_GPU
   if(a.tag==T_PTR&&a.i){ Hdr*h=uf_gc_find((void*)a.i);
     if(h&&uf_is_arrish(h)&&h->ety==1&&h->len>=(uint64_t)uf_gpu_min()){
       struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)h->len;
@@ -560,13 +608,14 @@ static void op_sqrt(Ctx*cx){ Cell a=pop(cx);
       int k=uf_spv_index("esqrt");
       int ok=k>=0&&uf_vk_run(k,h->len,uf_data(h),(size_t)h->len*8,NULL,0,uf_data(r),(size_t)h->len*8,pc);
       UF_UNPROTECT();
-      if(ok){ pushp(cx,r); return; }
+      if(ok){ UF_UNPROTECT(); pushp(cx,r); return; }
     } }
 #endif
   if(uf_numarr(a)){ Hdr*h=(Hdr*)(void*)a.i; uint64_t n=h->len; Hdr*r=uf_arr_like(h,n); UF_PROTECT(&r);
-    for(uint64_t i=0;i<n;i++) uf_put_el(r,i,sqrt(uf_el(h,i)));
-    UF_UNPROTECT(); pushp(cx,r); return; }
-  pushc(cx,uf_mkf(sqrt(uf_to_number(a)))); }
+    if(h->ety==1){ const double*A=(const double*)uf_data(h); double*R=(double*)uf_data(r); for(uint64_t i=0;i<n;i++)R[i]=sqrt(A[i]); }
+    else for(uint64_t i=0;i<n;i++) uf_put_el(r,i,sqrt(uf_el(h,i)));
+    UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); return; }
+  UF_UNPROTECT(); pushc(cx,uf_mkf(sqrt(uf_to_number(a)))); }
 static void op_lte(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_clte(a,b)); }
 static void op_gte(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_cgte(a,b)); }
 static void op_drop(Ctx*cx){ (void)pop(cx); }
@@ -602,6 +651,7 @@ static void* uf_alloc(size_t sz,int align){ void*p=NULL; if(align>0){ if(posix_m
 static void op_arrn(Ctx*cx,uint64_t tag,int align){ int64_t ty=pop(cx).i; Cell top=pop(cx); int64_t esz=(ty==3)?1:8; if(top.tag==T_PTR && top.i && uf_gc_find((void*)top.i) && ((Hdr*)(void*)top.i)->tag==HT_DYN){
     /* v13: `list type array` — copy the list's elements into a typed array */
     Dyn* d=(Dyn*)(void*)top.i; uint64_t len=d->len;
+    UF_PROTECT((void**)(void*)&top.i);
     Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)len*(size_t)esz,align); h->tag=tag; h->len=len; h->esz=(uint64_t)esz; h->ety=(uint64_t)ty;
     for(uint64_t i=0;i<len;i++){
       Cell c=d->data[i];
@@ -609,7 +659,7 @@ static void op_arrn(Ctx*cx,uint64_t tag,int align){ int64_t ty=pop(cx).i; Cell t
       else if(ty==1) ((double*)h->data)[i]=uf_f(c);
       else ((int64_t*)h->data)[i]=uf_i(c);
     }
-    pushp(cx,h); return;
+    UF_UNPROTECT(); pushp(cx,h); return;
   }
   int64_t len=top.i; if(len<0)die("negative length"); Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)len*(size_t)esz,align); h->tag=tag; h->len=(uint64_t)len; h->esz=(uint64_t)esz; h->ety=(uint64_t)ty; memset(h->data,0,(size_t)len*(size_t)esz); pushp(cx,h); }
 static void op_arr(Ctx*cx){ op_arrn(cx,HT_ARR,0); }
@@ -637,6 +687,7 @@ static void op_tensor(Ctx*cx){
           /* [rows cols v0 v1 ...] type tensor — matrix from flat row-major data */
           Cell tyc=pop(cx); (void)pop(cx);
           uint64_t ety=(uint64_t)tyc.i, eszb=(ety==3)?1:8;
+          UF_PROTECT((void**)(void*)&shp.i);
           Hdr*h=uf_mat_new((uint64_t)rows,(uint64_t)cols,ety); UF_PROTECT(&h);
           for(uint64_t i=0;i<(uint64_t)(rows*cols);i++){
             Cell c=d->data[i+2];
@@ -646,7 +697,7 @@ static void op_tensor(Ctx*cx){
             else ((int64_t*)dt)[i]=uf_i(c);
           }
           (void)eszb;
-          UF_UNPROTECT(); pushp(cx,h); return;
+          UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,h); return;
         }
       }
     }
@@ -659,9 +710,10 @@ static void op_clone(Ctx*cx){
   if(a->tag==HT_ITER)die("CLONE: iterators are single-use");
   if(a->tag!=HT_ARR&&a->tag!=HT_TENSOR&&a->tag!=HT_MAT)die("CLONE: only arr/tensor/matrix");
   size_t nb=(a->tag==HT_MAT)?((size_t)a->len*((a->ety==3)?1:8)):(size_t)a->len*a->esz;
-  size_t sz=sizeof(Hdr)+nb; Hdr*n=(Hdr*)uf_gc_alloc(sz,a->tag==HT_TENSOR?64:0);
+  size_t sz=sizeof(Hdr)+nb; UF_PROTECT((void**)(void*)&h.i);
+  Hdr*n=(Hdr*)uf_gc_alloc(sz,a->tag==HT_TENSOR?64:0);
   memcpy(n,a,sz); n->gc_next=0; n->gc_flags=((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
-  pushp(cx,n);
+  UF_UNPROTECT(); pushp(cx,n);
 }
 static void op_cast(Ctx*cx){ Cell id=pop(cx); Cell h=pop(cx); Hdr*a=(Hdr*)((void*)h.i); int64_t tk=(a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag; if(tk!=id.i)die("CAST: type mismatch"); pushc(cx,h); }
 
@@ -866,12 +918,13 @@ static void op_cat(Ctx*cx){
   Hdr*ha=a.tag==T_PTR&&a.i?uf_gc_find((void*)a.i):0;
   Hdr*hb=b.tag==T_PTR&&b.i?uf_gc_find((void*)b.i):0;
   uint64_t ta=ha?ha->tag:0, tb=hb?hb->tag:0;
+  UF_PROTECT((void**)(void*)&a.i); UF_PROTECT((void**)(void*)&b.i);
   if(ta==HT_DYN||tb==HT_DYN){
     if(ta!=HT_DYN||tb!=HT_DYN)die("CAT: list/str mismatch");
     Dyn*x=(Dyn*)ha,*y=(Dyn*)hb; Dyn*r=uf_dyn_new(x->len+y->len); UF_PROTECT(&r);
     for(uint64_t i=0;i<x->len;i++)uf_dyn_push(&r,x->data[i]);
     for(uint64_t i=0;i<y->len;i++)uf_dyn_push(&r,y->data[i]);
-    UF_UNPROTECT(); pushp(cx,r); return;
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); return;
   }
   if((ta==HT_ARR||ta==HT_TENSOR)||(tb==HT_ARR||tb==HT_TENSOR)){
     if((ta!=HT_ARR&&ta!=HT_TENSOR)||(tb!=HT_ARR&&tb!=HT_TENSOR))die("CAT: arr/str mismatch");
@@ -880,35 +933,36 @@ static void op_cat(Ctx*cx){
     UF_PROTECT(&r);
     r->tag=HT_ARR; r->len=n; r->esz=ha->esz; r->ety=ha->ety;
     memcpy(r->data,ha->data,ha->len*ha->esz); memcpy(r->data+ha->len*ha->esz,hb->data,hb->len*hb->esz);
-    UF_UNPROTECT(); pushp(cx,r); return;
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); return;
   }
   { const char* x=uf_sptr(a),*y=uf_sptr(b); size_t la=strlen(x),lb=strlen(y);
     Str* r=(Str*)uf_gc_alloc(sizeof(Str)+la+lb+1,0); r->tag=HT_STR; r->esz=1; r->len=la+lb; r->mlen=0;
-    memcpy(r->data,x,la); memcpy(r->data+la,y,lb+1); pushp(cx,r); }
+    memcpy(r->data,x,la); memcpy(r->data+la,y,lb+1); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); }
 }
 /* SLICE: seq a b -> seq' (tag-dispatched; Python slice semantics) */
 static void op_slice(Ctx*cx){
   Cell b=pop(cx),a=pop(cx),st=pop(cx);
   Hdr*h=st.tag==T_PTR&&st.i?uf_gc_find((void*)st.i):0;
+  UF_PROTECT((void**)(void*)&st.i);
   if(!h){ /* legacy raw char* */
     const char* S=(const char*)st.i; int64_t n=(int64_t)strlen(S);
     int64_t i=a.i,j=b.i; if(i<0)i+=n; if(j<0)j+=n; if(i<0)i=0; if(j<0)j=0; if(i>n)i=n; if(j>n)j=n; if(j<i)j=i;
-    pushc(cx,uf_str_new(S+i,(size_t)(j-i))); return;
+    UF_UNPROTECT(); pushc(cx,uf_str_new(S+i,(size_t)(j-i))); return;
   }
   int64_t n=(int64_t)h->len;
   int64_t i=a.i,j=b.i; if(i<0)i+=n; if(j<0)j+=n; if(i<0)i=0; if(j<0)j=0; if(i>n)i=n; if(j>n)j=n; if(j<i)j=i;
-  if(h->tag==HT_STR){ Str*s=(Str*)h; pushc(cx,uf_str_new(uf_sbytes(s)+i,(size_t)(j-i))); return; }
-  if(h->tag==HT_BUF){ pushc(cx,uf_str_new(h->data+i,(size_t)(j-i))); return; }
+  if(h->tag==HT_STR){ Str*s=(Str*)h; UF_UNPROTECT(); pushc(cx,uf_str_new(uf_sbytes(s)+i,(size_t)(j-i))); return; }
+  if(h->tag==HT_BUF){ UF_UNPROTECT(); pushc(cx,uf_str_new(h->data+i,(size_t)(j-i))); return; }
   if(h->tag==HT_DYN){
     Dyn*d=(Dyn*)h; Dyn*r=uf_dyn_new((uint64_t)(j-i)); UF_PROTECT(&r);
     for(int64_t q=i;q<j;q++)uf_dyn_push(&r,d->data[q]);
-    UF_UNPROTECT(); pushp(cx,r); return;
+    UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); return;
   }
   if(h->tag==HT_ARR||h->tag==HT_TENSOR){
     Hdr*r=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)(j-i)*h->esz,0);
     r->tag=h->tag; r->len=(uint64_t)(j-i); r->esz=h->esz; r->ety=h->ety;
     memcpy(r->data,uf_data(h)+i*h->esz,(size_t)(j-i)*h->esz);
-    pushp(cx,r); return;
+    UF_UNPROTECT(); pushp(cx,r); return;
   }
   die("SLICE: unsupported handle");
 }
@@ -928,8 +982,10 @@ static char* uf_fmt(const char*f,Cell*a,int n){
   for(const char*p=f;*p;){
     if(*p!='%'){ if(bi+2>cap){cap*=2;buf=(char*)realloc(buf,cap);} buf[bi++]=*p++; continue; }
     if(p[1]=='%'){ if(bi+2>cap){cap*=2;buf=(char*)realloc(buf,cap);} buf[bi++]='%'; p+=2; continue; }
-    char d[32]; int di=0; d[di++]='%'; p++;
+    char d[48]; int di=0; d[di++]='%'; p++;
     while(*p&&strchr("-+ #0",*p)) d[di++]=*p++;
+    if(*p=='*'){ p++; if(ai>=n) die("FMT: not enough args"); long w=(long)uf_i(a[ai++]); if(w<0){ d[di++]='-'; w=-w; } di+=snprintf(d+di,sizeof(d)-di-8,"%ld",w); }
+
     while(*p&&(isdigit((unsigned char)*p)||*p=='.')) d[di++]=*p++;
     while(*p&&strchr("hlLjzt",*p)) p++;
     char conv=*p?*p++:'d';
@@ -1266,7 +1322,7 @@ static void uf_weave(Ctx*cx,WeaveTask*ts,int n,UfRun run){
     for(int i=0;i<nw-1;i++) pthread_join(th[i],0);
   }
   uf_active_job=0;
-  if(getenv("UF_WEAVE_DEBUG")){
+  if(getenv("NKR_WEAVE_DEBUG")){
     for(int i=0;i<n;i++){
       WeaveTask*t=&ts[i];
       fprintf(stderr,"weave: task pc=%ld wall=%.3fms workers=%ld items=%ld retries=%ld tolerated=%ld\n",
@@ -1857,21 +1913,22 @@ static void uf_put_el(Hdr*a,uint64_t i,double d){ char*dt=uf_data(a); if(a->ety=
 static Hdr* uf_arr_like(Hdr*a,uint64_t n){
   /* HT_MAT: esz is rows, not element bytes — derive byte size from ety */
   uint64_t nb=(a->tag==HT_MAT)?(n*((a->ety==3)?1:8)):(n*a->esz);
-  Hdr*r=(Hdr*)uf_gc_alloc(sizeof(Hdr)+nb,0); r->tag=a->tag; r->len=n; r->esz=a->esz; r->ety=a->ety; return r;
+  /* data is fully overwritten by every caller (elementwise ops, memcpy) — no zero-fill */
+  Hdr*r=(Hdr*)uf_gc_alloc_nz(sizeof(Hdr)+nb,0); r->tag=a->tag; r->len=n; r->esz=a->esz; r->ety=a->ety; return r;
 }
 
 /* ================= GPU compute offloading (Vulkan, v13.1) =================
-   Enabled when the compiler embedded the SPIR-V blobs and defined UF_GPU
+   Enabled when the compiler embedded the SPIR-V blobs and defined NKR_GPU
    (automatic when glslc is present and device mode != cpu). The shims below
    lazily initialize Vulkan, pick the device (auto = most free VRAM via
    VK_EXT_memory_budget, discrete preferred; or the pinned --device bake),
    and LAUNCH prebuilt kernels for eligible ops when the element count clears
-   UF_GPU_MIN (env, default 65536). Any failure or too-small workload falls
+   NKR_GPU_MIN (env, default 65536). Any failure or too-small workload falls
    back to the CPU implementation — the GPU is a fast path, never a
    correctness dependency. Kernels are float64; other element types stay CPU.
    NOTE: `div` on the GPU yields inf/nan for zero divisors where the CPU dies
    (documented divergence). */
-#ifdef UF_GPU
+#ifdef NKR_GPU
 #include <vulkan/vulkan.h>
 static VkInstance uf_vk_inst;
 static VkPhysicalDevice uf_vk_pd;
@@ -1887,7 +1944,7 @@ static VkBuffer uf_vk_dummy;
 static VkDeviceMemory uf_vk_dummy_mem;
 static VkPipeline uf_vk_pipe[sizeof(uf_spv_all)/sizeof(uf_spv_all[0])];
 static int uf_vk_ready, uf_vk_broken;
-static long uf_gpu_min(void){ const char*e=getenv("UF_GPU_MIN"); long v=e?atol(e):65536; return v>0?v:65536; }
+static long uf_gpu_min(void){ const char*e=getenv("NKR_GPU_MIN"); long v=e?atol(e):65536; return v>0?v:65536; }
 static pthread_mutex_t uf_gpu_mu = PTHREAD_MUTEX_INITIALIZER;
 static int uf_spv_index(const char*name){ for(size_t i=0;i<sizeof(uf_spv_all)/sizeof(uf_spv_all[0]);i++) if(!strcmp(uf_spv_all[i].name,name))return (int)i; return -1; }
 
@@ -1916,7 +1973,7 @@ static uint64_t uf_vk_free_mem(VkPhysicalDevice pd, int have_budget, int*discret
 
 static void uf_vk_init(void){
   if(uf_vk_ready||uf_vk_broken) return;
-  VkApplicationInfo app; memset(&app,0,sizeof app); app.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO; app.pApplicationName="uflux"; app.apiVersion=VK_API_VERSION_1_1;
+  VkApplicationInfo app; memset(&app,0,sizeof app); app.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO; app.pApplicationName="enmerkar"; app.apiVersion=VK_API_VERSION_1_1;
   VkInstanceCreateInfo ci; memset(&ci,0,sizeof ci); ci.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ci.pApplicationInfo=&app;
   if(vkCreateInstance(&ci,0,&uf_vk_inst)!=VK_SUCCESS){ uf_vk_broken=1; return; }
   uint32_t nd=0; vkEnumeratePhysicalDevices(uf_vk_inst,&nd,0);
@@ -2039,7 +2096,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   uf_vk_init();
   if(!uf_vk_ready) return 0;
   pthread_mutex_lock(&uf_gpu_mu);
-  if(getenv("UF_VK_DEBUG"))fprintf(stderr,"[vk] bufs a=%zu b=%zu r=%zu\n",asz,bsz,rsz);
+  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] bufs a=%zu b=%zu r=%zu\n",asz,bsz,rsz);
   UFBuf ba,bb,br; memset(&ba,0,sizeof ba); memset(&bb,0,sizeof bb); memset(&br,0,sizeof br);
   if(!uf_vk_buf(asz,A,&ba)){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
   if(B&&!uf_vk_buf(bsz,B,&bb)){ uf_vk_buf_free(&ba); pthread_mutex_unlock(&uf_gpu_mu); return 0; }
@@ -2047,7 +2104,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
   VkDescriptorSet ds;
   VkResult ar=vkAllocateDescriptorSets(uf_vk_dev,&dsai,&ds);
-  if(getenv("UF_VK_DEBUG"))fprintf(stderr,"[vk] dsalloc=%d\n",(int)ar);
+  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] dsalloc=%d\n",(int)ar);
   if(ar!=VK_SUCCESS){ uf_vk_buf_free(&ba); uf_vk_buf_free(&bb); uf_vk_buf_free(&br); return 0; }
   VkWriteDescriptorSet w[3]; VkDescriptorBufferInfo bi[3];
   memset(w,0,sizeof w); memset(bi,0,sizeof bi);
@@ -2056,9 +2113,9 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   bi[2].buffer=br.buf; bi[2].offset=0; bi[2].range=VK_WHOLE_SIZE;
   for(int i=0;i<3;i++){ w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet=ds; w[i].dstBinding=(uint32_t)i; w[i].descriptorCount=1; w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo=&bi[i]; }
   vkUpdateDescriptorSets(uf_vk_dev,3,w,0,0);
-  if(getenv("UF_VK_DEBUG"))fprintf(stderr,"[vk] updated\n");
+  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] updated\n");
   VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  if(getenv("UF_VK_DEBUG"))fprintf(stderr,"[vk] run k=%d n=%llu begin\n",k,(unsigned long long)n);
+  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] run k=%d n=%llu begin\n",k,(unsigned long long)n);
   vkBeginCommandBuffer(uf_vk_cb,&cbbi);
   vkCmdBindPipeline(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_pipe[k]);
   vkCmdPushConstants(uf_vk_cb,uf_vk_playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
@@ -2067,7 +2124,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   vkCmdDispatch(uf_vk_cb,(uint32_t)(groups>0x7fffffff?0x7fffffff:groups),1,1);
   vkEndCommandBuffer(uf_vk_cb);
   VkSubmitInfo si; memset(&si,0,sizeof si); si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount=1; si.pCommandBuffers=&uf_vk_cb;
-  if(getenv("UF_VK_DEBUG"))fprintf(stderr,"[vk] submit\n");
+  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] submit\n");
   VkFence fence; VkFenceCreateInfo fci; memset(&fci,0,sizeof fci); fci.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   vkCreateFence(uf_vk_dev,&fci,0,&fence);
   int ok = vkQueueSubmit(uf_vk_q,1,&si,fence)==VK_SUCCESS && vkWaitForFences(uf_vk_dev,1,&fence,VK_TRUE,UINT64_MAX)==VK_SUCCESS;
@@ -2083,7 +2140,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
    One kernel launch for a whole compilable task body: inputs are the top n
    cells of the ds (peeked, not popped — the ret epilogue drains), the task
    kernel table follows the static library pipelines. Declines (no device,
-   non-float/mismatched inputs, below UF_GPU_MIN, any Vulkan failure) return
+   non-float/mismatched inputs, below NKR_GPU_MIN, any Vulkan failure) return
    the sentinel and the CPU body runs instead. */
 static Cell uf_gpu_decline(void);
 static Cell uf_gpu_task(Ctx*cx,int k,int n){
@@ -2296,7 +2353,10 @@ static Hdr* uf_vecmat(Hdr*v,Hdr*m){
 static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn){
   Hdr*ha=uf_numarr(a)?(Hdr*)(void*)a.i:0;
   Hdr*hb=uf_numarr(b)?(Hdr*)(void*)b.i:0;
-#ifdef UF_GPU
+  /* operands are popped from the ds before we allocate the result — keep them
+     rooted or a GC triggered by the result allocation would sweep them */
+  UF_PROTECT((void**)(void*)&a.i); UF_PROTECT((void**)(void*)&b.i);
+#ifdef NKR_GPU
   if(ha&&hb&&ha->ety==1&&hb->ety==1){
     uint64_t work = (op==2&&ha->tag==HT_MAT&&hb->tag==HT_MAT) ? (ha->esz*(hb->len/hb->esz))
       : (op==2&&ha->tag==HT_MAT) ? ha->esz
@@ -2304,42 +2364,72 @@ static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn){
       : (ha->len>hb->len?ha->len:hb->len);
     if(work>=(uint64_t)uf_gpu_min()){
       Cell g=uf_gpu_arith(a,b,op);
-      if(!(g.tag==T_INT&&g.i==0)) return g;
+      if(!(g.tag==T_INT&&g.i==0)){ UF_UNPROTECT(); UF_UNPROTECT(); return g; }
     }
   }
   if((ha&&!hb&&ha->ety==1&&ha->len>=(uint64_t)uf_gpu_min())||(hb&&!ha&&hb->ety==1&&hb->len>=(uint64_t)uf_gpu_min())){
     Cell g=uf_gpu_arith(a,b,op);
-    if(!(g.tag==T_INT&&g.i==0)) return g;
+    if(!(g.tag==T_INT&&g.i==0)){ UF_UNPROTECT(); UF_UNPROTECT(); return g; }
   }
 #endif
   if(ha&&hb){
-    if(op==2&&ha->tag==HT_MAT&&hb->tag==HT_MAT){ Hdr*r=uf_matmul(ha,hb); return uf_mkp(r); }
-    if(op==2&&ha->tag==HT_MAT&&hb->tag!=HT_MAT){ Hdr*r=uf_matvec(ha,hb); return uf_mkp(r); }
-    if(op==2&&ha->tag!=HT_MAT&&hb->tag==HT_MAT){ Hdr*r=uf_vecmat(ha,hb); return uf_mkp(r); }
+    if(op==2&&ha->tag==HT_MAT&&hb->tag==HT_MAT){ Hdr*r=uf_matmul(ha,hb); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r); }
+    if(op==2&&ha->tag==HT_MAT&&hb->tag!=HT_MAT){ Hdr*r=uf_matvec(ha,hb); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r); }
+    if(op==2&&ha->tag!=HT_MAT&&hb->tag==HT_MAT){ Hdr*r=uf_vecmat(ha,hb); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r); }
     /* elementwise (arrays, or matrices of identical shape) */
     if(ha->len!=hb->len){ char m[96]; snprintf(m,sizeof m,"%s: length mismatch (%llu vs %llu)",opn,(unsigned long long)ha->len,(unsigned long long)hb->len); die(m); }
     if(ha->tag==HT_MAT&&hb->tag==HT_MAT&&ha->esz!=hb->esz){ char da[32],db[32]; uf_dims(ha,da,sizeof da); uf_dims(hb,db,sizeof db); char m[128]; snprintf(m,sizeof m,"%s: matrix shape mismatch (%s vs %s)",opn,da,db); die(m); }
     uint64_t n=ha->len; Hdr*r=uf_arr_like(ha,n); UF_PROTECT(&r);
+    /* v13.2 f64 fast path: raw typed loops, no per-element ety/tag dispatch
+       (mirrors the matmul path) — vectorizable by cc at -O2 */
+    if(ha->ety==1&&hb->ety==1){
+      const double*A=(const double*)uf_data(ha); const double*B=(const double*)uf_data(hb); double*R=(double*)uf_data(r);
+      if(op==0){ for(uint64_t i=0;i<n;i++)R[i]=A[i]+B[i]; }
+      else if(op==1){ for(uint64_t i=0;i<n;i++)R[i]=A[i]-B[i]; }
+      else if(op==2){ for(uint64_t i=0;i<n;i++)R[i]=A[i]*B[i]; }
+      else { for(uint64_t i=0;i<n;i++){ double y=B[i]; if(y==0.0){ char m[64]; snprintf(m,sizeof m,"%s: zero divisor",opn); UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); die(m); } R[i]=A[i]/y; } }
+      UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
+    }
     if(op==3) for(uint64_t i=0;i<n;i++) if(uf_el(hb,i)==0.0){ char m[64]; snprintf(m,sizeof m,"%s: zero divisor",opn); UF_UNPROTECT(); die(m); }
     for(uint64_t i=0;i<n;i++){
       double x=uf_el(ha,i),y=uf_el(hb,i);
       double v = op==0?x+y : op==1?x-y : op==2?x*y : x/y;
       uf_put_el(r,i,v);
     }
-    UF_UNPROTECT(); return uf_mkp(r);
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
   }
   /* scalar broadcast */
   if(ha&&!hb){
     uint64_t n=ha->len; Hdr*r=uf_arr_like(ha,n); UF_PROTECT(&r);
+    if(ha->ety==1&&ha->tag!=HT_MAT){
+      /* v13.2 f64 fast path (raw typed loop) */
+      const double*A=(const double*)uf_data(ha); double*R=(double*)uf_data(r); double d=uf_f(b);
+      if(op==3&&d==0.0){ UF_UNPROTECT(); UF_UNPROTECT(); die("div: zero divisor"); }
+      if(op==0){ for(uint64_t i=0;i<n;i++)R[i]=A[i]+d; }
+      else if(op==1){ for(uint64_t i=0;i<n;i++)R[i]=A[i]-d; }
+      else if(op==2){ for(uint64_t i=0;i<n;i++)R[i]=A[i]*d; }
+      else { for(uint64_t i=0;i<n;i++)R[i]=A[i]/d; }
+      UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
+    }
     if(ha->ety==1||b.tag==T_FLOAT){ double d=uf_f(b); if(op==3&&d==0.0){ UF_UNPROTECT(); die("div: zero divisor"); } for(uint64_t i=0;i<n;i++){ double x=uf_el(ha,i); uf_put_el(r,i, op==0?x+d : op==1?x-d : op==2?x*d : x/d); } }
     else { int64_t d=b.i; if(op==3&&d==0){ UF_UNPROTECT(); die("div: zero divisor"); } for(uint64_t i=0;i<n;i++){ double x=uf_el(ha,i); uf_put_el(r,i, op==0?x+(double)d : op==1?x-(double)d : op==2?x*(double)d : x/(double)d); } }
-    UF_UNPROTECT(); return uf_mkp(r);
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
   }
   if(hb&&!ha){
     uint64_t n=hb->len; Hdr*r=uf_arr_like(hb,n); UF_PROTECT(&r);
+    if(hb->ety==1&&hb->tag!=HT_MAT){
+      /* v13.2 f64 fast path (raw typed loop, scalar on the left) */
+      const double*B=(const double*)uf_data(hb); double*R=(double*)uf_data(r); double d=uf_f(a);
+      if(op==3&&d==0.0){ UF_UNPROTECT(); UF_UNPROTECT(); die("div: zero divisor"); }
+      if(op==0){ for(uint64_t i=0;i<n;i++)R[i]=d+B[i]; }
+      else if(op==1){ for(uint64_t i=0;i<n;i++)R[i]=d-B[i]; }
+      else if(op==2){ for(uint64_t i=0;i<n;i++)R[i]=d*B[i]; }
+      else { for(uint64_t i=0;i<n;i++)R[i]=d/B[i]; }
+      UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
+    }
     if(hb->ety==1||a.tag==T_FLOAT){ double d=uf_f(a); if(op==3&&d==0.0){ UF_UNPROTECT(); die("div: zero divisor"); } for(uint64_t i=0;i<n;i++){ double y=uf_el(hb,i); uf_put_el(r,i, op==0?d+y : op==1?d-y : op==2?d*y : d/y); } }
     else { int64_t d=a.i; if(op==3&&d==0){ UF_UNPROTECT(); die("div: zero divisor"); } for(uint64_t i=0;i<n;i++){ double y=uf_el(hb,i); uf_put_el(r,i, op==0?(double)d+y : op==1?(double)d-y : op==2?(double)d*y : (double)d/y); } }
-    UF_UNPROTECT(); return uf_mkp(r);
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
   }
   die("poly arith: no array operand");
 }
@@ -2349,55 +2439,62 @@ static void op_transpose(Ctx*cx){
   Cell h=pop(cx); Hdr*a=uf_handle(h,"transpose");
   if(a->tag!=HT_MAT)die("transpose: not a matrix (build one with [rows cols] type tensor)");
   uint64_t r=a->esz,c=a->len/r;
-#ifdef UF_GPU
+  UF_PROTECT((void**)(void*)&h.i);
+#ifdef NKR_GPU
   if(a->ety==1&&(r*c)>=(uint64_t)uf_gpu_min()){
     Hdr*g=uf_mat_new(c,r,1); UF_PROTECT(&g);
     struct UFPC pc; memset(&pc,0,sizeof pc); pc.n1=(int64_t)r; pc.n2=(int64_t)c;
     int k=uf_spv_index("transpose");
     int ok=k>=0&&uf_vk_run(k,r*c,uf_data(a),(size_t)(r*c)*8,NULL,0,uf_data(g),(size_t)(r*c)*8,pc);
     UF_UNPROTECT();
-    if(ok){ pushp(cx,g); return; }
+    if(ok){ UF_UNPROTECT(); pushp(cx,g); return; }
     /* fall through to CPU */
   }
 #endif
   Hdr*t=uf_mat_new(c,r,a->ety); UF_PROTECT(&t);
   for(uint64_t i=0;i<r;i++) for(uint64_t j=0;j<c;j++) uf_put_el(t,j*r+i,uf_el(a,i*c+j));
-  UF_UNPROTECT(); pushp(cx,t);
+  UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,t);
 }
 static Hdr* uf_vcheck(Cell h,const char*op){ Hdr*a=uf_handle(h,op); if(a->tag!=HT_ARR&&a->tag!=HT_TENSOR&&a->tag!=HT_MAT)die("vector op: not an arr"); return a; }
 /* scalar arr ops: arr scalar -> arr' */
-#define UF_VSOP(NAME,EXPR,ZERO_DIE) \
+#define UF_VSOP(NAME,EXPR,RAWEXPR,ZERO_DIE) \
 static void NAME(Ctx*cx){ Cell s=pop(cx),h=pop(cx); Hdr*a=uf_vcheck(h,#NAME); \
+  UF_PROTECT((void**)(void*)&h.i); \
   uint64_t n=a->len; Hdr*r=uf_arr_like(a,n); UF_PROTECT(&r); \
-  if(a->ety==1||s.tag==T_FLOAT){ double d=uf_f(s); if(ZERO_DIE&&d==0.0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); } \
+  if(a->ety==1&&a->tag!=HT_MAT){ const double*A=(const double*)uf_data(a); double*R=(double*)uf_data(r); double d=uf_f(s); if(ZERO_DIE&&d==0.0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)R[i]=(RAWEXPR); } \
+  else if(s.tag==T_FLOAT){ double d=uf_f(s); if(ZERO_DIE&&d==0.0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); } \
   else { int64_t d=s.i; if(ZERO_DIE&&d==0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); } \
-  UF_UNPROTECT(); pushp(cx,r); }
-UF_VSOP(op_vadd, uf_el(a,i)+d, 0)
-UF_VSOP(op_vsub, uf_el(a,i)-d, 0)
-UF_VSOP(op_vmul, uf_el(a,i)*d, 0)
-UF_VSOP(op_vdiv, uf_el(a,i)/d, 1)
+  UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); }
+UF_VSOP(op_vadd, uf_el(a,i)+d, A[i]+d, 0)
+UF_VSOP(op_vsub, uf_el(a,i)-d, A[i]-d, 0)
+UF_VSOP(op_vmul, uf_el(a,i)*d, A[i]*d, 0)
+UF_VSOP(op_vdiv, uf_el(a,i)/d, A[i]/d, 1)
 /* elementwise arr arr ops: length mismatch dies */
-#define UF_VEOP(NAME,EXPR,ZERO_DIE) \
+#define UF_VEOP(NAME,EXPR,RAWEXPR,ZERO_DIE) \
 static void NAME(Ctx*cx){ Cell h2=pop(cx),h1=pop(cx); Hdr*a=uf_vcheck(h1,#NAME); Hdr*b=uf_vcheck(h2,#NAME); \
   if(a->len!=b->len)die(#NAME ": length mismatch"); \
+  UF_PROTECT((void**)(void*)&h1.i); UF_PROTECT((void**)(void*)&h2.i); \
   uint64_t n=a->len; Hdr*r=uf_arr_like(a,n); UF_PROTECT(&r); \
+  if(a->ety==1&&b->ety==1&&a->tag!=HT_MAT&&b->tag!=HT_MAT){ const double*A=(const double*)uf_data(a); const double*B=(const double*)uf_data(b); double*R=(double*)uf_data(r); for(uint64_t i=0;i<n;i++)R[i]=(RAWEXPR); } \
+  else { \
   if(ZERO_DIE) for(uint64_t i=0;i<n;i++) if(uf_el(b,i)==0.0)die(#NAME ": zero divisor"); \
-  for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); \
-  UF_UNPROTECT(); pushp(cx,r); }
-UF_VEOP(op_veadd, uf_el(a,i)+uf_el(b,i), 0)
-UF_VEOP(op_vesub, uf_el(a,i)-uf_el(b,i), 0)
-UF_VEOP(op_vemul, uf_el(a,i)*uf_el(b,i), 0)
-UF_VEOP(op_vediv, uf_el(a,i)/uf_el(b,i), 1)
-UF_VEOP(op_vemax, uf_el(a,i)>uf_el(b,i)?uf_el(a,i):uf_el(b,i), 0)
-UF_VEOP(op_vemin, uf_el(a,i)<uf_el(b,i)?uf_el(a,i):uf_el(b,i), 0)
+  for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); } \
+  UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); }
+UF_VEOP(op_veadd, uf_el(a,i)+uf_el(b,i), A[i]+B[i], 0)
+UF_VEOP(op_vesub, uf_el(a,i)-uf_el(b,i), A[i]-B[i], 0)
+UF_VEOP(op_vemul, uf_el(a,i)*uf_el(b,i), A[i]*B[i], 0)
+UF_VEOP(op_vediv, uf_el(a,i)/uf_el(b,i), A[i]/B[i], 1)
+UF_VEOP(op_vemax, uf_el(a,i)>uf_el(b,i)?uf_el(a,i):uf_el(b,i), A[i]>B[i]?A[i]:B[i], 0)
+UF_VEOP(op_vemin, uf_el(a,i)<uf_el(b,i)?uf_el(a,i):uf_el(b,i), A[i]<B[i]?A[i]:B[i], 0)
 /* comparisons: arr scalar -> bitmap */
 static Bitmap* uf_bm_new(uint64_t nbits){ Bitmap*b=(Bitmap*)uf_gc_alloc(sizeof(Bitmap)+((nbits+63)/64)*8,0); b->tag=HT_BITMAP; b->len=nbits; b->esz=8; memset(b->words,0,((nbits+63)/64)*8); return b; }
 #define UF_VCOP(NAME,EXPR) \
 static void NAME(Ctx*cx){ Cell s=pop(cx),h=pop(cx); Hdr*a=uf_vcheck(h,#NAME); \
+  UF_PROTECT((void**)(void*)&h.i); \
   uint64_t n=a->len; Bitmap*r=uf_bm_new(n); UF_PROTECT(&r); \
   double d=uf_f(s); \
   for(uint64_t i=0;i<n;i++) if(EXPR) r->words[i>>6]|=(1ULL<<(i&63)); \
-  UF_UNPROTECT(); pushp(cx,r); }
+  UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); }
 UF_VCOP(op_veq, uf_el(a,i)==d)
 UF_VCOP(op_vlt, uf_el(a,i)<d)
 UF_VCOP(op_vgt, uf_el(a,i)>d)
@@ -2413,29 +2510,31 @@ static void op_vcount(Ctx*cx){ Cell h=pop(cx); Bitmap*a=uf_bm_check(h); uint64_t
 static void op_vgather(Ctx*cx){
   Cell h2=pop(cx),h1=pop(cx); Hdr*a=uf_vcheck(h1,"VGATHER"); Bitmap*b=uf_bm_check(h2);
   if(a->len!=b->len)die("VGATHER: length mismatch");
+  UF_PROTECT((void**)(void*)&h1.i);
   uint64_t n=0; for(uint64_t i=0;i<a->len;i++) if((b->words[i>>6]>>(i&63))&1)n++;
   Hdr*r=uf_arr_like(a,n); UF_PROTECT(&r);
   uint64_t k=0; for(uint64_t i=0;i<a->len;i++) if((b->words[i>>6]>>(i&63))&1)uf_put_el(r,k++,uf_el(a,i));
-  UF_UNPROTECT(); pushp(cx,r);
+  UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r);
 }
 /* reductions */
 static void op_vsum(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VSUM");
-#ifdef UF_GPU
+#ifdef NKR_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()){ double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rsum",&_r)){ pushf(cx,_r); return; } }
 #endif
+ if(a->ety==1){ const double*A=(const double*)uf_data(a); double s=0; for(uint64_t i=0;i<a->len;i++)s+=A[i]; pushf(cx,s); return; }
  double s=0; for(uint64_t i=0;i<a->len;i++)s+=uf_el(a,i); if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
 static void op_vmean(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMEAN"); if(!a->len)die("VMEAN: empty arr");
-#ifdef UF_GPU
+#ifdef NKR_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()){ double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rsum",&_r)){ pushf(cx,_r/(double)a->len); return; } }
 #endif
  double s=0; for(uint64_t i=0;i<a->len;i++)s+=uf_el(a,i); pushf(cx,s/(double)a->len); }
 static void op_vmin(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMIN"); if(!a->len)die("VMIN: empty arr");
-#ifdef UF_GPU
+#ifdef NKR_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()){ double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rmin",&_r)){ pushf(cx,_r); return; } }
 #endif
  double s=uf_el(a,0); for(uint64_t i=1;i<a->len;i++){double d=uf_el(a,i);if(d<s)s=d;} if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
 static void op_vmax(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMAX"); if(!a->len)die("VMAX: empty arr");
-#ifdef UF_GPU
+#ifdef NKR_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()){ double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rmax",&_r)){ pushf(cx,_r); return; } }
 #endif
  double s=uf_el(a,0); for(uint64_t i=1;i<a->len;i++){double d=uf_el(a,i);if(d>s)s=d;} if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
@@ -2652,20 +2751,20 @@ static void op_spit(Ctx*cx){
 }
 /* ARGV: -> list of strings */
 static void op_argv(Ctx*cx){
-  Dyn* d=uf_dyn_new((uint64_t)uf_argc); UF_PROTECT(&d);
-  char** av=(char**)uf_argv;
-  for(int64_t i=0;i<uf_argc;i++){ Cell s=uf_str_new(av[i],strlen(av[i])); uf_dyn_push(&d,s); }
+  Dyn* d=uf_dyn_new((uint64_t)nkr_argc); UF_PROTECT(&d);
+  char** av=(char**)nkr_argv;
+  for(int64_t i=0;i<nkr_argc;i++){ Cell s=uf_str_new(av[i],strlen(av[i])); uf_dyn_push(&d,s); }
   UF_UNPROTECT(); pushp(cx,d);
 }
 /* HASARGS: -> int (1 if argv has >1 element, else 0) */
 static void op_hasargs(Ctx*cx){
-  pushi(cx, uf_argc>1 ? 1 : 0);
+  pushi(cx, nkr_argc>1 ? 1 : 0);
 }
 /* ARGI: index -> int (argv[index] parsed as integer) */
 static void op_argi(Ctx*cx){
   int64_t idx=uf_i(pop(cx));
-  if(idx<0||idx>=uf_argc) die("ARGI: index out of bounds");
-  pushi(cx,(int64_t)strtoll(((char**)uf_argv)[idx],0,10));
+  if(idx<0||idx>=nkr_argc) die("ARGI: index out of bounds");
+  pushi(cx,(int64_t)strtoll(((char**)nkr_argv)[idx],0,10));
 }
 
 /* ================= zero-copy file access + streaming ================= */
@@ -3254,7 +3353,7 @@ static void op_spawn(Ctx*cx){
   pthread_detach(th);
   pushp(cx,r);
 }
-/* init-TU worker: fire-and-forget thread for init.uf entry points.
+/* init-TU worker: fire-and-forget thread for init.en entry points.
    Same as uf_spawn_worker minus the chan — process exit kills these. */
 static void* uf_init_worker(void* arg){
   Ctx* c=ctx_new(1<<16,1<<12);
@@ -3367,10 +3466,10 @@ static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag;
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl101 = {0,0,0,9,2,1,0,0,0,"++"};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl102 = {0,0,0,9,2,1,0,0,0,"--"};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl103 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl104 = {0,0,0,9,16,1,0,0,0,"^%s@ 1 add ^%s! "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl104 = {0,0,0,9,31,1,0,0,0,"^%s@ ^pt! ^%s@ 1 add ^%s! ^pt@ "};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[28]; } uf_sl105 = {0,0,0,9,27,1,0,0,0,"postfix ++ needs a variable"};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl106 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl107 = {0,0,0,9,16,1,0,0,0,"^%s@ 1 sub ^%s! "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl107 = {0,0,0,9,31,1,0,0,0,"^%s@ ^pt! ^%s@ 1 sub ^%s! ^pt@ "};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[28]; } uf_sl108 = {0,0,0,9,27,1,0,0,0,"postfix -- needs a variable"};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl109 = {0,0,0,9,6,1,0,0,0,"[0-9]*"};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl110 = {0,0,0,9,1,1,0,0,0,"'"};
@@ -3388,11 +3487,11 @@ static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag;
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl122 = {0,0,0,9,0,1,0,0,0,""};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl123 = {0,0,0,9,1,1,0,0,0,")"};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl124 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[23]; } uf_sl125 = {0,0,0,9,22,1,0,0,0,"extern \"uf_argc\" load "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[24]; } uf_sl125 = {0,0,0,9,23,1,0,0,0,"extern \"nkr_argc\" load "};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl126 = {0,0,0,9,0,1,0,0,0,""};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl127 = {0,0,0,9,1,1,0,0,0,"["};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl128 = {0,0,0,9,1,1,0,0,0,"]"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[38]; } uf_sl129 = {0,0,0,9,37,1,0,0,0,"8 mul extern \"uf_argv\" load add load "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[39]; } uf_sl129 = {0,0,0,9,38,1,0,0,0,"8 mul extern \"nkr_argv\" load add load "};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl130 = {0,0,0,9,0,1,0,0,0,""};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl131 = {0,0,0,9,1,1,0,0,0,"("};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl132 = {0,0,0,9,1,1,0,0,0,")"};
@@ -3417,177 +3516,197 @@ static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag;
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl151 = {0,0,0,9,2,1,0,0,0,"\\'"};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl152 = {0,0,0,9,1,1,0,0,0," "};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[16]; } uf_sl153 = {0,0,0,9,15,1,0,0,0,"bad char escape"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl154 = {0,0,0,9,1,1,0,0,0,")"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl155 = {0,0,0,9,1,1,0,0,0,")"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[10]; } uf_sl156 = {0,0,0,9,9,1,0,0,0,"_call %s "};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl157 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl158 = {0,0,0,9,1,1,0,0,0,","};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl159 = {0,0,0,9,1,1,0,0,0,"["};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl160 = {0,0,0,9,1,1,0,0,0,"]"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[39]; } uf_sl161 = {0,0,0,9,38,1,0,0,0,"^%s@ \"\" _call strstr add load 255 and "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl154 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl155 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl156 = {0,0,0,9,1,1,0,0,0,")"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl157 = {0,0,0,9,1,1,0,0,0,")"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[11]; } uf_sl158 = {0,0,0,9,10,1,0,0,0,"_call k%d "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl159 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl160 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[35]; } uf_sl161 = {0,0,0,9,34,1,0,0,0,"k%d: %s%s_call %s ^pt! %sret ^pt@\n"};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl162 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl163 = {0,0,0,9,5,1,0,0,0,"^%s@ "};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[23]; } uf_sl164 = {0,0,0,9,22,1,0,0,0,"unknown array variable"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[21]; } uf_sl165 = {0,0,0,9,20,1,0,0,0,"undefined variable: "};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl166 = {0,0,0,9,1,1,0,0,0,"\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl167 = {0,0,0,9,6,1,0,0,0,"return"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl168 = {0,0,0,9,2,1,0,0,0,"if"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl169 = {0,0,0,9,5,1,0,0,0,"while"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[4]; } uf_sl170 = {0,0,0,9,3,1,0,0,0,"for"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl171 = {0,0,0,9,2,1,0,0,0,"do"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl172 = {0,0,0,9,5,1,0,0,0,"break"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[9]; } uf_sl173 = {0,0,0,9,8,1,0,0,0,"continue"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl174 = {0,0,0,9,1,1,0,0,0,"{"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl175 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl176 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl177 = {0,0,0,9,1,1,0,0,0,","};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl178 = {0,0,0,9,1,1,0,0,0,"="};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl179 = {0,0,0,9,5,1,0,0,0,"^%s!\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl180 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[12]; } uf_sl181 = {0,0,0,9,11,1,0,0,0,"_call exit\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl182 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[23]; } uf_sl183 = {0,0,0,9,22,1,0,0,0," ^rv! 1 ^fr! ret ^rv@\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl184 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[20]; } uf_sl185 = {0,0,0,9,19,1,0,0,0," ^rv!\n1 ^fr! 0 ret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl186 = {0,0,0,9,6,1,0,0,0,"0 ret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl187 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl188 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl189 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl190 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl191 = {0,0,0,9,1,1,0,0,0,"("};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl192 = {0,0,0,9,1,1,0,0,0,")"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl193 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl194 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl195 = {0,0,0,9,1,1,0,0,0,"i"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl196 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl197 = {0,0,0,9,2,1,0,0,0,":\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl198 = {0,0,0,9,4,1,0,0,0,"else"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl199 = {0,0,0,9,1,1,0,0,0,"e"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl200 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl201 = {0,0,0,9,2,1,0,0,0,":\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[19]; } uf_sl202 = {0,0,0,9,18,1,0,0,0,"'i%d 'e%d if_else\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[9]; } uf_sl203 = {0,0,0,9,8,1,0,0,0,"'i%d if\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[9]; } uf_sl163 = {0,0,0,9,8,1,0,0,0,"^svst@ ^"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl164 = {0,0,0,9,16,1,0,0,0,"@ append ^svst! "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl165 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[13]; } uf_sl166 = {0,0,0,9,12,1,0,0,0,"^svst@ pop ^"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl167 = {0,0,0,9,2,1,0,0,0,"! "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl168 = {0,0,0,9,1,1,0,0,0,","};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl169 = {0,0,0,9,1,1,0,0,0,"["};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl170 = {0,0,0,9,1,1,0,0,0,"]"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[39]; } uf_sl171 = {0,0,0,9,38,1,0,0,0,"^%s@ \"\" _call strstr add load 255 and "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl172 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl173 = {0,0,0,9,5,1,0,0,0,"^%s@ "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[23]; } uf_sl174 = {0,0,0,9,22,1,0,0,0,"unknown array variable"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[21]; } uf_sl175 = {0,0,0,9,20,1,0,0,0,"undefined variable: "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl176 = {0,0,0,9,1,1,0,0,0,"\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl177 = {0,0,0,9,6,1,0,0,0,"return"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl178 = {0,0,0,9,2,1,0,0,0,"if"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl179 = {0,0,0,9,5,1,0,0,0,"while"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[4]; } uf_sl180 = {0,0,0,9,3,1,0,0,0,"for"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl181 = {0,0,0,9,2,1,0,0,0,"do"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl182 = {0,0,0,9,5,1,0,0,0,"break"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[9]; } uf_sl183 = {0,0,0,9,8,1,0,0,0,"continue"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl184 = {0,0,0,9,1,1,0,0,0,"{"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl185 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl186 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl187 = {0,0,0,9,1,1,0,0,0,","};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl188 = {0,0,0,9,1,1,0,0,0,"="};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl189 = {0,0,0,9,5,1,0,0,0,"^%s!\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl190 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[12]; } uf_sl191 = {0,0,0,9,11,1,0,0,0,"_call exit\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl192 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[14]; } uf_sl193 = {0,0,0,9,13,1,0,0,0," ^rv!\n1 ^fr!\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl194 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[20]; } uf_sl195 = {0,0,0,9,19,1,0,0,0," ^rv!\n1 ^fr! 0 ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl196 = {0,0,0,9,6,1,0,0,0,"0 ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl197 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl198 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl199 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl200 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl201 = {0,0,0,9,1,1,0,0,0,"("};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl202 = {0,0,0,9,1,1,0,0,0,")"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl203 = {0,0,0,9,0,1,0,0,0,""};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl204 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl205 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl206 = {0,0,0,9,1,1,0,0,0,"c"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl207 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[12]; } uf_sl208 = {0,0,0,9,11,1,0,0,0,":\n^fr@ not "};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl209 = {0,0,0,9,1,1,0,0,0,"("};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl210 = {0,0,0,9,1,1,0,0,0,")"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[10]; } uf_sl211 = {0,0,0,9,9,1,0,0,0," and ret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl212 = {0,0,0,9,1,1,0,0,0,"b"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl213 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl214 = {0,0,0,9,2,1,0,0,0,":\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl215 = {0,0,0,9,16,1,0,0,0,"'c%d 'b%d while\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl216 = {0,0,0,9,1,1,0,0,0,"("};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl217 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl218 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl219 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl220 = {0,0,0,9,1,1,0,0,0,"c"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl221 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[12]; } uf_sl222 = {0,0,0,9,11,1,0,0,0,":\n^fr@ not "};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl223 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl224 = {0,0,0,9,4,1,0,0,0,"ret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl225 = {0,0,0,9,1,1,0,0,0,"b"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl226 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl227 = {0,0,0,9,2,1,0,0,0,":\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl228 = {0,0,0,9,1,1,0,0,0,")"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl229 = {0,0,0,9,1,1,0,0,0,")"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl230 = {0,0,0,9,16,1,0,0,0,"'c%d 'b%d while\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl231 = {0,0,0,9,1,1,0,0,0,"="};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl232 = {0,0,0,9,5,1,0,0,0,"^%s!\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl233 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl234 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl235 = {0,0,0,9,2,1,0,0,0,"1 "};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl236 = {0,0,0,9,5,1,0,0,0," and "};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl237 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl238 = {0,0,0,9,1,1,0,0,0,"("};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl239 = {0,0,0,9,1,1,0,0,0,")"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl240 = {0,0,0,9,4,1,0,0,0,"1 df"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl241 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl242 = {0,0,0,9,2,1,0,0,0,"!\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl205 = {0,0,0,9,1,1,0,0,0,"i"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl206 = {0,0,0,9,2,1,0,0,0,"%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl207 = {0,0,0,9,2,1,0,0,0,":\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl208 = {0,0,0,9,4,1,0,0,0,"else"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl209 = {0,0,0,9,1,1,0,0,0,"e"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl210 = {0,0,0,9,2,1,0,0,0,"%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl211 = {0,0,0,9,2,1,0,0,0,":\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[19]; } uf_sl212 = {0,0,0,9,18,1,0,0,0,"'i%d 'e%d if_else\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[9]; } uf_sl213 = {0,0,0,9,8,1,0,0,0,"'i%d if\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl214 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl215 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl216 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl217 = {0,0,0,9,1,1,0,0,0,"c"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl218 = {0,0,0,9,2,1,0,0,0,"%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[12]; } uf_sl219 = {0,0,0,9,11,1,0,0,0,":\n^fr@ not "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl220 = {0,0,0,9,1,1,0,0,0,"("};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl221 = {0,0,0,9,1,1,0,0,0,")"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[10]; } uf_sl222 = {0,0,0,9,9,1,0,0,0," and ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl223 = {0,0,0,9,1,1,0,0,0,"b"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl224 = {0,0,0,9,2,1,0,0,0,"%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl225 = {0,0,0,9,2,1,0,0,0,":\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl226 = {0,0,0,9,16,1,0,0,0,"'c%d 'b%d while\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl227 = {0,0,0,9,1,1,0,0,0,"("};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl228 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl229 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl230 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[4]; } uf_sl231 = {0,0,0,9,3,1,0,0,0,"n%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl232 = {0,0,0,9,1,1,0,0,0,"c"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl233 = {0,0,0,9,2,1,0,0,0,"%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[12]; } uf_sl234 = {0,0,0,9,11,1,0,0,0,":\n^fr@ not "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl235 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[10]; } uf_sl236 = {0,0,0,9,9,1,0,0,0," and ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl237 = {0,0,0,9,1,1,0,0,0,"b"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl238 = {0,0,0,9,2,1,0,0,0,"%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl239 = {0,0,0,9,2,1,0,0,0,":\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl240 = {0,0,0,9,1,1,0,0,0,")"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl241 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl242 = {0,0,0,9,0,1,0,0,0,""};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl243 = {0,0,0,9,0,1,0,0,0,""};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl244 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl245 = {0,0,0,9,1,1,0,0,0,"b"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl246 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl247 = {0,0,0,9,2,1,0,0,0,":\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl248 = {0,0,0,9,4,1,0,0,0,"0 df"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl249 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl250 = {0,0,0,9,2,1,0,0,0,"!\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl251 = {0,0,0,9,5,1,0,0,0,"while"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl252 = {0,0,0,9,1,1,0,0,0,"("};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl253 = {0,0,0,9,1,1,0,0,0,"c"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl254 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[14]; } uf_sl255 = {0,0,0,9,13,1,0,0,0,":\n^fr@ not df"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl256 = {0,0,0,9,2,1,0,0,0,"%d"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl257 = {0,0,0,9,2,1,0,0,0,"@ "};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[13]; } uf_sl258 = {0,0,0,9,12,1,0,0,0," or and ret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl259 = {0,0,0,9,1,1,0,0,0,")"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl260 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl261 = {0,0,0,9,16,1,0,0,0,"'c%d 'b%d while\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[47]; } uf_sl262 = {0,0,0,9,46,1,0,0,0,"^fr@ ^wdone@ or not 'c%d 'b%d while\n0 ^wdone!\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl245 = {0,0,0,9,1,1,0,0,0,")"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[11]; } uf_sl246 = {0,0,0,9,10,1,0,0,0,"^fr@ not '"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl247 = {0,0,0,9,4,1,0,0,0," if\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl248 = {0,0,0,9,2,1,0,0,0,":\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl249 = {0,0,0,9,6,1,0,0,0,"0 ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl250 = {0,0,0,9,16,1,0,0,0,"'c%d 'b%d while\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl251 = {0,0,0,9,1,1,0,0,0,"="};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl252 = {0,0,0,9,5,1,0,0,0,"^%s!\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl253 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl254 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl255 = {0,0,0,9,2,1,0,0,0,"1 "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl256 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl257 = {0,0,0,9,1,1,0,0,0,"("};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl258 = {0,0,0,9,1,1,0,0,0,")"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl259 = {0,0,0,9,4,1,0,0,0,"1 df"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl260 = {0,0,0,9,2,1,0,0,0,"%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl261 = {0,0,0,9,2,1,0,0,0,"!\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl262 = {0,0,0,9,0,1,0,0,0,""};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl263 = {0,0,0,9,0,1,0,0,0,""};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl264 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl265 = {0,0,0,9,5,1,0,0,0,"b%d:\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl266 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl267 = {0,0,0,9,16,1,0,0,0,"1 ^wdone! 0 ret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[30]; } uf_sl268 = {0,0,0,9,29,1,0,0,0,"c%d:\n^fr@ ^wdone@ or not ret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl269 = {0,0,0,9,16,1,0,0,0,"1 ^wdone! 0 ret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[30]; } uf_sl270 = {0,0,0,9,29,1,0,0,0,"c%d:\n^fr@ ^wdone@ or not ret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl271 = {0,0,0,9,1,1,0,0,0,"}"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl272 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl273 = {0,0,0,9,6,1,0,0,0,"break\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl274 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl275 = {0,0,0,9,5,1,0,0,0,"cont\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl276 = {0,0,0,9,1,1,0,0,0,"}"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl265 = {0,0,0,9,1,1,0,0,0,"b"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl266 = {0,0,0,9,2,1,0,0,0,"%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl267 = {0,0,0,9,2,1,0,0,0,":\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl268 = {0,0,0,9,4,1,0,0,0,"0 df"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl269 = {0,0,0,9,2,1,0,0,0,"%d"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl270 = {0,0,0,9,2,1,0,0,0,"!\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl271 = {0,0,0,9,5,1,0,0,0,"while"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl272 = {0,0,0,9,1,1,0,0,0,"("};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl273 = {0,0,0,9,16,1,0,0,0,"c%d:\n^fr@ not df"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl274 = {0,0,0,9,4,1,0,0,0,"%d@ "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[13]; } uf_sl275 = {0,0,0,9,12,1,0,0,0," or and ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl276 = {0,0,0,9,1,1,0,0,0,")"};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl277 = {0,0,0,9,1,1,0,0,0,";"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl278 = {0,0,0,9,1,1,0,0,0,"("};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl279 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl280 = {0,0,0,9,4,1,0,0,0,"main"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl281 = {0,0,0,9,4,1,0,0,0,"main"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl282 = {0,0,0,9,1,1,0,0,0,"{"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl283 = {0,0,0,9,2,1,0,0,0,"%s"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl284 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl285 = {0,0,0,9,2,1,0,0,0,"%s"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl286 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl287 = {0,0,0,9,2,1,0,0,0,"%s"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl288 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[8]; } uf_sl289 = {0,0,0,9,7,1,0,0,0,"entry:\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl290 = {0,0,0,9,4,1,0,0,0,"%s:\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl291 = {0,0,0,9,1,1,0,0,0,")"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl292 = {0,0,0,9,1,1,0,0,0,","};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl293 = {0,0,0,9,1,1,0,0,0,"*"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl294 = {0,0,0,9,5,1,0,0,0,"^%s!\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl295 = {0,0,0,9,1,1,0,0,0,"}"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[18]; } uf_sl296 = {0,0,0,9,17,1,0,0,0,"0 _call exit\nret\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[38]; } uf_sl297 = {0,0,0,9,37,1,0,0,0,"^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl298 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl278 = {0,0,0,9,16,1,0,0,0,"'c%d 'b%d while\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[24]; } uf_sl279 = {0,0,0,9,23,1,0,0,0,"^fr@ 'c%d 'b%d if_else\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl280 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl281 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl282 = {0,0,0,9,5,1,0,0,0,"b%d:\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl283 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl284 = {0,0,0,9,6,1,0,0,0,"0 ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[12]; } uf_sl285 = {0,0,0,9,11,1,0,0,0,"c%d:\n0 ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl286 = {0,0,0,9,6,1,0,0,0,"0 ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[12]; } uf_sl287 = {0,0,0,9,11,1,0,0,0,"c%d:\n0 ret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl288 = {0,0,0,9,1,1,0,0,0,"}"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl289 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl290 = {0,0,0,9,6,1,0,0,0,"break\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl291 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[10]; } uf_sl292 = {0,0,0,9,9,1,0,0,0,"continue\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl293 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[7]; } uf_sl294 = {0,0,0,9,6,1,0,0,0,"_call "};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[11]; } uf_sl295 = {0,0,0,9,10,1,0,0,0," continue\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl296 = {0,0,0,9,1,1,0,0,0,"}"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl297 = {0,0,0,9,1,1,0,0,0,";"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl298 = {0,0,0,9,1,1,0,0,0,"("};
 static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl299 = {0,0,0,9,0,1,0,0,0,""};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl300 = {0,0,0,9,1,1,0,0,0,"r"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl301 = {0,0,0,9,31,1,0,0,0,"import c\"printf\"(ptr,...)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[28]; } uf_sl302 = {0,0,0,9,27,1,0,0,0,"import c\"malloc\"(int)->ptr\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[27]; } uf_sl303 = {0,0,0,9,26,1,0,0,0,"import c\"free\"(ptr)->void\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[26]; } uf_sl304 = {0,0,0,9,25,1,0,0,0,"import c\"puts\"(ptr)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[29]; } uf_sl305 = {0,0,0,9,28,1,0,0,0,"import c\"putchar\"(int)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[26]; } uf_sl306 = {0,0,0,9,25,1,0,0,0,"import c\"getchar\"()->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[31]; } uf_sl307 = {0,0,0,9,30,1,0,0,0,"import c\"fputs\"(ptr,ptr)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[40]; } uf_sl308 = {0,0,0,9,39,1,0,0,0,"import c\"fwrite\"(ptr,int,int,ptr)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[28]; } uf_sl309 = {0,0,0,9,27,1,0,0,0,"import c\"strlen\"(ptr)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl310 = {0,0,0,9,31,1,0,0,0,"import c\"strcmp\"(ptr,ptr)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[37]; } uf_sl311 = {0,0,0,9,36,1,0,0,0,"import c\"strncmp\"(ptr,ptr,int)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl312 = {0,0,0,9,31,1,0,0,0,"import c\"strcpy\"(ptr,ptr)->ptr\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl313 = {0,0,0,9,31,1,0,0,0,"import c\"strcat\"(ptr,ptr)->ptr\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[27]; } uf_sl314 = {0,0,0,9,26,1,0,0,0,"import c\"exit\"(int)->void\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[31]; } uf_sl315 = {0,0,0,9,30,1,0,0,0,"import c\"fopen\"(ptr,ptr)->ptr\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[28]; } uf_sl316 = {0,0,0,9,27,1,0,0,0,"import c\"fclose\"(ptr)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[27]; } uf_sl317 = {0,0,0,9,26,1,0,0,0,"import c\"fgetc\"(ptr)->int\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl318 = {0,0,0,9,31,1,0,0,0,"import c\"strstr\"(ptr,ptr)->ptr\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl319 = {0,0,0,9,16,1,0,0,0,"extern \"stdout\"\n"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[20]; } uf_sl320 = {0,0,0,9,19,1,0,0,0,"usage: trans file.c"};
-static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[18]; } uf_sl321 = {0,0,0,9,17,1,0,0,0,"cannot open input"};
-static void* uf_lits[] = {(void*)&uf_sl0,(void*)&uf_sl1,(void*)&uf_sl2,(void*)&uf_sl3,(void*)&uf_sl4,(void*)&uf_sl5,(void*)&uf_sl6,(void*)&uf_sl7,(void*)&uf_sl8,(void*)&uf_sl9,(void*)&uf_sl10,(void*)&uf_sl11,(void*)&uf_sl12,(void*)&uf_sl13,(void*)&uf_sl14,(void*)&uf_sl15,(void*)&uf_sl16,(void*)&uf_sl17,(void*)&uf_sl18,(void*)&uf_sl19,(void*)&uf_sl20,(void*)&uf_sl21,(void*)&uf_sl22,(void*)&uf_sl23,(void*)&uf_sl24,(void*)&uf_sl25,(void*)&uf_sl26,(void*)&uf_sl27,(void*)&uf_sl28,(void*)&uf_sl29,(void*)&uf_sl30,(void*)&uf_sl31,(void*)&uf_sl32,(void*)&uf_sl33,(void*)&uf_sl34,(void*)&uf_sl35,(void*)&uf_sl36,(void*)&uf_sl37,(void*)&uf_sl38,(void*)&uf_sl39,(void*)&uf_sl40,(void*)&uf_sl41,(void*)&uf_sl42,(void*)&uf_sl43,(void*)&uf_sl44,(void*)&uf_sl45,(void*)&uf_sl46,(void*)&uf_sl47,(void*)&uf_sl48,(void*)&uf_sl49,(void*)&uf_sl50,(void*)&uf_sl51,(void*)&uf_sl52,(void*)&uf_sl53,(void*)&uf_sl54,(void*)&uf_sl55,(void*)&uf_sl56,(void*)&uf_sl57,(void*)&uf_sl58,(void*)&uf_sl59,(void*)&uf_sl60,(void*)&uf_sl61,(void*)&uf_sl62,(void*)&uf_sl63,(void*)&uf_sl64,(void*)&uf_sl65,(void*)&uf_sl66,(void*)&uf_sl67,(void*)&uf_sl68,(void*)&uf_sl69,(void*)&uf_sl70,(void*)&uf_sl71,(void*)&uf_sl72,(void*)&uf_sl73,(void*)&uf_sl74,(void*)&uf_sl75,(void*)&uf_sl76,(void*)&uf_sl77,(void*)&uf_sl78,(void*)&uf_sl79,(void*)&uf_sl80,(void*)&uf_sl81,(void*)&uf_sl82,(void*)&uf_sl83,(void*)&uf_sl84,(void*)&uf_sl85,(void*)&uf_sl86,(void*)&uf_sl87,(void*)&uf_sl88,(void*)&uf_sl89,(void*)&uf_sl90,(void*)&uf_sl91,(void*)&uf_sl92,(void*)&uf_sl93,(void*)&uf_sl94,(void*)&uf_sl95,(void*)&uf_sl96,(void*)&uf_sl97,(void*)&uf_sl98,(void*)&uf_sl99,(void*)&uf_sl100,(void*)&uf_sl101,(void*)&uf_sl102,(void*)&uf_sl103,(void*)&uf_sl104,(void*)&uf_sl105,(void*)&uf_sl106,(void*)&uf_sl107,(void*)&uf_sl108,(void*)&uf_sl109,(void*)&uf_sl110,(void*)&uf_sl111,(void*)&uf_sl112,(void*)&uf_sl113,(void*)&uf_sl114,(void*)&uf_sl115,(void*)&uf_sl116,(void*)&uf_sl117,(void*)&uf_sl118,(void*)&uf_sl119,(void*)&uf_sl120,(void*)&uf_sl121,(void*)&uf_sl122,(void*)&uf_sl123,(void*)&uf_sl124,(void*)&uf_sl125,(void*)&uf_sl126,(void*)&uf_sl127,(void*)&uf_sl128,(void*)&uf_sl129,(void*)&uf_sl130,(void*)&uf_sl131,(void*)&uf_sl132,(void*)&uf_sl133,(void*)&uf_sl134,(void*)&uf_sl135,(void*)&uf_sl136,(void*)&uf_sl137,(void*)&uf_sl138,(void*)&uf_sl139,(void*)&uf_sl140,(void*)&uf_sl141,(void*)&uf_sl142,(void*)&uf_sl143,(void*)&uf_sl144,(void*)&uf_sl145,(void*)&uf_sl146,(void*)&uf_sl147,(void*)&uf_sl148,(void*)&uf_sl149,(void*)&uf_sl150,(void*)&uf_sl151,(void*)&uf_sl152,(void*)&uf_sl153,(void*)&uf_sl154,(void*)&uf_sl155,(void*)&uf_sl156,(void*)&uf_sl157,(void*)&uf_sl158,(void*)&uf_sl159,(void*)&uf_sl160,(void*)&uf_sl161,(void*)&uf_sl162,(void*)&uf_sl163,(void*)&uf_sl164,(void*)&uf_sl165,(void*)&uf_sl166,(void*)&uf_sl167,(void*)&uf_sl168,(void*)&uf_sl169,(void*)&uf_sl170,(void*)&uf_sl171,(void*)&uf_sl172,(void*)&uf_sl173,(void*)&uf_sl174,(void*)&uf_sl175,(void*)&uf_sl176,(void*)&uf_sl177,(void*)&uf_sl178,(void*)&uf_sl179,(void*)&uf_sl180,(void*)&uf_sl181,(void*)&uf_sl182,(void*)&uf_sl183,(void*)&uf_sl184,(void*)&uf_sl185,(void*)&uf_sl186,(void*)&uf_sl187,(void*)&uf_sl188,(void*)&uf_sl189,(void*)&uf_sl190,(void*)&uf_sl191,(void*)&uf_sl192,(void*)&uf_sl193,(void*)&uf_sl194,(void*)&uf_sl195,(void*)&uf_sl196,(void*)&uf_sl197,(void*)&uf_sl198,(void*)&uf_sl199,(void*)&uf_sl200,(void*)&uf_sl201,(void*)&uf_sl202,(void*)&uf_sl203,(void*)&uf_sl204,(void*)&uf_sl205,(void*)&uf_sl206,(void*)&uf_sl207,(void*)&uf_sl208,(void*)&uf_sl209,(void*)&uf_sl210,(void*)&uf_sl211,(void*)&uf_sl212,(void*)&uf_sl213,(void*)&uf_sl214,(void*)&uf_sl215,(void*)&uf_sl216,(void*)&uf_sl217,(void*)&uf_sl218,(void*)&uf_sl219,(void*)&uf_sl220,(void*)&uf_sl221,(void*)&uf_sl222,(void*)&uf_sl223,(void*)&uf_sl224,(void*)&uf_sl225,(void*)&uf_sl226,(void*)&uf_sl227,(void*)&uf_sl228,(void*)&uf_sl229,(void*)&uf_sl230,(void*)&uf_sl231,(void*)&uf_sl232,(void*)&uf_sl233,(void*)&uf_sl234,(void*)&uf_sl235,(void*)&uf_sl236,(void*)&uf_sl237,(void*)&uf_sl238,(void*)&uf_sl239,(void*)&uf_sl240,(void*)&uf_sl241,(void*)&uf_sl242,(void*)&uf_sl243,(void*)&uf_sl244,(void*)&uf_sl245,(void*)&uf_sl246,(void*)&uf_sl247,(void*)&uf_sl248,(void*)&uf_sl249,(void*)&uf_sl250,(void*)&uf_sl251,(void*)&uf_sl252,(void*)&uf_sl253,(void*)&uf_sl254,(void*)&uf_sl255,(void*)&uf_sl256,(void*)&uf_sl257,(void*)&uf_sl258,(void*)&uf_sl259,(void*)&uf_sl260,(void*)&uf_sl261,(void*)&uf_sl262,(void*)&uf_sl263,(void*)&uf_sl264,(void*)&uf_sl265,(void*)&uf_sl266,(void*)&uf_sl267,(void*)&uf_sl268,(void*)&uf_sl269,(void*)&uf_sl270,(void*)&uf_sl271,(void*)&uf_sl272,(void*)&uf_sl273,(void*)&uf_sl274,(void*)&uf_sl275,(void*)&uf_sl276,(void*)&uf_sl277,(void*)&uf_sl278,(void*)&uf_sl279,(void*)&uf_sl280,(void*)&uf_sl281,(void*)&uf_sl282,(void*)&uf_sl283,(void*)&uf_sl284,(void*)&uf_sl285,(void*)&uf_sl286,(void*)&uf_sl287,(void*)&uf_sl288,(void*)&uf_sl289,(void*)&uf_sl290,(void*)&uf_sl291,(void*)&uf_sl292,(void*)&uf_sl293,(void*)&uf_sl294,(void*)&uf_sl295,(void*)&uf_sl296,(void*)&uf_sl297,(void*)&uf_sl298,(void*)&uf_sl299,(void*)&uf_sl300,(void*)&uf_sl301,(void*)&uf_sl302,(void*)&uf_sl303,(void*)&uf_sl304,(void*)&uf_sl305,(void*)&uf_sl306,(void*)&uf_sl307,(void*)&uf_sl308,(void*)&uf_sl309,(void*)&uf_sl310,(void*)&uf_sl311,(void*)&uf_sl312,(void*)&uf_sl313,(void*)&uf_sl314,(void*)&uf_sl315,(void*)&uf_sl316,(void*)&uf_sl317,(void*)&uf_sl318,(void*)&uf_sl319,(void*)&uf_sl320,(void*)&uf_sl321};
-extern char uf_x0[] __asm__("uf_argc");
-extern char uf_x1[] __asm__("uf_argv");
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl300 = {0,0,0,9,4,1,0,0,0,"main"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl301 = {0,0,0,9,4,1,0,0,0,"main"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl302 = {0,0,0,9,1,1,0,0,0,"{"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl303 = {0,0,0,9,2,1,0,0,0,"%s"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl304 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl305 = {0,0,0,9,2,1,0,0,0,"%s"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl306 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[3]; } uf_sl307 = {0,0,0,9,2,1,0,0,0,"%s"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl308 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[20]; } uf_sl309 = {0,0,0,9,19,1,0,0,0,"entry:\nlist ^svst!\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[5]; } uf_sl310 = {0,0,0,9,4,1,0,0,0,"%s:\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl311 = {0,0,0,9,1,1,0,0,0,")"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl312 = {0,0,0,9,1,1,0,0,0,","};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl313 = {0,0,0,9,1,1,0,0,0,"*"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[6]; } uf_sl314 = {0,0,0,9,5,1,0,0,0,"^%s!\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl315 = {0,0,0,9,1,1,0,0,0,"}"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[18]; } uf_sl316 = {0,0,0,9,17,1,0,0,0,"0 _call exit\nret\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[38]; } uf_sl317 = {0,0,0,9,37,1,0,0,0,"^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl318 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[1]; } uf_sl319 = {0,0,0,9,0,1,0,0,0,""};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[2]; } uf_sl320 = {0,0,0,9,1,1,0,0,0,"r"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl321 = {0,0,0,9,31,1,0,0,0,"import c\"printf\"(ptr,...)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[28]; } uf_sl322 = {0,0,0,9,27,1,0,0,0,"import c\"malloc\"(int)->ptr\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[27]; } uf_sl323 = {0,0,0,9,26,1,0,0,0,"import c\"free\"(ptr)->void\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[26]; } uf_sl324 = {0,0,0,9,25,1,0,0,0,"import c\"puts\"(ptr)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[29]; } uf_sl325 = {0,0,0,9,28,1,0,0,0,"import c\"putchar\"(int)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[26]; } uf_sl326 = {0,0,0,9,25,1,0,0,0,"import c\"getchar\"()->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[31]; } uf_sl327 = {0,0,0,9,30,1,0,0,0,"import c\"fputs\"(ptr,ptr)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[40]; } uf_sl328 = {0,0,0,9,39,1,0,0,0,"import c\"fwrite\"(ptr,int,int,ptr)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[28]; } uf_sl329 = {0,0,0,9,27,1,0,0,0,"import c\"strlen\"(ptr)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl330 = {0,0,0,9,31,1,0,0,0,"import c\"strcmp\"(ptr,ptr)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[37]; } uf_sl331 = {0,0,0,9,36,1,0,0,0,"import c\"strncmp\"(ptr,ptr,int)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl332 = {0,0,0,9,31,1,0,0,0,"import c\"strcpy\"(ptr,ptr)->ptr\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl333 = {0,0,0,9,31,1,0,0,0,"import c\"strcat\"(ptr,ptr)->ptr\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[27]; } uf_sl334 = {0,0,0,9,26,1,0,0,0,"import c\"exit\"(int)->void\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[31]; } uf_sl335 = {0,0,0,9,30,1,0,0,0,"import c\"fopen\"(ptr,ptr)->ptr\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[28]; } uf_sl336 = {0,0,0,9,27,1,0,0,0,"import c\"fclose\"(ptr)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[27]; } uf_sl337 = {0,0,0,9,26,1,0,0,0,"import c\"fgetc\"(ptr)->int\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[32]; } uf_sl338 = {0,0,0,9,31,1,0,0,0,"import c\"strstr\"(ptr,ptr)->ptr\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[17]; } uf_sl339 = {0,0,0,9,16,1,0,0,0,"extern \"stdout\"\n"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[20]; } uf_sl340 = {0,0,0,9,19,1,0,0,0,"usage: trans file.c"};
+static struct { void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[18]; } uf_sl341 = {0,0,0,9,17,1,0,0,0,"cannot open input"};
+static void* uf_lits[] = {(void*)&uf_sl0,(void*)&uf_sl1,(void*)&uf_sl2,(void*)&uf_sl3,(void*)&uf_sl4,(void*)&uf_sl5,(void*)&uf_sl6,(void*)&uf_sl7,(void*)&uf_sl8,(void*)&uf_sl9,(void*)&uf_sl10,(void*)&uf_sl11,(void*)&uf_sl12,(void*)&uf_sl13,(void*)&uf_sl14,(void*)&uf_sl15,(void*)&uf_sl16,(void*)&uf_sl17,(void*)&uf_sl18,(void*)&uf_sl19,(void*)&uf_sl20,(void*)&uf_sl21,(void*)&uf_sl22,(void*)&uf_sl23,(void*)&uf_sl24,(void*)&uf_sl25,(void*)&uf_sl26,(void*)&uf_sl27,(void*)&uf_sl28,(void*)&uf_sl29,(void*)&uf_sl30,(void*)&uf_sl31,(void*)&uf_sl32,(void*)&uf_sl33,(void*)&uf_sl34,(void*)&uf_sl35,(void*)&uf_sl36,(void*)&uf_sl37,(void*)&uf_sl38,(void*)&uf_sl39,(void*)&uf_sl40,(void*)&uf_sl41,(void*)&uf_sl42,(void*)&uf_sl43,(void*)&uf_sl44,(void*)&uf_sl45,(void*)&uf_sl46,(void*)&uf_sl47,(void*)&uf_sl48,(void*)&uf_sl49,(void*)&uf_sl50,(void*)&uf_sl51,(void*)&uf_sl52,(void*)&uf_sl53,(void*)&uf_sl54,(void*)&uf_sl55,(void*)&uf_sl56,(void*)&uf_sl57,(void*)&uf_sl58,(void*)&uf_sl59,(void*)&uf_sl60,(void*)&uf_sl61,(void*)&uf_sl62,(void*)&uf_sl63,(void*)&uf_sl64,(void*)&uf_sl65,(void*)&uf_sl66,(void*)&uf_sl67,(void*)&uf_sl68,(void*)&uf_sl69,(void*)&uf_sl70,(void*)&uf_sl71,(void*)&uf_sl72,(void*)&uf_sl73,(void*)&uf_sl74,(void*)&uf_sl75,(void*)&uf_sl76,(void*)&uf_sl77,(void*)&uf_sl78,(void*)&uf_sl79,(void*)&uf_sl80,(void*)&uf_sl81,(void*)&uf_sl82,(void*)&uf_sl83,(void*)&uf_sl84,(void*)&uf_sl85,(void*)&uf_sl86,(void*)&uf_sl87,(void*)&uf_sl88,(void*)&uf_sl89,(void*)&uf_sl90,(void*)&uf_sl91,(void*)&uf_sl92,(void*)&uf_sl93,(void*)&uf_sl94,(void*)&uf_sl95,(void*)&uf_sl96,(void*)&uf_sl97,(void*)&uf_sl98,(void*)&uf_sl99,(void*)&uf_sl100,(void*)&uf_sl101,(void*)&uf_sl102,(void*)&uf_sl103,(void*)&uf_sl104,(void*)&uf_sl105,(void*)&uf_sl106,(void*)&uf_sl107,(void*)&uf_sl108,(void*)&uf_sl109,(void*)&uf_sl110,(void*)&uf_sl111,(void*)&uf_sl112,(void*)&uf_sl113,(void*)&uf_sl114,(void*)&uf_sl115,(void*)&uf_sl116,(void*)&uf_sl117,(void*)&uf_sl118,(void*)&uf_sl119,(void*)&uf_sl120,(void*)&uf_sl121,(void*)&uf_sl122,(void*)&uf_sl123,(void*)&uf_sl124,(void*)&uf_sl125,(void*)&uf_sl126,(void*)&uf_sl127,(void*)&uf_sl128,(void*)&uf_sl129,(void*)&uf_sl130,(void*)&uf_sl131,(void*)&uf_sl132,(void*)&uf_sl133,(void*)&uf_sl134,(void*)&uf_sl135,(void*)&uf_sl136,(void*)&uf_sl137,(void*)&uf_sl138,(void*)&uf_sl139,(void*)&uf_sl140,(void*)&uf_sl141,(void*)&uf_sl142,(void*)&uf_sl143,(void*)&uf_sl144,(void*)&uf_sl145,(void*)&uf_sl146,(void*)&uf_sl147,(void*)&uf_sl148,(void*)&uf_sl149,(void*)&uf_sl150,(void*)&uf_sl151,(void*)&uf_sl152,(void*)&uf_sl153,(void*)&uf_sl154,(void*)&uf_sl155,(void*)&uf_sl156,(void*)&uf_sl157,(void*)&uf_sl158,(void*)&uf_sl159,(void*)&uf_sl160,(void*)&uf_sl161,(void*)&uf_sl162,(void*)&uf_sl163,(void*)&uf_sl164,(void*)&uf_sl165,(void*)&uf_sl166,(void*)&uf_sl167,(void*)&uf_sl168,(void*)&uf_sl169,(void*)&uf_sl170,(void*)&uf_sl171,(void*)&uf_sl172,(void*)&uf_sl173,(void*)&uf_sl174,(void*)&uf_sl175,(void*)&uf_sl176,(void*)&uf_sl177,(void*)&uf_sl178,(void*)&uf_sl179,(void*)&uf_sl180,(void*)&uf_sl181,(void*)&uf_sl182,(void*)&uf_sl183,(void*)&uf_sl184,(void*)&uf_sl185,(void*)&uf_sl186,(void*)&uf_sl187,(void*)&uf_sl188,(void*)&uf_sl189,(void*)&uf_sl190,(void*)&uf_sl191,(void*)&uf_sl192,(void*)&uf_sl193,(void*)&uf_sl194,(void*)&uf_sl195,(void*)&uf_sl196,(void*)&uf_sl197,(void*)&uf_sl198,(void*)&uf_sl199,(void*)&uf_sl200,(void*)&uf_sl201,(void*)&uf_sl202,(void*)&uf_sl203,(void*)&uf_sl204,(void*)&uf_sl205,(void*)&uf_sl206,(void*)&uf_sl207,(void*)&uf_sl208,(void*)&uf_sl209,(void*)&uf_sl210,(void*)&uf_sl211,(void*)&uf_sl212,(void*)&uf_sl213,(void*)&uf_sl214,(void*)&uf_sl215,(void*)&uf_sl216,(void*)&uf_sl217,(void*)&uf_sl218,(void*)&uf_sl219,(void*)&uf_sl220,(void*)&uf_sl221,(void*)&uf_sl222,(void*)&uf_sl223,(void*)&uf_sl224,(void*)&uf_sl225,(void*)&uf_sl226,(void*)&uf_sl227,(void*)&uf_sl228,(void*)&uf_sl229,(void*)&uf_sl230,(void*)&uf_sl231,(void*)&uf_sl232,(void*)&uf_sl233,(void*)&uf_sl234,(void*)&uf_sl235,(void*)&uf_sl236,(void*)&uf_sl237,(void*)&uf_sl238,(void*)&uf_sl239,(void*)&uf_sl240,(void*)&uf_sl241,(void*)&uf_sl242,(void*)&uf_sl243,(void*)&uf_sl244,(void*)&uf_sl245,(void*)&uf_sl246,(void*)&uf_sl247,(void*)&uf_sl248,(void*)&uf_sl249,(void*)&uf_sl250,(void*)&uf_sl251,(void*)&uf_sl252,(void*)&uf_sl253,(void*)&uf_sl254,(void*)&uf_sl255,(void*)&uf_sl256,(void*)&uf_sl257,(void*)&uf_sl258,(void*)&uf_sl259,(void*)&uf_sl260,(void*)&uf_sl261,(void*)&uf_sl262,(void*)&uf_sl263,(void*)&uf_sl264,(void*)&uf_sl265,(void*)&uf_sl266,(void*)&uf_sl267,(void*)&uf_sl268,(void*)&uf_sl269,(void*)&uf_sl270,(void*)&uf_sl271,(void*)&uf_sl272,(void*)&uf_sl273,(void*)&uf_sl274,(void*)&uf_sl275,(void*)&uf_sl276,(void*)&uf_sl277,(void*)&uf_sl278,(void*)&uf_sl279,(void*)&uf_sl280,(void*)&uf_sl281,(void*)&uf_sl282,(void*)&uf_sl283,(void*)&uf_sl284,(void*)&uf_sl285,(void*)&uf_sl286,(void*)&uf_sl287,(void*)&uf_sl288,(void*)&uf_sl289,(void*)&uf_sl290,(void*)&uf_sl291,(void*)&uf_sl292,(void*)&uf_sl293,(void*)&uf_sl294,(void*)&uf_sl295,(void*)&uf_sl296,(void*)&uf_sl297,(void*)&uf_sl298,(void*)&uf_sl299,(void*)&uf_sl300,(void*)&uf_sl301,(void*)&uf_sl302,(void*)&uf_sl303,(void*)&uf_sl304,(void*)&uf_sl305,(void*)&uf_sl306,(void*)&uf_sl307,(void*)&uf_sl308,(void*)&uf_sl309,(void*)&uf_sl310,(void*)&uf_sl311,(void*)&uf_sl312,(void*)&uf_sl313,(void*)&uf_sl314,(void*)&uf_sl315,(void*)&uf_sl316,(void*)&uf_sl317,(void*)&uf_sl318,(void*)&uf_sl319,(void*)&uf_sl320,(void*)&uf_sl321,(void*)&uf_sl322,(void*)&uf_sl323,(void*)&uf_sl324,(void*)&uf_sl325,(void*)&uf_sl326,(void*)&uf_sl327,(void*)&uf_sl328,(void*)&uf_sl329,(void*)&uf_sl330,(void*)&uf_sl331,(void*)&uf_sl332,(void*)&uf_sl333,(void*)&uf_sl334,(void*)&uf_sl335,(void*)&uf_sl336,(void*)&uf_sl337,(void*)&uf_sl338,(void*)&uf_sl339,(void*)&uf_sl340,(void*)&uf_sl341};
+extern char uf_x0[] __asm__("nkr_argc");
+extern char uf_x1[] __asm__("nkr_argv");
 extern int64_t uf_im0() __asm__("printf");
 extern void* uf_im1() __asm__("malloc");
 extern void* uf_im2() __asm__("fopen");
@@ -3642,50 +3761,68 @@ static Cell var_trans__lasts;
 static Cell var_trans__ptk;
 static Cell var_trans__zm;
 static Cell var_trans__ci;
+static Cell var_trans__ckl;
+static Cell var_trans__psnaps;
+static Cell var_trans__pends;
+static Cell var_trans__ckargs;
+static Cell var_trans__cksv;
+static Cell var_trans__svpre;
+static Cell var_trans__svpost;
+static Cell var_trans__pparams;
+static Cell var_trans__pni;
+static Cell var_trans__ckfn;
+static Cell var_trans__flabels;
+static Cell var_trans__psl;
 static Cell var_trans__didret;
 static Cell var_trans__slot;
 static Cell var_trans__slot2;
 static Cell var_trans__inmain;
 static Cell var_trans__cret;
 static Cell var_trans__dchunk;
-static Cell var_trans__pends;
 static Cell var_trans__cp;
-static Cell var_trans__psnaps;
 static Cell var_trans__sv;
 static Cell var_trans__tlbl;
 static Cell var_trans__elbl;
 static Cell var_trans__clbl;
 static Cell var_trans__blbl;
+static Cell var_trans__lstack;
 static Cell var_trans__fclbl;
 static Cell var_trans__fblbl;
+static Cell var_trans__filbl;
 static Cell var_trans__pfpi;
 static Cell var_trans__pfd;
+static Cell var_trans__fchunk;
+static Cell var_trans__pfsv;
 static Cell var_trans__pfpi2;
+static Cell var_trans__finc;
+static Cell var_trans__pfsv2;
+static Cell var_trans__finm;
 static Cell var_trans__dflbl;
 static Cell var_trans__wclbl;
 static Cell var_trans__wblbl;
 static Cell var_trans__wchunk;
 static Cell var_trans__wsv;
 static Cell var_trans__wb;
-static Cell var_trans__flabels;
+static Cell var_trans__pctop;
 static Cell var_trans__fname;
 static Cell var_trans__pl;
 static Cell var_trans__pfi;
 static Cell var_trans__nt;
+static Cell var_trans__svst;
 static Cell var_trans__path;
 static Cell var_trans__f;
-static Cell* uf_vroots[] = {&var_trans__zt,&var_trans__ps,&var_trans__zs,&var_trans__sp2,&var_trans__rr,&var_trans__ls,&var_trans__s,&var_trans__emode,&var_trans__inq,&var_trans__qout,&var_trans__douts,&var_trans__di,&var_trans__old,&var_trans__nv,&var_trans__n,&var_trans__sn,&var_trans__a2,&var_trans__b2,&var_trans__toks,&var_trans__pi,&var_trans__lbl,&var_trans__it,&var_trans__its,&var_trans__fid,&var_trans__nv2,&var_trans__vars,&var_trans__tm_pat,&var_trans__src,&var_trans__pos,&var_trans__srclen,&var_trans__tmm,&var_trans__rest,&var_trans__ln,&var_trans__fi,&var_trans__lv,&var_trans__pc_op,&var_trans__pc_slot,&var_trans__pc_o,&var_trans__lasts,&var_trans__ptk,&var_trans__zm,&var_trans__ci,&var_trans__didret,&var_trans__slot,&var_trans__slot2,&var_trans__inmain,&var_trans__cret,&var_trans__dchunk,&var_trans__pends,&var_trans__cp,&var_trans__psnaps,&var_trans__sv,&var_trans__tlbl,&var_trans__elbl,&var_trans__clbl,&var_trans__blbl,&var_trans__fclbl,&var_trans__fblbl,&var_trans__pfpi,&var_trans__pfd,&var_trans__pfpi2,&var_trans__dflbl,&var_trans__wclbl,&var_trans__wblbl,&var_trans__wchunk,&var_trans__wsv,&var_trans__wb,&var_trans__flabels,&var_trans__fname,&var_trans__pl,&var_trans__pfi,&var_trans__nt,&var_trans__path,&var_trans__f};
-static long uf_lc_v[3141];
-static void uf_init_locals(void){uf_lc_v[959]=0;uf_lc_v[22]=0;uf_lc_v[118]=0;uf_lc_v[111]=0;uf_lc_v[571]=0;uf_lc_v[97]=0;uf_lc_v[195]=0;uf_lc_v[89]=0;uf_lc_v[36]=0;uf_lc_v[753]=0;uf_lc_v[42]=0;uf_lc_v[926]=0;uf_lc_v[1889]=0;uf_lc_v[1765]=0;uf_lc_v[715]=0;uf_lc_v[1870]=0;uf_lc_v[248]=1;uf_lc_v[155]=0;uf_lc_v[734]=0;uf_lc_v[796]=0;uf_lc_v[8]=0;uf_lc_v[0]=0;uf_lc_v[30]=0;uf_lc_v[2991]=0;uf_lc_v[135]=2;uf_lc_v[395]=0;uf_lc_v[215]=0;uf_lc_v[566]=0;uf_lc_v[883]=0;uf_lc_v[107]=0;uf_lc_v[127]=0;}
+static Cell* uf_vroots[] = {&var_trans__zt,&var_trans__ps,&var_trans__zs,&var_trans__sp2,&var_trans__rr,&var_trans__ls,&var_trans__s,&var_trans__emode,&var_trans__inq,&var_trans__qout,&var_trans__douts,&var_trans__di,&var_trans__old,&var_trans__nv,&var_trans__n,&var_trans__sn,&var_trans__a2,&var_trans__b2,&var_trans__toks,&var_trans__pi,&var_trans__lbl,&var_trans__it,&var_trans__its,&var_trans__fid,&var_trans__nv2,&var_trans__vars,&var_trans__tm_pat,&var_trans__src,&var_trans__pos,&var_trans__srclen,&var_trans__tmm,&var_trans__rest,&var_trans__ln,&var_trans__fi,&var_trans__lv,&var_trans__pc_op,&var_trans__pc_slot,&var_trans__pc_o,&var_trans__lasts,&var_trans__ptk,&var_trans__zm,&var_trans__ci,&var_trans__ckl,&var_trans__psnaps,&var_trans__pends,&var_trans__ckargs,&var_trans__cksv,&var_trans__svpre,&var_trans__svpost,&var_trans__pparams,&var_trans__pni,&var_trans__ckfn,&var_trans__flabels,&var_trans__psl,&var_trans__didret,&var_trans__slot,&var_trans__slot2,&var_trans__inmain,&var_trans__cret,&var_trans__dchunk,&var_trans__cp,&var_trans__sv,&var_trans__tlbl,&var_trans__elbl,&var_trans__clbl,&var_trans__blbl,&var_trans__lstack,&var_trans__fclbl,&var_trans__fblbl,&var_trans__filbl,&var_trans__pfpi,&var_trans__pfd,&var_trans__fchunk,&var_trans__pfsv,&var_trans__pfpi2,&var_trans__finc,&var_trans__pfsv2,&var_trans__finm,&var_trans__dflbl,&var_trans__wclbl,&var_trans__wblbl,&var_trans__wchunk,&var_trans__wsv,&var_trans__wb,&var_trans__pctop,&var_trans__fname,&var_trans__pl,&var_trans__pfi,&var_trans__nt,&var_trans__svst,&var_trans__path,&var_trans__f};
+static long uf_lc_v[3380];
+static void uf_init_locals(void){uf_lc_v[734]=0;uf_lc_v[195]=0;uf_lc_v[97]=0;uf_lc_v[566]=0;uf_lc_v[571]=0;uf_lc_v[42]=0;uf_lc_v[30]=0;uf_lc_v[959]=0;uf_lc_v[118]=0;uf_lc_v[1989]=0;uf_lc_v[1865]=0;uf_lc_v[0]=0;uf_lc_v[89]=0;uf_lc_v[36]=0;uf_lc_v[111]=0;uf_lc_v[135]=2;uf_lc_v[395]=0;uf_lc_v[753]=0;uf_lc_v[3015]=0;uf_lc_v[215]=0;uf_lc_v[883]=0;uf_lc_v[248]=1;uf_lc_v[155]=0;uf_lc_v[796]=0;uf_lc_v[22]=0;uf_lc_v[127]=0;uf_lc_v[8]=0;uf_lc_v[715]=0;uf_lc_v[1970]=0;uf_lc_v[3226]=0;uf_lc_v[107]=0;uf_lc_v[926]=0;}
 static long uf_lc(long pc){ return (pc>=0&&(unsigned long)pc<(unsigned long)(sizeof(uf_lc_v)/sizeof(uf_lc_v[0])))?uf_lc_v[pc]:0; }
 
-static void uflux_run(Ctx*cx, long pc){
+static void nkr_run(Ctx*cx, long pc){
   uf_current_ctx=cx;
   if(pc<0){ goto *(void*)uf_entry_addr; }
   /* v11: set up the entry label's local frame (v13: capacity-checked) */
   cx->local_frames[cx->local_fsp++]=cx->local_base; cx->local_base+=uf_lc(pc); if(cx->local_base>cx->local_cap)die("local frame overflow");
-  static const void* labtab[] = {[0]=&&L_0,[50]=&&L_50,[55]=&&L_55,[62]=&&L_62,[69]=&&L_69,[144]=&&L_144,[199]=&&L_199,[209]=&&L_209,[241]=&&L_241,[268]=&&L_268,[276]=&&L_276,[281]=&&L_281,[289]=&&L_289,[306]=&&L_306,[313]=&&L_313,[325]=&&L_325,[332]=&&L_332,[344]=&&L_344,[351]=&&L_351,[363]=&&L_363,[370]=&&L_370,[382]=&&L_382,[389]=&&L_389,[414]=&&L_414,[438]=&&L_438,[450]=&&L_450,[456]=&&L_456,[465]=&&L_465,[478]=&&L_478,[486]=&&L_486,[491]=&&L_491,[500]=&&L_500,[513]=&&L_513,[521]=&&L_521,[526]=&&L_526,[535]=&&L_535,[548]=&&L_548,[556]=&&L_556,[561]=&&L_561,[581]=&&L_581,[585]=&&L_585,[618]=&&L_618,[626]=&&L_626,[644]=&&L_644,[655]=&&L_655,[678]=&&L_678,[685]=&&L_685,[694]=&&L_694,[703]=&&L_703,[712]=&&L_712,[720]=&&L_720,[727]=&&L_727,[739]=&&L_739,[746]=&&L_746,[758]=&&L_758,[769]=&&L_769,[778]=&&L_778,[787]=&&L_787,[801]=&&L_801,[820]=&&L_820,[829]=&&L_829,[838]=&&L_838,[847]=&&L_847,[856]=&&L_856,[865]=&&L_865,[874]=&&L_874,[888]=&&L_888,[899]=&&L_899,[908]=&&L_908,[917]=&&L_917,[940]=&&L_940,[947]=&&L_947,[956]=&&L_956,[966]=&&L_966,[975]=&&L_975,[984]=&&L_984,[993]=&&L_993,[1002]=&&L_1002,[1011]=&&L_1011,[1022]=&&L_1022,[1031]=&&L_1031,[1040]=&&L_1040,[1047]=&&L_1047,[1065]=&&L_1065,[1068]=&&L_1068,[1086]=&&L_1086,[1089]=&&L_1089,[1101]=&&L_1101,[1110]=&&L_1110,[1124]=&&L_1124,[1127]=&&L_1127,[1141]=&&L_1141,[1144]=&&L_1144,[1158]=&&L_1158,[1167]=&&L_1167,[1176]=&&L_1176,[1185]=&&L_1185,[1194]=&&L_1194,[1203]=&&L_1203,[1212]=&&L_1212,[1221]=&&L_1221,[1230]=&&L_1230,[1239]=&&L_1239,[1257]=&&L_1257,[1269]=&&L_1269,[1287]=&&L_1287,[1297]=&&L_1297,[1326]=&&L_1326,[1355]=&&L_1355,[1365]=&&L_1365,[1375]=&&L_1375,[1392]=&&L_1392,[1405]=&&L_1405,[1414]=&&L_1414,[1424]=&&L_1424,[1433]=&&L_1433,[1443]=&&L_1443,[1452]=&&L_1452,[1462]=&&L_1462,[1471]=&&L_1471,[1481]=&&L_1481,[1490]=&&L_1490,[1500]=&&L_1500,[1509]=&&L_1509,[1519]=&&L_1519,[1522]=&&L_1522,[1552]=&&L_1552,[1557]=&&L_1557,[1564]=&&L_1564,[1571]=&&L_1571,[1578]=&&L_1578,[1587]=&&L_1587,[1618]=&&L_1618,[1635]=&&L_1635,[1638]=&&L_1638,[1653]=&&L_1653,[1662]=&&L_1662,[1671]=&&L_1671,[1680]=&&L_1680,[1689]=&&L_1689,[1698]=&&L_1698,[1707]=&&L_1707,[1716]=&&L_1716,[1725]=&&L_1725,[1734]=&&L_1734,[1751]=&&L_1751,[1758]=&&L_1758,[1778]=&&L_1778,[1791]=&&L_1791,[1796]=&&L_1796,[1804]=&&L_1804,[1823]=&&L_1823,[1830]=&&L_1830,[1849]=&&L_1849,[1898]=&&L_1898,[1910]=&&L_1910,[1917]=&&L_1917,[1920]=&&L_1920,[1930]=&&L_1930,[1937]=&&L_1937,[1940]=&&L_1940,[2005]=&&L_2005,[2010]=&&L_2010,[2015]=&&L_2015,[2053]=&&L_2053,[2073]=&&L_2073,[2166]=&&L_2166,[2289]=&&L_2289,[2295]=&&L_2295,[2303]=&&L_2303,[2342]=&&L_2342,[2357]=&&L_2357,[2367]=&&L_2367,[2382]=&&L_2382,[2387]=&&L_2387,[2396]=&&L_2396,[2406]=&&L_2406,[2415]=&&L_2415,[2426]=&&L_2426,[2431]=&&L_2431,[2437]=&&L_2437,[2443]=&&L_2443,[2448]=&&L_2448,[2454]=&&L_2454,[2594]=&&L_2594,[2597]=&&L_2597,[2658]=&&L_2658,[2675]=&&L_2675,[2690]=&&L_2690,[2698]=&&L_2698,[2704]=&&L_2704,[2721]=&&L_2721,[2738]=&&L_2738,[2746]=&&L_2746,[2754]=&&L_2754,[2760]=&&L_2760,[2766]=&&L_2766,[2864]=&&L_2864,[2867]=&&L_2867,[2874]=&&L_2874,[2879]=&&L_2879,[2886]=&&L_2886,[2894]=&&L_2894,[2903]=&&L_2903,[2909]=&&L_2909,[2921]=&&L_2921,[2927]=&&L_2927,[2937]=&&L_2937,[2945]=&&L_2945,[2963]=&&L_2963,[2971]=&&L_2971,[2977]=&&L_2977,[2984]=&&L_2984,[2995]=&&L_2995,[3003]=&&L_3003,[3133]=&&L_3133,[3136]=&&L_3136,};
-  if(pc==0) goto L_3009;
+  static const void* labtab[] = {[0]=&&L_0,[50]=&&L_50,[55]=&&L_55,[62]=&&L_62,[69]=&&L_69,[144]=&&L_144,[199]=&&L_199,[209]=&&L_209,[241]=&&L_241,[268]=&&L_268,[276]=&&L_276,[281]=&&L_281,[289]=&&L_289,[306]=&&L_306,[313]=&&L_313,[325]=&&L_325,[332]=&&L_332,[344]=&&L_344,[351]=&&L_351,[363]=&&L_363,[370]=&&L_370,[382]=&&L_382,[389]=&&L_389,[414]=&&L_414,[438]=&&L_438,[450]=&&L_450,[456]=&&L_456,[465]=&&L_465,[478]=&&L_478,[486]=&&L_486,[491]=&&L_491,[500]=&&L_500,[513]=&&L_513,[521]=&&L_521,[526]=&&L_526,[535]=&&L_535,[548]=&&L_548,[556]=&&L_556,[561]=&&L_561,[581]=&&L_581,[585]=&&L_585,[618]=&&L_618,[626]=&&L_626,[644]=&&L_644,[655]=&&L_655,[678]=&&L_678,[685]=&&L_685,[694]=&&L_694,[703]=&&L_703,[712]=&&L_712,[720]=&&L_720,[727]=&&L_727,[739]=&&L_739,[746]=&&L_746,[758]=&&L_758,[769]=&&L_769,[778]=&&L_778,[787]=&&L_787,[801]=&&L_801,[820]=&&L_820,[829]=&&L_829,[838]=&&L_838,[847]=&&L_847,[856]=&&L_856,[865]=&&L_865,[874]=&&L_874,[888]=&&L_888,[899]=&&L_899,[908]=&&L_908,[917]=&&L_917,[940]=&&L_940,[947]=&&L_947,[956]=&&L_956,[966]=&&L_966,[975]=&&L_975,[984]=&&L_984,[993]=&&L_993,[1002]=&&L_1002,[1011]=&&L_1011,[1022]=&&L_1022,[1031]=&&L_1031,[1040]=&&L_1040,[1047]=&&L_1047,[1067]=&&L_1067,[1070]=&&L_1070,[1090]=&&L_1090,[1093]=&&L_1093,[1105]=&&L_1105,[1114]=&&L_1114,[1129]=&&L_1129,[1132]=&&L_1132,[1147]=&&L_1147,[1150]=&&L_1150,[1164]=&&L_1164,[1173]=&&L_1173,[1182]=&&L_1182,[1191]=&&L_1191,[1200]=&&L_1200,[1209]=&&L_1209,[1218]=&&L_1218,[1227]=&&L_1227,[1236]=&&L_1236,[1245]=&&L_1245,[1263]=&&L_1263,[1275]=&&L_1275,[1293]=&&L_1293,[1303]=&&L_1303,[1332]=&&L_1332,[1361]=&&L_1361,[1371]=&&L_1371,[1381]=&&L_1381,[1398]=&&L_1398,[1411]=&&L_1411,[1420]=&&L_1420,[1430]=&&L_1430,[1439]=&&L_1439,[1449]=&&L_1449,[1458]=&&L_1458,[1468]=&&L_1468,[1477]=&&L_1477,[1487]=&&L_1487,[1496]=&&L_1496,[1506]=&&L_1506,[1515]=&&L_1515,[1525]=&&L_1525,[1528]=&&L_1528,[1616]=&&L_1616,[1623]=&&L_1623,[1652]=&&L_1652,[1657]=&&L_1657,[1664]=&&L_1664,[1671]=&&L_1671,[1678]=&&L_1678,[1687]=&&L_1687,[1718]=&&L_1718,[1735]=&&L_1735,[1738]=&&L_1738,[1753]=&&L_1753,[1762]=&&L_1762,[1771]=&&L_1771,[1780]=&&L_1780,[1789]=&&L_1789,[1798]=&&L_1798,[1807]=&&L_1807,[1816]=&&L_1816,[1825]=&&L_1825,[1834]=&&L_1834,[1851]=&&L_1851,[1858]=&&L_1858,[1878]=&&L_1878,[1891]=&&L_1891,[1896]=&&L_1896,[1904]=&&L_1904,[1923]=&&L_1923,[1930]=&&L_1930,[1949]=&&L_1949,[1998]=&&L_1998,[2010]=&&L_2010,[2017]=&&L_2017,[2020]=&&L_2020,[2030]=&&L_2030,[2037]=&&L_2037,[2040]=&&L_2040,[2105]=&&L_2105,[2110]=&&L_2110,[2115]=&&L_2115,[2153]=&&L_2153,[2173]=&&L_2173,[2272]=&&L_2272,[2490]=&&L_2490,[2496]=&&L_2496,[2504]=&&L_2504,[2543]=&&L_2543,[2558]=&&L_2558,[2566]=&&L_2566,[2581]=&&L_2581,[2586]=&&L_2586,[2595]=&&L_2595,[2605]=&&L_2605,[2614]=&&L_2614,[2625]=&&L_2625,[2630]=&&L_2630,[2636]=&&L_2636,[2642]=&&L_2642,[2647]=&&L_2647,[2653]=&&L_2653,[2792]=&&L_2792,[2795]=&&L_2795,[2856]=&&L_2856,[2873]=&&L_2873,[2888]=&&L_2888,[2896]=&&L_2896,[2902]=&&L_2902,[2919]=&&L_2919,[2938]=&&L_2938,[2945]=&&L_2945,[2961]=&&L_2961,[2972]=&&L_2972,[2980]=&&L_2980,[2988]=&&L_2988,[2994]=&&L_2994,[3000]=&&L_3000,[3096]=&&L_3096,[3103]=&&L_3103,[3108]=&&L_3108,[3115]=&&L_3115,[3123]=&&L_3123,[3132]=&&L_3132,[3138]=&&L_3138,[3150]=&&L_3150,[3156]=&&L_3156,[3166]=&&L_3166,[3174]=&&L_3174,[3198]=&&L_3198,[3206]=&&L_3206,[3212]=&&L_3212,[3219]=&&L_3219,[3230]=&&L_3230,[3238]=&&L_3238,[3372]=&&L_3372,[3375]=&&L_3375,};
+  if(pc==0) goto L_3244;
   goto *labtab[pc];
   static const struct { int64_t tk; int64_t mh; const void* lab; } uf_mt[] = {{0,0,&&L_0}};
 L_0: Cell _pp0=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:pshL': missing parameter 'zt' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_1: Cell t1=var_trans__ps;L_2: L_3: var_trans__zt=_pp0;pushc(cx,t1);pushc(cx,_pp0);uf_cur_op="op_push";op_push(cx);
@@ -3699,7 +3836,7 @@ L_30: Cell t18=var_trans__ls;L_31: pushc(cx,t18);uf_cur_op="op_lpop";op_lpop(cx)
 L_32: Cell t19=pop(cx);L_33: var_trans__rr=t19;pushc(cx,t19);L_34: Cell t20=var_trans__rr;L_35: Cell _rv21=t20;{if(cx->csp==0){pushc(cx,_rv21);return;}cx->csp--;const void*_r22=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv21);if(!_r22)return;goto *_r22;}
 L_36: Cell t23=var_trans__ps;L_37: pushc(cx,t23);uf_cur_op="op_lpop";op_lpop(cx);
 L_38: Cell t24=pop(cx);L_39: var_trans__rr=t24;pushc(cx,t24);L_40: Cell t25=var_trans__rr;L_41: Cell _rv26=t25;{if(cx->csp==0){pushc(cx,_rv26);return;}cx->csp--;const void*_r27=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv26);if(!_r27)return;goto *_r27;}
-L_42: Cell _pp28=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:emit': missing parameter 's' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_43: Cell t29=var_trans__emode;L_44: L_45: Cell t30=uf_ceq(t29,uf_mki(2LL));L_46: var_trans__s=_pp28;pushc(cx,t30);pushp(cx,(void*)&&L_69);
+L_42: Cell _pp28=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:emit': missing parameter 's' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_43: Cell t29=var_trans__emode;L_44: L_45: var_trans__s=_pp28;Cell t30=uf_ceq(t29,uf_mki(2LL));L_46: pushc(cx,t30);pushp(cx,(void*)&&L_69);
 L_47: pushp(cx,(void*)&&L_50);
 L_48: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_48,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_48,cx->sp>0?cx->sp-0:0);goto *el;}K_48:;}
 L_49: Cell _rv31=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv31);return;}cx->csp--;const void*_r32=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv31);if(!_r32)return;goto *_r32;}
@@ -3727,7 +3864,7 @@ L_108: L_109: pushi(cx,1LL);uf_cur_op="exit";{Cell a0=pop(cx);((void(*)(int64_t)
 L_110: Cell _rv68=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv68);return;}cx->csp--;const void*_r69=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv68);if(!_r69)return;goto *_r69;}
 L_111: Cell t70=var_trans__toks;L_112: Cell t71=var_trans__pi;L_113: pushc(cx,t70);pushc(cx,t71);uf_cur_op="op_get";op_get(cx);
 L_114: Cell t72=pop(cx);L_115: var_trans__rr=t72;pushc(cx,t72);L_116: Cell t73=var_trans__rr;L_117: Cell _rv74=t73;{if(cx->csp==0){pushc(cx,_rv74);return;}cx->csp--;const void*_r75=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv74);if(!_r75)return;goto *_r75;}
-L_118: Cell t76=var_trans__toks;L_119: Cell t77=var_trans__pi;L_120: L_121: Cell t78=uf_cadd(t77,uf_mki(1LL));L_122: pushc(cx,t76);pushc(cx,t78);uf_cur_op="op_get";op_get(cx);
+L_118: Cell t76=var_trans__toks;L_119: Cell t77=var_trans__pi;L_120: L_121: pushc(cx,t76);Cell t78=uf_cadd(t77,uf_mki(1LL));L_122: pushc(cx,t78);uf_cur_op="op_get";op_get(cx);
 L_123: Cell t79=pop(cx);L_124: var_trans__rr=t79;pushc(cx,t79);L_125: Cell t80=var_trans__rr;L_126: Cell _rv81=t80;{if(cx->csp==0){pushc(cx,_rv81);return;}cx->csp--;const void*_r82=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv81);if(!_r82)return;goto *_r82;}
 L_127: Cell t83=var_trans__pi;L_128: L_129: Cell t84=uf_cadd(t83,uf_mki(1LL));L_130: L_131: L_132: var_trans__pi=t84;var_trans__rr=t84;pushc(cx,t84);L_133: Cell t85=var_trans__rr;L_134: Cell _rv86=t85;{if(cx->csp==0){pushc(cx,_rv86);return;}cx->csp--;const void*_r87=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv86);if(!_r87)return;goto *_r87;}
 L_135: Cell t88=var_trans__lbl;L_136: L_137: Cell t89=uf_cadd(t88,uf_mki(1LL));L_138: L_139: L_140: L_141: var_trans__lbl=t89;var_trans__rr=t89;pushc(cx,t89);pushc(cx,t89);L_142: Cell t90=var_trans__rr;L_143: Cell _rv91=t90;{if(cx->csp==0){pushc(cx,_rv91);return;}cx->csp--;const void*_r92=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv91);if(!_r92)return;goto *_r92;}
@@ -3767,28 +3904,28 @@ L_209: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_csp
 L_210: L_211: L_212: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_213: Cell t153=var_trans__rr;L_214: Cell _rv154=t153;{if(cx->csp==0){pushc(cx,_rv154);return;}cx->csp--;const void*_r155=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv154);if(!_r155)return;goto *_r155;}
 L_215: Cell _pp156=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:newvar': missing parameter 'nv' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_216: Cell t157=uf_mkp((void*)&uf_sl15);L_217: Cell t158=var_trans__fid;L_218: Cell t159=uf_mkp((void*)&uf_sl16);L_219: var_trans__nv=_pp156;pushc(cx,t157);pushc(cx,t158);pushc(cx,t159);uf_cur_op="op_fmt";op_fmt(cx);
 L_220: uf_cur_op="op_cat";op_cat(cx);
-L_221: Cell t160=pop(cx);L_222: Cell t161=var_trans__fid;L_223: L_224: Cell t162=uf_cadd(t161,uf_mki(1LL));L_225: L_226: Cell t163=var_trans__vars;L_227: Cell t164=var_trans__nv;L_228: L_229: var_trans__nv2=t160;var_trans__fid=t162;pushc(cx,t160);pushc(cx,t162);pushc(cx,t163);pushc(cx,t164);pushc(cx,t160);uf_cur_op="op_set";op_set(cx);
-L_230: L_231: Cell t165=var_trans__nv2;L_232: Cell _rv166=t165;{if(cx->csp==0){pushc(cx,_rv166);return;}cx->csp--;const void*_r167=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv166);if(!_r167)return;goto *_r167;}
-L_233: Cell _pp168=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:findvar': missing parameter 'nv' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_234: Cell t169=var_trans__vars;L_235: L_236: var_trans__nv=_pp168;pushc(cx,t169);pushc(cx,_pp168);uf_cur_op="op_getq";op_getq(cx);
-L_237: Cell t170=pop(cx);Cell t171=uf_cnot(t170);L_238: pushc(cx,t171);pushp(cx,(void*)&&L_241);
+L_221: Cell t160=pop(cx);L_222: Cell t161=var_trans__fid;L_223: L_224: var_trans__nv2=t160;pushc(cx,t160);Cell t162=uf_cadd(t161,uf_mki(1LL));L_225: L_226: Cell t163=var_trans__vars;L_227: Cell t164=var_trans__nv;L_228: Cell t165=var_trans__nv2;L_229: var_trans__fid=t162;pushc(cx,t162);pushc(cx,t163);pushc(cx,t164);pushc(cx,t165);uf_cur_op="op_set";op_set(cx);
+L_230: L_231: Cell t166=var_trans__nv2;L_232: Cell _rv167=t166;{if(cx->csp==0){pushc(cx,_rv167);return;}cx->csp--;const void*_r168=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv167);if(!_r168)return;goto *_r168;}
+L_233: Cell _pp169=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:findvar': missing parameter 'nv' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_234: Cell t170=var_trans__vars;L_235: L_236: var_trans__nv=_pp169;pushc(cx,t170);pushc(cx,_pp169);uf_cur_op="op_getq";op_getq(cx);
+L_237: Cell t171=pop(cx);Cell t172=uf_cnot(t171);L_238: pushc(cx,t172);pushp(cx,(void*)&&L_241);
 L_239: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_239,cx->sp>0?cx->sp-0:0);goto *b;K_239:;}}
-L_240: Cell _rv172=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv172);return;}cx->csp--;const void*_r173=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv172);if(!_r173)return;goto *_r173;}
-L_241: Cell t174=uf_mkp((void*)&uf_sl17);L_242: Cell t175=var_trans__nv;L_243: pushc(cx,t174);pushc(cx,t175);uf_cur_op="op_cat";op_cat(cx);
-L_244: Cell t176=uf_mkp((void*)&uf_sl18);L_245: pushc(cx,t176);uf_cur_op="op_cat";op_cat(cx);
+L_240: Cell _rv173=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv173);return;}cx->csp--;const void*_r174=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv173);if(!_r174)return;goto *_r174;}
+L_241: Cell t175=uf_mkp((void*)&uf_sl17);L_242: Cell t176=var_trans__nv;L_243: pushc(cx,t175);pushc(cx,t176);uf_cur_op="op_cat";op_cat(cx);
+L_244: Cell t177=uf_mkp((void*)&uf_sl18);L_245: pushc(cx,t177);uf_cur_op="op_cat";op_cat(cx);
 L_246: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_246,cx->sp>0?cx->sp-0:0);goto L_107;K_246:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_247: Cell _rv177=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv177);return;}cx->csp--;const void*_r178=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv177);if(!_r178)return;goto *_r178;}
-L_248: Cell _pp179=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:trymatch': missing parameter 'tm_pat' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_249: Cell t180=var_trans__src;L_250: Cell t181=var_trans__pos;L_251: Cell t182=var_trans__srclen;L_252: var_trans__tm_pat=_pp179;pushc(cx,t180);pushc(cx,t181);pushc(cx,t182);uf_cur_op="op_slice";op_slice(cx);
-L_253: Cell t183=var_trans__tm_pat;L_254: pushc(cx,t183);uf_cur_op="op_match";op_match(cx);
-L_255: Cell t184=pop(cx);cx->locals[cx->local_base+0]=t184;L_256: Cell t185=cx->locals[cx->local_base+0];L_257: L_258: pushc(cx,t184);pushc(cx,t185);pushi(cx,0LL);uf_cur_op="op_getq";op_getq(cx);
-L_259: Cell t186=pop(cx);L_260: L_261: var_trans__tmm=t186;pushc(cx,t186);pushc(cx,t186);uf_cur_op="op_len";op_len(cx);
-L_262: L_263: Cell t187=pop(cx);Cell t188=uf_cgt(t187,uf_mki(0LL));L_264: pushc(cx,t188);pushp(cx,(void*)&&L_268);
+L_247: Cell _rv178=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv178);return;}cx->csp--;const void*_r179=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv178);if(!_r179)return;goto *_r179;}
+L_248: Cell _pp180=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:trymatch': missing parameter 'tm_pat' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_249: Cell t181=var_trans__src;L_250: Cell t182=var_trans__pos;L_251: Cell t183=var_trans__srclen;L_252: var_trans__tm_pat=_pp180;pushc(cx,t181);pushc(cx,t182);pushc(cx,t183);uf_cur_op="op_slice";op_slice(cx);
+L_253: Cell t184=var_trans__tm_pat;L_254: pushc(cx,t184);uf_cur_op="op_match";op_match(cx);
+L_255: Cell t185=pop(cx);cx->locals[cx->local_base+0]=t185;L_256: Cell t186=cx->locals[cx->local_base+0];L_257: L_258: pushc(cx,t185);pushc(cx,t186);pushi(cx,0LL);uf_cur_op="op_getq";op_getq(cx);
+L_259: Cell t187=pop(cx);L_260: L_261: var_trans__tmm=t187;pushc(cx,t187);pushc(cx,t187);uf_cur_op="op_len";op_len(cx);
+L_262: L_263: Cell t188=pop(cx);Cell t189=uf_cgt(t188,uf_mki(0LL));L_264: pushc(cx,t189);pushp(cx,(void*)&&L_268);
 L_265: pushp(cx,(void*)&&L_276);
 L_266: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_266,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_266,cx->sp>0?cx->sp-0:0);goto *el;}K_266:;}
-L_267: Cell _rv189=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv189);return;}cx->csp--;const void*_r190=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv189);if(!_r190)return;goto *_r190;}
-L_268: Cell t191=var_trans__tmm;L_269: L_270: pushc(cx,t191);pushi(cx,0LL);uf_cur_op="op_get";op_get(cx);
+L_267: Cell _rv190=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv190);return;}cx->csp--;const void*_r191=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv190);if(!_r191)return;goto *_r191;}
+L_268: Cell t192=var_trans__tmm;L_269: L_270: pushc(cx,t192);pushi(cx,0LL);uf_cur_op="op_get";op_get(cx);
 L_271: uf_cur_op="strlen";{Cell a0=pop(cx);int r=((int(*)(void*))uf_im9)((void*)uf_sptr(a0));pushi(cx,(int64_t)r);}
-L_272: Cell t192=pop(cx);L_273: var_trans__rr=t192;pushc(cx,t192);L_274: Cell t193=var_trans__rr;L_275: Cell _rv194=t193;{if(cx->csp==0){pushc(cx,_rv194);return;}cx->csp--;const void*_r195=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv194);if(!_r195)return;goto *_r195;}
-L_276: L_277: L_278: var_trans__rr=uf_mki(-1LL);pushi(cx,-1LL);L_279: Cell t196=var_trans__rr;L_280: Cell _rv197=t196;{if(cx->csp==0){pushc(cx,_rv197);return;}cx->csp--;const void*_r198=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv197);if(!_r198)return;goto *_r198;}
+L_272: Cell t193=pop(cx);L_273: var_trans__rr=t193;pushc(cx,t193);L_274: Cell t194=var_trans__rr;L_275: Cell _rv195=t194;{if(cx->csp==0){pushc(cx,_rv195);return;}cx->csp--;const void*_r196=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv195);if(!_r196)return;goto *_r196;}
+L_276: L_277: L_278: var_trans__rr=uf_mki(-1LL);pushi(cx,-1LL);L_279: Cell t197=var_trans__rr;L_280: Cell _rv198=t197;{if(cx->csp==0){pushc(cx,_rv198);return;}cx->csp--;const void*_r199=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv198);if(!_r199)return;goto *_r199;}
 L_281: pushp(cx,(void*)&&L_414);
 L_282: pushp(cx,(void*)&&L_438);
 L_283: {const void* bod=(const void*)pop(cx).i;const void* cnd=(const void*)pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;
@@ -3798,182 +3935,182 @@ if(uf_zero(pop(cx)))goto K_WE_283;
 uf_cspush(cx,&&K_WB_283,cx->sp>0?cx->sp-0:0);goto *bod;K_WB_283:;pop(cx);
 goto K_WT_283;
 K_WE_283:;cx->lsp=fr;}
-L_284: L_285: Cell t199=var_trans__pos;L_286: Cell t200=var_trans__srclen;L_287: Cell t201=uf_clt(t199,t200);L_288: Cell _rv202=t201;{if(cx->csp==0){pushc(cx,_rv202);return;}cx->csp--;const void*_r203=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv202);if(!_r203)return;goto *_r203;}
-L_289: Cell t204=var_trans__src;L_290: Cell t205=var_trans__pos;L_291: Cell t206=var_trans__srclen;L_292: pushc(cx,t204);pushc(cx,t205);pushc(cx,t206);uf_cur_op="op_slice";op_slice(cx);
-L_293: Cell t207=pop(cx);L_294: L_295: Cell t208=uf_mkp((void*)&uf_sl19);L_296: var_trans__rest=t207;pushc(cx,t207);pushc(cx,t207);pushc(cx,t208);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_296,cx->sp>1?cx->sp-1:0);goto L_248;K_296:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_297: Cell t209=pop(cx);L_298: L_299: L_300: Cell t210=uf_ceq(t209,uf_mki(-1LL));L_301: Cell t211=uf_cnot(t210);L_302: var_trans__ln=t209;pushc(cx,t209);pushc(cx,t211);pushp(cx,(void*)&&L_306);
+L_284: L_285: Cell t200=var_trans__pos;L_286: Cell t201=var_trans__srclen;L_287: Cell t202=uf_clt(t200,t201);L_288: Cell _rv203=t202;{if(cx->csp==0){pushc(cx,_rv203);return;}cx->csp--;const void*_r204=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv203);if(!_r204)return;goto *_r204;}
+L_289: Cell t205=var_trans__src;L_290: Cell t206=var_trans__pos;L_291: Cell t207=var_trans__srclen;L_292: pushc(cx,t205);pushc(cx,t206);pushc(cx,t207);uf_cur_op="op_slice";op_slice(cx);
+L_293: Cell t208=pop(cx);L_294: L_295: Cell t209=uf_mkp((void*)&uf_sl19);L_296: var_trans__rest=t208;pushc(cx,t208);pushc(cx,t208);pushc(cx,t209);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_296,cx->sp>1?cx->sp-1:0);goto L_248;K_296:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_297: Cell t210=pop(cx);L_298: L_299: L_300: var_trans__ln=t210;pushc(cx,t210);Cell t211=uf_ceq(t210,uf_mki(-1LL));L_301: Cell t212=uf_cnot(t211);L_302: pushc(cx,t212);pushp(cx,(void*)&&L_306);
 L_303: pushp(cx,(void*)&&L_313);
 L_304: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_304,cx->sp>1?cx->sp-1:0);goto *th;}else{uf_cspush(cx,&&K_304,cx->sp>0?cx->sp-0:0);goto *el;}K_304:;}
-L_305: Cell _rv212=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv212);return;}cx->csp--;const void*_r213=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv212);if(!_r213)return;goto *_r213;}
-L_306: Cell _pp214=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_str': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_307: var_trans__ln=_pp214;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_307,cx->sp>0?cx->sp-0:0);goto L_395;K_307:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_308: L_309: L_310: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_311: Cell t215=var_trans__rr;L_312: Cell _rv216=t215;{if(cx->csp==0){pushc(cx,_rv216);return;}cx->csp--;const void*_r217=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv216);if(!_r217)return;goto *_r217;}
-L_313: Cell t218=var_trans__rest;L_314: Cell t219=uf_mkp((void*)&uf_sl20);L_315: pushc(cx,t218);pushc(cx,t219);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_315,cx->sp>1?cx->sp-1:0);goto L_248;K_315:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_316: Cell t220=pop(cx);L_317: L_318: L_319: Cell t221=uf_ceq(t220,uf_mki(-1LL));L_320: Cell t222=uf_cnot(t221);L_321: var_trans__ln=t220;pushc(cx,t220);pushc(cx,t222);pushp(cx,(void*)&&L_325);
+L_305: Cell _rv213=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv213);return;}cx->csp--;const void*_r214=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv213);if(!_r214)return;goto *_r214;}
+L_306: Cell _pp215=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_str': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_307: var_trans__ln=_pp215;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_307,cx->sp>0?cx->sp-0:0);goto L_395;K_307:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_308: L_309: L_310: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_311: Cell t216=var_trans__rr;L_312: Cell _rv217=t216;{if(cx->csp==0){pushc(cx,_rv217);return;}cx->csp--;const void*_r218=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv217);if(!_r218)return;goto *_r218;}
+L_313: Cell t219=var_trans__rest;L_314: Cell t220=uf_mkp((void*)&uf_sl20);L_315: pushc(cx,t219);pushc(cx,t220);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_315,cx->sp>1?cx->sp-1:0);goto L_248;K_315:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_316: Cell t221=pop(cx);L_317: L_318: L_319: var_trans__ln=t221;pushc(cx,t221);Cell t222=uf_ceq(t221,uf_mki(-1LL));L_320: Cell t223=uf_cnot(t222);L_321: pushc(cx,t223);pushp(cx,(void*)&&L_325);
 L_322: pushp(cx,(void*)&&L_332);
 L_323: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_323,cx->sp>1?cx->sp-1:0);goto *th;}else{uf_cspush(cx,&&K_323,cx->sp>0?cx->sp-0:0);goto *el;}K_323:;}
-L_324: Cell _rv223=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv223);return;}cx->csp--;const void*_r224=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv223);if(!_r224)return;goto *_r224;}
-L_325: Cell _pp225=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_chr': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_326: var_trans__ln=_pp225;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_326,cx->sp>0?cx->sp-0:0);goto L_395;K_326:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_327: L_328: L_329: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_330: Cell t226=var_trans__rr;L_331: Cell _rv227=t226;{if(cx->csp==0){pushc(cx,_rv227);return;}cx->csp--;const void*_r228=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv227);if(!_r228)return;goto *_r228;}
-L_332: Cell t229=var_trans__rest;L_333: Cell t230=uf_mkp((void*)&uf_sl21);L_334: pushc(cx,t229);pushc(cx,t230);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_334,cx->sp>1?cx->sp-1:0);goto L_248;K_334:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_335: Cell t231=pop(cx);L_336: L_337: L_338: Cell t232=uf_ceq(t231,uf_mki(-1LL));L_339: Cell t233=uf_cnot(t232);L_340: var_trans__ln=t231;pushc(cx,t231);pushc(cx,t233);pushp(cx,(void*)&&L_344);
+L_324: Cell _rv224=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv224);return;}cx->csp--;const void*_r225=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv224);if(!_r225)return;goto *_r225;}
+L_325: Cell _pp226=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_chr': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_326: var_trans__ln=_pp226;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_326,cx->sp>0?cx->sp-0:0);goto L_395;K_326:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_327: L_328: L_329: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_330: Cell t227=var_trans__rr;L_331: Cell _rv228=t227;{if(cx->csp==0){pushc(cx,_rv228);return;}cx->csp--;const void*_r229=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv228);if(!_r229)return;goto *_r229;}
+L_332: Cell t230=var_trans__rest;L_333: Cell t231=uf_mkp((void*)&uf_sl21);L_334: pushc(cx,t230);pushc(cx,t231);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_334,cx->sp>1?cx->sp-1:0);goto L_248;K_334:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_335: Cell t232=pop(cx);L_336: L_337: L_338: var_trans__ln=t232;pushc(cx,t232);Cell t233=uf_ceq(t232,uf_mki(-1LL));L_339: Cell t234=uf_cnot(t233);L_340: pushc(cx,t234);pushp(cx,(void*)&&L_344);
 L_341: pushp(cx,(void*)&&L_351);
 L_342: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_342,cx->sp>1?cx->sp-1:0);goto *th;}else{uf_cspush(cx,&&K_342,cx->sp>0?cx->sp-0:0);goto *el;}K_342:;}
-L_343: Cell _rv234=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv234);return;}cx->csp--;const void*_r235=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv234);if(!_r235)return;goto *_r235;}
-L_344: Cell _pp236=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_num': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_345: var_trans__ln=_pp236;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_345,cx->sp>0?cx->sp-0:0);goto L_395;K_345:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_346: L_347: L_348: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_349: Cell t237=var_trans__rr;L_350: Cell _rv238=t237;{if(cx->csp==0){pushc(cx,_rv238);return;}cx->csp--;const void*_r239=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv238);if(!_r239)return;goto *_r239;}
-L_351: Cell t240=var_trans__rest;L_352: Cell t241=uf_mkp((void*)&uf_sl22);L_353: pushc(cx,t240);pushc(cx,t241);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_353,cx->sp>1?cx->sp-1:0);goto L_248;K_353:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_354: Cell t242=pop(cx);L_355: L_356: L_357: Cell t243=uf_ceq(t242,uf_mki(-1LL));L_358: Cell t244=uf_cnot(t243);L_359: var_trans__ln=t242;pushc(cx,t242);pushc(cx,t244);pushp(cx,(void*)&&L_363);
+L_343: Cell _rv235=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv235);return;}cx->csp--;const void*_r236=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv235);if(!_r236)return;goto *_r236;}
+L_344: Cell _pp237=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_num': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_345: var_trans__ln=_pp237;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_345,cx->sp>0?cx->sp-0:0);goto L_395;K_345:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_346: L_347: L_348: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_349: Cell t238=var_trans__rr;L_350: Cell _rv239=t238;{if(cx->csp==0){pushc(cx,_rv239);return;}cx->csp--;const void*_r240=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv239);if(!_r240)return;goto *_r240;}
+L_351: Cell t241=var_trans__rest;L_352: Cell t242=uf_mkp((void*)&uf_sl22);L_353: pushc(cx,t241);pushc(cx,t242);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_353,cx->sp>1?cx->sp-1:0);goto L_248;K_353:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_354: Cell t243=pop(cx);L_355: L_356: L_357: var_trans__ln=t243;pushc(cx,t243);Cell t244=uf_ceq(t243,uf_mki(-1LL));L_358: Cell t245=uf_cnot(t244);L_359: pushc(cx,t245);pushp(cx,(void*)&&L_363);
 L_360: pushp(cx,(void*)&&L_370);
 L_361: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_361,cx->sp>1?cx->sp-1:0);goto *th;}else{uf_cspush(cx,&&K_361,cx->sp>0?cx->sp-0:0);goto *el;}K_361:;}
-L_362: Cell _rv245=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv245);return;}cx->csp--;const void*_r246=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv245);if(!_r246)return;goto *_r246;}
-L_363: Cell _pp247=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_id': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_364: var_trans__ln=_pp247;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_364,cx->sp>0?cx->sp-0:0);goto L_395;K_364:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_365: L_366: L_367: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_368: Cell t248=var_trans__rr;L_369: Cell _rv249=t248;{if(cx->csp==0){pushc(cx,_rv249);return;}cx->csp--;const void*_r250=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv249);if(!_r250)return;goto *_r250;}
-L_370: Cell t251=var_trans__rest;L_371: Cell t252=uf_mkp((void*)&uf_sl23);L_372: pushc(cx,t251);pushc(cx,t252);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_372,cx->sp>1?cx->sp-1:0);goto L_248;K_372:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_373: Cell t253=pop(cx);L_374: L_375: L_376: Cell t254=uf_ceq(t253,uf_mki(-1LL));L_377: Cell t255=uf_cnot(t254);L_378: var_trans__ln=t253;pushc(cx,t253);pushc(cx,t255);pushp(cx,(void*)&&L_382);
+L_362: Cell _rv246=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv246);return;}cx->csp--;const void*_r247=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv246);if(!_r247)return;goto *_r247;}
+L_363: Cell _pp248=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_id': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_364: var_trans__ln=_pp248;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_364,cx->sp>0?cx->sp-0:0);goto L_395;K_364:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_365: L_366: L_367: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_368: Cell t249=var_trans__rr;L_369: Cell _rv250=t249;{if(cx->csp==0){pushc(cx,_rv250);return;}cx->csp--;const void*_r251=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv250);if(!_r251)return;goto *_r251;}
+L_370: Cell t252=var_trans__rest;L_371: Cell t253=uf_mkp((void*)&uf_sl23);L_372: pushc(cx,t252);pushc(cx,t253);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_372,cx->sp>1?cx->sp-1:0);goto L_248;K_372:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_373: Cell t254=pop(cx);L_374: L_375: L_376: var_trans__ln=t254;pushc(cx,t254);Cell t255=uf_ceq(t254,uf_mki(-1LL));L_377: Cell t256=uf_cnot(t255);L_378: pushc(cx,t256);pushp(cx,(void*)&&L_382);
 L_379: pushp(cx,(void*)&&L_389);
 L_380: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_380,cx->sp>1?cx->sp-1:0);goto *th;}else{uf_cspush(cx,&&K_380,cx->sp>0?cx->sp-0:0);goto *el;}K_380:;}
-L_381: Cell _rv256=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv256);return;}cx->csp--;const void*_r257=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv256);if(!_r257)return;goto *_r257;}
-L_382: Cell _pp258=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_mop': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_383: var_trans__ln=_pp258;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_383,cx->sp>0?cx->sp-0:0);goto L_395;K_383:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_384: L_385: L_386: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_387: Cell t259=var_trans__rr;L_388: Cell _rv260=t259;{if(cx->csp==0){pushc(cx,_rv260);return;}cx->csp--;const void*_r261=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv260);if(!_r261)return;goto *_r261;}
+L_381: Cell _rv257=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv257);return;}cx->csp--;const void*_r258=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv257);if(!_r258)return;goto *_r258;}
+L_382: Cell _pp259=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?pop(cx):(die("label 'trans:lex_mop': missing parameter 'ln' (1 parameter(s) declared, fewer present at runtime — null-fill was removed)"),uf_mki(0));L_383: var_trans__ln=_pp259;cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_383,cx->sp>0?cx->sp-0:0);goto L_395;K_383:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_384: L_385: L_386: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_387: Cell t260=var_trans__rr;L_388: Cell _rv261=t260;{if(cx->csp==0){pushc(cx,_rv261);return;}cx->csp--;const void*_r262=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv261);if(!_r262)return;goto *_r262;}
 L_389: L_390: L_391: var_trans__ln=uf_mki(1LL);pushi(cx,1LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_391,cx->sp>0?cx->sp-0:0);goto L_395;K_391:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_392: L_393: L_394: Cell _rv262=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv262);return;}cx->csp--;const void*_r263=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv262);if(!_r263)return;goto *_r263;}
-L_395: Cell t264=var_trans__src;L_396: Cell t265=var_trans__pos;L_397: L_398: Cell t266=var_trans__ln;L_399: Cell t267=uf_cadd(var_trans__pos,t266);L_400: pushc(cx,t264);pushc(cx,t265);pushc(cx,t267);uf_cur_op="op_slice";op_slice(cx);
-L_401: Cell t268=pop(cx);L_402: Cell t269=var_trans__toks;L_403: L_404: var_trans__zs=t268;pushc(cx,t268);pushc(cx,t269);pushc(cx,t268);uf_cur_op="op_push";op_push(cx);
-L_405: Cell t270=pop(cx);L_406: Cell t271=var_trans__pos;L_407: Cell t272=var_trans__ln;L_408: Cell t273=uf_cadd(t271,t272);L_409: L_410: L_411: var_trans__toks=t270;var_trans__pos=t273;var_trans__rr=t273;pushc(cx,t270);pushc(cx,t273);L_412: Cell t274=var_trans__rr;L_413: Cell _rv275=t274;{if(cx->csp==0){pushc(cx,_rv275);return;}cx->csp--;const void*_r276=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv275);if(!_r276)return;goto *_r276;}
-L_414: Cell t277=var_trans__src;L_415: Cell t278=var_trans__pos;L_416: Cell t279=var_trans__srclen;L_417: pushc(cx,t277);pushc(cx,t278);pushc(cx,t279);uf_cur_op="op_slice";op_slice(cx);
-L_418: Cell t280=pop(cx);L_419: L_420: Cell t281=uf_mkp((void*)&uf_sl24);L_421: var_trans__rest=t280;pushc(cx,t280);pushc(cx,t280);pushc(cx,t281);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_421,cx->sp>1?cx->sp-1:0);goto L_248;K_421:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_422: L_423: Cell t282=pop(cx);Cell t283=uf_ceq(t282,uf_mki(-1LL));L_424: Cell t284=uf_cnot(t283);L_425: Cell t285=var_trans__rest;L_426: Cell t286=uf_mkp((void*)&uf_sl25);L_427: pushc(cx,t284);pushc(cx,t285);pushc(cx,t286);uf_cur_op="op_starts";op_starts(cx);
-L_428: Cell t287=pop(cx);Cell t288=pop(cx);Cell t289=uf_cadd(t288,t287);L_429: Cell t290=var_trans__rest;L_430: Cell t291=uf_mkp((void*)&uf_sl26);L_431: pushc(cx,t289);pushc(cx,t290);pushc(cx,t291);uf_cur_op="op_starts";op_starts(cx);
-L_432: Cell t292=pop(cx);Cell t293=pop(cx);Cell t294=uf_cadd(t293,t292);L_433: Cell t295=var_trans__rest;L_434: Cell t296=uf_mkp((void*)&uf_sl27);L_435: pushc(cx,t294);pushc(cx,t295);pushc(cx,t296);uf_cur_op="op_starts";op_starts(cx);
-L_436: Cell t297=pop(cx);Cell t298=pop(cx);Cell t299=uf_cadd(t298,t297);L_437: Cell _rv300=t299;{if(cx->csp==0){pushc(cx,_rv300);return;}cx->csp--;const void*_r301=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv300);if(!_r301)return;goto *_r301;}
-L_438: Cell t302=var_trans__rest;L_439: Cell t303=uf_mkp((void*)&uf_sl28);L_440: pushc(cx,t302);pushc(cx,t303);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_440,cx->sp>1?cx->sp-1:0);goto L_248;K_440:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_441: Cell t304=pop(cx);L_442: L_443: L_444: Cell t305=uf_ceq(t304,uf_mki(-1LL));L_445: Cell t306=uf_cnot(t305);L_446: var_trans__ln=t304;pushc(cx,t304);pushc(cx,t306);pushp(cx,(void*)&&L_450);
+L_392: L_393: L_394: Cell _rv263=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv263);return;}cx->csp--;const void*_r264=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv263);if(!_r264)return;goto *_r264;}
+L_395: Cell t265=var_trans__src;L_396: Cell t266=var_trans__pos;L_397: L_398: Cell t267=var_trans__ln;L_399: pushc(cx,t265);pushc(cx,t266);Cell t268=uf_cadd(var_trans__pos,t267);L_400: pushc(cx,t268);uf_cur_op="op_slice";op_slice(cx);
+L_401: Cell t269=pop(cx);L_402: Cell t270=var_trans__toks;L_403: L_404: var_trans__zs=t269;pushc(cx,t269);pushc(cx,t270);pushc(cx,t269);uf_cur_op="op_push";op_push(cx);
+L_405: Cell t271=pop(cx);L_406: Cell t272=var_trans__pos;L_407: Cell t273=var_trans__ln;L_408: var_trans__toks=t271;pushc(cx,t271);Cell t274=uf_cadd(t272,t273);L_409: L_410: L_411: var_trans__pos=t274;var_trans__rr=t274;pushc(cx,t274);L_412: Cell t275=var_trans__rr;L_413: Cell _rv276=t275;{if(cx->csp==0){pushc(cx,_rv276);return;}cx->csp--;const void*_r277=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv276);if(!_r277)return;goto *_r277;}
+L_414: Cell t278=var_trans__src;L_415: Cell t279=var_trans__pos;L_416: Cell t280=var_trans__srclen;L_417: pushc(cx,t278);pushc(cx,t279);pushc(cx,t280);uf_cur_op="op_slice";op_slice(cx);
+L_418: Cell t281=pop(cx);L_419: L_420: Cell t282=uf_mkp((void*)&uf_sl24);L_421: var_trans__rest=t281;pushc(cx,t281);pushc(cx,t281);pushc(cx,t282);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_421,cx->sp>1?cx->sp-1:0);goto L_248;K_421:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_422: L_423: Cell t283=pop(cx);Cell t284=uf_ceq(t283,uf_mki(-1LL));L_424: Cell t285=uf_cnot(t284);L_425: Cell t286=var_trans__rest;L_426: Cell t287=uf_mkp((void*)&uf_sl25);L_427: pushc(cx,t285);pushc(cx,t286);pushc(cx,t287);uf_cur_op="op_starts";op_starts(cx);
+L_428: Cell t288=pop(cx);Cell t289=pop(cx);Cell t290=uf_cadd(t289,t288);L_429: Cell t291=var_trans__rest;L_430: Cell t292=uf_mkp((void*)&uf_sl26);L_431: pushc(cx,t290);pushc(cx,t291);pushc(cx,t292);uf_cur_op="op_starts";op_starts(cx);
+L_432: Cell t293=pop(cx);Cell t294=pop(cx);Cell t295=uf_cadd(t294,t293);L_433: Cell t296=var_trans__rest;L_434: Cell t297=uf_mkp((void*)&uf_sl27);L_435: pushc(cx,t295);pushc(cx,t296);pushc(cx,t297);uf_cur_op="op_starts";op_starts(cx);
+L_436: Cell t298=pop(cx);Cell t299=pop(cx);Cell t300=uf_cadd(t299,t298);L_437: Cell _rv301=t300;{if(cx->csp==0){pushc(cx,_rv301);return;}cx->csp--;const void*_r302=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv301);if(!_r302)return;goto *_r302;}
+L_438: Cell t303=var_trans__rest;L_439: Cell t304=uf_mkp((void*)&uf_sl28);L_440: pushc(cx,t303);pushc(cx,t304);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_440,cx->sp>1?cx->sp-1:0);goto L_248;K_440:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_441: Cell t305=pop(cx);L_442: L_443: L_444: var_trans__ln=t305;pushc(cx,t305);Cell t306=uf_ceq(t305,uf_mki(-1LL));L_445: Cell t307=uf_cnot(t306);L_446: pushc(cx,t307);pushp(cx,(void*)&&L_450);
 L_447: pushp(cx,(void*)&&L_456);
 L_448: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_448,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_448,cx->sp>0?cx->sp-0:0);goto *el;}K_448:;}
-L_449: Cell _rv307=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv307);return;}cx->csp--;const void*_r308=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv307);if(!_r308)return;goto *_r308;}
-L_450: Cell t309=var_trans__pos;L_451: Cell t310=pop(cx);Cell t311=uf_cadd(t310,t309);L_452: L_453: var_trans__pos=t311;pushc(cx,t311);L_454: L_455: Cell _rv312=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv312);return;}cx->csp--;const void*_r313=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv312);if(!_r313)return;goto *_r313;}
-L_456: Cell t314=var_trans__rest;L_457: Cell t315=uf_mkp((void*)&uf_sl29);L_458: pushc(cx,t314);pushc(cx,t315);uf_cur_op="op_starts";op_starts(cx);
+L_449: Cell _rv308=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv308);return;}cx->csp--;const void*_r309=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv308);if(!_r309)return;goto *_r309;}
+L_450: Cell t310=var_trans__pos;L_451: Cell t311=pop(cx);Cell t312=uf_cadd(t311,t310);L_452: L_453: var_trans__pos=t312;pushc(cx,t312);L_454: L_455: Cell _rv313=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv313);return;}cx->csp--;const void*_r314=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv313);if(!_r314)return;goto *_r314;}
+L_456: Cell t315=var_trans__rest;L_457: Cell t316=uf_mkp((void*)&uf_sl29);L_458: pushc(cx,t315);pushc(cx,t316);uf_cur_op="op_starts";op_starts(cx);
 L_459: pushp(cx,(void*)&&L_465);
 L_460: pushp(cx,(void*)&&L_491);
 L_461: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_461,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_461,cx->sp>0?cx->sp-0:0);goto *el;}K_461:;}
-L_462: L_463: L_464: Cell _rv316=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv316);return;}cx->csp--;const void*_r317=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv316);if(!_r317)return;goto *_r317;}
-L_465: Cell t318=var_trans__rest;L_466: Cell t319=uf_mkp((void*)&uf_sl30);L_467: pushc(cx,t318);pushc(cx,t319);uf_cur_op="op_find";op_find(cx);
-L_468: Cell t320=pop(cx);L_469: L_470: L_471: Cell t321=uf_ceq(t320,uf_mki(-1LL));L_472: var_trans__fi=t320;pushc(cx,t320);pushc(cx,t321);pushp(cx,(void*)&&L_486);
+L_462: L_463: L_464: Cell _rv317=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv317);return;}cx->csp--;const void*_r318=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv317);if(!_r318)return;goto *_r318;}
+L_465: Cell t319=var_trans__rest;L_466: Cell t320=uf_mkp((void*)&uf_sl30);L_467: pushc(cx,t319);pushc(cx,t320);uf_cur_op="op_find";op_find(cx);
+L_468: Cell t321=pop(cx);L_469: L_470: L_471: var_trans__fi=t321;pushc(cx,t321);Cell t322=uf_ceq(t321,uf_mki(-1LL));L_472: pushc(cx,t322);pushp(cx,(void*)&&L_486);
 L_473: pushp(cx,(void*)&&L_478);
 L_474: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_474,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_474,cx->sp>0?cx->sp-0:0);goto *el;}K_474:;}
-L_475: L_476: L_477: Cell _rv322=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv322);return;}cx->csp--;const void*_r323=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv322);if(!_r323)return;goto *_r323;}
-L_478: Cell t324=var_trans__pos;L_479: Cell t325=pop(cx);Cell t326=uf_cadd(t325,t324);L_480: L_481: Cell t327=uf_cadd(t326,uf_mki(1LL));L_482: L_483: var_trans__pos=t327;pushc(cx,t327);L_484: L_485: Cell _rv328=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv328);return;}cx->csp--;const void*_r329=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv328);if(!_r329)return;goto *_r329;}
-L_486: Cell t330=var_trans__srclen;L_487: L_488: var_trans__pos=t330;pushc(cx,t330);L_489: L_490: Cell _rv331=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv331);return;}cx->csp--;const void*_r332=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv331);if(!_r332)return;goto *_r332;}
-L_491: Cell t333=var_trans__rest;L_492: Cell t334=uf_mkp((void*)&uf_sl31);L_493: pushc(cx,t333);pushc(cx,t334);uf_cur_op="op_starts";op_starts(cx);
+L_475: L_476: L_477: Cell _rv323=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv323);return;}cx->csp--;const void*_r324=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv323);if(!_r324)return;goto *_r324;}
+L_478: Cell t325=var_trans__pos;L_479: Cell t326=pop(cx);Cell t327=uf_cadd(t326,t325);L_480: L_481: Cell t328=uf_cadd(t327,uf_mki(1LL));L_482: L_483: var_trans__pos=t328;pushc(cx,t328);L_484: L_485: Cell _rv329=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv329);return;}cx->csp--;const void*_r330=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv329);if(!_r330)return;goto *_r330;}
+L_486: Cell t331=var_trans__srclen;L_487: L_488: var_trans__pos=t331;pushc(cx,t331);L_489: L_490: Cell _rv332=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv332);return;}cx->csp--;const void*_r333=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv332);if(!_r333)return;goto *_r333;}
+L_491: Cell t334=var_trans__rest;L_492: Cell t335=uf_mkp((void*)&uf_sl31);L_493: pushc(cx,t334);pushc(cx,t335);uf_cur_op="op_starts";op_starts(cx);
 L_494: pushp(cx,(void*)&&L_500);
 L_495: pushp(cx,(void*)&&L_526);
 L_496: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_496,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_496,cx->sp>0?cx->sp-0:0);goto *el;}K_496:;}
-L_497: L_498: L_499: Cell _rv335=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv335);return;}cx->csp--;const void*_r336=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv335);if(!_r336)return;goto *_r336;}
-L_500: Cell t337=var_trans__rest;L_501: Cell t338=uf_mkp((void*)&uf_sl32);L_502: pushc(cx,t337);pushc(cx,t338);uf_cur_op="op_find";op_find(cx);
-L_503: Cell t339=pop(cx);L_504: L_505: L_506: Cell t340=uf_ceq(t339,uf_mki(-1LL));L_507: var_trans__fi=t339;pushc(cx,t339);pushc(cx,t340);pushp(cx,(void*)&&L_521);
+L_497: L_498: L_499: Cell _rv336=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv336);return;}cx->csp--;const void*_r337=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv336);if(!_r337)return;goto *_r337;}
+L_500: Cell t338=var_trans__rest;L_501: Cell t339=uf_mkp((void*)&uf_sl32);L_502: pushc(cx,t338);pushc(cx,t339);uf_cur_op="op_find";op_find(cx);
+L_503: Cell t340=pop(cx);L_504: L_505: L_506: var_trans__fi=t340;pushc(cx,t340);Cell t341=uf_ceq(t340,uf_mki(-1LL));L_507: pushc(cx,t341);pushp(cx,(void*)&&L_521);
 L_508: pushp(cx,(void*)&&L_513);
 L_509: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_509,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_509,cx->sp>0?cx->sp-0:0);goto *el;}K_509:;}
-L_510: L_511: L_512: Cell _rv341=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv341);return;}cx->csp--;const void*_r342=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv341);if(!_r342)return;goto *_r342;}
-L_513: Cell t343=var_trans__pos;L_514: Cell t344=pop(cx);Cell t345=uf_cadd(t344,t343);L_515: L_516: Cell t346=uf_cadd(t345,uf_mki(2LL));L_517: L_518: var_trans__pos=t346;pushc(cx,t346);L_519: L_520: Cell _rv347=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv347);return;}cx->csp--;const void*_r348=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv347);if(!_r348)return;goto *_r348;}
-L_521: Cell t349=var_trans__srclen;L_522: L_523: var_trans__pos=t349;pushc(cx,t349);L_524: L_525: Cell _rv350=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv350);return;}cx->csp--;const void*_r351=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv350);if(!_r351)return;goto *_r351;}
-L_526: Cell t352=var_trans__rest;L_527: Cell t353=uf_mkp((void*)&uf_sl33);L_528: pushc(cx,t352);pushc(cx,t353);uf_cur_op="op_starts";op_starts(cx);
+L_510: L_511: L_512: Cell _rv342=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv342);return;}cx->csp--;const void*_r343=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv342);if(!_r343)return;goto *_r343;}
+L_513: Cell t344=var_trans__pos;L_514: Cell t345=pop(cx);Cell t346=uf_cadd(t345,t344);L_515: L_516: Cell t347=uf_cadd(t346,uf_mki(2LL));L_517: L_518: var_trans__pos=t347;pushc(cx,t347);L_519: L_520: Cell _rv348=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv348);return;}cx->csp--;const void*_r349=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv348);if(!_r349)return;goto *_r349;}
+L_521: Cell t350=var_trans__srclen;L_522: L_523: var_trans__pos=t350;pushc(cx,t350);L_524: L_525: Cell _rv351=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv351);return;}cx->csp--;const void*_r352=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv351);if(!_r352)return;goto *_r352;}
+L_526: Cell t353=var_trans__rest;L_527: Cell t354=uf_mkp((void*)&uf_sl33);L_528: pushc(cx,t353);pushc(cx,t354);uf_cur_op="op_starts";op_starts(cx);
 L_529: pushp(cx,(void*)&&L_535);
 L_530: pushp(cx,(void*)&&L_561);
 L_531: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_531,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_531,cx->sp>0?cx->sp-0:0);goto *el;}K_531:;}
-L_532: L_533: L_534: Cell _rv354=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv354);return;}cx->csp--;const void*_r355=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv354);if(!_r355)return;goto *_r355;}
-L_535: Cell t356=var_trans__rest;L_536: Cell t357=uf_mkp((void*)&uf_sl34);L_537: pushc(cx,t356);pushc(cx,t357);uf_cur_op="op_find";op_find(cx);
-L_538: Cell t358=pop(cx);L_539: L_540: L_541: Cell t359=uf_ceq(t358,uf_mki(-1LL));L_542: var_trans__fi=t358;pushc(cx,t358);pushc(cx,t359);pushp(cx,(void*)&&L_556);
+L_532: L_533: L_534: Cell _rv355=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv355);return;}cx->csp--;const void*_r356=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv355);if(!_r356)return;goto *_r356;}
+L_535: Cell t357=var_trans__rest;L_536: Cell t358=uf_mkp((void*)&uf_sl34);L_537: pushc(cx,t357);pushc(cx,t358);uf_cur_op="op_find";op_find(cx);
+L_538: Cell t359=pop(cx);L_539: L_540: L_541: var_trans__fi=t359;pushc(cx,t359);Cell t360=uf_ceq(t359,uf_mki(-1LL));L_542: pushc(cx,t360);pushp(cx,(void*)&&L_556);
 L_543: pushp(cx,(void*)&&L_548);
 L_544: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_544,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_544,cx->sp>0?cx->sp-0:0);goto *el;}K_544:;}
-L_545: L_546: L_547: Cell _rv360=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv360);return;}cx->csp--;const void*_r361=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv360);if(!_r361)return;goto *_r361;}
-L_548: Cell t362=var_trans__pos;L_549: Cell t363=pop(cx);Cell t364=uf_cadd(t363,t362);L_550: L_551: Cell t365=uf_cadd(t364,uf_mki(1LL));L_552: L_553: var_trans__pos=t365;pushc(cx,t365);L_554: L_555: Cell _rv366=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv366);return;}cx->csp--;const void*_r367=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv366);if(!_r367)return;goto *_r367;}
-L_556: Cell t368=var_trans__srclen;L_557: L_558: var_trans__pos=t368;pushc(cx,t368);L_559: L_560: Cell _rv369=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv369);return;}cx->csp--;const void*_r370=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv369);if(!_r370)return;goto *_r370;}
-L_561: L_562: L_563: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_564: Cell t371=var_trans__rr;L_565: Cell _rv372=t371;{if(cx->csp==0){pushc(cx,_rv372);return;}cx->csp--;const void*_r373=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv372);if(!_r373)return;goto *_r373;}
+L_545: L_546: L_547: Cell _rv361=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv361);return;}cx->csp--;const void*_r362=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv361);if(!_r362)return;goto *_r362;}
+L_548: Cell t363=var_trans__pos;L_549: Cell t364=pop(cx);Cell t365=uf_cadd(t364,t363);L_550: L_551: Cell t366=uf_cadd(t365,uf_mki(1LL));L_552: L_553: var_trans__pos=t366;pushc(cx,t366);L_554: L_555: Cell _rv367=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv367);return;}cx->csp--;const void*_r368=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv367);if(!_r368)return;goto *_r368;}
+L_556: Cell t369=var_trans__srclen;L_557: L_558: var_trans__pos=t369;pushc(cx,t369);L_559: L_560: Cell _rv370=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv370);return;}cx->csp--;const void*_r371=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv370);if(!_r371)return;goto *_r371;}
+L_561: L_562: L_563: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_564: Cell t372=var_trans__rr;L_565: Cell _rv373=t372;{if(cx->csp==0){pushc(cx,_rv373);return;}cx->csp--;const void*_r374=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv373);if(!_r374)return;goto *_r374;}
 L_566: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_566,cx->sp>0?cx->sp-0:0);goto L_571;K_566:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_567: Cell t374=pop(cx);L_568: var_trans__rr=t374;pushc(cx,t374);L_569: Cell t375=var_trans__rr;L_570: Cell _rv376=t375;{if(cx->csp==0){pushc(cx,_rv376);return;}cx->csp--;const void*_r377=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv376);if(!_r377)return;goto *_r377;}
-L_571: Cell t378=var_trans__vars;L_572: pushc(cx,t378);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_572,cx->sp>0?cx->sp-0:0);goto L_111;K_572:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_567: Cell t375=pop(cx);L_568: var_trans__rr=t375;pushc(cx,t375);L_569: Cell t376=var_trans__rr;L_570: Cell _rv377=t376;{if(cx->csp==0){pushc(cx,_rv377);return;}cx->csp--;const void*_r378=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv377);if(!_r378)return;goto *_r378;}
+L_571: Cell t379=var_trans__vars;L_572: pushc(cx,t379);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_572,cx->sp>0?cx->sp-0:0);goto L_111;K_572:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_573: uf_cur_op="op_getq";op_getq(cx);
-L_574: Cell t379=pop(cx);L_575: L_576: Cell t380=uf_cnot(t379);L_577: var_trans__lv=t379;pushc(cx,t379);pushc(cx,t380);pushp(cx,(void*)&&L_581);
+L_574: Cell t380=pop(cx);L_575: L_576: Cell t381=uf_cnot(t380);L_577: var_trans__lv=t380;pushc(cx,t380);pushc(cx,t381);pushp(cx,(void*)&&L_581);
 L_578: pushp(cx,(void*)&&L_585);
 L_579: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_579,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_579,cx->sp>0?cx->sp-0:0);goto *el;}K_579:;}
-L_580: Cell _rv381=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv381);return;}cx->csp--;const void*_r382=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv381);if(!_r382)return;goto *_r382;}
+L_580: Cell _rv382=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv382);return;}cx->csp--;const void*_r383=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv382);if(!_r383)return;goto *_r383;}
 L_581: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_581,cx->sp>0?cx->sp-0:0);goto L_715;K_581:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_582: L_583: L_584: Cell _rv383=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv383);return;}cx->csp--;const void*_r384=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv383);if(!_r384)return;goto *_r384;}
+L_582: L_583: L_584: Cell _rv384=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv384);return;}cx->csp--;const void*_r385=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv384);if(!_r385)return;goto *_r385;}
 L_585: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_585,cx->sp>1?cx->sp-1:0);goto L_0;K_585:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_586: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_586,cx->sp>0?cx->sp-0:0);goto L_118;K_586:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_587: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_587,cx->sp>1?cx->sp-1:0);goto L_0;K_587:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_588: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_588,cx->sp>0?cx->sp-0:0);goto L_8;K_588:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_589: Cell t385=uf_mkp((void*)&uf_sl35);L_590: pushc(cx,t385);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_590,cx->sp>2?cx->sp-2:0);goto L_97;K_590:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_589: Cell t386=uf_mkp((void*)&uf_sl35);L_590: pushc(cx,t386);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_590,cx->sp>2?cx->sp-2:0);goto L_97;K_590:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_591: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_591,cx->sp>0?cx->sp-0:0);goto L_8;K_591:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_592: Cell t386=uf_mkp((void*)&uf_sl36);L_593: pushc(cx,t386);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_593,cx->sp>2?cx->sp-2:0);goto L_97;K_593:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_594: Cell t387=pop(cx);Cell t388=pop(cx);Cell t389=uf_cadd(t388,t387);L_595: pushc(cx,t389);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_595,cx->sp>0?cx->sp-0:0);goto L_8;K_595:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_596: Cell t390=uf_mkp((void*)&uf_sl37);L_597: pushc(cx,t390);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_597,cx->sp>2?cx->sp-2:0);goto L_97;K_597:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_598: Cell t391=pop(cx);Cell t392=pop(cx);Cell t393=uf_cadd(t392,t391);L_599: pushc(cx,t393);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_599,cx->sp>0?cx->sp-0:0);goto L_8;K_599:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_600: Cell t394=uf_mkp((void*)&uf_sl38);L_601: pushc(cx,t394);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_601,cx->sp>2?cx->sp-2:0);goto L_97;K_601:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_602: Cell t395=pop(cx);Cell t396=pop(cx);Cell t397=uf_cadd(t396,t395);L_603: pushc(cx,t397);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_603,cx->sp>0?cx->sp-0:0);goto L_8;K_603:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_604: Cell t398=uf_mkp((void*)&uf_sl39);L_605: pushc(cx,t398);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_605,cx->sp>2?cx->sp-2:0);goto L_97;K_605:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_606: Cell t399=pop(cx);Cell t400=pop(cx);Cell t401=uf_cadd(t400,t399);L_607: pushc(cx,t401);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_607,cx->sp>0?cx->sp-0:0);goto L_8;K_607:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_608: Cell t402=uf_mkp((void*)&uf_sl40);L_609: pushc(cx,t402);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_609,cx->sp>2?cx->sp-2:0);goto L_97;K_609:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_610: Cell t403=pop(cx);Cell t404=pop(cx);Cell t405=uf_cadd(t404,t403);L_611: Cell t406=uf_cnot(t405);L_612: pushc(cx,t406);pushp(cx,(void*)&&L_618);
+L_592: Cell t387=uf_mkp((void*)&uf_sl36);L_593: pushc(cx,t387);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_593,cx->sp>2?cx->sp-2:0);goto L_97;K_593:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_594: Cell t388=pop(cx);Cell t389=pop(cx);Cell t390=uf_cadd(t389,t388);L_595: pushc(cx,t390);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_595,cx->sp>0?cx->sp-0:0);goto L_8;K_595:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_596: Cell t391=uf_mkp((void*)&uf_sl37);L_597: pushc(cx,t391);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_597,cx->sp>2?cx->sp-2:0);goto L_97;K_597:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_598: Cell t392=pop(cx);Cell t393=pop(cx);Cell t394=uf_cadd(t393,t392);L_599: pushc(cx,t394);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_599,cx->sp>0?cx->sp-0:0);goto L_8;K_599:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_600: Cell t395=uf_mkp((void*)&uf_sl38);L_601: pushc(cx,t395);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_601,cx->sp>2?cx->sp-2:0);goto L_97;K_601:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_602: Cell t396=pop(cx);Cell t397=pop(cx);Cell t398=uf_cadd(t397,t396);L_603: pushc(cx,t398);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_603,cx->sp>0?cx->sp-0:0);goto L_8;K_603:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_604: Cell t399=uf_mkp((void*)&uf_sl39);L_605: pushc(cx,t399);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_605,cx->sp>2?cx->sp-2:0);goto L_97;K_605:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_606: Cell t400=pop(cx);Cell t401=pop(cx);Cell t402=uf_cadd(t401,t400);L_607: pushc(cx,t402);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_607,cx->sp>0?cx->sp-0:0);goto L_8;K_607:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_608: Cell t403=uf_mkp((void*)&uf_sl40);L_609: pushc(cx,t403);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_609,cx->sp>2?cx->sp-2:0);goto L_97;K_609:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_610: Cell t404=pop(cx);Cell t405=pop(cx);Cell t406=uf_cadd(t405,t404);L_611: Cell t407=uf_cnot(t406);L_612: pushc(cx,t407);pushp(cx,(void*)&&L_618);
 L_613: pushp(cx,(void*)&&L_626);
 L_614: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_614,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_614,cx->sp>0?cx->sp-0:0);goto *el;}K_614:;}
-L_615: L_616: L_617: Cell _rv407=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv407);return;}cx->csp--;const void*_r408=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv407);if(!_r408)return;goto *_r408;}
+L_615: L_616: L_617: Cell _rv408=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv408);return;}cx->csp--;const void*_r409=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv408);if(!_r409)return;goto *_r409;}
 L_618: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_618,cx->sp>0?cx->sp-0:0);goto L_36;K_618:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_619: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_619,cx->sp>0?cx->sp-0:0);goto L_36;K_619:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_620: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_620,cx->sp>0?cx->sp-0:0);goto L_715;K_620:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_621: L_622: L_623: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_624: Cell t409=var_trans__rr;L_625: Cell _rv410=t409;{if(cx->csp==0){pushc(cx,_rv410);return;}cx->csp--;const void*_r411=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv410);if(!_r411)return;goto *_r411;}
+L_621: L_622: L_623: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_624: Cell t410=var_trans__rr;L_625: Cell _rv411=t410;{if(cx->csp==0){pushc(cx,_rv411);return;}cx->csp--;const void*_r412=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv411);if(!_r412)return;goto *_r412;}
 L_626: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_626,cx->sp>0?cx->sp-0:0);goto L_8;K_626:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_627: Cell t412=uf_mkp((void*)&uf_sl41);L_628: pushc(cx,t412);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_628,cx->sp>2?cx->sp-2:0);goto L_97;K_628:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_627: Cell t413=uf_mkp((void*)&uf_sl41);L_628: pushc(cx,t413);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_628,cx->sp>2?cx->sp-2:0);goto L_97;K_628:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_629: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_629,cx->sp>0?cx->sp-0:0);goto L_8;K_629:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_630: Cell t413=uf_mkp((void*)&uf_sl42);L_631: pushc(cx,t413);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_631,cx->sp>2?cx->sp-2:0);goto L_97;K_631:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_632: Cell t414=pop(cx);Cell t415=pop(cx);Cell t416=uf_cadd(t415,t414);L_633: pushc(cx,t416);pushp(cx,(void*)&&L_712);
+L_630: Cell t414=uf_mkp((void*)&uf_sl42);L_631: pushc(cx,t414);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_631,cx->sp>2?cx->sp-2:0);goto L_97;K_631:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_632: Cell t415=pop(cx);Cell t416=pop(cx);Cell t417=uf_cadd(t416,t415);L_633: pushc(cx,t417);pushp(cx,(void*)&&L_712);
 L_634: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_634,cx->sp>0?cx->sp-0:0);goto *b;K_634:;}}
 L_635: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_635,cx->sp>0?cx->sp-0:0);goto L_8;K_635:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_636: Cell t417=uf_mkp((void*)&uf_sl43);L_637: pushc(cx,t417);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_637,cx->sp>2?cx->sp-2:0);goto L_97;K_637:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_636: Cell t418=uf_mkp((void*)&uf_sl43);L_637: pushc(cx,t418);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_637,cx->sp>2?cx->sp-2:0);goto L_97;K_637:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_638: pushp(cx,(void*)&&L_644);
 L_639: pushp(cx,(void*)&&L_655);
 L_640: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_640,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_640,cx->sp>0?cx->sp-0:0);goto *el;}K_640:;}
-L_641: L_642: L_643: Cell _rv418=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv418);return;}cx->csp--;const void*_r419=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv418);if(!_r419)return;goto *_r419;}
+L_641: L_642: L_643: Cell _rv419=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv419);return;}cx->csp--;const void*_r420=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv419);if(!_r420)return;goto *_r420;}
 L_644: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_644,cx->sp>0?cx->sp-0:0);goto L_127;K_644:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_645: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_645,cx->sp>0?cx->sp-0:0);goto L_127;K_645:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_646: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_646,cx->sp>0?cx->sp-0:0);goto L_571;K_646:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_647: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_647,cx->sp>0?cx->sp-0:0);goto L_36;K_647:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_648: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_648,cx->sp>0?cx->sp-0:0);goto L_36;K_648:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_649: Cell t420=uf_mkp((void*)&uf_sl44);L_650: pushc(cx,t420);uf_cur_op="op_fmt";op_fmt(cx);
+L_649: Cell t421=uf_mkp((void*)&uf_sl44);L_650: pushc(cx,t421);uf_cur_op="op_fmt";op_fmt(cx);
 L_651: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_651,cx->sp>1?cx->sp-1:0);goto L_42;K_651:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_652: L_653: L_654: Cell _rv421=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv421);return;}cx->csp--;const void*_r422=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv421);if(!_r422)return;goto *_r422;}
+L_652: L_653: L_654: Cell _rv422=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv422);return;}cx->csp--;const void*_r423=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv422);if(!_r423)return;goto *_r423;}
 L_655: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_655,cx->sp>0?cx->sp-0:0);goto L_36;K_655:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_656: Cell t423=pop(cx);L_657: var_trans__pc_op=t423;pushc(cx,t423);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_657,cx->sp>0?cx->sp-0:0);goto L_36;K_657:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_658: Cell t424=pop(cx);L_659: var_trans__pc_slot=t424;pushc(cx,t424);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_659,cx->sp>0?cx->sp-0:0);goto L_127;K_659:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_656: Cell t424=pop(cx);L_657: var_trans__pc_op=t424;pushc(cx,t424);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_657,cx->sp>0?cx->sp-0:0);goto L_36;K_657:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_658: Cell t425=pop(cx);L_659: var_trans__pc_slot=t425;pushc(cx,t425);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_659,cx->sp>0?cx->sp-0:0);goto L_127;K_659:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_660: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_660,cx->sp>0?cx->sp-0:0);goto L_127;K_660:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_661: Cell t425=var_trans__pc_slot;L_662: Cell t426=uf_mkp((void*)&uf_sl45);L_663: pushc(cx,t425);pushc(cx,t426);uf_cur_op="op_fmt";op_fmt(cx);
+L_661: Cell t426=var_trans__pc_slot;L_662: Cell t427=uf_mkp((void*)&uf_sl45);L_663: pushc(cx,t426);pushc(cx,t427);uf_cur_op="op_fmt";op_fmt(cx);
 L_664: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_664,cx->sp>1?cx->sp-1:0);goto L_42;K_664:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_665: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_665,cx->sp>0?cx->sp-0:0);goto L_571;K_665:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_666: Cell t427=var_trans__pc_op;L_667: L_668: L_669: pushc(cx,t427);pushi(cx,0LL);pushi(cx,1LL);uf_cur_op="op_slice";op_slice(cx);
-L_670: Cell t428=pop(cx);L_671: L_672: Cell t429=uf_mkp((void*)&uf_sl46);L_673: var_trans__pc_o=t428;pushc(cx,t428);pushc(cx,t428);pushc(cx,t429);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_673,cx->sp>2?cx->sp-2:0);goto L_97;K_673:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_666: Cell t428=var_trans__pc_op;L_667: L_668: L_669: pushc(cx,t428);pushi(cx,0LL);pushi(cx,1LL);uf_cur_op="op_slice";op_slice(cx);
+L_670: Cell t429=pop(cx);L_671: L_672: Cell t430=uf_mkp((void*)&uf_sl46);L_673: var_trans__pc_o=t429;pushc(cx,t429);pushc(cx,t429);pushc(cx,t430);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_673,cx->sp>2?cx->sp-2:0);goto L_97;K_673:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_674: pushp(cx,(void*)&&L_685);
 L_675: pushp(cx,(void*)&&L_678);
 L_676: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_676,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_676,cx->sp>0?cx->sp-0:0);goto *el;}K_676:;}
-L_677: Cell _rv430=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv430);return;}cx->csp--;const void*_r431=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv430);if(!_r431)return;goto *_r431;}
-L_678: Cell t432=var_trans__pc_o;L_679: Cell t433=uf_mkp((void*)&uf_sl47);L_680: pushc(cx,t432);pushc(cx,t433);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_680,cx->sp>2?cx->sp-2:0);goto L_97;K_680:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_677: Cell _rv431=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv431);return;}cx->csp--;const void*_r432=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv431);if(!_r432)return;goto *_r432;}
+L_678: Cell t433=var_trans__pc_o;L_679: Cell t434=uf_mkp((void*)&uf_sl47);L_680: pushc(cx,t433);pushc(cx,t434);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_680,cx->sp>2?cx->sp-2:0);goto L_97;K_680:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_681: pushp(cx,(void*)&&L_694);
 L_682: pushp(cx,(void*)&&L_703);
 L_683: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_683,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_683,cx->sp>0?cx->sp-0:0);goto *el;}K_683:;}
-L_684: Cell _rv434=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv434);return;}cx->csp--;const void*_r435=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv434);if(!_r435)return;goto *_r435;}
-L_685: Cell t436=uf_mkp((void*)&uf_sl48);L_686: pushc(cx,t436);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_686,cx->sp>1?cx->sp-1:0);goto L_42;K_686:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_687: Cell t437=var_trans__pc_slot;L_688: Cell t438=uf_mkp((void*)&uf_sl49);L_689: pushc(cx,t437);pushc(cx,t438);uf_cur_op="op_fmt";op_fmt(cx);
+L_684: Cell _rv435=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv435);return;}cx->csp--;const void*_r436=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv435);if(!_r436)return;goto *_r436;}
+L_685: Cell t437=uf_mkp((void*)&uf_sl48);L_686: pushc(cx,t437);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_686,cx->sp>1?cx->sp-1:0);goto L_42;K_686:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_687: Cell t438=var_trans__pc_slot;L_688: Cell t439=uf_mkp((void*)&uf_sl49);L_689: pushc(cx,t438);pushc(cx,t439);uf_cur_op="op_fmt";op_fmt(cx);
 L_690: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_690,cx->sp>1?cx->sp-1:0);goto L_42;K_690:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_691: L_692: L_693: Cell _rv439=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv439);return;}cx->csp--;const void*_r440=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv439);if(!_r440)return;goto *_r440;}
-L_694: Cell t441=uf_mkp((void*)&uf_sl50);L_695: pushc(cx,t441);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_695,cx->sp>1?cx->sp-1:0);goto L_42;K_695:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_696: Cell t442=var_trans__pc_slot;L_697: Cell t443=uf_mkp((void*)&uf_sl51);L_698: pushc(cx,t442);pushc(cx,t443);uf_cur_op="op_fmt";op_fmt(cx);
+L_691: L_692: L_693: Cell _rv440=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv440);return;}cx->csp--;const void*_r441=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv440);if(!_r441)return;goto *_r441;}
+L_694: Cell t442=uf_mkp((void*)&uf_sl50);L_695: pushc(cx,t442);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_695,cx->sp>1?cx->sp-1:0);goto L_42;K_695:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_696: Cell t443=var_trans__pc_slot;L_697: Cell t444=uf_mkp((void*)&uf_sl51);L_698: pushc(cx,t443);pushc(cx,t444);uf_cur_op="op_fmt";op_fmt(cx);
 L_699: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_699,cx->sp>1?cx->sp-1:0);goto L_42;K_699:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_700: L_701: L_702: Cell _rv444=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv444);return;}cx->csp--;const void*_r445=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv444);if(!_r445)return;goto *_r445;}
-L_703: Cell t446=uf_mkp((void*)&uf_sl52);L_704: pushc(cx,t446);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_704,cx->sp>1?cx->sp-1:0);goto L_42;K_704:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_705: Cell t447=var_trans__pc_slot;L_706: Cell t448=uf_mkp((void*)&uf_sl53);L_707: pushc(cx,t447);pushc(cx,t448);uf_cur_op="op_fmt";op_fmt(cx);
+L_700: L_701: L_702: Cell _rv445=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv445);return;}cx->csp--;const void*_r446=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv445);if(!_r446)return;goto *_r446;}
+L_703: Cell t447=uf_mkp((void*)&uf_sl52);L_704: pushc(cx,t447);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_704,cx->sp>1?cx->sp-1:0);goto L_42;K_704:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_705: Cell t448=var_trans__pc_slot;L_706: Cell t449=uf_mkp((void*)&uf_sl53);L_707: pushc(cx,t448);pushc(cx,t449);uf_cur_op="op_fmt";op_fmt(cx);
 L_708: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_708,cx->sp>1?cx->sp-1:0);goto L_42;K_708:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_709: L_710: L_711: Cell _rv449=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv449);return;}cx->csp--;const void*_r450=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv449);if(!_r450)return;goto *_r450;}
-L_712: Cell t451=uf_mkp((void*)&uf_sl54);L_713: pushc(cx,t451);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_713,cx->sp>0?cx->sp-0:0);goto L_107;K_713:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_714: Cell _rv452=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv452);return;}cx->csp--;const void*_r453=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv452);if(!_r453)return;goto *_r453;}
+L_709: L_710: L_711: Cell _rv450=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv450);return;}cx->csp--;const void*_r451=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv450);if(!_r451)return;goto *_r451;}
+L_712: Cell t452=uf_mkp((void*)&uf_sl54);L_713: pushc(cx,t452);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_713,cx->sp>0?cx->sp-0:0);goto L_107;K_713:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_714: Cell _rv453=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv453);return;}cx->csp--;const void*_r454=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv453);if(!_r454)return;goto *_r454;}
 L_715: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_715,cx->sp>0?cx->sp-0:0);goto L_734;K_715:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_716: L_717: L_718: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_718;cx->loops[fr].end=&&K_WE_718;long _sp0=cx->sp;
 K_WC_718:;{Cell _wc;{
@@ -3986,14 +4123,14 @@ WB718_L728: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;u
 WB718_L729: Cell t0=uf_mkp((void*)&uf_sl56);WB718_L730: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB718_730,cx->sp>1?cx->sp-1:0);goto L_42;K_WB718_730:;cx->local_base=cx->local_frames[--cx->local_fsp];
 WB718_L731: }cx->sp=_sp0;goto K_WC_718;}
 K_WE_718:;cx->lsp=fr;}
-L_719: Cell _rv454=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv454);return;}cx->csp--;const void*_r455=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv454);if(!_r455)return;goto *_r455;}
+L_719: Cell _rv455=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv455);return;}cx->csp--;const void*_r456=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv455);if(!_r456)return;goto *_r456;}
 L_720: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_720,cx->sp>0?cx->sp-0:0);goto L_111;K_720:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_721: Cell t456=uf_mkp((void*)&uf_sl55);L_722: pushc(cx,t456);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_722,cx->sp>2?cx->sp-2:0);goto L_97;K_722:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_723: Cell t457=pop(cx);L_724: var_trans__rr=t457;pushc(cx,t457);L_725: Cell t458=var_trans__rr;L_726: Cell _rv459=t458;{if(cx->csp==0){pushc(cx,_rv459);return;}cx->csp--;const void*_r460=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv459);if(!_r460)return;goto *_r460;}
+L_721: Cell t457=uf_mkp((void*)&uf_sl55);L_722: pushc(cx,t457);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_722,cx->sp>2?cx->sp-2:0);goto L_97;K_722:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_723: Cell t458=pop(cx);L_724: var_trans__rr=t458;pushc(cx,t458);L_725: Cell t459=var_trans__rr;L_726: Cell _rv460=t459;{if(cx->csp==0){pushc(cx,_rv460);return;}cx->csp--;const void*_r461=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv460);if(!_r461)return;goto *_r461;}
 L_727: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_727,cx->sp>0?cx->sp-0:0);goto L_127;K_727:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_728: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_728,cx->sp>0?cx->sp-0:0);goto L_734;K_728:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_729: Cell t461=uf_mkp((void*)&uf_sl56);L_730: pushc(cx,t461);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_730,cx->sp>1?cx->sp-1:0);goto L_42;K_730:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_731: L_732: L_733: Cell _rv462=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv462);return;}cx->csp--;const void*_r463=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv462);if(!_r463)return;goto *_r463;}
+L_729: Cell t462=uf_mkp((void*)&uf_sl56);L_730: pushc(cx,t462);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_730,cx->sp>1?cx->sp-1:0);goto L_42;K_730:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_731: L_732: L_733: Cell _rv463=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv463);return;}cx->csp--;const void*_r464=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv463);if(!_r464)return;goto *_r464;}
 L_734: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_734,cx->sp>0?cx->sp-0:0);goto L_753;K_734:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_735: L_736: L_737: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_737;cx->loops[fr].end=&&K_WE_737;long _sp0=cx->sp;
 K_WC_737:;{Cell _wc;{
@@ -4006,14 +4143,14 @@ WB737_L747: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;u
 WB737_L748: Cell t0=uf_mkp((void*)&uf_sl58);WB737_L749: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB737_749,cx->sp>1?cx->sp-1:0);goto L_42;K_WB737_749:;cx->local_base=cx->local_frames[--cx->local_fsp];
 WB737_L750: }cx->sp=_sp0;goto K_WC_737;}
 K_WE_737:;cx->lsp=fr;}
-L_738: Cell _rv464=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv464);return;}cx->csp--;const void*_r465=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv464);if(!_r465)return;goto *_r465;}
+L_738: Cell _rv465=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv465);return;}cx->csp--;const void*_r466=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv465);if(!_r466)return;goto *_r466;}
 L_739: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_739,cx->sp>0?cx->sp-0:0);goto L_111;K_739:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_740: Cell t466=uf_mkp((void*)&uf_sl57);L_741: pushc(cx,t466);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_741,cx->sp>2?cx->sp-2:0);goto L_97;K_741:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_742: Cell t467=pop(cx);L_743: var_trans__rr=t467;pushc(cx,t467);L_744: Cell t468=var_trans__rr;L_745: Cell _rv469=t468;{if(cx->csp==0){pushc(cx,_rv469);return;}cx->csp--;const void*_r470=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv469);if(!_r470)return;goto *_r470;}
+L_740: Cell t467=uf_mkp((void*)&uf_sl57);L_741: pushc(cx,t467);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_741,cx->sp>2?cx->sp-2:0);goto L_97;K_741:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_742: Cell t468=pop(cx);L_743: var_trans__rr=t468;pushc(cx,t468);L_744: Cell t469=var_trans__rr;L_745: Cell _rv470=t469;{if(cx->csp==0){pushc(cx,_rv470);return;}cx->csp--;const void*_r471=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv470);if(!_r471)return;goto *_r471;}
 L_746: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_746,cx->sp>0?cx->sp-0:0);goto L_127;K_746:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_747: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_747,cx->sp>0?cx->sp-0:0);goto L_753;K_747:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_748: Cell t471=uf_mkp((void*)&uf_sl58);L_749: pushc(cx,t471);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_749,cx->sp>1?cx->sp-1:0);goto L_42;K_749:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_750: L_751: L_752: Cell _rv472=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv472);return;}cx->csp--;const void*_r473=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv472);if(!_r473)return;goto *_r473;}
+L_748: Cell t472=uf_mkp((void*)&uf_sl58);L_749: pushc(cx,t472);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_749,cx->sp>1?cx->sp-1:0);goto L_42;K_749:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_750: L_751: L_752: Cell _rv473=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv473);return;}cx->csp--;const void*_r474=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv473);if(!_r474)return;goto *_r474;}
 L_753: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_753,cx->sp>0?cx->sp-0:0);goto L_796;K_753:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_754: L_755: L_756: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_756;cx->loops[fr].end=&&K_WE_756;long _sp0=cx->sp;
 K_WC_756:;{Cell _wc;{
@@ -4030,26 +4167,26 @@ WB756_L773: pushp(cx,(void*)&&L_787);
 WB756_L774: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_WB756_774,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_WB756_774,cx->sp>0?cx->sp-0:0);goto *el;}K_WB756_774:;}
 WB756_L775: }cx->sp=_sp0;goto K_WC_756;}
 K_WE_756:;cx->lsp=fr;}
-L_757: Cell _rv474=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv474);return;}cx->csp--;const void*_r475=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv474);if(!_r475)return;goto *_r475;}
+L_757: Cell _rv475=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv475);return;}cx->csp--;const void*_r476=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv475);if(!_r476)return;goto *_r476;}
 L_758: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_758,cx->sp>0?cx->sp-0:0);goto L_111;K_758:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_759: Cell t476=uf_mkp((void*)&uf_sl59);L_760: pushc(cx,t476);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_760,cx->sp>2?cx->sp-2:0);goto L_97;K_760:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_759: Cell t477=uf_mkp((void*)&uf_sl59);L_760: pushc(cx,t477);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_760,cx->sp>2?cx->sp-2:0);goto L_97;K_760:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_761: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_761,cx->sp>0?cx->sp-0:0);goto L_111;K_761:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_762: Cell t477=uf_mkp((void*)&uf_sl60);L_763: pushc(cx,t477);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_763,cx->sp>2?cx->sp-2:0);goto L_97;K_763:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_764: Cell t478=pop(cx);Cell t479=pop(cx);Cell t480=uf_cadd(t479,t478);L_765: L_766: var_trans__rr=t480;pushc(cx,t480);L_767: Cell t481=var_trans__rr;L_768: Cell _rv482=t481;{if(cx->csp==0){pushc(cx,_rv482);return;}cx->csp--;const void*_r483=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv482);if(!_r483)return;goto *_r483;}
+L_762: Cell t478=uf_mkp((void*)&uf_sl60);L_763: pushc(cx,t478);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_763,cx->sp>2?cx->sp-2:0);goto L_97;K_763:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_764: Cell t479=pop(cx);Cell t480=pop(cx);Cell t481=uf_cadd(t480,t479);L_765: L_766: var_trans__rr=t481;pushc(cx,t481);L_767: Cell t482=var_trans__rr;L_768: Cell _rv483=t482;{if(cx->csp==0){pushc(cx,_rv483);return;}cx->csp--;const void*_r484=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv483);if(!_r484)return;goto *_r484;}
 L_769: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_769,cx->sp>0?cx->sp-0:0);goto L_111;K_769:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_770: Cell t484=uf_mkp((void*)&uf_sl61);L_771: pushc(cx,t484);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_771,cx->sp>2?cx->sp-2:0);goto L_97;K_771:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_770: Cell t485=uf_mkp((void*)&uf_sl61);L_771: pushc(cx,t485);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_771,cx->sp>2?cx->sp-2:0);goto L_97;K_771:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_772: pushp(cx,(void*)&&L_778);
 L_773: pushp(cx,(void*)&&L_787);
 L_774: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_774,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_774,cx->sp>0?cx->sp-0:0);goto *el;}K_774:;}
-L_775: L_776: L_777: Cell _rv485=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv485);return;}cx->csp--;const void*_r486=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv485);if(!_r486)return;goto *_r486;}
+L_775: L_776: L_777: Cell _rv486=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv486);return;}cx->csp--;const void*_r487=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv486);if(!_r487)return;goto *_r487;}
 L_778: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_778,cx->sp>0?cx->sp-0:0);goto L_127;K_778:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_779: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_779,cx->sp>0?cx->sp-0:0);goto L_796;K_779:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_780: Cell t487=uf_mkp((void*)&uf_sl62);L_781: pushc(cx,t487);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_781,cx->sp>1?cx->sp-1:0);goto L_42;K_781:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_782: L_783: L_784: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_785: Cell t488=var_trans__rr;L_786: Cell _rv489=t488;{if(cx->csp==0){pushc(cx,_rv489);return;}cx->csp--;const void*_r490=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv489);if(!_r490)return;goto *_r490;}
+L_780: Cell t488=uf_mkp((void*)&uf_sl62);L_781: pushc(cx,t488);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_781,cx->sp>1?cx->sp-1:0);goto L_42;K_781:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_782: L_783: L_784: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_785: Cell t489=var_trans__rr;L_786: Cell _rv490=t489;{if(cx->csp==0){pushc(cx,_rv490);return;}cx->csp--;const void*_r491=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv490);if(!_r491)return;goto *_r491;}
 L_787: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_787,cx->sp>0?cx->sp-0:0);goto L_127;K_787:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_788: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_788,cx->sp>0?cx->sp-0:0);goto L_796;K_788:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_789: Cell t491=uf_mkp((void*)&uf_sl63);L_790: pushc(cx,t491);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_790,cx->sp>1?cx->sp-1:0);goto L_42;K_790:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_791: L_792: L_793: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_794: Cell t492=var_trans__rr;L_795: Cell _rv493=t492;{if(cx->csp==0){pushc(cx,_rv493);return;}cx->csp--;const void*_r494=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv493);if(!_r494)return;goto *_r494;}
+L_789: Cell t492=uf_mkp((void*)&uf_sl63);L_790: pushc(cx,t492);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_790,cx->sp>1?cx->sp-1:0);goto L_42;K_790:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_791: L_792: L_793: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_794: Cell t493=var_trans__rr;L_795: Cell _rv494=t493;{if(cx->csp==0){pushc(cx,_rv494);return;}cx->csp--;const void*_r495=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv494);if(!_r495)return;goto *_r495;}
 L_796: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_796,cx->sp>0?cx->sp-0:0);goto L_883;K_796:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_797: L_798: L_799: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_799;cx->loops[fr].end=&&K_WE_799;long _sp0=cx->sp;
 K_WC_799:;{Cell _wc;{
@@ -4070,50 +4207,50 @@ WB799_L824: pushp(cx,(void*)&&L_838);
 WB799_L825: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_WB799_825,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_WB799_825,cx->sp>0?cx->sp-0:0);goto *el;}K_WB799_825:;}
 WB799_L826: }cx->sp=_sp0;goto K_WC_799;}
 K_WE_799:;cx->lsp=fr;}
-L_800: Cell _rv495=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv495);return;}cx->csp--;const void*_r496=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv495);if(!_r496)return;goto *_r496;}
+L_800: Cell _rv496=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv496);return;}cx->csp--;const void*_r497=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv496);if(!_r497)return;goto *_r497;}
 L_801: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_801,cx->sp>0?cx->sp-0:0);goto L_111;K_801:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_802: Cell t497=uf_mkp((void*)&uf_sl64);L_803: pushc(cx,t497);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_803,cx->sp>2?cx->sp-2:0);goto L_97;K_803:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_802: Cell t498=uf_mkp((void*)&uf_sl64);L_803: pushc(cx,t498);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_803,cx->sp>2?cx->sp-2:0);goto L_97;K_803:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_804: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_804,cx->sp>0?cx->sp-0:0);goto L_111;K_804:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_805: Cell t498=uf_mkp((void*)&uf_sl65);L_806: pushc(cx,t498);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_806,cx->sp>2?cx->sp-2:0);goto L_97;K_806:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_807: Cell t499=pop(cx);Cell t500=pop(cx);Cell t501=uf_cadd(t500,t499);L_808: pushc(cx,t501);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_808,cx->sp>0?cx->sp-0:0);goto L_111;K_808:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_809: Cell t502=uf_mkp((void*)&uf_sl66);L_810: pushc(cx,t502);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_810,cx->sp>2?cx->sp-2:0);goto L_97;K_810:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_811: Cell t503=pop(cx);Cell t504=pop(cx);Cell t505=uf_cadd(t504,t503);L_812: pushc(cx,t505);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_812,cx->sp>0?cx->sp-0:0);goto L_111;K_812:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_813: Cell t506=uf_mkp((void*)&uf_sl67);L_814: pushc(cx,t506);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_814,cx->sp>2?cx->sp-2:0);goto L_97;K_814:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_815: Cell t507=pop(cx);Cell t508=pop(cx);Cell t509=uf_cadd(t508,t507);L_816: L_817: var_trans__rr=t509;pushc(cx,t509);L_818: Cell t510=var_trans__rr;L_819: Cell _rv511=t510;{if(cx->csp==0){pushc(cx,_rv511);return;}cx->csp--;const void*_r512=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv511);if(!_r512)return;goto *_r512;}
+L_805: Cell t499=uf_mkp((void*)&uf_sl65);L_806: pushc(cx,t499);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_806,cx->sp>2?cx->sp-2:0);goto L_97;K_806:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_807: Cell t500=pop(cx);Cell t501=pop(cx);Cell t502=uf_cadd(t501,t500);L_808: pushc(cx,t502);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_808,cx->sp>0?cx->sp-0:0);goto L_111;K_808:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_809: Cell t503=uf_mkp((void*)&uf_sl66);L_810: pushc(cx,t503);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_810,cx->sp>2?cx->sp-2:0);goto L_97;K_810:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_811: Cell t504=pop(cx);Cell t505=pop(cx);Cell t506=uf_cadd(t505,t504);L_812: pushc(cx,t506);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_812,cx->sp>0?cx->sp-0:0);goto L_111;K_812:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_813: Cell t507=uf_mkp((void*)&uf_sl67);L_814: pushc(cx,t507);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_814,cx->sp>2?cx->sp-2:0);goto L_97;K_814:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_815: Cell t508=pop(cx);Cell t509=pop(cx);Cell t510=uf_cadd(t509,t508);L_816: L_817: var_trans__rr=t510;pushc(cx,t510);L_818: Cell t511=var_trans__rr;L_819: Cell _rv512=t511;{if(cx->csp==0){pushc(cx,_rv512);return;}cx->csp--;const void*_r513=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv512);if(!_r513)return;goto *_r513;}
 L_820: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_820,cx->sp>0?cx->sp-0:0);goto L_111;K_820:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_821: Cell t513=uf_mkp((void*)&uf_sl68);L_822: pushc(cx,t513);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_822,cx->sp>2?cx->sp-2:0);goto L_97;K_822:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_821: Cell t514=uf_mkp((void*)&uf_sl68);L_822: pushc(cx,t514);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_822,cx->sp>2?cx->sp-2:0);goto L_97;K_822:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_823: pushp(cx,(void*)&&L_829);
 L_824: pushp(cx,(void*)&&L_838);
 L_825: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_825,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_825,cx->sp>0?cx->sp-0:0);goto *el;}K_825:;}
-L_826: L_827: L_828: Cell _rv514=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv514);return;}cx->csp--;const void*_r515=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv514);if(!_r515)return;goto *_r515;}
+L_826: L_827: L_828: Cell _rv515=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv515);return;}cx->csp--;const void*_r516=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv515);if(!_r516)return;goto *_r516;}
 L_829: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_829,cx->sp>0?cx->sp-0:0);goto L_127;K_829:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_830: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_830,cx->sp>0?cx->sp-0:0);goto L_883;K_830:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_831: Cell t516=uf_mkp((void*)&uf_sl69);L_832: pushc(cx,t516);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_832,cx->sp>1?cx->sp-1:0);goto L_42;K_832:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_833: L_834: L_835: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_836: Cell t517=var_trans__rr;L_837: Cell _rv518=t517;{if(cx->csp==0){pushc(cx,_rv518);return;}cx->csp--;const void*_r519=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv518);if(!_r519)return;goto *_r519;}
+L_831: Cell t517=uf_mkp((void*)&uf_sl69);L_832: pushc(cx,t517);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_832,cx->sp>1?cx->sp-1:0);goto L_42;K_832:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_833: L_834: L_835: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_836: Cell t518=var_trans__rr;L_837: Cell _rv519=t518;{if(cx->csp==0){pushc(cx,_rv519);return;}cx->csp--;const void*_r520=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv519);if(!_r520)return;goto *_r520;}
 L_838: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_838,cx->sp>0?cx->sp-0:0);goto L_111;K_838:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_839: Cell t520=uf_mkp((void*)&uf_sl70);L_840: pushc(cx,t520);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_840,cx->sp>2?cx->sp-2:0);goto L_97;K_840:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_839: Cell t521=uf_mkp((void*)&uf_sl70);L_840: pushc(cx,t521);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_840,cx->sp>2?cx->sp-2:0);goto L_97;K_840:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_841: pushp(cx,(void*)&&L_847);
 L_842: pushp(cx,(void*)&&L_856);
 L_843: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_843,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_843,cx->sp>0?cx->sp-0:0);goto *el;}K_843:;}
-L_844: L_845: L_846: Cell _rv521=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv521);return;}cx->csp--;const void*_r522=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv521);if(!_r522)return;goto *_r522;}
+L_844: L_845: L_846: Cell _rv522=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv522);return;}cx->csp--;const void*_r523=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv522);if(!_r523)return;goto *_r523;}
 L_847: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_847,cx->sp>0?cx->sp-0:0);goto L_127;K_847:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_848: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_848,cx->sp>0?cx->sp-0:0);goto L_883;K_848:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_849: Cell t523=uf_mkp((void*)&uf_sl71);L_850: pushc(cx,t523);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_850,cx->sp>1?cx->sp-1:0);goto L_42;K_850:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_851: L_852: L_853: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_854: Cell t524=var_trans__rr;L_855: Cell _rv525=t524;{if(cx->csp==0){pushc(cx,_rv525);return;}cx->csp--;const void*_r526=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv525);if(!_r526)return;goto *_r526;}
+L_849: Cell t524=uf_mkp((void*)&uf_sl71);L_850: pushc(cx,t524);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_850,cx->sp>1?cx->sp-1:0);goto L_42;K_850:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_851: L_852: L_853: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_854: Cell t525=var_trans__rr;L_855: Cell _rv526=t525;{if(cx->csp==0){pushc(cx,_rv526);return;}cx->csp--;const void*_r527=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv526);if(!_r527)return;goto *_r527;}
 L_856: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_856,cx->sp>0?cx->sp-0:0);goto L_111;K_856:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_857: Cell t527=uf_mkp((void*)&uf_sl72);L_858: pushc(cx,t527);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_858,cx->sp>2?cx->sp-2:0);goto L_97;K_858:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_857: Cell t528=uf_mkp((void*)&uf_sl72);L_858: pushc(cx,t528);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_858,cx->sp>2?cx->sp-2:0);goto L_97;K_858:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_859: pushp(cx,(void*)&&L_865);
 L_860: pushp(cx,(void*)&&L_874);
 L_861: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_861,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_861,cx->sp>0?cx->sp-0:0);goto *el;}K_861:;}
-L_862: L_863: L_864: Cell _rv528=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv528);return;}cx->csp--;const void*_r529=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv528);if(!_r529)return;goto *_r529;}
+L_862: L_863: L_864: Cell _rv529=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv529);return;}cx->csp--;const void*_r530=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv529);if(!_r530)return;goto *_r530;}
 L_865: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_865,cx->sp>0?cx->sp-0:0);goto L_127;K_865:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_866: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_866,cx->sp>0?cx->sp-0:0);goto L_883;K_866:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_867: Cell t530=uf_mkp((void*)&uf_sl73);L_868: pushc(cx,t530);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_868,cx->sp>1?cx->sp-1:0);goto L_42;K_868:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_869: L_870: L_871: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_872: Cell t531=var_trans__rr;L_873: Cell _rv532=t531;{if(cx->csp==0){pushc(cx,_rv532);return;}cx->csp--;const void*_r533=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv532);if(!_r533)return;goto *_r533;}
+L_867: Cell t531=uf_mkp((void*)&uf_sl73);L_868: pushc(cx,t531);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_868,cx->sp>1?cx->sp-1:0);goto L_42;K_868:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_869: L_870: L_871: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_872: Cell t532=var_trans__rr;L_873: Cell _rv533=t532;{if(cx->csp==0){pushc(cx,_rv533);return;}cx->csp--;const void*_r534=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv533);if(!_r534)return;goto *_r534;}
 L_874: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_874,cx->sp>0?cx->sp-0:0);goto L_127;K_874:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_875: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_875,cx->sp>0?cx->sp-0:0);goto L_883;K_875:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_876: Cell t534=uf_mkp((void*)&uf_sl74);L_877: pushc(cx,t534);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_877,cx->sp>1?cx->sp-1:0);goto L_42;K_877:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_878: L_879: L_880: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_881: Cell t535=var_trans__rr;L_882: Cell _rv536=t535;{if(cx->csp==0){pushc(cx,_rv536);return;}cx->csp--;const void*_r537=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv536);if(!_r537)return;goto *_r537;}
+L_876: Cell t535=uf_mkp((void*)&uf_sl74);L_877: pushc(cx,t535);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_877,cx->sp>1?cx->sp-1:0);goto L_42;K_877:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_878: L_879: L_880: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_881: Cell t536=var_trans__rr;L_882: Cell _rv537=t536;{if(cx->csp==0){pushc(cx,_rv537);return;}cx->csp--;const void*_r538=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv537);if(!_r538)return;goto *_r538;}
 L_883: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_883,cx->sp>0?cx->sp-0:0);goto L_926;K_883:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_884: L_885: L_886: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_886;cx->loops[fr].end=&&K_WE_886;long _sp0=cx->sp;
 K_WC_886:;{Cell _wc;{
@@ -4130,26 +4267,26 @@ WB886_L903: pushp(cx,(void*)&&L_917);
 WB886_L904: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_WB886_904,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_WB886_904,cx->sp>0?cx->sp-0:0);goto *el;}K_WB886_904:;}
 WB886_L905: }cx->sp=_sp0;goto K_WC_886;}
 K_WE_886:;cx->lsp=fr;}
-L_887: Cell _rv538=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv538);return;}cx->csp--;const void*_r539=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv538);if(!_r539)return;goto *_r539;}
+L_887: Cell _rv539=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv539);return;}cx->csp--;const void*_r540=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv539);if(!_r540)return;goto *_r540;}
 L_888: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_888,cx->sp>0?cx->sp-0:0);goto L_111;K_888:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_889: Cell t540=uf_mkp((void*)&uf_sl75);L_890: pushc(cx,t540);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_890,cx->sp>2?cx->sp-2:0);goto L_97;K_890:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_889: Cell t541=uf_mkp((void*)&uf_sl75);L_890: pushc(cx,t541);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_890,cx->sp>2?cx->sp-2:0);goto L_97;K_890:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_891: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_891,cx->sp>0?cx->sp-0:0);goto L_111;K_891:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_892: Cell t541=uf_mkp((void*)&uf_sl76);L_893: pushc(cx,t541);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_893,cx->sp>2?cx->sp-2:0);goto L_97;K_893:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_894: Cell t542=pop(cx);Cell t543=pop(cx);Cell t544=uf_cadd(t543,t542);L_895: L_896: var_trans__rr=t544;pushc(cx,t544);L_897: Cell t545=var_trans__rr;L_898: Cell _rv546=t545;{if(cx->csp==0){pushc(cx,_rv546);return;}cx->csp--;const void*_r547=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv546);if(!_r547)return;goto *_r547;}
+L_892: Cell t542=uf_mkp((void*)&uf_sl76);L_893: pushc(cx,t542);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_893,cx->sp>2?cx->sp-2:0);goto L_97;K_893:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_894: Cell t543=pop(cx);Cell t544=pop(cx);Cell t545=uf_cadd(t544,t543);L_895: L_896: var_trans__rr=t545;pushc(cx,t545);L_897: Cell t546=var_trans__rr;L_898: Cell _rv547=t546;{if(cx->csp==0){pushc(cx,_rv547);return;}cx->csp--;const void*_r548=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv547);if(!_r548)return;goto *_r548;}
 L_899: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_899,cx->sp>0?cx->sp-0:0);goto L_111;K_899:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_900: Cell t548=uf_mkp((void*)&uf_sl77);L_901: pushc(cx,t548);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_901,cx->sp>2?cx->sp-2:0);goto L_97;K_901:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_900: Cell t549=uf_mkp((void*)&uf_sl77);L_901: pushc(cx,t549);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_901,cx->sp>2?cx->sp-2:0);goto L_97;K_901:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_902: pushp(cx,(void*)&&L_908);
 L_903: pushp(cx,(void*)&&L_917);
 L_904: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_904,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_904,cx->sp>0?cx->sp-0:0);goto *el;}K_904:;}
-L_905: L_906: L_907: Cell _rv549=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv549);return;}cx->csp--;const void*_r550=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv549);if(!_r550)return;goto *_r550;}
+L_905: L_906: L_907: Cell _rv550=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv550);return;}cx->csp--;const void*_r551=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv550);if(!_r551)return;goto *_r551;}
 L_908: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_908,cx->sp>0?cx->sp-0:0);goto L_127;K_908:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_909: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_909,cx->sp>0?cx->sp-0:0);goto L_926;K_909:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_910: Cell t551=uf_mkp((void*)&uf_sl78);L_911: pushc(cx,t551);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_911,cx->sp>1?cx->sp-1:0);goto L_42;K_911:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_912: L_913: L_914: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_915: Cell t552=var_trans__rr;L_916: Cell _rv553=t552;{if(cx->csp==0){pushc(cx,_rv553);return;}cx->csp--;const void*_r554=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv553);if(!_r554)return;goto *_r554;}
+L_910: Cell t552=uf_mkp((void*)&uf_sl78);L_911: pushc(cx,t552);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_911,cx->sp>1?cx->sp-1:0);goto L_42;K_911:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_912: L_913: L_914: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_915: Cell t553=var_trans__rr;L_916: Cell _rv554=t553;{if(cx->csp==0){pushc(cx,_rv554);return;}cx->csp--;const void*_r555=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv554);if(!_r555)return;goto *_r555;}
 L_917: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_917,cx->sp>0?cx->sp-0:0);goto L_127;K_917:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_918: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_918,cx->sp>0?cx->sp-0:0);goto L_926;K_918:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_919: Cell t555=uf_mkp((void*)&uf_sl79);L_920: pushc(cx,t555);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_920,cx->sp>1?cx->sp-1:0);goto L_42;K_920:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_921: L_922: L_923: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_924: Cell t556=var_trans__rr;L_925: Cell _rv557=t556;{if(cx->csp==0){pushc(cx,_rv557);return;}cx->csp--;const void*_r558=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv557);if(!_r558)return;goto *_r558;}
+L_919: Cell t556=uf_mkp((void*)&uf_sl79);L_920: pushc(cx,t556);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_920,cx->sp>1?cx->sp-1:0);goto L_42;K_920:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_921: L_922: L_923: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_924: Cell t557=var_trans__rr;L_925: Cell _rv558=t557;{if(cx->csp==0){pushc(cx,_rv558);return;}cx->csp--;const void*_r559=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv558);if(!_r559)return;goto *_r559;}
 L_926: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_926,cx->sp>0?cx->sp-0:0);goto L_959;K_926:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_927: L_928: L_929: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_929;cx->loops[fr].end=&&K_WE_929;long _sp0=cx->sp;
 K_WC_929:;{Cell _wc;{
@@ -4163,1151 +4300,1244 @@ WB929_L949: Cell t0=uf_mkp((void*)&uf_sl83);WB929_L950: pushc(cx,t0);cx->local_f
 WB929_L951: WB929_L952: WB929_L953: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB929_L954: Cell t1=var_trans__rr;pushc(cx,t1);}cx->sp=_sp0;goto K_WC_929;}
 K_WE_929:;cx->lsp=fr;}
 L_930: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_930,cx->sp>0?cx->sp-0:0);goto L_111;K_930:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_931: Cell t559=uf_mkp((void*)&uf_sl80);L_932: pushc(cx,t559);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_932,cx->sp>2?cx->sp-2:0);goto L_97;K_932:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_931: Cell t560=uf_mkp((void*)&uf_sl80);L_932: pushc(cx,t560);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_932,cx->sp>2?cx->sp-2:0);goto L_97;K_932:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_933: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_933,cx->sp>0?cx->sp-0:0);goto L_111;K_933:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_934: Cell t560=uf_mkp((void*)&uf_sl81);L_935: pushc(cx,t560);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_935,cx->sp>2?cx->sp-2:0);goto L_97;K_935:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_936: Cell t561=pop(cx);Cell t562=pop(cx);Cell t563=uf_cadd(t562,t561);L_937: pushc(cx,t563);pushp(cx,(void*)&&L_956);
+L_934: Cell t561=uf_mkp((void*)&uf_sl81);L_935: pushc(cx,t561);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_935,cx->sp>2?cx->sp-2:0);goto L_97;K_935:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_936: Cell t562=pop(cx);Cell t563=pop(cx);Cell t564=uf_cadd(t563,t562);L_937: pushc(cx,t564);pushp(cx,(void*)&&L_956);
 L_938: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_938,cx->sp>0?cx->sp-0:0);goto *b;K_938:;}}
-L_939: Cell _rv564=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv564);return;}cx->csp--;const void*_r565=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv564);if(!_r565)return;goto *_r565;}
+L_939: Cell _rv565=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv565);return;}cx->csp--;const void*_r566=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv565);if(!_r566)return;goto *_r566;}
 L_940: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_940,cx->sp>0?cx->sp-0:0);goto L_111;K_940:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_941: Cell t566=uf_mkp((void*)&uf_sl82);L_942: pushc(cx,t566);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_942,cx->sp>2?cx->sp-2:0);goto L_97;K_942:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_943: Cell t567=pop(cx);L_944: var_trans__rr=t567;pushc(cx,t567);L_945: Cell t568=var_trans__rr;L_946: Cell _rv569=t568;{if(cx->csp==0){pushc(cx,_rv569);return;}cx->csp--;const void*_r570=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv569);if(!_r570)return;goto *_r570;}
+L_941: Cell t567=uf_mkp((void*)&uf_sl82);L_942: pushc(cx,t567);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_942,cx->sp>2?cx->sp-2:0);goto L_97;K_942:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_943: Cell t568=pop(cx);L_944: var_trans__rr=t568;pushc(cx,t568);L_945: Cell t569=var_trans__rr;L_946: Cell _rv570=t569;{if(cx->csp==0){pushc(cx,_rv570);return;}cx->csp--;const void*_r571=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv570);if(!_r571)return;goto *_r571;}
 L_947: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_947,cx->sp>0?cx->sp-0:0);goto L_127;K_947:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_948: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_948,cx->sp>0?cx->sp-0:0);goto L_959;K_948:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_949: Cell t571=uf_mkp((void*)&uf_sl83);L_950: pushc(cx,t571);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_950,cx->sp>1?cx->sp-1:0);goto L_42;K_950:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_951: L_952: L_953: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_954: Cell t572=var_trans__rr;L_955: Cell _rv573=t572;{if(cx->csp==0){pushc(cx,_rv573);return;}cx->csp--;const void*_r574=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv573);if(!_r574)return;goto *_r574;}
-L_956: Cell t575=uf_mkp((void*)&uf_sl84);L_957: pushc(cx,t575);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_957,cx->sp>0?cx->sp-0:0);goto L_107;K_957:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_958: Cell _rv576=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv576);return;}cx->csp--;const void*_r577=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv576);if(!_r577)return;goto *_r577;}
+L_949: Cell t572=uf_mkp((void*)&uf_sl83);L_950: pushc(cx,t572);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_950,cx->sp>1?cx->sp-1:0);goto L_42;K_950:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_951: L_952: L_953: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_954: Cell t573=var_trans__rr;L_955: Cell _rv574=t573;{if(cx->csp==0){pushc(cx,_rv574);return;}cx->csp--;const void*_r575=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv574);if(!_r575)return;goto *_r575;}
+L_956: Cell t576=uf_mkp((void*)&uf_sl84);L_957: pushc(cx,t576);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_957,cx->sp>0?cx->sp-0:0);goto L_107;K_957:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_958: Cell _rv577=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv577);return;}cx->csp--;const void*_r578=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv577);if(!_r578)return;goto *_r578;}
 L_959: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_959,cx->sp>0?cx->sp-0:0);goto L_111;K_959:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_960: Cell t578=uf_mkp((void*)&uf_sl85);L_961: pushc(cx,t578);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_961,cx->sp>2?cx->sp-2:0);goto L_97;K_961:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_960: Cell t579=uf_mkp((void*)&uf_sl85);L_961: pushc(cx,t579);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_961,cx->sp>2?cx->sp-2:0);goto L_97;K_961:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_962: pushp(cx,(void*)&&L_1011);
 L_963: pushp(cx,(void*)&&L_966);
 L_964: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_964,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_964,cx->sp>0?cx->sp-0:0);goto *el;}K_964:;}
-L_965: Cell _rv579=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv579);return;}cx->csp--;const void*_r580=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv579);if(!_r580)return;goto *_r580;}
+L_965: Cell _rv580=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv580);return;}cx->csp--;const void*_r581=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv580);if(!_r581)return;goto *_r581;}
 L_966: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_966,cx->sp>0?cx->sp-0:0);goto L_111;K_966:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_967: Cell t581=uf_mkp((void*)&uf_sl86);L_968: pushc(cx,t581);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_968,cx->sp>2?cx->sp-2:0);goto L_97;K_968:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_967: Cell t582=uf_mkp((void*)&uf_sl86);L_968: pushc(cx,t582);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_968,cx->sp>2?cx->sp-2:0);goto L_97;K_968:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_969: pushp(cx,(void*)&&L_1022);
 L_970: pushp(cx,(void*)&&L_975);
 L_971: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_971,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_971,cx->sp>0?cx->sp-0:0);goto *el;}K_971:;}
-L_972: L_973: L_974: Cell _rv582=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv582);return;}cx->csp--;const void*_r583=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv582);if(!_r583)return;goto *_r583;}
+L_972: L_973: L_974: Cell _rv583=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv583);return;}cx->csp--;const void*_r584=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv583);if(!_r584)return;goto *_r584;}
 L_975: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_975,cx->sp>0?cx->sp-0:0);goto L_111;K_975:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_976: Cell t584=uf_mkp((void*)&uf_sl87);L_977: pushc(cx,t584);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_977,cx->sp>2?cx->sp-2:0);goto L_97;K_977:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_976: Cell t585=uf_mkp((void*)&uf_sl87);L_977: pushc(cx,t585);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_977,cx->sp>2?cx->sp-2:0);goto L_97;K_977:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_978: pushp(cx,(void*)&&L_1031);
 L_979: pushp(cx,(void*)&&L_984);
 L_980: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_980,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_980,cx->sp>0?cx->sp-0:0);goto *el;}K_980:;}
-L_981: L_982: L_983: Cell _rv585=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv585);return;}cx->csp--;const void*_r586=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv585);if(!_r586)return;goto *_r586;}
+L_981: L_982: L_983: Cell _rv586=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv586);return;}cx->csp--;const void*_r587=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv586);if(!_r587)return;goto *_r587;}
 L_984: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_984,cx->sp>0?cx->sp-0:0);goto L_111;K_984:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_985: Cell t587=uf_mkp((void*)&uf_sl88);L_986: pushc(cx,t587);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_986,cx->sp>2?cx->sp-2:0);goto L_97;K_986:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_985: Cell t588=uf_mkp((void*)&uf_sl88);L_986: pushc(cx,t588);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_986,cx->sp>2?cx->sp-2:0);goto L_97;K_986:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_987: pushp(cx,(void*)&&L_1040);
 L_988: pushp(cx,(void*)&&L_993);
 L_989: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_989,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_989,cx->sp>0?cx->sp-0:0);goto *el;}K_989:;}
-L_990: L_991: L_992: Cell _rv588=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv588);return;}cx->csp--;const void*_r589=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv588);if(!_r589)return;goto *_r589;}
+L_990: L_991: L_992: Cell _rv589=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv589);return;}cx->csp--;const void*_r590=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv589);if(!_r590)return;goto *_r590;}
 L_993: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_993,cx->sp>0?cx->sp-0:0);goto L_111;K_993:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_994: Cell t590=uf_mkp((void*)&uf_sl89);L_995: pushc(cx,t590);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_995,cx->sp>2?cx->sp-2:0);goto L_97;K_995:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_994: Cell t591=uf_mkp((void*)&uf_sl89);L_995: pushc(cx,t591);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_995,cx->sp>2?cx->sp-2:0);goto L_97;K_995:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_996: pushp(cx,(void*)&&L_1047);
 L_997: pushp(cx,(void*)&&L_1002);
 L_998: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_998,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_998,cx->sp>0?cx->sp-0:0);goto *el;}K_998:;}
-L_999: L_1000: L_1001: Cell _rv591=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv591);return;}cx->csp--;const void*_r592=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv591);if(!_r592)return;goto *_r592;}
+L_999: L_1000: L_1001: Cell _rv592=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv592);return;}cx->csp--;const void*_r593=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv592);if(!_r593)return;goto *_r593;}
 L_1002: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1002,cx->sp>0?cx->sp-0:0);goto L_111;K_1002:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1003: Cell t593=uf_mkp((void*)&uf_sl90);L_1004: pushc(cx,t593);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1004,cx->sp>2?cx->sp-2:0);goto L_97;K_1004:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1005: pushp(cx,(void*)&&L_1068);
-L_1006: pushp(cx,(void*)&&L_1089);
+L_1003: Cell t594=uf_mkp((void*)&uf_sl90);L_1004: pushc(cx,t594);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1004,cx->sp>2?cx->sp-2:0);goto L_97;K_1004:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1005: pushp(cx,(void*)&&L_1070);
+L_1006: pushp(cx,(void*)&&L_1093);
 L_1007: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1007,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1007,cx->sp>0?cx->sp-0:0);goto *el;}K_1007:;}
-L_1008: L_1009: L_1010: Cell _rv594=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv594);return;}cx->csp--;const void*_r595=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv594);if(!_r595)return;goto *_r595;}
+L_1008: L_1009: L_1010: Cell _rv595=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv595);return;}cx->csp--;const void*_r596=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv595);if(!_r596)return;goto *_r596;}
 L_1011: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1011,cx->sp>0?cx->sp-0:0);goto L_127;K_1011:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1012: Cell t596=uf_mkp((void*)&uf_sl91);L_1013: pushc(cx,t596);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1013,cx->sp>1?cx->sp-1:0);goto L_42;K_1013:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1012: Cell t597=uf_mkp((void*)&uf_sl91);L_1013: pushc(cx,t597);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1013,cx->sp>1?cx->sp-1:0);goto L_42;K_1013:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_1014: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1014,cx->sp>0?cx->sp-0:0);goto L_959;K_1014:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1015: Cell t597=uf_mkp((void*)&uf_sl92);L_1016: pushc(cx,t597);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1016,cx->sp>1?cx->sp-1:0);goto L_42;K_1016:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1017: L_1018: L_1019: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1020: Cell t598=var_trans__rr;L_1021: Cell _rv599=t598;{if(cx->csp==0){pushc(cx,_rv599);return;}cx->csp--;const void*_r600=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv599);if(!_r600)return;goto *_r600;}
+L_1015: Cell t598=uf_mkp((void*)&uf_sl92);L_1016: pushc(cx,t598);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1016,cx->sp>1?cx->sp-1:0);goto L_42;K_1016:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1017: L_1018: L_1019: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1020: Cell t599=var_trans__rr;L_1021: Cell _rv600=t599;{if(cx->csp==0){pushc(cx,_rv600);return;}cx->csp--;const void*_r601=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv600);if(!_r601)return;goto *_r601;}
 L_1022: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1022,cx->sp>0?cx->sp-0:0);goto L_127;K_1022:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_1023: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1023,cx->sp>0?cx->sp-0:0);goto L_959;K_1023:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1024: Cell t601=uf_mkp((void*)&uf_sl93);L_1025: pushc(cx,t601);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1025,cx->sp>1?cx->sp-1:0);goto L_42;K_1025:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1026: L_1027: L_1028: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1029: Cell t602=var_trans__rr;L_1030: Cell _rv603=t602;{if(cx->csp==0){pushc(cx,_rv603);return;}cx->csp--;const void*_r604=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv603);if(!_r604)return;goto *_r604;}
+L_1024: Cell t602=uf_mkp((void*)&uf_sl93);L_1025: pushc(cx,t602);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1025,cx->sp>1?cx->sp-1:0);goto L_42;K_1025:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1026: L_1027: L_1028: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1029: Cell t603=var_trans__rr;L_1030: Cell _rv604=t603;{if(cx->csp==0){pushc(cx,_rv604);return;}cx->csp--;const void*_r605=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv604);if(!_r605)return;goto *_r605;}
 L_1031: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1031,cx->sp>0?cx->sp-0:0);goto L_127;K_1031:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1032: Cell t605=uf_mkp((void*)&uf_sl94);L_1033: pushc(cx,t605);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1033,cx->sp>1?cx->sp-1:0);goto L_42;K_1033:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1032: Cell t606=uf_mkp((void*)&uf_sl94);L_1033: pushc(cx,t606);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1033,cx->sp>1?cx->sp-1:0);goto L_42;K_1033:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_1034: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1034,cx->sp>0?cx->sp-0:0);goto L_959;K_1034:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1035: Cell t606=uf_mkp((void*)&uf_sl95);L_1036: pushc(cx,t606);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1036,cx->sp>1?cx->sp-1:0);goto L_42;K_1036:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1037: L_1038: L_1039: Cell _rv607=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv607);return;}cx->csp--;const void*_r608=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv607);if(!_r608)return;goto *_r608;}
+L_1035: Cell t607=uf_mkp((void*)&uf_sl95);L_1036: pushc(cx,t607);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1036,cx->sp>1?cx->sp-1:0);goto L_42;K_1036:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1037: L_1038: L_1039: Cell _rv608=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv608);return;}cx->csp--;const void*_r609=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv608);if(!_r609)return;goto *_r609;}
 L_1040: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1040,cx->sp>0?cx->sp-0:0);goto L_127;K_1040:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_1041: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1041,cx->sp>0?cx->sp-0:0);goto L_959;K_1041:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1042: L_1043: L_1044: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1045: Cell t609=var_trans__rr;L_1046: Cell _rv610=t609;{if(cx->csp==0){pushc(cx,_rv610);return;}cx->csp--;const void*_r611=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv610);if(!_r611)return;goto *_r611;}
+L_1042: L_1043: L_1044: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1045: Cell t610=var_trans__rr;L_1046: Cell _rv611=t610;{if(cx->csp==0){pushc(cx,_rv611);return;}cx->csp--;const void*_r612=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv611);if(!_r612)return;goto *_r612;}
 L_1047: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1047,cx->sp>0?cx->sp-0:0);goto L_127;K_1047:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1048: Cell t612=var_trans__vars;L_1049: pushc(cx,t612);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1049,cx->sp>0?cx->sp-0:0);goto L_111;K_1049:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1048: Cell t613=var_trans__vars;L_1049: pushc(cx,t613);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1049,cx->sp>0?cx->sp-0:0);goto L_111;K_1049:;cx->local_base=cx->local_frames[--cx->local_fsp];
 L_1050: uf_cur_op="op_getq";op_getq(cx);
-L_1051: Cell t613=pop(cx);Cell t614=uf_cnot(t613);L_1052: pushc(cx,t614);pushp(cx,(void*)&&L_1065);
+L_1051: Cell t614=pop(cx);Cell t615=uf_cnot(t614);L_1052: pushc(cx,t615);pushp(cx,(void*)&&L_1067);
 L_1053: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1053,cx->sp>0?cx->sp-0:0);goto *b;K_1053:;}}
-L_1054: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1054,cx->sp>0?cx->sp-0:0);goto L_111;K_1054:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1055: Cell t615=pop(cx);L_1056: L_1057: L_1058: Cell t616=uf_mkp((void*)&uf_sl96);L_1059: var_trans__lasts=t615;pushc(cx,t615);pushc(cx,t615);pushc(cx,t615);pushc(cx,t616);uf_cur_op="op_fmt";op_fmt(cx);
-L_1060: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1060,cx->sp>1?cx->sp-1:0);goto L_42;K_1060:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1061: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1061,cx->sp>0?cx->sp-0:0);goto L_127;K_1061:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1062: L_1063: L_1064: Cell _rv617=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv617);return;}cx->csp--;const void*_r618=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv617);if(!_r618)return;goto *_r618;}
-L_1065: Cell t619=uf_mkp((void*)&uf_sl97);L_1066: pushc(cx,t619);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1066,cx->sp>0?cx->sp-0:0);goto L_107;K_1066:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1067: Cell _rv620=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv620);return;}cx->csp--;const void*_r621=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv620);if(!_r621)return;goto *_r621;}
-L_1068: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1068,cx->sp>0?cx->sp-0:0);goto L_127;K_1068:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1069: Cell t622=var_trans__vars;L_1070: pushc(cx,t622);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1070,cx->sp>0?cx->sp-0:0);goto L_111;K_1070:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1071: uf_cur_op="op_getq";op_getq(cx);
-L_1072: Cell t623=pop(cx);Cell t624=uf_cnot(t623);L_1073: pushc(cx,t624);pushp(cx,(void*)&&L_1086);
-L_1074: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1074,cx->sp>0?cx->sp-0:0);goto *b;K_1074:;}}
-L_1075: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1075,cx->sp>0?cx->sp-0:0);goto L_111;K_1075:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1076: Cell t625=pop(cx);L_1077: L_1078: L_1079: Cell t626=uf_mkp((void*)&uf_sl98);L_1080: var_trans__lasts=t625;pushc(cx,t625);pushc(cx,t625);pushc(cx,t625);pushc(cx,t626);uf_cur_op="op_fmt";op_fmt(cx);
-L_1081: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1081,cx->sp>1?cx->sp-1:0);goto L_42;K_1081:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1082: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1082,cx->sp>0?cx->sp-0:0);goto L_127;K_1082:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1083: L_1084: L_1085: Cell _rv627=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv627);return;}cx->csp--;const void*_r628=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv627);if(!_r628)return;goto *_r628;}
-L_1086: Cell t629=uf_mkp((void*)&uf_sl99);L_1087: pushc(cx,t629);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1087,cx->sp>0?cx->sp-0:0);goto L_107;K_1087:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1088: Cell _rv630=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv630);return;}cx->csp--;const void*_r631=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv630);if(!_r631)return;goto *_r631;}
-L_1089: Cell t632=uf_mkp((void*)&uf_sl100);L_1090: L_1091: var_trans__lasts=t632;pushc(cx,t632);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1091,cx->sp>0?cx->sp-0:0);goto L_1149;K_1091:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1092: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1092,cx->sp>0?cx->sp-0:0);goto L_111;K_1092:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1093: Cell t633=uf_mkp((void*)&uf_sl101);L_1094: pushc(cx,t633);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1094,cx->sp>2?cx->sp-2:0);goto L_97;K_1094:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1095: pushp(cx,(void*)&&L_1110);
-L_1096: pushp(cx,(void*)&&L_1101);
-L_1097: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1097,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1097,cx->sp>0?cx->sp-0:0);goto *el;}K_1097:;}
-L_1098: L_1099: L_1100: Cell _rv634=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv634);return;}cx->csp--;const void*_r635=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv634);if(!_r635)return;goto *_r635;}
-L_1101: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1101,cx->sp>0?cx->sp-0:0);goto L_111;K_1101:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1102: Cell t636=uf_mkp((void*)&uf_sl102);L_1103: pushc(cx,t636);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1103,cx->sp>2?cx->sp-2:0);goto L_97;K_1103:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1104: pushp(cx,(void*)&&L_1127);
-L_1105: pushp(cx,(void*)&&L_1144);
-L_1106: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1106,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1106,cx->sp>0?cx->sp-0:0);goto *el;}K_1106:;}
-L_1107: L_1108: L_1109: Cell _rv637=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv637);return;}cx->csp--;const void*_r638=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv637);if(!_r638)return;goto *_r638;}
-L_1110: Cell t639=var_trans__lasts;L_1111: Cell t640=uf_mkp((void*)&uf_sl103);L_1112: pushc(cx,t639);pushc(cx,t640);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1112,cx->sp>2?cx->sp-2:0);goto L_97;K_1112:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1113: pushp(cx,(void*)&&L_1124);
-L_1114: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1114,cx->sp>0?cx->sp-0:0);goto *b;K_1114:;}}
-L_1115: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1115,cx->sp>0?cx->sp-0:0);goto L_127;K_1115:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1116: Cell t641=var_trans__lasts;L_1117: L_1118: Cell t642=uf_mkp((void*)&uf_sl104);L_1119: pushc(cx,t641);pushc(cx,var_trans__lasts);pushc(cx,t642);uf_cur_op="op_fmt";op_fmt(cx);
-L_1120: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1120,cx->sp>1?cx->sp-1:0);goto L_42;K_1120:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1121: L_1122: L_1123: Cell _rv643=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv643);return;}cx->csp--;const void*_r644=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv643);if(!_r644)return;goto *_r644;}
-L_1124: Cell t645=uf_mkp((void*)&uf_sl105);L_1125: pushc(cx,t645);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1125,cx->sp>0?cx->sp-0:0);goto L_107;K_1125:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1126: Cell _rv646=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv646);return;}cx->csp--;const void*_r647=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv646);if(!_r647)return;goto *_r647;}
-L_1127: Cell t648=var_trans__lasts;L_1128: Cell t649=uf_mkp((void*)&uf_sl106);L_1129: pushc(cx,t648);pushc(cx,t649);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1129,cx->sp>2?cx->sp-2:0);goto L_97;K_1129:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1130: pushp(cx,(void*)&&L_1141);
-L_1131: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1131,cx->sp>0?cx->sp-0:0);goto *b;K_1131:;}}
-L_1132: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1132,cx->sp>0?cx->sp-0:0);goto L_127;K_1132:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1133: Cell t650=var_trans__lasts;L_1134: L_1135: Cell t651=uf_mkp((void*)&uf_sl107);L_1136: pushc(cx,t650);pushc(cx,var_trans__lasts);pushc(cx,t651);uf_cur_op="op_fmt";op_fmt(cx);
-L_1137: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1137,cx->sp>1?cx->sp-1:0);goto L_42;K_1137:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1138: L_1139: L_1140: Cell _rv652=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv652);return;}cx->csp--;const void*_r653=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv652);if(!_r653)return;goto *_r653;}
-L_1141: Cell t654=uf_mkp((void*)&uf_sl108);L_1142: pushc(cx,t654);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1142,cx->sp>0?cx->sp-0:0);goto L_107;K_1142:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1143: Cell _rv655=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv655);return;}cx->csp--;const void*_r656=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv655);if(!_r656)return;goto *_r656;}
-L_1144: L_1145: L_1146: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1147: Cell t657=var_trans__rr;L_1148: Cell _rv658=t657;{if(cx->csp==0){pushc(cx,_rv658);return;}cx->csp--;const void*_r659=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv658);if(!_r659)return;goto *_r659;}
-L_1149: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1149,cx->sp>0?cx->sp-0:0);goto L_111;K_1149:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1150: Cell t660=pop(cx);L_1151: L_1152: Cell t661=uf_mkp((void*)&uf_sl109);L_1153: var_trans__ptk=t660;pushc(cx,t660);pushc(cx,t660);pushc(cx,t661);uf_cur_op="op_glob";op_glob(cx);
-L_1154: pushp(cx,(void*)&&L_1239);
-L_1155: pushp(cx,(void*)&&L_1158);
-L_1156: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1156,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1156,cx->sp>0?cx->sp-0:0);goto *el;}K_1156:;}
-L_1157: Cell _rv662=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv662);return;}cx->csp--;const void*_r663=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv662);if(!_r663)return;goto *_r663;}
-L_1158: Cell t664=var_trans__ptk;L_1159: Cell t665=uf_mkp((void*)&uf_sl110);L_1160: pushc(cx,t664);pushc(cx,t665);uf_cur_op="op_starts";op_starts(cx);
-L_1161: pushp(cx,(void*)&&L_1375);
-L_1162: pushp(cx,(void*)&&L_1167);
-L_1163: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1163,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1163,cx->sp>0?cx->sp-0:0);goto *el;}K_1163:;}
-L_1164: L_1165: L_1166: Cell _rv666=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv666);return;}cx->csp--;const void*_r667=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv666);if(!_r667)return;goto *_r667;}
-L_1167: Cell t668=var_trans__ptk;L_1168: Cell t669=uf_mkp((void*)&uf_sl111);L_1169: pushc(cx,t668);pushc(cx,t669);uf_cur_op="op_starts";op_starts(cx);
-L_1170: pushp(cx,(void*)&&L_1257);
-L_1171: pushp(cx,(void*)&&L_1176);
-L_1172: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1172,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1172,cx->sp>0?cx->sp-0:0);goto *el;}K_1172:;}
-L_1173: L_1174: L_1175: Cell _rv670=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv670);return;}cx->csp--;const void*_r671=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv670);if(!_r671)return;goto *_r671;}
-L_1176: Cell t672=var_trans__ptk;L_1177: Cell t673=uf_mkp((void*)&uf_sl112);L_1178: pushc(cx,t672);pushc(cx,t673);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1178,cx->sp>2?cx->sp-2:0);goto L_97;K_1178:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1179: pushp(cx,(void*)&&L_1269);
-L_1180: pushp(cx,(void*)&&L_1185);
-L_1181: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1181,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1181,cx->sp>0?cx->sp-0:0);goto *el;}K_1181:;}
-L_1182: L_1183: L_1184: Cell _rv674=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv674);return;}cx->csp--;const void*_r675=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv674);if(!_r675)return;goto *_r675;}
-L_1185: Cell t676=var_trans__ptk;L_1186: Cell t677=uf_mkp((void*)&uf_sl113);L_1187: pushc(cx,t676);pushc(cx,t677);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1187,cx->sp>2?cx->sp-2:0);goto L_97;K_1187:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1188: pushp(cx,(void*)&&L_1287);
-L_1189: pushp(cx,(void*)&&L_1194);
-L_1190: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1190,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1190,cx->sp>0?cx->sp-0:0);goto *el;}K_1190:;}
-L_1191: L_1192: L_1193: Cell _rv678=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv678);return;}cx->csp--;const void*_r679=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv678);if(!_r679)return;goto *_r679;}
-L_1194: Cell t680=var_trans__ptk;L_1195: Cell t681=uf_mkp((void*)&uf_sl114);L_1196: pushc(cx,t680);pushc(cx,t681);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1196,cx->sp>2?cx->sp-2:0);goto L_97;K_1196:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1197: pushp(cx,(void*)&&L_1297);
-L_1198: pushp(cx,(void*)&&L_1203);
-L_1199: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1199,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1199,cx->sp>0?cx->sp-0:0);goto *el;}K_1199:;}
-L_1200: L_1201: L_1202: Cell _rv682=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv682);return;}cx->csp--;const void*_r683=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv682);if(!_r683)return;goto *_r683;}
-L_1203: Cell t684=var_trans__ptk;L_1204: Cell t685=uf_mkp((void*)&uf_sl115);L_1205: pushc(cx,t684);pushc(cx,t685);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1205,cx->sp>2?cx->sp-2:0);goto L_97;K_1205:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1206: pushp(cx,(void*)&&L_1326);
-L_1207: pushp(cx,(void*)&&L_1212);
-L_1208: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1208,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1208,cx->sp>0?cx->sp-0:0);goto *el;}K_1208:;}
-L_1209: L_1210: L_1211: Cell _rv686=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv686);return;}cx->csp--;const void*_r687=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv686);if(!_r687)return;goto *_r687;}
-L_1212: Cell t688=var_trans__ptk;L_1213: Cell t689=uf_mkp((void*)&uf_sl116);L_1214: pushc(cx,t688);pushc(cx,t689);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1214,cx->sp>2?cx->sp-2:0);goto L_97;K_1214:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1215: pushp(cx,(void*)&&L_1355);
-L_1216: pushp(cx,(void*)&&L_1221);
-L_1217: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1217,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1217,cx->sp>0?cx->sp-0:0);goto *el;}K_1217:;}
-L_1218: L_1219: L_1220: Cell _rv690=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv690);return;}cx->csp--;const void*_r691=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv690);if(!_r691)return;goto *_r691;}
-L_1221: Cell t692=var_trans__ptk;L_1222: Cell t693=uf_mkp((void*)&uf_sl117);L_1223: pushc(cx,t692);pushc(cx,t693);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1223,cx->sp>2?cx->sp-2:0);goto L_97;K_1223:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1224: pushp(cx,(void*)&&L_1365);
-L_1225: pushp(cx,(void*)&&L_1230);
-L_1226: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1226,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1226,cx->sp>0?cx->sp-0:0);goto *el;}K_1226:;}
-L_1227: L_1228: L_1229: Cell _rv694=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv694);return;}cx->csp--;const void*_r695=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv694);if(!_r695)return;goto *_r695;}
-L_1230: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1230,cx->sp>0?cx->sp-0:0);goto L_118;K_1230:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1231: Cell t696=uf_mkp((void*)&uf_sl118);L_1232: pushc(cx,t696);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1232,cx->sp>2?cx->sp-2:0);goto L_97;K_1232:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1233: pushp(cx,(void*)&&L_1522);
-L_1234: pushp(cx,(void*)&&L_1578);
-L_1235: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1235,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1235,cx->sp>0?cx->sp-0:0);goto *el;}K_1235:;}
-L_1236: L_1237: L_1238: Cell _rv697=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv697);return;}cx->csp--;const void*_r698=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv697);if(!_r698)return;goto *_r698;}
-L_1239: Cell t699=var_trans__ptk;L_1240: Cell t700=uf_mkp((void*)&uf_sl119);L_1241: pushc(cx,t699);pushc(cx,t700);uf_cur_op="op_match";op_match(cx);
-L_1242: Cell t701=pop(cx);cx->locals[cx->local_base+1]=t701;L_1243: Cell t702=cx->locals[cx->local_base+1];L_1244: L_1245: pushc(cx,t701);pushc(cx,t702);pushi(cx,0LL);uf_cur_op="op_getq";op_getq(cx);
-L_1246: Cell t703=pop(cx);L_1247: L_1248: L_1249: var_trans__zm=t703;pushc(cx,t703);pushc(cx,t703);pushi(cx,0LL);uf_cur_op="op_get";op_get(cx);
-L_1250: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1250,cx->sp>1?cx->sp-1:0);goto L_42;K_1250:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1251: Cell t704=uf_mkp((void*)&uf_sl120);L_1252: pushc(cx,t704);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1252,cx->sp>1?cx->sp-1:0);goto L_42;K_1252:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1253: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1253,cx->sp>0?cx->sp-0:0);goto L_127;K_1253:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1254: L_1255: L_1256: Cell _rv705=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv705);return;}cx->csp--;const void*_r706=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv705);if(!_r706)return;goto *_r706;}
-L_1257: Cell t707=var_trans__ptk;L_1258: pushc(cx,t707);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1258,cx->sp>1?cx->sp-1:0);goto L_42;K_1258:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1259: Cell t708=uf_mkp((void*)&uf_sl121);L_1260: pushc(cx,t708);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1260,cx->sp>1?cx->sp-1:0);goto L_42;K_1260:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1261: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1261,cx->sp>0?cx->sp-0:0);goto L_127;K_1261:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1262: Cell t709=uf_mkp((void*)&uf_sl122);L_1263: L_1264: L_1265: L_1266: var_trans__lasts=t709;var_trans__rr=uf_mki(0LL);pushc(cx,t709);pushi(cx,0LL);L_1267: Cell t710=var_trans__rr;L_1268: Cell _rv711=t710;{if(cx->csp==0){pushc(cx,_rv711);return;}cx->csp--;const void*_r712=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv711);if(!_r712)return;goto *_r712;}
-L_1269: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1269,cx->sp>0?cx->sp-0:0);goto L_127;K_1269:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1270: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1270,cx->sp>0?cx->sp-0:0);goto L_566;K_1270:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1271: Cell t713=uf_mkp((void*)&uf_sl123);L_1272: cx->locals[cx->local_base+0]=t713;L_1273: pushc(cx,t713);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1273,cx->sp>0?cx->sp-0:0);goto L_111;K_1273:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1274: Cell t714=cx->locals[cx->local_base+0];L_1275: pushc(cx,t714);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1275,cx->sp>2?cx->sp-2:0);goto L_97;K_1275:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1276: Cell t715=pop(cx);Cell t716=uf_cnot(t715);L_1277: pushc(cx,t716);pushp(cx,(void*)&&L_144);
-L_1278: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1278,cx->sp>0?cx->sp-0:0);goto *b;K_1278:;}}
-L_1279: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1279,cx->sp>0?cx->sp-0:0);goto L_127;K_1279:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1280: Cell t717=uf_mkp((void*)&uf_sl124);L_1281: L_1282: L_1283: L_1284: var_trans__lasts=t717;var_trans__rr=uf_mki(0LL);pushc(cx,t717);pushi(cx,0LL);L_1285: Cell t718=var_trans__rr;L_1286: Cell _rv719=t718;{if(cx->csp==0){pushc(cx,_rv719);return;}cx->csp--;const void*_r720=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv719);if(!_r720)return;goto *_r720;}
-L_1287: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1287,cx->sp>0?cx->sp-0:0);goto L_127;K_1287:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1288: Cell t721=uf_mkp((void*)&uf_sl125);L_1289: pushc(cx,t721);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1289,cx->sp>1?cx->sp-1:0);goto L_42;K_1289:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1290: Cell t722=uf_mkp((void*)&uf_sl126);L_1291: L_1292: L_1293: L_1294: var_trans__lasts=t722;var_trans__rr=uf_mki(0LL);pushc(cx,t722);pushi(cx,0LL);L_1295: Cell t723=var_trans__rr;L_1296: Cell _rv724=t723;{if(cx->csp==0){pushc(cx,_rv724);return;}cx->csp--;const void*_r725=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv724);if(!_r725)return;goto *_r725;}
-L_1297: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1297,cx->sp>0?cx->sp-0:0);goto L_127;K_1297:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1298: Cell t726=uf_mkp((void*)&uf_sl127);L_1299: cx->locals[cx->local_base+0]=t726;L_1300: pushc(cx,t726);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1300,cx->sp>0?cx->sp-0:0);goto L_111;K_1300:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1301: Cell t727=cx->locals[cx->local_base+0];L_1302: pushc(cx,t727);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1302,cx->sp>2?cx->sp-2:0);goto L_97;K_1302:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1303: Cell t728=pop(cx);Cell t729=uf_cnot(t728);L_1304: pushc(cx,t729);pushp(cx,(void*)&&L_144);
-L_1305: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1305,cx->sp>0?cx->sp-0:0);goto *b;K_1305:;}}
-L_1306: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1306,cx->sp>0?cx->sp-0:0);goto L_127;K_1306:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1307: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1307,cx->sp>0?cx->sp-0:0);goto L_566;K_1307:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1308: Cell t730=uf_mkp((void*)&uf_sl128);L_1309: cx->locals[cx->local_base+0]=t730;L_1310: pushc(cx,t730);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1310,cx->sp>0?cx->sp-0:0);goto L_111;K_1310:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1311: Cell t731=cx->locals[cx->local_base+0];L_1312: pushc(cx,t731);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1312,cx->sp>2?cx->sp-2:0);goto L_97;K_1312:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1313: Cell t732=pop(cx);Cell t733=uf_cnot(t732);L_1314: pushc(cx,t733);pushp(cx,(void*)&&L_144);
-L_1315: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1315,cx->sp>0?cx->sp-0:0);goto *b;K_1315:;}}
-L_1316: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1316,cx->sp>0?cx->sp-0:0);goto L_127;K_1316:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1317: Cell t734=uf_mkp((void*)&uf_sl129);L_1318: pushc(cx,t734);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1318,cx->sp>1?cx->sp-1:0);goto L_42;K_1318:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1319: Cell t735=uf_mkp((void*)&uf_sl130);L_1320: L_1321: L_1322: L_1323: var_trans__lasts=t735;var_trans__rr=uf_mki(0LL);pushc(cx,t735);pushi(cx,0LL);L_1324: Cell t736=var_trans__rr;L_1325: Cell _rv737=t736;{if(cx->csp==0){pushc(cx,_rv737);return;}cx->csp--;const void*_r738=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv737);if(!_r738)return;goto *_r738;}
-L_1326: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1326,cx->sp>0?cx->sp-0:0);goto L_127;K_1326:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1327: Cell t739=uf_mkp((void*)&uf_sl131);L_1328: cx->locals[cx->local_base+0]=t739;L_1329: pushc(cx,t739);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1329,cx->sp>0?cx->sp-0:0);goto L_111;K_1329:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1330: Cell t740=cx->locals[cx->local_base+0];L_1331: pushc(cx,t740);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1331,cx->sp>2?cx->sp-2:0);goto L_97;K_1331:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1332: Cell t741=pop(cx);Cell t742=uf_cnot(t741);L_1333: pushc(cx,t742);pushp(cx,(void*)&&L_144);
-L_1334: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1334,cx->sp>0?cx->sp-0:0);goto *b;K_1334:;}}
-L_1335: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1335,cx->sp>0?cx->sp-0:0);goto L_127;K_1335:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1336: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1336,cx->sp>0?cx->sp-0:0);goto L_566;K_1336:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1337: Cell t743=uf_mkp((void*)&uf_sl132);L_1338: cx->locals[cx->local_base+0]=t743;L_1339: pushc(cx,t743);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1339,cx->sp>0?cx->sp-0:0);goto L_111;K_1339:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1340: Cell t744=cx->locals[cx->local_base+0];L_1341: pushc(cx,t744);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1341,cx->sp>2?cx->sp-2:0);goto L_97;K_1341:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1342: Cell t745=pop(cx);Cell t746=uf_cnot(t745);L_1343: pushc(cx,t746);pushp(cx,(void*)&&L_144);
-L_1344: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1344,cx->sp>0?cx->sp-0:0);goto *b;K_1344:;}}
-L_1345: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1345,cx->sp>0?cx->sp-0:0);goto L_127;K_1345:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1346: Cell t747=uf_mkp((void*)&uf_sl133);L_1347: pushc(cx,t747);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1347,cx->sp>1?cx->sp-1:0);goto L_42;K_1347:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1348: Cell t748=uf_mkp((void*)&uf_sl134);L_1349: L_1350: L_1351: L_1352: var_trans__lasts=t748;var_trans__rr=uf_mki(0LL);pushc(cx,t748);pushi(cx,0LL);L_1353: Cell t749=var_trans__rr;L_1354: Cell _rv750=t749;{if(cx->csp==0){pushc(cx,_rv750);return;}cx->csp--;const void*_r751=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv750);if(!_r751)return;goto *_r751;}
-L_1355: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1355,cx->sp>0?cx->sp-0:0);goto L_127;K_1355:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1356: Cell t752=uf_mkp((void*)&uf_sl135);L_1357: pushc(cx,t752);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1357,cx->sp>1?cx->sp-1:0);goto L_42;K_1357:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1358: Cell t753=uf_mkp((void*)&uf_sl136);L_1359: L_1360: L_1361: L_1362: var_trans__lasts=t753;var_trans__rr=uf_mki(0LL);pushc(cx,t753);pushi(cx,0LL);L_1363: Cell t754=var_trans__rr;L_1364: Cell _rv755=t754;{if(cx->csp==0){pushc(cx,_rv755);return;}cx->csp--;const void*_r756=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv755);if(!_r756)return;goto *_r756;}
-L_1365: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1365,cx->sp>0?cx->sp-0:0);goto L_127;K_1365:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1366: Cell t757=uf_mkp((void*)&uf_sl137);L_1367: pushc(cx,t757);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1367,cx->sp>1?cx->sp-1:0);goto L_42;K_1367:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1368: Cell t758=uf_mkp((void*)&uf_sl138);L_1369: L_1370: L_1371: L_1372: var_trans__lasts=t758;var_trans__rr=uf_mki(0LL);pushc(cx,t758);pushi(cx,0LL);L_1373: Cell t759=var_trans__rr;L_1374: Cell _rv760=t759;{if(cx->csp==0){pushc(cx,_rv760);return;}cx->csp--;const void*_r761=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv760);if(!_r761)return;goto *_r761;}
-L_1375: Cell t762=var_trans__ptk;L_1376: L_1377: L_1378: pushc(cx,t762);pushi(cx,1LL);pushc(cx,var_trans__ptk);uf_cur_op="strlen";{Cell a0=pop(cx);int r=((int(*)(void*))uf_im9)((void*)uf_sptr(a0));pushi(cx,(int64_t)r);}
-L_1379: L_1380: Cell t763=pop(cx);Cell t764=uf_csub(t763,uf_mki(1LL));L_1381: pushc(cx,t764);uf_cur_op="op_slice";op_slice(cx);
-L_1382: Cell t765=pop(cx);L_1383: L_1384: Cell t766=uf_mkp((void*)&uf_sl139);L_1385: var_trans__ci=t765;pushc(cx,t765);pushc(cx,t765);pushc(cx,t766);uf_cur_op="op_starts";op_starts(cx);
-L_1386: pushp(cx,(void*)&&L_1405);
-L_1387: pushp(cx,(void*)&&L_1392);
-L_1388: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1388,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1388,cx->sp>0?cx->sp-0:0);goto *el;}K_1388:;}
-L_1389: L_1390: L_1391: Cell _rv767=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv767);return;}cx->csp--;const void*_r768=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv767);if(!_r768)return;goto *_r768;}
-L_1392: Cell t769=var_trans__ci;L_1393: pushc(cx,t769);uf_cur_op="op_loadx";op_loadx(cx);
-L_1394: L_1395: Cell t770=pop(cx);Cell t771=uf_cand(t770,uf_mki(255LL));L_1396: pushc(cx,t771);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1396,cx->sp>1?cx->sp-1:0);goto L_89;K_1396:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1397: Cell t772=uf_mkp((void*)&uf_sl140);L_1398: pushc(cx,t772);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1398,cx->sp>1?cx->sp-1:0);goto L_42;K_1398:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1399: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1399,cx->sp>0?cx->sp-0:0);goto L_127;K_1399:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1400: L_1401: L_1402: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1403: Cell t773=var_trans__rr;L_1404: Cell _rv774=t773;{if(cx->csp==0){pushc(cx,_rv774);return;}cx->csp--;const void*_r775=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv774);if(!_r775)return;goto *_r775;}
-L_1405: Cell t776=var_trans__ci;L_1406: Cell t777=uf_mkp((void*)&uf_sl141);L_1407: pushc(cx,t776);pushc(cx,t777);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1407,cx->sp>2?cx->sp-2:0);goto L_97;K_1407:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1408: pushp(cx,(void*)&&L_1414);
-L_1409: pushp(cx,(void*)&&L_1424);
-L_1410: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1410,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1410,cx->sp>0?cx->sp-0:0);goto *el;}K_1410:;}
-L_1411: L_1412: L_1413: Cell _rv778=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv778);return;}cx->csp--;const void*_r779=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv778);if(!_r779)return;goto *_r779;}
-L_1414: L_1415: pushi(cx,10LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1415,cx->sp>1?cx->sp-1:0);goto L_89;K_1415:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1416: Cell t780=uf_mkp((void*)&uf_sl142);L_1417: pushc(cx,t780);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1417,cx->sp>1?cx->sp-1:0);goto L_42;K_1417:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1418: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1418,cx->sp>0?cx->sp-0:0);goto L_127;K_1418:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1419: L_1420: L_1421: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1422: Cell t781=var_trans__rr;L_1423: Cell _rv782=t781;{if(cx->csp==0){pushc(cx,_rv782);return;}cx->csp--;const void*_r783=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv782);if(!_r783)return;goto *_r783;}
-L_1424: Cell t784=var_trans__ci;L_1425: Cell t785=uf_mkp((void*)&uf_sl143);L_1426: pushc(cx,t784);pushc(cx,t785);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1426,cx->sp>2?cx->sp-2:0);goto L_97;K_1426:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1427: pushp(cx,(void*)&&L_1433);
-L_1428: pushp(cx,(void*)&&L_1443);
-L_1429: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1429,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1429,cx->sp>0?cx->sp-0:0);goto *el;}K_1429:;}
-L_1430: L_1431: L_1432: Cell _rv786=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv786);return;}cx->csp--;const void*_r787=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv786);if(!_r787)return;goto *_r787;}
-L_1433: L_1434: pushi(cx,9LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1434,cx->sp>1?cx->sp-1:0);goto L_89;K_1434:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1435: Cell t788=uf_mkp((void*)&uf_sl144);L_1436: pushc(cx,t788);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1436,cx->sp>1?cx->sp-1:0);goto L_42;K_1436:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1437: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1437,cx->sp>0?cx->sp-0:0);goto L_127;K_1437:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1438: L_1439: L_1440: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1441: Cell t789=var_trans__rr;L_1442: Cell _rv790=t789;{if(cx->csp==0){pushc(cx,_rv790);return;}cx->csp--;const void*_r791=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv790);if(!_r791)return;goto *_r791;}
-L_1443: Cell t792=var_trans__ci;L_1444: Cell t793=uf_mkp((void*)&uf_sl145);L_1445: pushc(cx,t792);pushc(cx,t793);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1445,cx->sp>2?cx->sp-2:0);goto L_97;K_1445:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1446: pushp(cx,(void*)&&L_1452);
-L_1447: pushp(cx,(void*)&&L_1462);
-L_1448: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1448,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1448,cx->sp>0?cx->sp-0:0);goto *el;}K_1448:;}
-L_1449: L_1450: L_1451: Cell _rv794=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv794);return;}cx->csp--;const void*_r795=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv794);if(!_r795)return;goto *_r795;}
-L_1452: L_1453: pushi(cx,13LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1453,cx->sp>1?cx->sp-1:0);goto L_89;K_1453:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1454: Cell t796=uf_mkp((void*)&uf_sl146);L_1455: pushc(cx,t796);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1455,cx->sp>1?cx->sp-1:0);goto L_42;K_1455:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1456: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1456,cx->sp>0?cx->sp-0:0);goto L_127;K_1456:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1457: L_1458: L_1459: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1460: Cell t797=var_trans__rr;L_1461: Cell _rv798=t797;{if(cx->csp==0){pushc(cx,_rv798);return;}cx->csp--;const void*_r799=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv798);if(!_r799)return;goto *_r799;}
-L_1462: Cell t800=var_trans__ci;L_1463: Cell t801=uf_mkp((void*)&uf_sl147);L_1464: pushc(cx,t800);pushc(cx,t801);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1464,cx->sp>2?cx->sp-2:0);goto L_97;K_1464:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1465: pushp(cx,(void*)&&L_1471);
-L_1466: pushp(cx,(void*)&&L_1481);
-L_1467: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1467,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1467,cx->sp>0?cx->sp-0:0);goto *el;}K_1467:;}
-L_1468: L_1469: L_1470: Cell _rv802=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv802);return;}cx->csp--;const void*_r803=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv802);if(!_r803)return;goto *_r803;}
-L_1471: L_1472: pushi(cx,0LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1472,cx->sp>1?cx->sp-1:0);goto L_89;K_1472:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1473: Cell t804=uf_mkp((void*)&uf_sl148);L_1474: pushc(cx,t804);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1474,cx->sp>1?cx->sp-1:0);goto L_42;K_1474:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1475: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1475,cx->sp>0?cx->sp-0:0);goto L_127;K_1475:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1476: L_1477: L_1478: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1479: Cell t805=var_trans__rr;L_1480: Cell _rv806=t805;{if(cx->csp==0){pushc(cx,_rv806);return;}cx->csp--;const void*_r807=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv806);if(!_r807)return;goto *_r807;}
-L_1481: Cell t808=var_trans__ci;L_1482: Cell t809=uf_mkp((void*)&uf_sl149);L_1483: pushc(cx,t808);pushc(cx,t809);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1483,cx->sp>2?cx->sp-2:0);goto L_97;K_1483:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1484: pushp(cx,(void*)&&L_1490);
-L_1485: pushp(cx,(void*)&&L_1500);
-L_1486: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1486,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1486,cx->sp>0?cx->sp-0:0);goto *el;}K_1486:;}
-L_1487: L_1488: L_1489: Cell _rv810=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv810);return;}cx->csp--;const void*_r811=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv810);if(!_r811)return;goto *_r811;}
-L_1490: L_1491: pushi(cx,92LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1491,cx->sp>1?cx->sp-1:0);goto L_89;K_1491:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1492: Cell t812=uf_mkp((void*)&uf_sl150);L_1493: pushc(cx,t812);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1493,cx->sp>1?cx->sp-1:0);goto L_42;K_1493:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1494: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1494,cx->sp>0?cx->sp-0:0);goto L_127;K_1494:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1495: L_1496: L_1497: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1498: Cell t813=var_trans__rr;L_1499: Cell _rv814=t813;{if(cx->csp==0){pushc(cx,_rv814);return;}cx->csp--;const void*_r815=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv814);if(!_r815)return;goto *_r815;}
-L_1500: Cell t816=var_trans__ci;L_1501: Cell t817=uf_mkp((void*)&uf_sl151);L_1502: pushc(cx,t816);pushc(cx,t817);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1502,cx->sp>2?cx->sp-2:0);goto L_97;K_1502:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1503: pushp(cx,(void*)&&L_1509);
-L_1504: pushp(cx,(void*)&&L_1519);
-L_1505: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1505,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1505,cx->sp>0?cx->sp-0:0);goto *el;}K_1505:;}
-L_1506: L_1507: L_1508: Cell _rv818=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv818);return;}cx->csp--;const void*_r819=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv818);if(!_r819)return;goto *_r819;}
-L_1509: L_1510: pushi(cx,39LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1510,cx->sp>1?cx->sp-1:0);goto L_89;K_1510:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1511: Cell t820=uf_mkp((void*)&uf_sl152);L_1512: pushc(cx,t820);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1512,cx->sp>1?cx->sp-1:0);goto L_42;K_1512:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1513: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1513,cx->sp>0?cx->sp-0:0);goto L_127;K_1513:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1514: L_1515: L_1516: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1517: Cell t821=var_trans__rr;L_1518: Cell _rv822=t821;{if(cx->csp==0){pushc(cx,_rv822);return;}cx->csp--;const void*_r823=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv822);if(!_r823)return;goto *_r823;}
-L_1519: Cell t824=uf_mkp((void*)&uf_sl153);L_1520: pushc(cx,t824);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1520,cx->sp>0?cx->sp-0:0);goto L_107;K_1520:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1521: Cell _rv825=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv825);return;}cx->csp--;const void*_r826=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv825);if(!_r826)return;goto *_r826;}
-L_1522: Cell t827=var_trans__ptk;L_1523: pushc(cx,t827);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1523,cx->sp>1?cx->sp-1:0);goto L_0;K_1523:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1524: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1524,cx->sp>0?cx->sp-0:0);goto L_127;K_1524:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1525: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1525,cx->sp>0?cx->sp-0:0);goto L_127;K_1525:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1526: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1526,cx->sp>0?cx->sp-0:0);goto L_111;K_1526:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1527: Cell t828=uf_mkp((void*)&uf_sl154);L_1528: pushc(cx,t828);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1528,cx->sp>2?cx->sp-2:0);goto L_97;K_1528:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1529: pushp(cx,(void*)&&L_1552);
-L_1530: pushp(cx,(void*)&&L_1557);
-L_1531: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1531,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1531,cx->sp>0?cx->sp-0:0);goto *el;}K_1531:;}
-L_1532: Cell t829=uf_mkp((void*)&uf_sl155);L_1533: cx->locals[cx->local_base+0]=t829;L_1534: pushc(cx,t829);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1534,cx->sp>0?cx->sp-0:0);goto L_111;K_1534:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1535: Cell t830=cx->locals[cx->local_base+0];L_1536: pushc(cx,t830);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1536,cx->sp>2?cx->sp-2:0);goto L_97;K_1536:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1537: Cell t831=pop(cx);Cell t832=uf_cnot(t831);L_1538: pushc(cx,t832);pushp(cx,(void*)&&L_144);
-L_1539: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1539,cx->sp>0?cx->sp-0:0);goto *b;K_1539:;}}
-L_1540: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1540,cx->sp>0?cx->sp-0:0);goto L_127;K_1540:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1541: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1541,cx->sp>0?cx->sp-0:0);goto L_36;K_1541:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1542: Cell t833=uf_mkp((void*)&uf_sl156);L_1543: pushc(cx,t833);uf_cur_op="op_fmt";op_fmt(cx);
-L_1544: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1544,cx->sp>1?cx->sp-1:0);goto L_42;K_1544:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1545: Cell t834=uf_mkp((void*)&uf_sl157);L_1546: L_1547: L_1548: L_1549: var_trans__lasts=t834;var_trans__rr=uf_mki(0LL);pushc(cx,t834);pushi(cx,0LL);L_1550: Cell t835=var_trans__rr;L_1551: Cell _rv836=t835;{if(cx->csp==0){pushc(cx,_rv836);return;}cx->csp--;const void*_r837=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv836);if(!_r837)return;goto *_r837;}
-L_1552: L_1553: L_1554: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1555: Cell t838=var_trans__rr;L_1556: Cell _rv839=t838;{if(cx->csp==0){pushc(cx,_rv839);return;}cx->csp--;const void*_r840=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv839);if(!_r840)return;goto *_r840;}
-L_1557: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1557,cx->sp>0?cx->sp-0:0);goto L_566;K_1557:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1558: L_1559: L_1560: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_1560;cx->loops[fr].end=&&K_WE_1560;long _sp0=cx->sp;
-K_WC_1560:;{Cell _wc;{
-WC1560_L1564: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC1560_1564,cx->sp>0?cx->sp-0:0);goto L_111;K_WC1560_1564:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC1560_L1565: Cell t0=uf_mkp((void*)&uf_sl158);WC1560_L1566: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC1560_1566,cx->sp>2?cx->sp-2:0);goto L_97;K_WC1560_1566:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC1560_L1567: Cell t1=pop(cx);WC1560_L1568: var_trans__rr=t1;pushc(cx,t1);WC1560_L1569: Cell t2=var_trans__rr;pushc(cx,t2);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_1560;
+L_1054: Cell t616=var_trans__vars;L_1055: pushc(cx,t616);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1055,cx->sp>0?cx->sp-0:0);goto L_111;K_1055:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1056: uf_cur_op="op_getq";op_getq(cx);
+L_1057: Cell t617=pop(cx);L_1058: L_1059: L_1060: Cell t618=uf_mkp((void*)&uf_sl96);L_1061: var_trans__lasts=t617;pushc(cx,t617);pushc(cx,t617);pushc(cx,t617);pushc(cx,t618);uf_cur_op="op_fmt";op_fmt(cx);
+L_1062: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1062,cx->sp>1?cx->sp-1:0);goto L_42;K_1062:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1063: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1063,cx->sp>0?cx->sp-0:0);goto L_127;K_1063:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1064: L_1065: L_1066: Cell _rv619=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv619);return;}cx->csp--;const void*_r620=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv619);if(!_r620)return;goto *_r620;}
+L_1067: Cell t621=uf_mkp((void*)&uf_sl97);L_1068: pushc(cx,t621);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1068,cx->sp>0?cx->sp-0:0);goto L_107;K_1068:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1069: Cell _rv622=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv622);return;}cx->csp--;const void*_r623=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv622);if(!_r623)return;goto *_r623;}
+L_1070: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1070,cx->sp>0?cx->sp-0:0);goto L_127;K_1070:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1071: Cell t624=var_trans__vars;L_1072: pushc(cx,t624);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1072,cx->sp>0?cx->sp-0:0);goto L_111;K_1072:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1073: uf_cur_op="op_getq";op_getq(cx);
+L_1074: Cell t625=pop(cx);Cell t626=uf_cnot(t625);L_1075: pushc(cx,t626);pushp(cx,(void*)&&L_1090);
+L_1076: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1076,cx->sp>0?cx->sp-0:0);goto *b;K_1076:;}}
+L_1077: Cell t627=var_trans__vars;L_1078: pushc(cx,t627);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1078,cx->sp>0?cx->sp-0:0);goto L_111;K_1078:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1079: uf_cur_op="op_getq";op_getq(cx);
+L_1080: Cell t628=pop(cx);L_1081: L_1082: L_1083: Cell t629=uf_mkp((void*)&uf_sl98);L_1084: var_trans__lasts=t628;pushc(cx,t628);pushc(cx,t628);pushc(cx,t628);pushc(cx,t629);uf_cur_op="op_fmt";op_fmt(cx);
+L_1085: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1085,cx->sp>1?cx->sp-1:0);goto L_42;K_1085:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1086: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1086,cx->sp>0?cx->sp-0:0);goto L_127;K_1086:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1087: L_1088: L_1089: Cell _rv630=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv630);return;}cx->csp--;const void*_r631=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv630);if(!_r631)return;goto *_r631;}
+L_1090: Cell t632=uf_mkp((void*)&uf_sl99);L_1091: pushc(cx,t632);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1091,cx->sp>0?cx->sp-0:0);goto L_107;K_1091:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1092: Cell _rv633=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv633);return;}cx->csp--;const void*_r634=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv633);if(!_r634)return;goto *_r634;}
+L_1093: Cell t635=uf_mkp((void*)&uf_sl100);L_1094: L_1095: var_trans__lasts=t635;pushc(cx,t635);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1095,cx->sp>0?cx->sp-0:0);goto L_1155;K_1095:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1096: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1096,cx->sp>0?cx->sp-0:0);goto L_111;K_1096:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1097: Cell t636=uf_mkp((void*)&uf_sl101);L_1098: pushc(cx,t636);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1098,cx->sp>2?cx->sp-2:0);goto L_97;K_1098:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1099: pushp(cx,(void*)&&L_1114);
+L_1100: pushp(cx,(void*)&&L_1105);
+L_1101: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1101,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1101,cx->sp>0?cx->sp-0:0);goto *el;}K_1101:;}
+L_1102: L_1103: L_1104: Cell _rv637=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv637);return;}cx->csp--;const void*_r638=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv637);if(!_r638)return;goto *_r638;}
+L_1105: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1105,cx->sp>0?cx->sp-0:0);goto L_111;K_1105:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1106: Cell t639=uf_mkp((void*)&uf_sl102);L_1107: pushc(cx,t639);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1107,cx->sp>2?cx->sp-2:0);goto L_97;K_1107:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1108: pushp(cx,(void*)&&L_1132);
+L_1109: pushp(cx,(void*)&&L_1150);
+L_1110: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1110,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1110,cx->sp>0?cx->sp-0:0);goto *el;}K_1110:;}
+L_1111: L_1112: L_1113: Cell _rv640=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv640);return;}cx->csp--;const void*_r641=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv640);if(!_r641)return;goto *_r641;}
+L_1114: Cell t642=var_trans__lasts;L_1115: Cell t643=uf_mkp((void*)&uf_sl103);L_1116: pushc(cx,t642);pushc(cx,t643);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1116,cx->sp>2?cx->sp-2:0);goto L_97;K_1116:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1117: pushp(cx,(void*)&&L_1129);
+L_1118: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1118,cx->sp>0?cx->sp-0:0);goto *b;K_1118:;}}
+L_1119: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1119,cx->sp>0?cx->sp-0:0);goto L_127;K_1119:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1120: Cell t644=var_trans__lasts;L_1121: L_1122: L_1123: Cell t645=uf_mkp((void*)&uf_sl104);L_1124: pushc(cx,t644);pushc(cx,var_trans__lasts);pushc(cx,var_trans__lasts);pushc(cx,t645);uf_cur_op="op_fmt";op_fmt(cx);
+L_1125: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1125,cx->sp>1?cx->sp-1:0);goto L_42;K_1125:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1126: L_1127: L_1128: Cell _rv646=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv646);return;}cx->csp--;const void*_r647=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv646);if(!_r647)return;goto *_r647;}
+L_1129: Cell t648=uf_mkp((void*)&uf_sl105);L_1130: pushc(cx,t648);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1130,cx->sp>0?cx->sp-0:0);goto L_107;K_1130:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1131: Cell _rv649=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv649);return;}cx->csp--;const void*_r650=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv649);if(!_r650)return;goto *_r650;}
+L_1132: Cell t651=var_trans__lasts;L_1133: Cell t652=uf_mkp((void*)&uf_sl106);L_1134: pushc(cx,t651);pushc(cx,t652);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1134,cx->sp>2?cx->sp-2:0);goto L_97;K_1134:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1135: pushp(cx,(void*)&&L_1147);
+L_1136: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1136,cx->sp>0?cx->sp-0:0);goto *b;K_1136:;}}
+L_1137: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1137,cx->sp>0?cx->sp-0:0);goto L_127;K_1137:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1138: Cell t653=var_trans__lasts;L_1139: L_1140: L_1141: Cell t654=uf_mkp((void*)&uf_sl107);L_1142: pushc(cx,t653);pushc(cx,var_trans__lasts);pushc(cx,var_trans__lasts);pushc(cx,t654);uf_cur_op="op_fmt";op_fmt(cx);
+L_1143: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1143,cx->sp>1?cx->sp-1:0);goto L_42;K_1143:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1144: L_1145: L_1146: Cell _rv655=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv655);return;}cx->csp--;const void*_r656=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv655);if(!_r656)return;goto *_r656;}
+L_1147: Cell t657=uf_mkp((void*)&uf_sl108);L_1148: pushc(cx,t657);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1148,cx->sp>0?cx->sp-0:0);goto L_107;K_1148:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1149: Cell _rv658=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv658);return;}cx->csp--;const void*_r659=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv658);if(!_r659)return;goto *_r659;}
+L_1150: L_1151: L_1152: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1153: Cell t660=var_trans__rr;L_1154: Cell _rv661=t660;{if(cx->csp==0){pushc(cx,_rv661);return;}cx->csp--;const void*_r662=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv661);if(!_r662)return;goto *_r662;}
+L_1155: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1155,cx->sp>0?cx->sp-0:0);goto L_111;K_1155:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1156: Cell t663=pop(cx);L_1157: L_1158: Cell t664=uf_mkp((void*)&uf_sl109);L_1159: var_trans__ptk=t663;pushc(cx,t663);pushc(cx,t663);pushc(cx,t664);uf_cur_op="op_glob";op_glob(cx);
+L_1160: pushp(cx,(void*)&&L_1245);
+L_1161: pushp(cx,(void*)&&L_1164);
+L_1162: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1162,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1162,cx->sp>0?cx->sp-0:0);goto *el;}K_1162:;}
+L_1163: Cell _rv665=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv665);return;}cx->csp--;const void*_r666=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv665);if(!_r666)return;goto *_r666;}
+L_1164: Cell t667=var_trans__ptk;L_1165: Cell t668=uf_mkp((void*)&uf_sl110);L_1166: pushc(cx,t667);pushc(cx,t668);uf_cur_op="op_starts";op_starts(cx);
+L_1167: pushp(cx,(void*)&&L_1381);
+L_1168: pushp(cx,(void*)&&L_1173);
+L_1169: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1169,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1169,cx->sp>0?cx->sp-0:0);goto *el;}K_1169:;}
+L_1170: L_1171: L_1172: Cell _rv669=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv669);return;}cx->csp--;const void*_r670=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv669);if(!_r670)return;goto *_r670;}
+L_1173: Cell t671=var_trans__ptk;L_1174: Cell t672=uf_mkp((void*)&uf_sl111);L_1175: pushc(cx,t671);pushc(cx,t672);uf_cur_op="op_starts";op_starts(cx);
+L_1176: pushp(cx,(void*)&&L_1263);
+L_1177: pushp(cx,(void*)&&L_1182);
+L_1178: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1178,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1178,cx->sp>0?cx->sp-0:0);goto *el;}K_1178:;}
+L_1179: L_1180: L_1181: Cell _rv673=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv673);return;}cx->csp--;const void*_r674=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv673);if(!_r674)return;goto *_r674;}
+L_1182: Cell t675=var_trans__ptk;L_1183: Cell t676=uf_mkp((void*)&uf_sl112);L_1184: pushc(cx,t675);pushc(cx,t676);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1184,cx->sp>2?cx->sp-2:0);goto L_97;K_1184:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1185: pushp(cx,(void*)&&L_1275);
+L_1186: pushp(cx,(void*)&&L_1191);
+L_1187: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1187,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1187,cx->sp>0?cx->sp-0:0);goto *el;}K_1187:;}
+L_1188: L_1189: L_1190: Cell _rv677=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv677);return;}cx->csp--;const void*_r678=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv677);if(!_r678)return;goto *_r678;}
+L_1191: Cell t679=var_trans__ptk;L_1192: Cell t680=uf_mkp((void*)&uf_sl113);L_1193: pushc(cx,t679);pushc(cx,t680);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1193,cx->sp>2?cx->sp-2:0);goto L_97;K_1193:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1194: pushp(cx,(void*)&&L_1293);
+L_1195: pushp(cx,(void*)&&L_1200);
+L_1196: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1196,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1196,cx->sp>0?cx->sp-0:0);goto *el;}K_1196:;}
+L_1197: L_1198: L_1199: Cell _rv681=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv681);return;}cx->csp--;const void*_r682=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv681);if(!_r682)return;goto *_r682;}
+L_1200: Cell t683=var_trans__ptk;L_1201: Cell t684=uf_mkp((void*)&uf_sl114);L_1202: pushc(cx,t683);pushc(cx,t684);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1202,cx->sp>2?cx->sp-2:0);goto L_97;K_1202:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1203: pushp(cx,(void*)&&L_1303);
+L_1204: pushp(cx,(void*)&&L_1209);
+L_1205: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1205,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1205,cx->sp>0?cx->sp-0:0);goto *el;}K_1205:;}
+L_1206: L_1207: L_1208: Cell _rv685=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv685);return;}cx->csp--;const void*_r686=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv685);if(!_r686)return;goto *_r686;}
+L_1209: Cell t687=var_trans__ptk;L_1210: Cell t688=uf_mkp((void*)&uf_sl115);L_1211: pushc(cx,t687);pushc(cx,t688);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1211,cx->sp>2?cx->sp-2:0);goto L_97;K_1211:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1212: pushp(cx,(void*)&&L_1332);
+L_1213: pushp(cx,(void*)&&L_1218);
+L_1214: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1214,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1214,cx->sp>0?cx->sp-0:0);goto *el;}K_1214:;}
+L_1215: L_1216: L_1217: Cell _rv689=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv689);return;}cx->csp--;const void*_r690=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv689);if(!_r690)return;goto *_r690;}
+L_1218: Cell t691=var_trans__ptk;L_1219: Cell t692=uf_mkp((void*)&uf_sl116);L_1220: pushc(cx,t691);pushc(cx,t692);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1220,cx->sp>2?cx->sp-2:0);goto L_97;K_1220:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1221: pushp(cx,(void*)&&L_1361);
+L_1222: pushp(cx,(void*)&&L_1227);
+L_1223: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1223,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1223,cx->sp>0?cx->sp-0:0);goto *el;}K_1223:;}
+L_1224: L_1225: L_1226: Cell _rv693=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv693);return;}cx->csp--;const void*_r694=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv693);if(!_r694)return;goto *_r694;}
+L_1227: Cell t695=var_trans__ptk;L_1228: Cell t696=uf_mkp((void*)&uf_sl117);L_1229: pushc(cx,t695);pushc(cx,t696);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1229,cx->sp>2?cx->sp-2:0);goto L_97;K_1229:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1230: pushp(cx,(void*)&&L_1371);
+L_1231: pushp(cx,(void*)&&L_1236);
+L_1232: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1232,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1232,cx->sp>0?cx->sp-0:0);goto *el;}K_1232:;}
+L_1233: L_1234: L_1235: Cell _rv697=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv697);return;}cx->csp--;const void*_r698=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv697);if(!_r698)return;goto *_r698;}
+L_1236: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1236,cx->sp>0?cx->sp-0:0);goto L_118;K_1236:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1237: Cell t699=uf_mkp((void*)&uf_sl118);L_1238: pushc(cx,t699);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1238,cx->sp>2?cx->sp-2:0);goto L_97;K_1238:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1239: pushp(cx,(void*)&&L_1528);
+L_1240: pushp(cx,(void*)&&L_1678);
+L_1241: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1241,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1241,cx->sp>0?cx->sp-0:0);goto *el;}K_1241:;}
+L_1242: L_1243: L_1244: Cell _rv700=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv700);return;}cx->csp--;const void*_r701=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv700);if(!_r701)return;goto *_r701;}
+L_1245: Cell t702=var_trans__ptk;L_1246: Cell t703=uf_mkp((void*)&uf_sl119);L_1247: pushc(cx,t702);pushc(cx,t703);uf_cur_op="op_match";op_match(cx);
+L_1248: Cell t704=pop(cx);cx->locals[cx->local_base+1]=t704;L_1249: Cell t705=cx->locals[cx->local_base+1];L_1250: L_1251: pushc(cx,t704);pushc(cx,t705);pushi(cx,0LL);uf_cur_op="op_getq";op_getq(cx);
+L_1252: Cell t706=pop(cx);L_1253: L_1254: L_1255: var_trans__zm=t706;pushc(cx,t706);pushc(cx,t706);pushi(cx,0LL);uf_cur_op="op_get";op_get(cx);
+L_1256: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1256,cx->sp>1?cx->sp-1:0);goto L_42;K_1256:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1257: Cell t707=uf_mkp((void*)&uf_sl120);L_1258: pushc(cx,t707);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1258,cx->sp>1?cx->sp-1:0);goto L_42;K_1258:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1259: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1259,cx->sp>0?cx->sp-0:0);goto L_127;K_1259:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1260: L_1261: L_1262: Cell _rv708=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv708);return;}cx->csp--;const void*_r709=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv708);if(!_r709)return;goto *_r709;}
+L_1263: Cell t710=var_trans__ptk;L_1264: pushc(cx,t710);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1264,cx->sp>1?cx->sp-1:0);goto L_42;K_1264:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1265: Cell t711=uf_mkp((void*)&uf_sl121);L_1266: pushc(cx,t711);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1266,cx->sp>1?cx->sp-1:0);goto L_42;K_1266:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1267: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1267,cx->sp>0?cx->sp-0:0);goto L_127;K_1267:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1268: Cell t712=uf_mkp((void*)&uf_sl122);L_1269: L_1270: L_1271: L_1272: var_trans__lasts=t712;var_trans__rr=uf_mki(0LL);pushc(cx,t712);pushi(cx,0LL);L_1273: Cell t713=var_trans__rr;L_1274: Cell _rv714=t713;{if(cx->csp==0){pushc(cx,_rv714);return;}cx->csp--;const void*_r715=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv714);if(!_r715)return;goto *_r715;}
+L_1275: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1275,cx->sp>0?cx->sp-0:0);goto L_127;K_1275:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1276: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1276,cx->sp>0?cx->sp-0:0);goto L_566;K_1276:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1277: Cell t716=uf_mkp((void*)&uf_sl123);L_1278: cx->locals[cx->local_base+0]=t716;L_1279: pushc(cx,t716);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1279,cx->sp>0?cx->sp-0:0);goto L_111;K_1279:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1280: Cell t717=cx->locals[cx->local_base+0];L_1281: pushc(cx,t717);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1281,cx->sp>2?cx->sp-2:0);goto L_97;K_1281:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1282: Cell t718=pop(cx);Cell t719=uf_cnot(t718);L_1283: pushc(cx,t719);pushp(cx,(void*)&&L_144);
+L_1284: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1284,cx->sp>0?cx->sp-0:0);goto *b;K_1284:;}}
+L_1285: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1285,cx->sp>0?cx->sp-0:0);goto L_127;K_1285:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1286: Cell t720=uf_mkp((void*)&uf_sl124);L_1287: L_1288: L_1289: L_1290: var_trans__lasts=t720;var_trans__rr=uf_mki(0LL);pushc(cx,t720);pushi(cx,0LL);L_1291: Cell t721=var_trans__rr;L_1292: Cell _rv722=t721;{if(cx->csp==0){pushc(cx,_rv722);return;}cx->csp--;const void*_r723=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv722);if(!_r723)return;goto *_r723;}
+L_1293: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1293,cx->sp>0?cx->sp-0:0);goto L_127;K_1293:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1294: Cell t724=uf_mkp((void*)&uf_sl125);L_1295: pushc(cx,t724);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1295,cx->sp>1?cx->sp-1:0);goto L_42;K_1295:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1296: Cell t725=uf_mkp((void*)&uf_sl126);L_1297: L_1298: L_1299: L_1300: var_trans__lasts=t725;var_trans__rr=uf_mki(0LL);pushc(cx,t725);pushi(cx,0LL);L_1301: Cell t726=var_trans__rr;L_1302: Cell _rv727=t726;{if(cx->csp==0){pushc(cx,_rv727);return;}cx->csp--;const void*_r728=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv727);if(!_r728)return;goto *_r728;}
+L_1303: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1303,cx->sp>0?cx->sp-0:0);goto L_127;K_1303:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1304: Cell t729=uf_mkp((void*)&uf_sl127);L_1305: cx->locals[cx->local_base+0]=t729;L_1306: pushc(cx,t729);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1306,cx->sp>0?cx->sp-0:0);goto L_111;K_1306:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1307: Cell t730=cx->locals[cx->local_base+0];L_1308: pushc(cx,t730);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1308,cx->sp>2?cx->sp-2:0);goto L_97;K_1308:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1309: Cell t731=pop(cx);Cell t732=uf_cnot(t731);L_1310: pushc(cx,t732);pushp(cx,(void*)&&L_144);
+L_1311: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1311,cx->sp>0?cx->sp-0:0);goto *b;K_1311:;}}
+L_1312: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1312,cx->sp>0?cx->sp-0:0);goto L_127;K_1312:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1313: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1313,cx->sp>0?cx->sp-0:0);goto L_566;K_1313:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1314: Cell t733=uf_mkp((void*)&uf_sl128);L_1315: cx->locals[cx->local_base+0]=t733;L_1316: pushc(cx,t733);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1316,cx->sp>0?cx->sp-0:0);goto L_111;K_1316:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1317: Cell t734=cx->locals[cx->local_base+0];L_1318: pushc(cx,t734);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1318,cx->sp>2?cx->sp-2:0);goto L_97;K_1318:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1319: Cell t735=pop(cx);Cell t736=uf_cnot(t735);L_1320: pushc(cx,t736);pushp(cx,(void*)&&L_144);
+L_1321: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1321,cx->sp>0?cx->sp-0:0);goto *b;K_1321:;}}
+L_1322: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1322,cx->sp>0?cx->sp-0:0);goto L_127;K_1322:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1323: Cell t737=uf_mkp((void*)&uf_sl129);L_1324: pushc(cx,t737);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1324,cx->sp>1?cx->sp-1:0);goto L_42;K_1324:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1325: Cell t738=uf_mkp((void*)&uf_sl130);L_1326: L_1327: L_1328: L_1329: var_trans__lasts=t738;var_trans__rr=uf_mki(0LL);pushc(cx,t738);pushi(cx,0LL);L_1330: Cell t739=var_trans__rr;L_1331: Cell _rv740=t739;{if(cx->csp==0){pushc(cx,_rv740);return;}cx->csp--;const void*_r741=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv740);if(!_r741)return;goto *_r741;}
+L_1332: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1332,cx->sp>0?cx->sp-0:0);goto L_127;K_1332:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1333: Cell t742=uf_mkp((void*)&uf_sl131);L_1334: cx->locals[cx->local_base+0]=t742;L_1335: pushc(cx,t742);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1335,cx->sp>0?cx->sp-0:0);goto L_111;K_1335:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1336: Cell t743=cx->locals[cx->local_base+0];L_1337: pushc(cx,t743);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1337,cx->sp>2?cx->sp-2:0);goto L_97;K_1337:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1338: Cell t744=pop(cx);Cell t745=uf_cnot(t744);L_1339: pushc(cx,t745);pushp(cx,(void*)&&L_144);
+L_1340: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1340,cx->sp>0?cx->sp-0:0);goto *b;K_1340:;}}
+L_1341: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1341,cx->sp>0?cx->sp-0:0);goto L_127;K_1341:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1342: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1342,cx->sp>0?cx->sp-0:0);goto L_566;K_1342:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1343: Cell t746=uf_mkp((void*)&uf_sl132);L_1344: cx->locals[cx->local_base+0]=t746;L_1345: pushc(cx,t746);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1345,cx->sp>0?cx->sp-0:0);goto L_111;K_1345:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1346: Cell t747=cx->locals[cx->local_base+0];L_1347: pushc(cx,t747);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1347,cx->sp>2?cx->sp-2:0);goto L_97;K_1347:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1348: Cell t748=pop(cx);Cell t749=uf_cnot(t748);L_1349: pushc(cx,t749);pushp(cx,(void*)&&L_144);
+L_1350: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1350,cx->sp>0?cx->sp-0:0);goto *b;K_1350:;}}
+L_1351: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1351,cx->sp>0?cx->sp-0:0);goto L_127;K_1351:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1352: Cell t750=uf_mkp((void*)&uf_sl133);L_1353: pushc(cx,t750);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1353,cx->sp>1?cx->sp-1:0);goto L_42;K_1353:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1354: Cell t751=uf_mkp((void*)&uf_sl134);L_1355: L_1356: L_1357: L_1358: var_trans__lasts=t751;var_trans__rr=uf_mki(0LL);pushc(cx,t751);pushi(cx,0LL);L_1359: Cell t752=var_trans__rr;L_1360: Cell _rv753=t752;{if(cx->csp==0){pushc(cx,_rv753);return;}cx->csp--;const void*_r754=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv753);if(!_r754)return;goto *_r754;}
+L_1361: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1361,cx->sp>0?cx->sp-0:0);goto L_127;K_1361:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1362: Cell t755=uf_mkp((void*)&uf_sl135);L_1363: pushc(cx,t755);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1363,cx->sp>1?cx->sp-1:0);goto L_42;K_1363:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1364: Cell t756=uf_mkp((void*)&uf_sl136);L_1365: L_1366: L_1367: L_1368: var_trans__lasts=t756;var_trans__rr=uf_mki(0LL);pushc(cx,t756);pushi(cx,0LL);L_1369: Cell t757=var_trans__rr;L_1370: Cell _rv758=t757;{if(cx->csp==0){pushc(cx,_rv758);return;}cx->csp--;const void*_r759=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv758);if(!_r759)return;goto *_r759;}
+L_1371: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1371,cx->sp>0?cx->sp-0:0);goto L_127;K_1371:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1372: Cell t760=uf_mkp((void*)&uf_sl137);L_1373: pushc(cx,t760);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1373,cx->sp>1?cx->sp-1:0);goto L_42;K_1373:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1374: Cell t761=uf_mkp((void*)&uf_sl138);L_1375: L_1376: L_1377: L_1378: var_trans__lasts=t761;var_trans__rr=uf_mki(0LL);pushc(cx,t761);pushi(cx,0LL);L_1379: Cell t762=var_trans__rr;L_1380: Cell _rv763=t762;{if(cx->csp==0){pushc(cx,_rv763);return;}cx->csp--;const void*_r764=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv763);if(!_r764)return;goto *_r764;}
+L_1381: Cell t765=var_trans__ptk;L_1382: L_1383: L_1384: pushc(cx,t765);pushi(cx,1LL);pushc(cx,var_trans__ptk);uf_cur_op="strlen";{Cell a0=pop(cx);int r=((int(*)(void*))uf_im9)((void*)uf_sptr(a0));pushi(cx,(int64_t)r);}
+L_1385: L_1386: Cell t766=pop(cx);Cell t767=uf_csub(t766,uf_mki(1LL));L_1387: pushc(cx,t767);uf_cur_op="op_slice";op_slice(cx);
+L_1388: Cell t768=pop(cx);L_1389: L_1390: Cell t769=uf_mkp((void*)&uf_sl139);L_1391: var_trans__ci=t768;pushc(cx,t768);pushc(cx,t768);pushc(cx,t769);uf_cur_op="op_starts";op_starts(cx);
+L_1392: pushp(cx,(void*)&&L_1411);
+L_1393: pushp(cx,(void*)&&L_1398);
+L_1394: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1394,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1394,cx->sp>0?cx->sp-0:0);goto *el;}K_1394:;}
+L_1395: L_1396: L_1397: Cell _rv770=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv770);return;}cx->csp--;const void*_r771=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv770);if(!_r771)return;goto *_r771;}
+L_1398: Cell t772=var_trans__ci;L_1399: pushc(cx,t772);uf_cur_op="op_loadx";op_loadx(cx);
+L_1400: L_1401: Cell t773=pop(cx);Cell t774=uf_cand(t773,uf_mki(255LL));L_1402: pushc(cx,t774);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1402,cx->sp>1?cx->sp-1:0);goto L_89;K_1402:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1403: Cell t775=uf_mkp((void*)&uf_sl140);L_1404: pushc(cx,t775);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1404,cx->sp>1?cx->sp-1:0);goto L_42;K_1404:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1405: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1405,cx->sp>0?cx->sp-0:0);goto L_127;K_1405:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1406: L_1407: L_1408: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1409: Cell t776=var_trans__rr;L_1410: Cell _rv777=t776;{if(cx->csp==0){pushc(cx,_rv777);return;}cx->csp--;const void*_r778=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv777);if(!_r778)return;goto *_r778;}
+L_1411: Cell t779=var_trans__ci;L_1412: Cell t780=uf_mkp((void*)&uf_sl141);L_1413: pushc(cx,t779);pushc(cx,t780);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1413,cx->sp>2?cx->sp-2:0);goto L_97;K_1413:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1414: pushp(cx,(void*)&&L_1420);
+L_1415: pushp(cx,(void*)&&L_1430);
+L_1416: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1416,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1416,cx->sp>0?cx->sp-0:0);goto *el;}K_1416:;}
+L_1417: L_1418: L_1419: Cell _rv781=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv781);return;}cx->csp--;const void*_r782=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv781);if(!_r782)return;goto *_r782;}
+L_1420: L_1421: pushi(cx,10LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1421,cx->sp>1?cx->sp-1:0);goto L_89;K_1421:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1422: Cell t783=uf_mkp((void*)&uf_sl142);L_1423: pushc(cx,t783);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1423,cx->sp>1?cx->sp-1:0);goto L_42;K_1423:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1424: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1424,cx->sp>0?cx->sp-0:0);goto L_127;K_1424:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1425: L_1426: L_1427: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1428: Cell t784=var_trans__rr;L_1429: Cell _rv785=t784;{if(cx->csp==0){pushc(cx,_rv785);return;}cx->csp--;const void*_r786=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv785);if(!_r786)return;goto *_r786;}
+L_1430: Cell t787=var_trans__ci;L_1431: Cell t788=uf_mkp((void*)&uf_sl143);L_1432: pushc(cx,t787);pushc(cx,t788);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1432,cx->sp>2?cx->sp-2:0);goto L_97;K_1432:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1433: pushp(cx,(void*)&&L_1439);
+L_1434: pushp(cx,(void*)&&L_1449);
+L_1435: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1435,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1435,cx->sp>0?cx->sp-0:0);goto *el;}K_1435:;}
+L_1436: L_1437: L_1438: Cell _rv789=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv789);return;}cx->csp--;const void*_r790=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv789);if(!_r790)return;goto *_r790;}
+L_1439: L_1440: pushi(cx,9LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1440,cx->sp>1?cx->sp-1:0);goto L_89;K_1440:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1441: Cell t791=uf_mkp((void*)&uf_sl144);L_1442: pushc(cx,t791);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1442,cx->sp>1?cx->sp-1:0);goto L_42;K_1442:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1443: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1443,cx->sp>0?cx->sp-0:0);goto L_127;K_1443:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1444: L_1445: L_1446: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1447: Cell t792=var_trans__rr;L_1448: Cell _rv793=t792;{if(cx->csp==0){pushc(cx,_rv793);return;}cx->csp--;const void*_r794=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv793);if(!_r794)return;goto *_r794;}
+L_1449: Cell t795=var_trans__ci;L_1450: Cell t796=uf_mkp((void*)&uf_sl145);L_1451: pushc(cx,t795);pushc(cx,t796);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1451,cx->sp>2?cx->sp-2:0);goto L_97;K_1451:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1452: pushp(cx,(void*)&&L_1458);
+L_1453: pushp(cx,(void*)&&L_1468);
+L_1454: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1454,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1454,cx->sp>0?cx->sp-0:0);goto *el;}K_1454:;}
+L_1455: L_1456: L_1457: Cell _rv797=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv797);return;}cx->csp--;const void*_r798=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv797);if(!_r798)return;goto *_r798;}
+L_1458: L_1459: pushi(cx,13LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1459,cx->sp>1?cx->sp-1:0);goto L_89;K_1459:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1460: Cell t799=uf_mkp((void*)&uf_sl146);L_1461: pushc(cx,t799);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1461,cx->sp>1?cx->sp-1:0);goto L_42;K_1461:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1462: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1462,cx->sp>0?cx->sp-0:0);goto L_127;K_1462:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1463: L_1464: L_1465: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1466: Cell t800=var_trans__rr;L_1467: Cell _rv801=t800;{if(cx->csp==0){pushc(cx,_rv801);return;}cx->csp--;const void*_r802=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv801);if(!_r802)return;goto *_r802;}
+L_1468: Cell t803=var_trans__ci;L_1469: Cell t804=uf_mkp((void*)&uf_sl147);L_1470: pushc(cx,t803);pushc(cx,t804);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1470,cx->sp>2?cx->sp-2:0);goto L_97;K_1470:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1471: pushp(cx,(void*)&&L_1477);
+L_1472: pushp(cx,(void*)&&L_1487);
+L_1473: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1473,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1473,cx->sp>0?cx->sp-0:0);goto *el;}K_1473:;}
+L_1474: L_1475: L_1476: Cell _rv805=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv805);return;}cx->csp--;const void*_r806=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv805);if(!_r806)return;goto *_r806;}
+L_1477: L_1478: pushi(cx,0LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1478,cx->sp>1?cx->sp-1:0);goto L_89;K_1478:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1479: Cell t807=uf_mkp((void*)&uf_sl148);L_1480: pushc(cx,t807);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1480,cx->sp>1?cx->sp-1:0);goto L_42;K_1480:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1481: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1481,cx->sp>0?cx->sp-0:0);goto L_127;K_1481:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1482: L_1483: L_1484: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1485: Cell t808=var_trans__rr;L_1486: Cell _rv809=t808;{if(cx->csp==0){pushc(cx,_rv809);return;}cx->csp--;const void*_r810=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv809);if(!_r810)return;goto *_r810;}
+L_1487: Cell t811=var_trans__ci;L_1488: Cell t812=uf_mkp((void*)&uf_sl149);L_1489: pushc(cx,t811);pushc(cx,t812);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1489,cx->sp>2?cx->sp-2:0);goto L_97;K_1489:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1490: pushp(cx,(void*)&&L_1496);
+L_1491: pushp(cx,(void*)&&L_1506);
+L_1492: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1492,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1492,cx->sp>0?cx->sp-0:0);goto *el;}K_1492:;}
+L_1493: L_1494: L_1495: Cell _rv813=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv813);return;}cx->csp--;const void*_r814=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv813);if(!_r814)return;goto *_r814;}
+L_1496: L_1497: pushi(cx,92LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1497,cx->sp>1?cx->sp-1:0);goto L_89;K_1497:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1498: Cell t815=uf_mkp((void*)&uf_sl150);L_1499: pushc(cx,t815);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1499,cx->sp>1?cx->sp-1:0);goto L_42;K_1499:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1500: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1500,cx->sp>0?cx->sp-0:0);goto L_127;K_1500:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1501: L_1502: L_1503: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1504: Cell t816=var_trans__rr;L_1505: Cell _rv817=t816;{if(cx->csp==0){pushc(cx,_rv817);return;}cx->csp--;const void*_r818=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv817);if(!_r818)return;goto *_r818;}
+L_1506: Cell t819=var_trans__ci;L_1507: Cell t820=uf_mkp((void*)&uf_sl151);L_1508: pushc(cx,t819);pushc(cx,t820);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1508,cx->sp>2?cx->sp-2:0);goto L_97;K_1508:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1509: pushp(cx,(void*)&&L_1515);
+L_1510: pushp(cx,(void*)&&L_1525);
+L_1511: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1511,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1511,cx->sp>0?cx->sp-0:0);goto *el;}K_1511:;}
+L_1512: L_1513: L_1514: Cell _rv821=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv821);return;}cx->csp--;const void*_r822=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv821);if(!_r822)return;goto *_r822;}
+L_1515: L_1516: pushi(cx,39LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1516,cx->sp>1?cx->sp-1:0);goto L_89;K_1516:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1517: Cell t823=uf_mkp((void*)&uf_sl152);L_1518: pushc(cx,t823);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1518,cx->sp>1?cx->sp-1:0);goto L_42;K_1518:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1519: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1519,cx->sp>0?cx->sp-0:0);goto L_127;K_1519:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1520: L_1521: L_1522: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1523: Cell t824=var_trans__rr;L_1524: Cell _rv825=t824;{if(cx->csp==0){pushc(cx,_rv825);return;}cx->csp--;const void*_r826=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv825);if(!_r826)return;goto *_r826;}
+L_1525: Cell t827=uf_mkp((void*)&uf_sl153);L_1526: pushc(cx,t827);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1526,cx->sp>0?cx->sp-0:0);goto L_107;K_1526:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1527: Cell _rv828=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv828);return;}cx->csp--;const void*_r829=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv828);if(!_r829)return;goto *_r829;}
+L_1528: Cell t830=var_trans__ptk;L_1529: pushc(cx,t830);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1529,cx->sp>1?cx->sp-1:0);goto L_0;K_1529:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1530: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1530,cx->sp>0?cx->sp-0:0);goto L_127;K_1530:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1531: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1531,cx->sp>0?cx->sp-0:0);goto L_127;K_1531:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1532: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_1532,cx->sp>0?cx->sp-0:0);goto L_135;K_1532:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1533: Cell t831=pop(cx);L_1534: L_1535: var_trans__ckl=t831;pushc(cx,t831);pushc(cx,t831);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1535,cx->sp>1?cx->sp-1:0);goto L_22;K_1535:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1536: Cell t832=var_trans__emode;L_1537: pushc(cx,t832);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1537,cx->sp>1?cx->sp-1:0);goto L_22;K_1537:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1538: Cell t833=var_trans__inq;L_1539: pushc(cx,t833);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1539,cx->sp>1?cx->sp-1:0);goto L_22;K_1539:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1540: Cell t834=var_trans__psnaps;L_1541: Cell t835=var_trans__pends;L_1542: pushc(cx,t834);pushc(cx,t835);uf_cur_op="op_push";op_push(cx);
+L_1543: Cell t836=pop(cx);L_1544: Cell t837=uf_mkp((void*)&uf_sl154);L_1545: L_1546: Cell t838=var_trans__douts;L_1547: Cell t839=uf_mkp((void*)&uf_sl155);L_1548: var_trans__psnaps=t836;var_trans__pends=t837;pushc(cx,t836);pushc(cx,t837);pushc(cx,t838);pushc(cx,t839);uf_cur_op="op_push";op_push(cx);
+L_1549: Cell t840=pop(cx);L_1550: L_1551: L_1552: var_trans__douts=t840;var_trans__emode=uf_mki(2LL);pushc(cx,t840);pushi(cx,2LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1552,cx->sp>0?cx->sp-0:0);goto L_111;K_1552:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1553: Cell t841=uf_mkp((void*)&uf_sl156);L_1554: pushc(cx,t841);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1554,cx->sp>2?cx->sp-2:0);goto L_97;K_1554:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1555: pushp(cx,(void*)&&L_1652);
+L_1556: pushp(cx,(void*)&&L_1657);
+L_1557: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1557,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1557,cx->sp>0?cx->sp-0:0);goto *el;}K_1557:;}
+L_1558: Cell t842=uf_mkp((void*)&uf_sl157);L_1559: cx->locals[cx->local_base+0]=t842;L_1560: pushc(cx,t842);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1560,cx->sp>0?cx->sp-0:0);goto L_111;K_1560:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1561: Cell t843=cx->locals[cx->local_base+0];L_1562: pushc(cx,t843);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1562,cx->sp>2?cx->sp-2:0);goto L_97;K_1562:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1563: Cell t844=pop(cx);Cell t845=uf_cnot(t844);L_1564: pushc(cx,t845);pushp(cx,(void*)&&L_144);
+L_1565: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1565,cx->sp>0?cx->sp-0:0);goto *b;K_1565:;}}
+L_1566: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1566,cx->sp>0?cx->sp-0:0);goto L_127;K_1566:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1567: Cell t846=var_trans__douts;L_1568: pushc(cx,t846);uf_cur_op="op_lpop";op_lpop(cx);
+L_1569: Cell t847=pop(cx);L_1570: Cell t848=var_trans__psnaps;L_1571: var_trans__ckargs=t847;pushc(cx,t847);pushc(cx,t848);uf_cur_op="op_lpop";op_lpop(cx);
+L_1572: Cell t849=pop(cx);L_1573: L_1574: Cell t850=var_trans__pends;L_1575: var_trans__cksv=t849;pushc(cx,t849);pushc(cx,t849);pushc(cx,t850);uf_cur_op="op_cat";op_cat(cx);
+L_1576: Cell t851=pop(cx);L_1577: var_trans__pends=t851;pushc(cx,t851);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1577,cx->sp>0?cx->sp-0:0);goto L_30;K_1577:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1578: Cell t852=pop(cx);L_1579: var_trans__inq=t852;pushc(cx,t852);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1579,cx->sp>0?cx->sp-0:0);goto L_30;K_1579:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1580: Cell t853=pop(cx);L_1581: var_trans__emode=t853;pushc(cx,t853);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1581,cx->sp>0?cx->sp-0:0);goto L_30;K_1581:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1582: Cell t854=pop(cx);L_1583: L_1584: Cell t855=uf_mkp((void*)&uf_sl158);L_1585: var_trans__ckl=t854;pushc(cx,t854);pushc(cx,t854);pushc(cx,t855);uf_cur_op="op_fmt";op_fmt(cx);
+L_1586: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1586,cx->sp>1?cx->sp-1:0);goto L_42;K_1586:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1587: Cell t856=uf_mkp((void*)&uf_sl159);L_1588: L_1589: Cell t857=uf_mkp((void*)&uf_sl160);L_1590: L_1591: Cell t858=var_trans__pparams;L_1592: var_trans__svpre=t856;var_trans__svpost=t857;pushc(cx,t856);pushc(cx,t857);pushc(cx,t858);uf_cur_op="op_len";op_len(cx);
+L_1593: Cell t859=pop(cx);L_1594: L_1595: L_1596: var_trans__pni=t859;pushc(cx,t859);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_1596;cx->loops[fr].end=&&K_WE_1596;long _sp0=cx->sp;
+K_WC_1596:;{Cell _wc;{
+WC1596_L1616: Cell t0=var_trans__pni;WC1596_L1617: WC1596_L1618: Cell t1=uf_cgt(t0,uf_mki(0LL));WC1596_L1619: WC1596_L1620: var_trans__rr=t1;pushc(cx,t1);WC1596_L1621: Cell t2=var_trans__rr;pushc(cx,t2);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_1596;
 {
-WB1560_L1571: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB1560_1571,cx->sp>0?cx->sp-0:0);goto L_127;K_WB1560_1571:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB1560_L1572: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB1560_1572,cx->sp>0?cx->sp-0:0);goto L_566;K_WB1560_1572:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB1560_L1573: WB1560_L1574: WB1560_L1575: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB1560_L1576: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_1560;}
-K_WE_1560:;cx->lsp=fr;}
-L_1561: L_1562: L_1563: Cell _rv841=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv841);return;}cx->csp--;const void*_r842=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv841);if(!_r842)return;goto *_r842;}
-L_1564: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1564,cx->sp>0?cx->sp-0:0);goto L_111;K_1564:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1565: Cell t843=uf_mkp((void*)&uf_sl158);L_1566: pushc(cx,t843);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1566,cx->sp>2?cx->sp-2:0);goto L_97;K_1566:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1567: Cell t844=pop(cx);L_1568: var_trans__rr=t844;pushc(cx,t844);L_1569: Cell t845=var_trans__rr;L_1570: Cell _rv846=t845;{if(cx->csp==0){pushc(cx,_rv846);return;}cx->csp--;const void*_r847=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv846);if(!_r847)return;goto *_r847;}
-L_1571: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1571,cx->sp>0?cx->sp-0:0);goto L_127;K_1571:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1572: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1572,cx->sp>0?cx->sp-0:0);goto L_566;K_1572:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1573: L_1574: L_1575: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1576: Cell t848=var_trans__rr;L_1577: Cell _rv849=t848;{if(cx->csp==0){pushc(cx,_rv849);return;}cx->csp--;const void*_r850=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv849);if(!_r850)return;goto *_r850;}
-L_1578: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1578,cx->sp>0?cx->sp-0:0);goto L_118;K_1578:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1579: Cell t851=uf_mkp((void*)&uf_sl159);L_1580: pushc(cx,t851);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1580,cx->sp>2?cx->sp-2:0);goto L_97;K_1580:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1581: pushp(cx,(void*)&&L_1587);
-L_1582: pushp(cx,(void*)&&L_1618);
-L_1583: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1583,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1583,cx->sp>0?cx->sp-0:0);goto *el;}K_1583:;}
-L_1584: L_1585: L_1586: Cell _rv852=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv852);return;}cx->csp--;const void*_r853=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv852);if(!_r853)return;goto *_r853;}
-L_1587: Cell t854=var_trans__vars;L_1588: Cell t855=var_trans__ptk;L_1589: pushc(cx,t854);pushc(cx,t855);uf_cur_op="op_getq";op_getq(cx);
-L_1590: Cell t856=pop(cx);L_1591: L_1592: Cell t857=uf_cnot(t856);L_1593: var_trans__lv=t856;pushc(cx,t856);pushc(cx,t857);pushp(cx,(void*)&&L_1635);
-L_1594: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1594,cx->sp>0?cx->sp-0:0);goto *b;K_1594:;}}
-L_1595: Cell t858=var_trans__lv;L_1596: pushc(cx,t858);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1596,cx->sp>1?cx->sp-1:0);goto L_0;K_1596:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1597: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1597,cx->sp>0?cx->sp-0:0);goto L_127;K_1597:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1598: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1598,cx->sp>0?cx->sp-0:0);goto L_127;K_1598:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1599: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1599,cx->sp>0?cx->sp-0:0);goto L_566;K_1599:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1600: Cell t859=uf_mkp((void*)&uf_sl160);L_1601: cx->locals[cx->local_base+0]=t859;L_1602: pushc(cx,t859);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1602,cx->sp>0?cx->sp-0:0);goto L_111;K_1602:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1603: Cell t860=cx->locals[cx->local_base+0];L_1604: pushc(cx,t860);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1604,cx->sp>2?cx->sp-2:0);goto L_97;K_1604:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1605: Cell t861=pop(cx);Cell t862=uf_cnot(t861);L_1606: pushc(cx,t862);pushp(cx,(void*)&&L_144);
-L_1607: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1607,cx->sp>0?cx->sp-0:0);goto *b;K_1607:;}}
-L_1608: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1608,cx->sp>0?cx->sp-0:0);goto L_127;K_1608:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1609: L_1610: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1610,cx->sp>0?cx->sp-0:0);goto L_36;K_1610:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1611: Cell t863=uf_mkp((void*)&uf_sl161);L_1612: pushc(cx,t863);uf_cur_op="op_fmt";op_fmt(cx);
-L_1613: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1613,cx->sp>1?cx->sp-1:0);goto L_42;K_1613:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1614: Cell t864=uf_mkp((void*)&uf_sl162);L_1615: L_1616: L_1617: var_trans__lasts=t864;pushc(cx,t864);pushi(cx,0LL);Cell _rv865=uf_list_build(cx,2);{if(cx->csp==0){pushc(cx,_rv865);return;}cx->csp--;const void*_r866=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv865);if(!_r866)return;goto *_r866;}
-L_1618: Cell t867=var_trans__vars;L_1619: Cell t868=var_trans__ptk;L_1620: pushc(cx,t867);pushc(cx,t868);uf_cur_op="op_getq";op_getq(cx);
-L_1621: Cell t869=pop(cx);L_1622: L_1623: Cell t870=uf_cnot(t869);L_1624: var_trans__lv=t869;pushc(cx,t869);pushc(cx,t870);pushp(cx,(void*)&&L_1638);
-L_1625: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1625,cx->sp>0?cx->sp-0:0);goto *b;K_1625:;}}
-L_1626: Cell t871=var_trans__lv;L_1627: L_1628: Cell t872=uf_mkp((void*)&uf_sl163);L_1629: var_trans__lasts=t871;pushc(cx,t871);pushc(cx,t872);uf_cur_op="op_fmt";op_fmt(cx);
-L_1630: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1630,cx->sp>1?cx->sp-1:0);goto L_42;K_1630:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1631: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1631,cx->sp>0?cx->sp-0:0);goto L_127;K_1631:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1632: L_1633: L_1634: Cell _rv873=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv873);return;}cx->csp--;const void*_r874=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv873);if(!_r874)return;goto *_r874;}
-L_1635: Cell t875=uf_mkp((void*)&uf_sl164);L_1636: pushc(cx,t875);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1636,cx->sp>0?cx->sp-0:0);goto L_107;K_1636:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1637: Cell _rv876=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv876);return;}cx->csp--;const void*_r877=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv876);if(!_r877)return;goto *_r877;}
-L_1638: Cell t878=uf_mkp((void*)&uf_sl165);L_1639: Cell t879=var_trans__ptk;L_1640: pushc(cx,t878);pushc(cx,t879);uf_cur_op="op_cat";op_cat(cx);
-L_1641: Cell t880=uf_mkp((void*)&uf_sl166);L_1642: pushc(cx,t880);uf_cur_op="op_cat";op_cat(cx);
-L_1643: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1643,cx->sp>0?cx->sp-0:0);goto L_107;K_1643:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1644: Cell _rv881=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv881);return;}cx->csp--;const void*_r882=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv881);if(!_r882)return;goto *_r882;}
-L_1645: L_1646: L_1647: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1647,cx->sp>0?cx->sp-0:0);goto L_111;K_1647:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1648: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1648,cx->sp>1?cx->sp-1:0);goto L_155;K_1648:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1649: pushp(cx,(void*)&&L_1734);
-L_1650: pushp(cx,(void*)&&L_1653);
-L_1651: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1651,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1651,cx->sp>0?cx->sp-0:0);goto *el;}K_1651:;}
-L_1652: Cell _rv883=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv883);return;}cx->csp--;const void*_r884=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv883);if(!_r884)return;goto *_r884;}
-L_1653: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1653,cx->sp>0?cx->sp-0:0);goto L_111;K_1653:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1654: Cell t885=uf_mkp((void*)&uf_sl167);L_1655: pushc(cx,t885);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1655,cx->sp>2?cx->sp-2:0);goto L_97;K_1655:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1656: pushp(cx,(void*)&&L_1796);
-L_1657: pushp(cx,(void*)&&L_1662);
-L_1658: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1658,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1658,cx->sp>0?cx->sp-0:0);goto *el;}K_1658:;}
-L_1659: L_1660: L_1661: Cell _rv886=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv886);return;}cx->csp--;const void*_r887=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv886);if(!_r887)return;goto *_r887;}
-L_1662: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1662,cx->sp>0?cx->sp-0:0);goto L_111;K_1662:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1663: Cell t888=uf_mkp((void*)&uf_sl168);L_1664: pushc(cx,t888);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1664,cx->sp>2?cx->sp-2:0);goto L_97;K_1664:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1665: pushp(cx,(void*)&&L_1940);
-L_1666: pushp(cx,(void*)&&L_1671);
-L_1667: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1667,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1667,cx->sp>0?cx->sp-0:0);goto *el;}K_1667:;}
-L_1668: L_1669: L_1670: Cell _rv889=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv889);return;}cx->csp--;const void*_r890=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv889);if(!_r890)return;goto *_r890;}
-L_1671: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1671,cx->sp>0?cx->sp-0:0);goto L_111;K_1671:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1672: Cell t891=uf_mkp((void*)&uf_sl169);L_1673: pushc(cx,t891);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1673,cx->sp>2?cx->sp-2:0);goto L_97;K_1673:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1674: pushp(cx,(void*)&&L_2073);
-L_1675: pushp(cx,(void*)&&L_1680);
-L_1676: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1676,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1676,cx->sp>0?cx->sp-0:0);goto *el;}K_1676:;}
-L_1677: L_1678: L_1679: Cell _rv892=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv892);return;}cx->csp--;const void*_r893=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv892);if(!_r893)return;goto *_r893;}
-L_1680: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1680,cx->sp>0?cx->sp-0:0);goto L_111;K_1680:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1681: Cell t894=uf_mkp((void*)&uf_sl170);L_1682: pushc(cx,t894);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1682,cx->sp>2?cx->sp-2:0);goto L_97;K_1682:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1683: pushp(cx,(void*)&&L_2166);
-L_1684: pushp(cx,(void*)&&L_1689);
-L_1685: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1685,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1685,cx->sp>0?cx->sp-0:0);goto *el;}K_1685:;}
-L_1686: L_1687: L_1688: Cell _rv895=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv895);return;}cx->csp--;const void*_r896=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv895);if(!_r896)return;goto *_r896;}
-L_1689: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1689,cx->sp>0?cx->sp-0:0);goto L_111;K_1689:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1690: Cell t897=uf_mkp((void*)&uf_sl171);L_1691: pushc(cx,t897);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1691,cx->sp>2?cx->sp-2:0);goto L_97;K_1691:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1692: pushp(cx,(void*)&&L_2454);
-L_1693: pushp(cx,(void*)&&L_1698);
-L_1694: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1694,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1694,cx->sp>0?cx->sp-0:0);goto *el;}K_1694:;}
-L_1695: L_1696: L_1697: Cell _rv898=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv898);return;}cx->csp--;const void*_r899=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv898);if(!_r899)return;goto *_r899;}
-L_1698: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1698,cx->sp>0?cx->sp-0:0);goto L_111;K_1698:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1699: Cell t900=uf_mkp((void*)&uf_sl172);L_1700: pushc(cx,t900);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1700,cx->sp>2?cx->sp-2:0);goto L_97;K_1700:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1701: pushp(cx,(void*)&&L_2704);
-L_1702: pushp(cx,(void*)&&L_1707);
-L_1703: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1703,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1703,cx->sp>0?cx->sp-0:0);goto *el;}K_1703:;}
-L_1704: L_1705: L_1706: Cell _rv901=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv901);return;}cx->csp--;const void*_r902=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv901);if(!_r902)return;goto *_r902;}
-L_1707: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1707,cx->sp>0?cx->sp-0:0);goto L_111;K_1707:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1708: Cell t903=uf_mkp((void*)&uf_sl173);L_1709: pushc(cx,t903);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1709,cx->sp>2?cx->sp-2:0);goto L_97;K_1709:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1710: pushp(cx,(void*)&&L_2721);
-L_1711: pushp(cx,(void*)&&L_1716);
-L_1712: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1712,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1712,cx->sp>0?cx->sp-0:0);goto *el;}K_1712:;}
-L_1713: L_1714: L_1715: Cell _rv904=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv904);return;}cx->csp--;const void*_r905=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv904);if(!_r905)return;goto *_r905;}
-L_1716: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1716,cx->sp>0?cx->sp-0:0);goto L_111;K_1716:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1717: Cell t906=uf_mkp((void*)&uf_sl174);L_1718: pushc(cx,t906);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1718,cx->sp>2?cx->sp-2:0);goto L_97;K_1718:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1719: pushp(cx,(void*)&&L_2738);
-L_1720: pushp(cx,(void*)&&L_1725);
-L_1721: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1721,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1721,cx->sp>0?cx->sp-0:0);goto *el;}K_1721:;}
-L_1722: L_1723: L_1724: Cell _rv907=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv907);return;}cx->csp--;const void*_r908=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv907);if(!_r908)return;goto *_r908;}
-L_1725: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1725,cx->sp>0?cx->sp-0:0);goto L_111;K_1725:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1726: Cell t909=uf_mkp((void*)&uf_sl175);L_1727: pushc(cx,t909);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1727,cx->sp>2?cx->sp-2:0);goto L_97;K_1727:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1728: pushp(cx,(void*)&&L_2760);
-L_1729: pushp(cx,(void*)&&L_2766);
-L_1730: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1730,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1730,cx->sp>0?cx->sp-0:0);goto *el;}K_1730:;}
-L_1731: L_1732: L_1733: Cell _rv910=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv910);return;}cx->csp--;const void*_r911=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv910);if(!_r911)return;goto *_r911;}
-L_1734: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1734,cx->sp>0?cx->sp-0:0);goto L_195;K_1734:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1735: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1735,cx->sp>0?cx->sp-0:0);goto L_1765;K_1735:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1736: L_1737: L_1738: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_1738;cx->loops[fr].end=&&K_WE_1738;long _sp0=cx->sp;
-K_WC_1738:;{Cell _wc;{
-WC1738_L1751: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC1738_1751,cx->sp>0?cx->sp-0:0);goto L_111;K_WC1738_1751:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC1738_L1752: Cell t0=uf_mkp((void*)&uf_sl177);WC1738_L1753: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC1738_1753,cx->sp>2?cx->sp-2:0);goto L_97;K_WC1738_1753:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC1738_L1754: Cell t1=pop(cx);WC1738_L1755: var_trans__rr=t1;pushc(cx,t1);WC1738_L1756: Cell t2=var_trans__rr;pushc(cx,t2);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_1738;
+WB1596_L1623: Cell t0=var_trans__pni;WB1596_L1624: WB1596_L1625: Cell t1=uf_csub(t0,uf_mki(1LL));WB1596_L1626: WB1596_L1627: Cell t2=var_trans__pparams;WB1596_L1628: WB1596_L1629: var_trans__pni=t1;pushc(cx,t1);pushc(cx,t2);pushc(cx,t1);uf_cur_op="op_get";op_get(cx);
+WB1596_L1630: Cell t3=pop(cx);WB1596_L1631: Cell t4=var_trans__svpre;WB1596_L1632: Cell t5=uf_mkp((void*)&uf_sl163);WB1596_L1633: var_trans__psl=t3;pushc(cx,t3);pushc(cx,t4);pushc(cx,t5);uf_cur_op="op_cat";op_cat(cx);
+WB1596_L1634: Cell t6=var_trans__psl;WB1596_L1635: pushc(cx,t6);uf_cur_op="op_cat";op_cat(cx);
+WB1596_L1636: Cell t7=uf_mkp((void*)&uf_sl164);WB1596_L1637: pushc(cx,t7);uf_cur_op="op_cat";op_cat(cx);
+WB1596_L1638: Cell t8=pop(cx);WB1596_L1639: Cell t9=uf_mkp((void*)&uf_sl165);WB1596_L1640: Cell t10=uf_mkp((void*)&uf_sl166);WB1596_L1641: var_trans__svpre=t8;pushc(cx,t8);pushc(cx,t9);pushc(cx,t10);uf_cur_op="op_cat";op_cat(cx);
+WB1596_L1642: Cell t11=var_trans__psl;WB1596_L1643: pushc(cx,t11);uf_cur_op="op_cat";op_cat(cx);
+WB1596_L1644: Cell t12=uf_mkp((void*)&uf_sl167);WB1596_L1645: pushc(cx,t12);uf_cur_op="op_cat";op_cat(cx);
+WB1596_L1646: Cell t13=var_trans__svpost;WB1596_L1647: pushc(cx,t13);uf_cur_op="op_cat";op_cat(cx);
+WB1596_L1648: Cell t14=pop(cx);WB1596_L1649: var_trans__svpost=t14;}cx->sp=_sp0;goto K_WC_1596;}
+K_WE_1596:;cx->lsp=fr;}
+L_1597: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1597,cx->sp>0?cx->sp-0:0);goto L_36;K_1597:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1598: Cell t860=pop(cx);L_1599: Cell t861=var_trans__flabels;L_1600: Cell t862=var_trans__ckl;L_1601: Cell t863=var_trans__svpre;L_1602: Cell t864=var_trans__ckargs;L_1603: L_1604: Cell t865=var_trans__svpost;L_1605: Cell t866=uf_mkp((void*)&uf_sl161);L_1606: var_trans__ckfn=t860;pushc(cx,t860);pushc(cx,t861);pushc(cx,t862);pushc(cx,t863);pushc(cx,t864);pushc(cx,t860);pushc(cx,t865);pushc(cx,t866);uf_cur_op="op_fmt";op_fmt(cx);
+L_1607: uf_cur_op="op_cat";op_cat(cx);
+L_1608: Cell t867=pop(cx);L_1609: Cell t868=uf_mkp((void*)&uf_sl162);L_1610: L_1611: L_1612: L_1613: var_trans__flabels=t867;var_trans__lasts=t868;var_trans__rr=uf_mki(0LL);pushc(cx,t867);pushc(cx,t868);pushi(cx,0LL);L_1614: Cell t869=var_trans__rr;L_1615: Cell _rv870=t869;{if(cx->csp==0){pushc(cx,_rv870);return;}cx->csp--;const void*_r871=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv870);if(!_r871)return;goto *_r871;}
+L_1616: Cell t872=var_trans__pni;L_1617: L_1618: Cell t873=uf_cgt(t872,uf_mki(0LL));L_1619: L_1620: var_trans__rr=t873;pushc(cx,t873);L_1621: Cell t874=var_trans__rr;L_1622: Cell _rv875=t874;{if(cx->csp==0){pushc(cx,_rv875);return;}cx->csp--;const void*_r876=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv875);if(!_r876)return;goto *_r876;}
+L_1623: Cell t877=var_trans__pni;L_1624: L_1625: Cell t878=uf_csub(t877,uf_mki(1LL));L_1626: L_1627: Cell t879=var_trans__pparams;L_1628: L_1629: var_trans__pni=t878;pushc(cx,t878);pushc(cx,t879);pushc(cx,t878);uf_cur_op="op_get";op_get(cx);
+L_1630: Cell t880=pop(cx);L_1631: Cell t881=var_trans__svpre;L_1632: Cell t882=uf_mkp((void*)&uf_sl163);L_1633: var_trans__psl=t880;pushc(cx,t880);pushc(cx,t881);pushc(cx,t882);uf_cur_op="op_cat";op_cat(cx);
+L_1634: Cell t883=var_trans__psl;L_1635: pushc(cx,t883);uf_cur_op="op_cat";op_cat(cx);
+L_1636: Cell t884=uf_mkp((void*)&uf_sl164);L_1637: pushc(cx,t884);uf_cur_op="op_cat";op_cat(cx);
+L_1638: Cell t885=pop(cx);L_1639: Cell t886=uf_mkp((void*)&uf_sl165);L_1640: Cell t887=uf_mkp((void*)&uf_sl166);L_1641: var_trans__svpre=t885;pushc(cx,t885);pushc(cx,t886);pushc(cx,t887);uf_cur_op="op_cat";op_cat(cx);
+L_1642: Cell t888=var_trans__psl;L_1643: pushc(cx,t888);uf_cur_op="op_cat";op_cat(cx);
+L_1644: Cell t889=uf_mkp((void*)&uf_sl167);L_1645: pushc(cx,t889);uf_cur_op="op_cat";op_cat(cx);
+L_1646: Cell t890=var_trans__svpost;L_1647: pushc(cx,t890);uf_cur_op="op_cat";op_cat(cx);
+L_1648: Cell t891=pop(cx);L_1649: var_trans__svpost=t891;pushc(cx,t891);L_1650: L_1651: Cell _rv892=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv892);return;}cx->csp--;const void*_r893=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv892);if(!_r893)return;goto *_r893;}
+L_1652: L_1653: L_1654: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1655: Cell t894=var_trans__rr;L_1656: Cell _rv895=t894;{if(cx->csp==0){pushc(cx,_rv895);return;}cx->csp--;const void*_r896=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv895);if(!_r896)return;goto *_r896;}
+L_1657: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1657,cx->sp>0?cx->sp-0:0);goto L_566;K_1657:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1658: L_1659: L_1660: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_1660;cx->loops[fr].end=&&K_WE_1660;long _sp0=cx->sp;
+K_WC_1660:;{Cell _wc;{
+WC1660_L1664: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC1660_1664,cx->sp>0?cx->sp-0:0);goto L_111;K_WC1660_1664:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC1660_L1665: Cell t0=uf_mkp((void*)&uf_sl168);WC1660_L1666: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC1660_1666,cx->sp>2?cx->sp-2:0);goto L_97;K_WC1660_1666:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC1660_L1667: Cell t1=pop(cx);WC1660_L1668: var_trans__rr=t1;pushc(cx,t1);WC1660_L1669: Cell t2=var_trans__rr;pushc(cx,t2);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_1660;
 {
-WB1738_L1758: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB1738_1758,cx->sp>0?cx->sp-0:0);goto L_127;K_WB1738_1758:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB1738_L1759: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB1738_1759,cx->sp>0?cx->sp-0:0);goto L_1765;K_WB1738_1759:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB1738_L1760: WB1738_L1761: WB1738_L1762: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB1738_L1763: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_1738;}
-K_WE_1738:;cx->lsp=fr;}
-L_1739: L_1740: Cell t912=uf_mkp((void*)&uf_sl176);L_1741: cx->locals[cx->local_base+0]=t912;L_1742: pushc(cx,t912);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1742,cx->sp>0?cx->sp-0:0);goto L_111;K_1742:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1743: Cell t913=cx->locals[cx->local_base+0];L_1744: pushc(cx,t913);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1744,cx->sp>2?cx->sp-2:0);goto L_97;K_1744:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1745: Cell t914=pop(cx);Cell t915=uf_cnot(t914);L_1746: pushc(cx,t915);pushp(cx,(void*)&&L_144);
-L_1747: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1747,cx->sp>0?cx->sp-0:0);goto *b;K_1747:;}}
-L_1748: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1748,cx->sp>0?cx->sp-0:0);goto L_127;K_1748:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1749: L_1750: Cell _rv916=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv916);return;}cx->csp--;const void*_r917=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv916);if(!_r917)return;goto *_r917;}
-L_1751: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1751,cx->sp>0?cx->sp-0:0);goto L_111;K_1751:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1752: Cell t918=uf_mkp((void*)&uf_sl177);L_1753: pushc(cx,t918);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1753,cx->sp>2?cx->sp-2:0);goto L_97;K_1753:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1754: Cell t919=pop(cx);L_1755: var_trans__rr=t919;pushc(cx,t919);L_1756: Cell t920=var_trans__rr;L_1757: Cell _rv921=t920;{if(cx->csp==0){pushc(cx,_rv921);return;}cx->csp--;const void*_r922=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv921);if(!_r922)return;goto *_r922;}
-L_1758: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1758,cx->sp>0?cx->sp-0:0);goto L_127;K_1758:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1759: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1759,cx->sp>0?cx->sp-0:0);goto L_1765;K_1759:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1760: L_1761: L_1762: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1763: Cell t923=var_trans__rr;L_1764: Cell _rv924=t923;{if(cx->csp==0){pushc(cx,_rv924);return;}cx->csp--;const void*_r925=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv924);if(!_r925)return;goto *_r925;}
-L_1765: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1765,cx->sp>0?cx->sp-0:0);goto L_111;K_1765:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1766: Cell t926=pop(cx);L_1767: var_trans__nv=t926;pushc(cx,t926);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1767,cx->sp>0?cx->sp-0:0);goto L_127;K_1767:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1768: Cell t927=var_trans__nv;L_1769: pushc(cx,t927);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1769,cx->sp>1?cx->sp-1:0);goto L_215;K_1769:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1770: Cell t928=pop(cx);L_1771: var_trans__slot=t928;pushc(cx,t928);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1771,cx->sp>0?cx->sp-0:0);goto L_111;K_1771:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1772: Cell t929=uf_mkp((void*)&uf_sl178);L_1773: pushc(cx,t929);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1773,cx->sp>2?cx->sp-2:0);goto L_97;K_1773:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1774: pushp(cx,(void*)&&L_1778);
-L_1775: pushp(cx,(void*)&&L_1791);
+WB1660_L1671: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB1660_1671,cx->sp>0?cx->sp-0:0);goto L_127;K_WB1660_1671:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB1660_L1672: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB1660_1672,cx->sp>0?cx->sp-0:0);goto L_566;K_WB1660_1672:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB1660_L1673: WB1660_L1674: WB1660_L1675: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB1660_L1676: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_1660;}
+K_WE_1660:;cx->lsp=fr;}
+L_1661: L_1662: L_1663: Cell _rv897=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv897);return;}cx->csp--;const void*_r898=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv897);if(!_r898)return;goto *_r898;}
+L_1664: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1664,cx->sp>0?cx->sp-0:0);goto L_111;K_1664:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1665: Cell t899=uf_mkp((void*)&uf_sl168);L_1666: pushc(cx,t899);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1666,cx->sp>2?cx->sp-2:0);goto L_97;K_1666:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1667: Cell t900=pop(cx);L_1668: var_trans__rr=t900;pushc(cx,t900);L_1669: Cell t901=var_trans__rr;L_1670: Cell _rv902=t901;{if(cx->csp==0){pushc(cx,_rv902);return;}cx->csp--;const void*_r903=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv902);if(!_r903)return;goto *_r903;}
+L_1671: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1671,cx->sp>0?cx->sp-0:0);goto L_127;K_1671:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1672: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1672,cx->sp>0?cx->sp-0:0);goto L_566;K_1672:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1673: L_1674: L_1675: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1676: Cell t904=var_trans__rr;L_1677: Cell _rv905=t904;{if(cx->csp==0){pushc(cx,_rv905);return;}cx->csp--;const void*_r906=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv905);if(!_r906)return;goto *_r906;}
+L_1678: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1678,cx->sp>0?cx->sp-0:0);goto L_118;K_1678:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1679: Cell t907=uf_mkp((void*)&uf_sl169);L_1680: pushc(cx,t907);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1680,cx->sp>2?cx->sp-2:0);goto L_97;K_1680:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1681: pushp(cx,(void*)&&L_1687);
+L_1682: pushp(cx,(void*)&&L_1718);
+L_1683: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1683,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1683,cx->sp>0?cx->sp-0:0);goto *el;}K_1683:;}
+L_1684: L_1685: L_1686: Cell _rv908=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv908);return;}cx->csp--;const void*_r909=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv908);if(!_r909)return;goto *_r909;}
+L_1687: Cell t910=var_trans__vars;L_1688: Cell t911=var_trans__ptk;L_1689: pushc(cx,t910);pushc(cx,t911);uf_cur_op="op_getq";op_getq(cx);
+L_1690: Cell t912=pop(cx);L_1691: L_1692: Cell t913=uf_cnot(t912);L_1693: var_trans__lv=t912;pushc(cx,t912);pushc(cx,t913);pushp(cx,(void*)&&L_1735);
+L_1694: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1694,cx->sp>0?cx->sp-0:0);goto *b;K_1694:;}}
+L_1695: Cell t914=var_trans__lv;L_1696: pushc(cx,t914);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1696,cx->sp>1?cx->sp-1:0);goto L_0;K_1696:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1697: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1697,cx->sp>0?cx->sp-0:0);goto L_127;K_1697:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1698: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1698,cx->sp>0?cx->sp-0:0);goto L_127;K_1698:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1699: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1699,cx->sp>0?cx->sp-0:0);goto L_566;K_1699:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1700: Cell t915=uf_mkp((void*)&uf_sl170);L_1701: cx->locals[cx->local_base+0]=t915;L_1702: pushc(cx,t915);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1702,cx->sp>0?cx->sp-0:0);goto L_111;K_1702:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1703: Cell t916=cx->locals[cx->local_base+0];L_1704: pushc(cx,t916);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1704,cx->sp>2?cx->sp-2:0);goto L_97;K_1704:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1705: Cell t917=pop(cx);Cell t918=uf_cnot(t917);L_1706: pushc(cx,t918);pushp(cx,(void*)&&L_144);
+L_1707: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1707,cx->sp>0?cx->sp-0:0);goto *b;K_1707:;}}
+L_1708: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1708,cx->sp>0?cx->sp-0:0);goto L_127;K_1708:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1709: L_1710: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1710,cx->sp>0?cx->sp-0:0);goto L_36;K_1710:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1711: Cell t919=uf_mkp((void*)&uf_sl171);L_1712: pushc(cx,t919);uf_cur_op="op_fmt";op_fmt(cx);
+L_1713: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1713,cx->sp>1?cx->sp-1:0);goto L_42;K_1713:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1714: Cell t920=uf_mkp((void*)&uf_sl172);L_1715: L_1716: L_1717: var_trans__lasts=t920;pushc(cx,t920);pushi(cx,0LL);Cell _rv921=uf_list_build(cx,2);{if(cx->csp==0){pushc(cx,_rv921);return;}cx->csp--;const void*_r922=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv921);if(!_r922)return;goto *_r922;}
+L_1718: Cell t923=var_trans__vars;L_1719: Cell t924=var_trans__ptk;L_1720: pushc(cx,t923);pushc(cx,t924);uf_cur_op="op_getq";op_getq(cx);
+L_1721: Cell t925=pop(cx);L_1722: L_1723: Cell t926=uf_cnot(t925);L_1724: var_trans__lv=t925;pushc(cx,t925);pushc(cx,t926);pushp(cx,(void*)&&L_1738);
+L_1725: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1725,cx->sp>0?cx->sp-0:0);goto *b;K_1725:;}}
+L_1726: Cell t927=var_trans__lv;L_1727: L_1728: Cell t928=uf_mkp((void*)&uf_sl173);L_1729: var_trans__lasts=t927;pushc(cx,t927);pushc(cx,t928);uf_cur_op="op_fmt";op_fmt(cx);
+L_1730: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1730,cx->sp>1?cx->sp-1:0);goto L_42;K_1730:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1731: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1731,cx->sp>0?cx->sp-0:0);goto L_127;K_1731:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1732: L_1733: L_1734: Cell _rv929=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv929);return;}cx->csp--;const void*_r930=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv929);if(!_r930)return;goto *_r930;}
+L_1735: Cell t931=uf_mkp((void*)&uf_sl174);L_1736: pushc(cx,t931);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1736,cx->sp>0?cx->sp-0:0);goto L_107;K_1736:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1737: Cell _rv932=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv932);return;}cx->csp--;const void*_r933=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv932);if(!_r933)return;goto *_r933;}
+L_1738: Cell t934=uf_mkp((void*)&uf_sl175);L_1739: Cell t935=var_trans__ptk;L_1740: pushc(cx,t934);pushc(cx,t935);uf_cur_op="op_cat";op_cat(cx);
+L_1741: Cell t936=uf_mkp((void*)&uf_sl176);L_1742: pushc(cx,t936);uf_cur_op="op_cat";op_cat(cx);
+L_1743: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1743,cx->sp>0?cx->sp-0:0);goto L_107;K_1743:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1744: Cell _rv937=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv937);return;}cx->csp--;const void*_r938=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv937);if(!_r938)return;goto *_r938;}
+L_1745: L_1746: L_1747: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1747,cx->sp>0?cx->sp-0:0);goto L_111;K_1747:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1748: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1748,cx->sp>1?cx->sp-1:0);goto L_155;K_1748:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1749: pushp(cx,(void*)&&L_1834);
+L_1750: pushp(cx,(void*)&&L_1753);
+L_1751: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1751,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1751,cx->sp>0?cx->sp-0:0);goto *el;}K_1751:;}
+L_1752: Cell _rv939=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv939);return;}cx->csp--;const void*_r940=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv939);if(!_r940)return;goto *_r940;}
+L_1753: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1753,cx->sp>0?cx->sp-0:0);goto L_111;K_1753:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1754: Cell t941=uf_mkp((void*)&uf_sl177);L_1755: pushc(cx,t941);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1755,cx->sp>2?cx->sp-2:0);goto L_97;K_1755:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1756: pushp(cx,(void*)&&L_1896);
+L_1757: pushp(cx,(void*)&&L_1762);
+L_1758: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1758,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1758,cx->sp>0?cx->sp-0:0);goto *el;}K_1758:;}
+L_1759: L_1760: L_1761: Cell _rv942=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv942);return;}cx->csp--;const void*_r943=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv942);if(!_r943)return;goto *_r943;}
+L_1762: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1762,cx->sp>0?cx->sp-0:0);goto L_111;K_1762:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1763: Cell t944=uf_mkp((void*)&uf_sl178);L_1764: pushc(cx,t944);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1764,cx->sp>2?cx->sp-2:0);goto L_97;K_1764:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1765: pushp(cx,(void*)&&L_2040);
+L_1766: pushp(cx,(void*)&&L_1771);
+L_1767: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1767,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1767,cx->sp>0?cx->sp-0:0);goto *el;}K_1767:;}
+L_1768: L_1769: L_1770: Cell _rv945=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv945);return;}cx->csp--;const void*_r946=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv945);if(!_r946)return;goto *_r946;}
+L_1771: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1771,cx->sp>0?cx->sp-0:0);goto L_111;K_1771:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1772: Cell t947=uf_mkp((void*)&uf_sl179);L_1773: pushc(cx,t947);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1773,cx->sp>2?cx->sp-2:0);goto L_97;K_1773:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1774: pushp(cx,(void*)&&L_2173);
+L_1775: pushp(cx,(void*)&&L_1780);
 L_1776: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1776,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1776,cx->sp>0?cx->sp-0:0);goto *el;}K_1776:;}
-L_1777: Cell _rv930=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv930);return;}cx->csp--;const void*_r931=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv930);if(!_r931)return;goto *_r931;}
-L_1778: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1778,cx->sp>0?cx->sp-0:0);goto L_127;K_1778:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1779: Cell t932=var_trans__slot;L_1780: pushc(cx,t932);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1780,cx->sp>1?cx->sp-1:0);goto L_0;K_1780:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1781: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1781,cx->sp>0?cx->sp-0:0);goto L_571;K_1781:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1782: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1782,cx->sp>0?cx->sp-0:0);goto L_36;K_1782:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1783: Cell t933=pop(cx);L_1784: L_1785: Cell t934=uf_mkp((void*)&uf_sl179);L_1786: var_trans__slot2=t933;pushc(cx,t933);pushc(cx,t933);pushc(cx,t934);uf_cur_op="op_fmt";op_fmt(cx);
-L_1787: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1787,cx->sp>1?cx->sp-1:0);goto L_42;K_1787:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1788: L_1789: L_1790: Cell _rv935=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv935);return;}cx->csp--;const void*_r936=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv935);if(!_r936)return;goto *_r936;}
-L_1791: L_1792: L_1793: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1794: Cell t937=var_trans__rr;L_1795: Cell _rv938=t937;{if(cx->csp==0){pushc(cx,_rv938);return;}cx->csp--;const void*_r939=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv938);if(!_r939)return;goto *_r939;}
-L_1796: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1796,cx->sp>0?cx->sp-0:0);goto L_127;K_1796:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1797: Cell t940=var_trans__inmain;L_1798: pushc(cx,t940);pushp(cx,(void*)&&L_1804);
-L_1799: pushp(cx,(void*)&&L_1823);
-L_1800: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1800,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1800,cx->sp>0?cx->sp-0:0);goto *el;}K_1800:;}
-L_1801: L_1802: L_1803: Cell _rv941=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv941);return;}cx->csp--;const void*_r942=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv941);if(!_r942)return;goto *_r942;}
-L_1804: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1804,cx->sp>0?cx->sp-0:0);goto L_566;K_1804:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1805: Cell t943=uf_mkp((void*)&uf_sl180);L_1806: cx->locals[cx->local_base+0]=t943;L_1807: pushc(cx,t943);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1807,cx->sp>0?cx->sp-0:0);goto L_111;K_1807:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1808: Cell t944=cx->locals[cx->local_base+0];L_1809: pushc(cx,t944);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1809,cx->sp>2?cx->sp-2:0);goto L_97;K_1809:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1810: Cell t945=pop(cx);Cell t946=uf_cnot(t945);L_1811: pushc(cx,t946);pushp(cx,(void*)&&L_144);
-L_1812: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1812,cx->sp>0?cx->sp-0:0);goto *b;K_1812:;}}
-L_1813: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1813,cx->sp>0?cx->sp-0:0);goto L_127;K_1813:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1814: Cell t947=uf_mkp((void*)&uf_sl181);L_1815: pushc(cx,t947);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1815,cx->sp>1?cx->sp-1:0);goto L_42;K_1815:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1816: L_1817: L_1818: L_1819: L_1820: var_trans__didret=uf_mki(0LL);var_trans__rr=uf_mki(0LL);pushi(cx,0LL);pushi(cx,0LL);L_1821: Cell t948=var_trans__rr;L_1822: Cell _rv949=t948;{if(cx->csp==0){pushc(cx,_rv949);return;}cx->csp--;const void*_r950=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv949);if(!_r950)return;goto *_r950;}
-L_1823: Cell t951=var_trans__inq;L_1824: pushc(cx,t951);pushp(cx,(void*)&&L_1849);
-L_1825: pushp(cx,(void*)&&L_1830);
-L_1826: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1826,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1826,cx->sp>0?cx->sp-0:0);goto *el;}K_1826:;}
-L_1827: L_1828: L_1829: Cell _rv952=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv952);return;}cx->csp--;const void*_r953=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv952);if(!_r953)return;goto *_r953;}
-L_1830: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1830,cx->sp>0?cx->sp-0:0);goto L_566;K_1830:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1831: Cell t954=uf_mkp((void*)&uf_sl182);L_1832: cx->locals[cx->local_base+0]=t954;L_1833: pushc(cx,t954);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1833,cx->sp>0?cx->sp-0:0);goto L_111;K_1833:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1834: Cell t955=cx->locals[cx->local_base+0];L_1835: pushc(cx,t955);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1835,cx->sp>2?cx->sp-2:0);goto L_97;K_1835:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1836: Cell t956=pop(cx);Cell t957=uf_cnot(t956);L_1837: pushc(cx,t957);pushp(cx,(void*)&&L_144);
-L_1838: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1838,cx->sp>0?cx->sp-0:0);goto *b;K_1838:;}}
-L_1839: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1839,cx->sp>0?cx->sp-0:0);goto L_127;K_1839:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1840: Cell t958=uf_mkp((void*)&uf_sl183);L_1841: pushc(cx,t958);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1841,cx->sp>1?cx->sp-1:0);goto L_42;K_1841:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1842: L_1843: L_1844: L_1845: L_1846: var_trans__didret=uf_mki(2LL);var_trans__rr=uf_mki(0LL);pushi(cx,2LL);pushi(cx,0LL);L_1847: Cell t959=var_trans__rr;L_1848: Cell _rv960=t959;{if(cx->csp==0){pushc(cx,_rv960);return;}cx->csp--;const void*_r961=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv960);if(!_r961)return;goto *_r961;}
-L_1849: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1849,cx->sp>0?cx->sp-0:0);goto L_566;K_1849:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1850: Cell t962=uf_mkp((void*)&uf_sl184);L_1851: cx->locals[cx->local_base+0]=t962;L_1852: pushc(cx,t962);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1852,cx->sp>0?cx->sp-0:0);goto L_111;K_1852:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1853: Cell t963=cx->locals[cx->local_base+0];L_1854: pushc(cx,t963);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1854,cx->sp>2?cx->sp-2:0);goto L_97;K_1854:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1855: Cell t964=pop(cx);Cell t965=uf_cnot(t964);L_1856: pushc(cx,t965);pushp(cx,(void*)&&L_144);
-L_1857: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1857,cx->sp>0?cx->sp-0:0);goto *b;K_1857:;}}
+L_1777: L_1778: L_1779: Cell _rv948=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv948);return;}cx->csp--;const void*_r949=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv948);if(!_r949)return;goto *_r949;}
+L_1780: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1780,cx->sp>0?cx->sp-0:0);goto L_111;K_1780:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1781: Cell t950=uf_mkp((void*)&uf_sl180);L_1782: pushc(cx,t950);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1782,cx->sp>2?cx->sp-2:0);goto L_97;K_1782:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1783: pushp(cx,(void*)&&L_2272);
+L_1784: pushp(cx,(void*)&&L_1789);
+L_1785: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1785,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1785,cx->sp>0?cx->sp-0:0);goto *el;}K_1785:;}
+L_1786: L_1787: L_1788: Cell _rv951=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv951);return;}cx->csp--;const void*_r952=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv951);if(!_r952)return;goto *_r952;}
+L_1789: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1789,cx->sp>0?cx->sp-0:0);goto L_111;K_1789:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1790: Cell t953=uf_mkp((void*)&uf_sl181);L_1791: pushc(cx,t953);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1791,cx->sp>2?cx->sp-2:0);goto L_97;K_1791:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1792: pushp(cx,(void*)&&L_2653);
+L_1793: pushp(cx,(void*)&&L_1798);
+L_1794: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1794,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1794,cx->sp>0?cx->sp-0:0);goto *el;}K_1794:;}
+L_1795: L_1796: L_1797: Cell _rv954=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv954);return;}cx->csp--;const void*_r955=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv954);if(!_r955)return;goto *_r955;}
+L_1798: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1798,cx->sp>0?cx->sp-0:0);goto L_111;K_1798:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1799: Cell t956=uf_mkp((void*)&uf_sl182);L_1800: pushc(cx,t956);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1800,cx->sp>2?cx->sp-2:0);goto L_97;K_1800:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1801: pushp(cx,(void*)&&L_2902);
+L_1802: pushp(cx,(void*)&&L_1807);
+L_1803: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1803,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1803,cx->sp>0?cx->sp-0:0);goto *el;}K_1803:;}
+L_1804: L_1805: L_1806: Cell _rv957=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv957);return;}cx->csp--;const void*_r958=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv957);if(!_r958)return;goto *_r958;}
+L_1807: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1807,cx->sp>0?cx->sp-0:0);goto L_111;K_1807:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1808: Cell t959=uf_mkp((void*)&uf_sl183);L_1809: pushc(cx,t959);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1809,cx->sp>2?cx->sp-2:0);goto L_97;K_1809:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1810: pushp(cx,(void*)&&L_2919);
+L_1811: pushp(cx,(void*)&&L_1816);
+L_1812: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1812,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1812,cx->sp>0?cx->sp-0:0);goto *el;}K_1812:;}
+L_1813: L_1814: L_1815: Cell _rv960=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv960);return;}cx->csp--;const void*_r961=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv960);if(!_r961)return;goto *_r961;}
+L_1816: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1816,cx->sp>0?cx->sp-0:0);goto L_111;K_1816:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1817: Cell t962=uf_mkp((void*)&uf_sl184);L_1818: pushc(cx,t962);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1818,cx->sp>2?cx->sp-2:0);goto L_97;K_1818:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1819: pushp(cx,(void*)&&L_2972);
+L_1820: pushp(cx,(void*)&&L_1825);
+L_1821: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1821,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1821,cx->sp>0?cx->sp-0:0);goto *el;}K_1821:;}
+L_1822: L_1823: L_1824: Cell _rv963=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv963);return;}cx->csp--;const void*_r964=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv963);if(!_r964)return;goto *_r964;}
+L_1825: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1825,cx->sp>0?cx->sp-0:0);goto L_111;K_1825:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1826: Cell t965=uf_mkp((void*)&uf_sl185);L_1827: pushc(cx,t965);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1827,cx->sp>2?cx->sp-2:0);goto L_97;K_1827:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1828: pushp(cx,(void*)&&L_2994);
+L_1829: pushp(cx,(void*)&&L_3000);
+L_1830: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1830,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1830,cx->sp>0?cx->sp-0:0);goto *el;}K_1830:;}
+L_1831: L_1832: L_1833: Cell _rv966=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv966);return;}cx->csp--;const void*_r967=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv966);if(!_r967)return;goto *_r967;}
+L_1834: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1834,cx->sp>0?cx->sp-0:0);goto L_195;K_1834:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1835: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1835,cx->sp>0?cx->sp-0:0);goto L_1865;K_1835:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1836: L_1837: L_1838: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_1838;cx->loops[fr].end=&&K_WE_1838;long _sp0=cx->sp;
+K_WC_1838:;{Cell _wc;{
+WC1838_L1851: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC1838_1851,cx->sp>0?cx->sp-0:0);goto L_111;K_WC1838_1851:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC1838_L1852: Cell t0=uf_mkp((void*)&uf_sl187);WC1838_L1853: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC1838_1853,cx->sp>2?cx->sp-2:0);goto L_97;K_WC1838_1853:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC1838_L1854: Cell t1=pop(cx);WC1838_L1855: var_trans__rr=t1;pushc(cx,t1);WC1838_L1856: Cell t2=var_trans__rr;pushc(cx,t2);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_1838;
+{
+WB1838_L1858: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB1838_1858,cx->sp>0?cx->sp-0:0);goto L_127;K_WB1838_1858:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB1838_L1859: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB1838_1859,cx->sp>0?cx->sp-0:0);goto L_1865;K_WB1838_1859:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB1838_L1860: WB1838_L1861: WB1838_L1862: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB1838_L1863: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_1838;}
+K_WE_1838:;cx->lsp=fr;}
+L_1839: L_1840: Cell t968=uf_mkp((void*)&uf_sl186);L_1841: cx->locals[cx->local_base+0]=t968;L_1842: pushc(cx,t968);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1842,cx->sp>0?cx->sp-0:0);goto L_111;K_1842:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1843: Cell t969=cx->locals[cx->local_base+0];L_1844: pushc(cx,t969);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1844,cx->sp>2?cx->sp-2:0);goto L_97;K_1844:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1845: Cell t970=pop(cx);Cell t971=uf_cnot(t970);L_1846: pushc(cx,t971);pushp(cx,(void*)&&L_144);
+L_1847: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1847,cx->sp>0?cx->sp-0:0);goto *b;K_1847:;}}
+L_1848: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1848,cx->sp>0?cx->sp-0:0);goto L_127;K_1848:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1849: L_1850: Cell _rv972=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv972);return;}cx->csp--;const void*_r973=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv972);if(!_r973)return;goto *_r973;}
+L_1851: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1851,cx->sp>0?cx->sp-0:0);goto L_111;K_1851:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1852: Cell t974=uf_mkp((void*)&uf_sl187);L_1853: pushc(cx,t974);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1853,cx->sp>2?cx->sp-2:0);goto L_97;K_1853:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1854: Cell t975=pop(cx);L_1855: var_trans__rr=t975;pushc(cx,t975);L_1856: Cell t976=var_trans__rr;L_1857: Cell _rv977=t976;{if(cx->csp==0){pushc(cx,_rv977);return;}cx->csp--;const void*_r978=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv977);if(!_r978)return;goto *_r978;}
 L_1858: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1858,cx->sp>0?cx->sp-0:0);goto L_127;K_1858:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1859: Cell t966=uf_mkp((void*)&uf_sl185);L_1860: pushc(cx,t966);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1860,cx->sp>1?cx->sp-1:0);goto L_42;K_1860:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1861: L_1862: L_1863: L_1864: L_1865: L_1866: L_1867: var_trans__cret=uf_mki(1LL);var_trans__didret=uf_mki(2LL);var_trans__rr=uf_mki(0LL);pushi(cx,1LL);pushi(cx,2LL);pushi(cx,0LL);L_1868: Cell t967=var_trans__rr;L_1869: Cell _rv968=t967;{if(cx->csp==0){pushc(cx,_rv968);return;}cx->csp--;const void*_r969=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv968);if(!_r969)return;goto *_r969;}
-L_1870: Cell t970=var_trans__douts;L_1871: pushc(cx,t970);uf_cur_op="op_lpop";op_lpop(cx);
-L_1872: Cell t971=pop(cx);L_1873: L_1874: Cell t972=var_trans__pends;L_1875: var_trans__dchunk=t971;pushc(cx,t971);pushc(cx,t971);pushc(cx,t972);uf_cur_op="op_cat";op_cat(cx);
-L_1876: Cell t973=pop(cx);L_1877: Cell t974=var_trans__psnaps;L_1878: var_trans__cp=t973;pushc(cx,t973);pushc(cx,t974);uf_cur_op="op_lpop";op_lpop(cx);
-L_1879: Cell t975=pop(cx);L_1880: L_1881: Cell t976=var_trans__cp;L_1882: var_trans__sv=t975;pushc(cx,t975);pushc(cx,t975);pushc(cx,t976);uf_cur_op="op_cat";op_cat(cx);
-L_1883: Cell t977=var_trans__pends;L_1884: pushc(cx,t977);uf_cur_op="op_cat";op_cat(cx);
-L_1885: Cell t978=pop(cx);L_1886: var_trans__pends=t978;pushc(cx,t978);L_1887: L_1888: Cell _rv979=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv979);return;}cx->csp--;const void*_r980=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv979);if(!_r980)return;goto *_r980;}
-L_1889: Cell t981=var_trans__didret;L_1890: L_1891: Cell t982=uf_ceq(t981,uf_mki(2LL));L_1892: pushc(cx,t982);pushp(cx,(void*)&&L_1920);
-L_1893: pushp(cx,(void*)&&L_1898);
-L_1894: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1894,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1894,cx->sp>0?cx->sp-0:0);goto *el;}K_1894:;}
-L_1895: L_1896: L_1897: Cell _rv983=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv983);return;}cx->csp--;const void*_r984=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv983);if(!_r984)return;goto *_r984;}
-L_1898: Cell t985=uf_mkp((void*)&uf_sl186);L_1899: pushc(cx,t985);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1899,cx->sp>1?cx->sp-1:0);goto L_42;K_1899:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1900: Cell t986=var_trans__pends;L_1901: Cell t987=uf_mkp((void*)&uf_sl187);L_1902: pushc(cx,t986);pushc(cx,t987);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1902,cx->sp>2?cx->sp-2:0);goto L_97;K_1902:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1903: Cell t988=pop(cx);Cell t989=uf_cnot(t988);L_1904: pushc(cx,t989);pushp(cx,(void*)&&L_1910);
-L_1905: pushp(cx,(void*)&&L_1917);
-L_1906: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1906,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1906,cx->sp>0?cx->sp-0:0);goto *el;}K_1906:;}
-L_1907: L_1908: L_1909: Cell _rv990=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv990);return;}cx->csp--;const void*_r991=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv990);if(!_r991)return;goto *_r991;}
-L_1910: Cell t992=var_trans__pends;L_1911: pushc(cx,t992);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1911,cx->sp>1?cx->sp-1:0);goto L_42;K_1911:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1912: Cell t993=uf_mkp((void*)&uf_sl188);L_1913: L_1914: var_trans__pends=t993;pushc(cx,t993);L_1915: L_1916: Cell _rv994=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv994);return;}cx->csp--;const void*_r995=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv994);if(!_r995)return;goto *_r995;}
-L_1917: L_1918: L_1919: Cell _rv996=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv996);return;}cx->csp--;const void*_r997=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv996);if(!_r997)return;goto *_r997;}
-L_1920: Cell t998=var_trans__pends;L_1921: Cell t999=uf_mkp((void*)&uf_sl189);L_1922: pushc(cx,t998);pushc(cx,t999);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1922,cx->sp>2?cx->sp-2:0);goto L_97;K_1922:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1923: Cell t1000=pop(cx);Cell t1001=uf_cnot(t1000);L_1924: pushc(cx,t1001);pushp(cx,(void*)&&L_1930);
-L_1925: pushp(cx,(void*)&&L_1937);
+L_1859: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1859,cx->sp>0?cx->sp-0:0);goto L_1865;K_1859:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1860: L_1861: L_1862: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1863: Cell t979=var_trans__rr;L_1864: Cell _rv980=t979;{if(cx->csp==0){pushc(cx,_rv980);return;}cx->csp--;const void*_r981=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv980);if(!_r981)return;goto *_r981;}
+L_1865: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1865,cx->sp>0?cx->sp-0:0);goto L_111;K_1865:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1866: Cell t982=pop(cx);L_1867: var_trans__nv=t982;pushc(cx,t982);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1867,cx->sp>0?cx->sp-0:0);goto L_127;K_1867:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1868: Cell t983=var_trans__nv;L_1869: pushc(cx,t983);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1869,cx->sp>1?cx->sp-1:0);goto L_215;K_1869:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1870: Cell t984=pop(cx);L_1871: var_trans__slot=t984;pushc(cx,t984);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1871,cx->sp>0?cx->sp-0:0);goto L_111;K_1871:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1872: Cell t985=uf_mkp((void*)&uf_sl188);L_1873: pushc(cx,t985);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1873,cx->sp>2?cx->sp-2:0);goto L_97;K_1873:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1874: pushp(cx,(void*)&&L_1878);
+L_1875: pushp(cx,(void*)&&L_1891);
+L_1876: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1876,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1876,cx->sp>0?cx->sp-0:0);goto *el;}K_1876:;}
+L_1877: Cell _rv986=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv986);return;}cx->csp--;const void*_r987=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv986);if(!_r987)return;goto *_r987;}
+L_1878: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1878,cx->sp>0?cx->sp-0:0);goto L_127;K_1878:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1879: Cell t988=var_trans__slot;L_1880: pushc(cx,t988);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1880,cx->sp>1?cx->sp-1:0);goto L_0;K_1880:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1881: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1881,cx->sp>0?cx->sp-0:0);goto L_571;K_1881:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1882: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1882,cx->sp>0?cx->sp-0:0);goto L_36;K_1882:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1883: Cell t989=pop(cx);L_1884: L_1885: Cell t990=uf_mkp((void*)&uf_sl189);L_1886: var_trans__slot2=t989;pushc(cx,t989);pushc(cx,t989);pushc(cx,t990);uf_cur_op="op_fmt";op_fmt(cx);
+L_1887: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1887,cx->sp>1?cx->sp-1:0);goto L_42;K_1887:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1888: L_1889: L_1890: Cell _rv991=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv991);return;}cx->csp--;const void*_r992=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv991);if(!_r992)return;goto *_r992;}
+L_1891: L_1892: L_1893: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_1894: Cell t993=var_trans__rr;L_1895: Cell _rv994=t993;{if(cx->csp==0){pushc(cx,_rv994);return;}cx->csp--;const void*_r995=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv994);if(!_r995)return;goto *_r995;}
+L_1896: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1896,cx->sp>0?cx->sp-0:0);goto L_127;K_1896:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1897: Cell t996=var_trans__inmain;L_1898: pushc(cx,t996);pushp(cx,(void*)&&L_1904);
+L_1899: pushp(cx,(void*)&&L_1923);
+L_1900: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1900,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1900,cx->sp>0?cx->sp-0:0);goto *el;}K_1900:;}
+L_1901: L_1902: L_1903: Cell _rv997=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv997);return;}cx->csp--;const void*_r998=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv997);if(!_r998)return;goto *_r998;}
+L_1904: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1904,cx->sp>0?cx->sp-0:0);goto L_566;K_1904:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1905: Cell t999=uf_mkp((void*)&uf_sl190);L_1906: cx->locals[cx->local_base+0]=t999;L_1907: pushc(cx,t999);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1907,cx->sp>0?cx->sp-0:0);goto L_111;K_1907:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1908: Cell t1000=cx->locals[cx->local_base+0];L_1909: pushc(cx,t1000);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1909,cx->sp>2?cx->sp-2:0);goto L_97;K_1909:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1910: Cell t1001=pop(cx);Cell t1002=uf_cnot(t1001);L_1911: pushc(cx,t1002);pushp(cx,(void*)&&L_144);
+L_1912: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1912,cx->sp>0?cx->sp-0:0);goto *b;K_1912:;}}
+L_1913: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1913,cx->sp>0?cx->sp-0:0);goto L_127;K_1913:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1914: Cell t1003=uf_mkp((void*)&uf_sl191);L_1915: pushc(cx,t1003);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1915,cx->sp>1?cx->sp-1:0);goto L_42;K_1915:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1916: L_1917: L_1918: L_1919: L_1920: var_trans__didret=uf_mki(0LL);var_trans__rr=uf_mki(0LL);pushi(cx,0LL);pushi(cx,0LL);L_1921: Cell t1004=var_trans__rr;L_1922: Cell _rv1005=t1004;{if(cx->csp==0){pushc(cx,_rv1005);return;}cx->csp--;const void*_r1006=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1005);if(!_r1006)return;goto *_r1006;}
+L_1923: Cell t1007=var_trans__inq;L_1924: pushc(cx,t1007);pushp(cx,(void*)&&L_1949);
+L_1925: pushp(cx,(void*)&&L_1930);
 L_1926: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1926,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1926,cx->sp>0?cx->sp-0:0);goto *el;}K_1926:;}
-L_1927: L_1928: L_1929: Cell _rv1002=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1002);return;}cx->csp--;const void*_r1003=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1002);if(!_r1003)return;goto *_r1003;}
-L_1930: Cell t1004=var_trans__pends;L_1931: pushc(cx,t1004);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1931,cx->sp>1?cx->sp-1:0);goto L_42;K_1931:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1932: Cell t1005=uf_mkp((void*)&uf_sl190);L_1933: L_1934: var_trans__pends=t1005;pushc(cx,t1005);L_1935: L_1936: Cell _rv1006=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1006);return;}cx->csp--;const void*_r1007=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1006);if(!_r1007)return;goto *_r1007;}
-L_1937: L_1938: L_1939: Cell _rv1008=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1008);return;}cx->csp--;const void*_r1009=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1008);if(!_r1009)return;goto *_r1009;}
-L_1940: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1940,cx->sp>0?cx->sp-0:0);goto L_127;K_1940:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1941: Cell t1010=uf_mkp((void*)&uf_sl191);L_1942: cx->locals[cx->local_base+0]=t1010;L_1943: pushc(cx,t1010);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1943,cx->sp>0?cx->sp-0:0);goto L_111;K_1943:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1944: Cell t1011=cx->locals[cx->local_base+0];L_1945: pushc(cx,t1011);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1945,cx->sp>2?cx->sp-2:0);goto L_97;K_1945:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1946: Cell t1012=pop(cx);Cell t1013=uf_cnot(t1012);L_1947: pushc(cx,t1013);pushp(cx,(void*)&&L_144);
-L_1948: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1948,cx->sp>0?cx->sp-0:0);goto *b;K_1948:;}}
-L_1949: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1949,cx->sp>0?cx->sp-0:0);goto L_127;K_1949:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1950: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1950,cx->sp>0?cx->sp-0:0);goto L_566;K_1950:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1951: Cell t1014=uf_mkp((void*)&uf_sl192);L_1952: cx->locals[cx->local_base+0]=t1014;L_1953: pushc(cx,t1014);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1953,cx->sp>0?cx->sp-0:0);goto L_111;K_1953:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1954: Cell t1015=cx->locals[cx->local_base+0];L_1955: pushc(cx,t1015);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1955,cx->sp>2?cx->sp-2:0);goto L_97;K_1955:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1956: Cell t1016=pop(cx);Cell t1017=uf_cnot(t1016);L_1957: pushc(cx,t1017);pushp(cx,(void*)&&L_144);
-L_1958: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1958,cx->sp>0?cx->sp-0:0);goto *b;K_1958:;}}
-L_1959: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1959,cx->sp>0?cx->sp-0:0);goto L_127;K_1959:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1960: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_1960,cx->sp>0?cx->sp-0:0);goto L_135;K_1960:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1961: Cell t1018=pop(cx);L_1962: Cell t1019=var_trans__inq;L_1963: var_trans__tlbl=t1018;pushc(cx,t1018);pushc(cx,t1019);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1963,cx->sp>1?cx->sp-1:0);goto L_22;K_1963:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1964: Cell t1020=var_trans__emode;L_1965: pushc(cx,t1020);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1965,cx->sp>1?cx->sp-1:0);goto L_22;K_1965:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1966: Cell t1021=var_trans__tlbl;L_1967: pushc(cx,t1021);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1967,cx->sp>1?cx->sp-1:0);goto L_22;K_1967:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1968: Cell t1022=var_trans__inq;L_1969: L_1970: Cell t1023=uf_ceq(t1022,uf_mki(1LL));L_1971: pushc(cx,t1023);pushp(cx,(void*)&&L_2005);
-L_1972: pushp(cx,(void*)&&L_2010);
-L_1973: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1973,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1973,cx->sp>0?cx->sp-0:0);goto *el;}K_1973:;}
-L_1974: Cell t1024=var_trans__psnaps;L_1975: Cell t1025=var_trans__pends;L_1976: pushc(cx,t1024);pushc(cx,t1025);uf_cur_op="op_push";op_push(cx);
-L_1977: Cell t1026=pop(cx);L_1978: Cell t1027=uf_mkp((void*)&uf_sl193);L_1979: L_1980: Cell t1028=var_trans__douts;L_1981: Cell t1029=uf_mkp((void*)&uf_sl194);L_1982: var_trans__psnaps=t1026;var_trans__pends=t1027;pushc(cx,t1026);pushc(cx,t1027);pushc(cx,t1028);pushc(cx,t1029);uf_cur_op="op_push";op_push(cx);
-L_1983: Cell t1030=pop(cx);L_1984: L_1985: L_1986: Cell t1031=uf_mkp((void*)&uf_sl195);L_1987: Cell t1032=var_trans__tlbl;L_1988: Cell t1033=uf_mkp((void*)&uf_sl196);L_1989: var_trans__douts=t1030;var_trans__inq=uf_mki(1LL);pushc(cx,t1030);pushi(cx,1LL);pushc(cx,t1031);pushc(cx,t1032);pushc(cx,t1033);uf_cur_op="op_fmt";op_fmt(cx);
-L_1990: uf_cur_op="op_cat";op_cat(cx);
-L_1991: Cell t1034=uf_mkp((void*)&uf_sl197);L_1992: pushc(cx,t1034);uf_cur_op="op_cat";op_cat(cx);
-L_1993: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1993,cx->sp>1?cx->sp-1:0);goto L_42;K_1993:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1994: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1994,cx->sp>0?cx->sp-0:0);goto L_1645;K_1994:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1995: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1995,cx->sp>0?cx->sp-0:0);goto L_1889;K_1995:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1996: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1996,cx->sp>0?cx->sp-0:0);goto L_111;K_1996:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1997: Cell t1035=uf_mkp((void*)&uf_sl198);L_1998: pushc(cx,t1035);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1998,cx->sp>2?cx->sp-2:0);goto L_97;K_1998:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_1999: pushp(cx,(void*)&&L_2015);
-L_2000: pushp(cx,(void*)&&L_2053);
-L_2001: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2001,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2001,cx->sp>0?cx->sp-0:0);goto *el;}K_2001:;}
-L_2002: L_2003: L_2004: Cell _rv1036=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1036);return;}cx->csp--;const void*_r1037=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1036);if(!_r1037)return;goto *_r1037;}
-L_2005: L_2006: L_2007: var_trans__emode=uf_mki(2LL);pushi(cx,2LL);L_2008: L_2009: Cell _rv1038=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1038);return;}cx->csp--;const void*_r1039=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1038);if(!_r1039)return;goto *_r1039;}
-L_2010: L_2011: L_2012: var_trans__emode=uf_mki(0LL);pushi(cx,0LL);L_2013: L_2014: Cell _rv1040=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1040);return;}cx->csp--;const void*_r1041=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1040);if(!_r1041)return;goto *_r1041;}
-L_2015: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2015,cx->sp>0?cx->sp-0:0);goto L_135;K_2015:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2016: Cell t1042=pop(cx);L_2017: L_2018: var_trans__elbl=t1042;pushc(cx,t1042);pushc(cx,t1042);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2018,cx->sp>1?cx->sp-1:0);goto L_22;K_2018:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2019: Cell t1043=uf_mkp((void*)&uf_sl199);L_2020: Cell t1044=var_trans__elbl;L_2021: Cell t1045=uf_mkp((void*)&uf_sl200);L_2022: pushc(cx,t1043);pushc(cx,t1044);pushc(cx,t1045);uf_cur_op="op_fmt";op_fmt(cx);
-L_2023: uf_cur_op="op_cat";op_cat(cx);
-L_2024: Cell t1046=uf_mkp((void*)&uf_sl201);L_2025: pushc(cx,t1046);uf_cur_op="op_cat";op_cat(cx);
-L_2026: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2026,cx->sp>1?cx->sp-1:0);goto L_42;K_2026:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2027: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2027,cx->sp>0?cx->sp-0:0);goto L_127;K_2027:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2028: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2028,cx->sp>0?cx->sp-0:0);goto L_1645;K_2028:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2029: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2029,cx->sp>0?cx->sp-0:0);goto L_1889;K_2029:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2030: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2030,cx->sp>0?cx->sp-0:0);goto L_30;K_2030:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2031: Cell t1047=pop(cx);L_2032: var_trans__elbl=t1047;pushc(cx,t1047);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2032,cx->sp>0?cx->sp-0:0);goto L_30;K_2032:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2033: Cell t1048=pop(cx);L_2034: var_trans__tlbl=t1048;pushc(cx,t1048);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2034,cx->sp>0?cx->sp-0:0);goto L_30;K_2034:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2035: Cell t1049=pop(cx);L_2036: var_trans__emode=t1049;pushc(cx,t1049);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2036,cx->sp>0?cx->sp-0:0);goto L_1870;K_2036:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2037: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2037,cx->sp>0?cx->sp-0:0);goto L_30;K_2037:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2038: Cell t1050=pop(cx);L_2039: Cell t1051=var_trans__tlbl;L_2040: Cell t1052=var_trans__elbl;L_2041: Cell t1053=uf_mkp((void*)&uf_sl202);L_2042: var_trans__inq=t1050;pushc(cx,t1050);pushc(cx,t1051);pushc(cx,t1052);pushc(cx,t1053);uf_cur_op="op_fmt";op_fmt(cx);
-L_2043: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2043,cx->sp>1?cx->sp-1:0);goto L_42;K_2043:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2044: L_2045: L_2046: Cell t1054=var_trans__cret;L_2047: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1054);pushp(cx,(void*)&&L_2597);
-L_2048: pushp(cx,(void*)&&L_2594);
-L_2049: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2049,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2049,cx->sp>0?cx->sp-0:0);goto *el;}K_2049:;}
-L_2050: L_2051: L_2052: Cell _rv1055=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1055);return;}cx->csp--;const void*_r1056=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1055);if(!_r1056)return;goto *_r1056;}
-L_2053: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2053,cx->sp>0?cx->sp-0:0);goto L_30;K_2053:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2054: Cell t1057=pop(cx);L_2055: var_trans__tlbl=t1057;pushc(cx,t1057);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2055,cx->sp>0?cx->sp-0:0);goto L_30;K_2055:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2056: Cell t1058=pop(cx);L_2057: var_trans__emode=t1058;pushc(cx,t1058);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2057,cx->sp>0?cx->sp-0:0);goto L_1870;K_2057:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2058: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2058,cx->sp>0?cx->sp-0:0);goto L_30;K_2058:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2059: Cell t1059=pop(cx);L_2060: Cell t1060=var_trans__tlbl;L_2061: Cell t1061=uf_mkp((void*)&uf_sl203);L_2062: var_trans__inq=t1059;pushc(cx,t1059);pushc(cx,t1060);pushc(cx,t1061);uf_cur_op="op_fmt";op_fmt(cx);
-L_2063: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2063,cx->sp>1?cx->sp-1:0);goto L_42;K_2063:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2064: L_2065: L_2066: Cell t1062=var_trans__cret;L_2067: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1062);pushp(cx,(void*)&&L_2597);
-L_2068: pushp(cx,(void*)&&L_2594);
-L_2069: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2069,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2069,cx->sp>0?cx->sp-0:0);goto *el;}K_2069:;}
-L_2070: L_2071: L_2072: Cell _rv1063=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1063);return;}cx->csp--;const void*_r1064=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1063);if(!_r1064)return;goto *_r1064;}
-L_2073: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2073,cx->sp>0?cx->sp-0:0);goto L_127;K_2073:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2074: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2074,cx->sp>0?cx->sp-0:0);goto L_135;K_2074:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2075: Cell t1065=pop(cx);L_2076: var_trans__clbl=t1065;pushc(cx,t1065);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2076,cx->sp>0?cx->sp-0:0);goto L_135;K_2076:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2077: Cell t1066=pop(cx);L_2078: Cell t1067=var_trans__inq;L_2079: var_trans__blbl=t1066;pushc(cx,t1066);pushc(cx,t1067);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2079,cx->sp>1?cx->sp-1:0);goto L_22;K_2079:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2080: Cell t1068=var_trans__emode;L_2081: pushc(cx,t1068);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2081,cx->sp>1?cx->sp-1:0);goto L_22;K_2081:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2082: Cell t1069=var_trans__clbl;L_2083: pushc(cx,t1069);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2083,cx->sp>1?cx->sp-1:0);goto L_22;K_2083:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2084: Cell t1070=var_trans__blbl;L_2085: pushc(cx,t1070);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2085,cx->sp>1?cx->sp-1:0);goto L_22;K_2085:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2086: Cell t1071=var_trans__inq;L_2087: L_2088: Cell t1072=uf_ceq(t1071,uf_mki(1LL));L_2089: pushc(cx,t1072);pushp(cx,(void*)&&L_2005);
-L_2090: pushp(cx,(void*)&&L_2010);
-L_2091: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2091,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2091,cx->sp>0?cx->sp-0:0);goto *el;}K_2091:;}
-L_2092: Cell t1073=var_trans__psnaps;L_2093: Cell t1074=var_trans__pends;L_2094: pushc(cx,t1073);pushc(cx,t1074);uf_cur_op="op_push";op_push(cx);
-L_2095: Cell t1075=pop(cx);L_2096: Cell t1076=uf_mkp((void*)&uf_sl204);L_2097: L_2098: Cell t1077=var_trans__douts;L_2099: Cell t1078=uf_mkp((void*)&uf_sl205);L_2100: var_trans__psnaps=t1075;var_trans__pends=t1076;pushc(cx,t1075);pushc(cx,t1076);pushc(cx,t1077);pushc(cx,t1078);uf_cur_op="op_push";op_push(cx);
-L_2101: Cell t1079=pop(cx);L_2102: L_2103: L_2104: Cell t1080=uf_mkp((void*)&uf_sl206);L_2105: Cell t1081=var_trans__clbl;L_2106: Cell t1082=uf_mkp((void*)&uf_sl207);L_2107: var_trans__douts=t1079;var_trans__inq=uf_mki(1LL);pushc(cx,t1079);pushi(cx,1LL);pushc(cx,t1080);pushc(cx,t1081);pushc(cx,t1082);uf_cur_op="op_fmt";op_fmt(cx);
-L_2108: uf_cur_op="op_cat";op_cat(cx);
-L_2109: Cell t1083=uf_mkp((void*)&uf_sl208);L_2110: pushc(cx,t1083);uf_cur_op="op_cat";op_cat(cx);
-L_2111: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2111,cx->sp>1?cx->sp-1:0);goto L_42;K_2111:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2112: Cell t1084=uf_mkp((void*)&uf_sl209);L_2113: cx->locals[cx->local_base+0]=t1084;L_2114: pushc(cx,t1084);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2114,cx->sp>0?cx->sp-0:0);goto L_111;K_2114:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2115: Cell t1085=cx->locals[cx->local_base+0];L_2116: pushc(cx,t1085);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2116,cx->sp>2?cx->sp-2:0);goto L_97;K_2116:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2117: Cell t1086=pop(cx);Cell t1087=uf_cnot(t1086);L_2118: pushc(cx,t1087);pushp(cx,(void*)&&L_144);
-L_2119: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2119,cx->sp>0?cx->sp-0:0);goto *b;K_2119:;}}
-L_2120: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2120,cx->sp>0?cx->sp-0:0);goto L_127;K_2120:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2121: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2121,cx->sp>0?cx->sp-0:0);goto L_566;K_2121:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2122: Cell t1088=uf_mkp((void*)&uf_sl210);L_2123: cx->locals[cx->local_base+0]=t1088;L_2124: pushc(cx,t1088);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2124,cx->sp>0?cx->sp-0:0);goto L_111;K_2124:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2125: Cell t1089=cx->locals[cx->local_base+0];L_2126: pushc(cx,t1089);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2126,cx->sp>2?cx->sp-2:0);goto L_97;K_2126:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2127: Cell t1090=pop(cx);Cell t1091=uf_cnot(t1090);L_2128: pushc(cx,t1091);pushp(cx,(void*)&&L_144);
-L_2129: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2129,cx->sp>0?cx->sp-0:0);goto *b;K_2129:;}}
-L_2130: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2130,cx->sp>0?cx->sp-0:0);goto L_127;K_2130:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2131: Cell t1092=uf_mkp((void*)&uf_sl211);L_2132: pushc(cx,t1092);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2132,cx->sp>1?cx->sp-1:0);goto L_42;K_2132:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2133: Cell t1093=uf_mkp((void*)&uf_sl212);L_2134: Cell t1094=var_trans__blbl;L_2135: Cell t1095=uf_mkp((void*)&uf_sl213);L_2136: pushc(cx,t1093);pushc(cx,t1094);pushc(cx,t1095);uf_cur_op="op_fmt";op_fmt(cx);
-L_2137: uf_cur_op="op_cat";op_cat(cx);
-L_2138: Cell t1096=uf_mkp((void*)&uf_sl214);L_2139: pushc(cx,t1096);uf_cur_op="op_cat";op_cat(cx);
-L_2140: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2140,cx->sp>1?cx->sp-1:0);goto L_42;K_2140:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2141: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2141,cx->sp>0?cx->sp-0:0);goto L_1645;K_2141:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2142: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2142,cx->sp>0?cx->sp-0:0);goto L_1889;K_2142:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2143: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2143,cx->sp>0?cx->sp-0:0);goto L_30;K_2143:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2144: Cell t1097=pop(cx);L_2145: var_trans__blbl=t1097;pushc(cx,t1097);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2145,cx->sp>0?cx->sp-0:0);goto L_30;K_2145:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2146: Cell t1098=pop(cx);L_2147: var_trans__clbl=t1098;pushc(cx,t1098);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2147,cx->sp>0?cx->sp-0:0);goto L_30;K_2147:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2148: Cell t1099=pop(cx);L_2149: var_trans__emode=t1099;pushc(cx,t1099);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2149,cx->sp>0?cx->sp-0:0);goto L_1870;K_2149:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2150: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2150,cx->sp>0?cx->sp-0:0);goto L_30;K_2150:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2151: Cell t1100=pop(cx);L_2152: Cell t1101=var_trans__clbl;L_2153: Cell t1102=var_trans__blbl;L_2154: Cell t1103=uf_mkp((void*)&uf_sl215);L_2155: var_trans__inq=t1100;pushc(cx,t1100);pushc(cx,t1101);pushc(cx,t1102);pushc(cx,t1103);uf_cur_op="op_fmt";op_fmt(cx);
-L_2156: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2156,cx->sp>1?cx->sp-1:0);goto L_42;K_2156:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2157: L_2158: L_2159: Cell t1104=var_trans__cret;L_2160: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1104);pushp(cx,(void*)&&L_2597);
-L_2161: pushp(cx,(void*)&&L_2594);
-L_2162: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2162,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2162,cx->sp>0?cx->sp-0:0);goto *el;}K_2162:;}
-L_2163: L_2164: L_2165: Cell _rv1105=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1105);return;}cx->csp--;const void*_r1106=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1105);if(!_r1106)return;goto *_r1106;}
-L_2166: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2166,cx->sp>0?cx->sp-0:0);goto L_127;K_2166:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2167: Cell t1107=uf_mkp((void*)&uf_sl216);L_2168: cx->locals[cx->local_base+0]=t1107;L_2169: pushc(cx,t1107);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2169,cx->sp>0?cx->sp-0:0);goto L_111;K_2169:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2170: Cell t1108=cx->locals[cx->local_base+0];L_2171: pushc(cx,t1108);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2171,cx->sp>2?cx->sp-2:0);goto L_97;K_2171:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2172: Cell t1109=pop(cx);Cell t1110=uf_cnot(t1109);L_2173: pushc(cx,t1110);pushp(cx,(void*)&&L_144);
-L_2174: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2174,cx->sp>0?cx->sp-0:0);goto *b;K_2174:;}}
-L_2175: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2175,cx->sp>0?cx->sp-0:0);goto L_127;K_2175:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2176: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2176,cx->sp>0?cx->sp-0:0);goto L_135;K_2176:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2177: Cell t1111=pop(cx);L_2178: var_trans__fclbl=t1111;pushc(cx,t1111);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2178,cx->sp>0?cx->sp-0:0);goto L_135;K_2178:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2179: Cell t1112=pop(cx);L_2180: var_trans__fblbl=t1112;pushc(cx,t1112);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2180,cx->sp>0?cx->sp-0:0);goto L_111;K_2180:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2181: Cell t1113=uf_mkp((void*)&uf_sl217);L_2182: pushc(cx,t1113);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2182,cx->sp>2?cx->sp-2:0);goto L_97;K_2182:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2183: pushp(cx,(void*)&&L_2289);
-L_2184: pushp(cx,(void*)&&L_2295);
-L_2185: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2185,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2185,cx->sp>0?cx->sp-0:0);goto *el;}K_2185:;}
-L_2186: Cell t1114=var_trans__inq;L_2187: pushc(cx,t1114);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2187,cx->sp>1?cx->sp-1:0);goto L_22;K_2187:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2188: Cell t1115=var_trans__emode;L_2189: pushc(cx,t1115);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2189,cx->sp>1?cx->sp-1:0);goto L_22;K_2189:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2190: Cell t1116=var_trans__fclbl;L_2191: pushc(cx,t1116);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2191,cx->sp>1?cx->sp-1:0);goto L_22;K_2191:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2192: Cell t1117=var_trans__fblbl;L_2193: pushc(cx,t1117);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2193,cx->sp>1?cx->sp-1:0);goto L_22;K_2193:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2194: Cell t1118=var_trans__inq;L_2195: L_2196: Cell t1119=uf_ceq(t1118,uf_mki(1LL));L_2197: pushc(cx,t1119);pushp(cx,(void*)&&L_2005);
-L_2198: pushp(cx,(void*)&&L_2010);
-L_2199: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2199,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2199,cx->sp>0?cx->sp-0:0);goto *el;}K_2199:;}
-L_2200: Cell t1120=var_trans__psnaps;L_2201: Cell t1121=var_trans__pends;L_2202: pushc(cx,t1120);pushc(cx,t1121);uf_cur_op="op_push";op_push(cx);
-L_2203: Cell t1122=pop(cx);L_2204: Cell t1123=uf_mkp((void*)&uf_sl218);L_2205: L_2206: Cell t1124=var_trans__douts;L_2207: Cell t1125=uf_mkp((void*)&uf_sl219);L_2208: var_trans__psnaps=t1122;var_trans__pends=t1123;pushc(cx,t1122);pushc(cx,t1123);pushc(cx,t1124);pushc(cx,t1125);uf_cur_op="op_push";op_push(cx);
-L_2209: Cell t1126=pop(cx);L_2210: L_2211: L_2212: Cell t1127=uf_mkp((void*)&uf_sl220);L_2213: Cell t1128=var_trans__fclbl;L_2214: Cell t1129=uf_mkp((void*)&uf_sl221);L_2215: var_trans__douts=t1126;var_trans__inq=uf_mki(1LL);pushc(cx,t1126);pushi(cx,1LL);pushc(cx,t1127);pushc(cx,t1128);pushc(cx,t1129);uf_cur_op="op_fmt";op_fmt(cx);
-L_2216: uf_cur_op="op_cat";op_cat(cx);
-L_2217: Cell t1130=uf_mkp((void*)&uf_sl222);L_2218: pushc(cx,t1130);uf_cur_op="op_cat";op_cat(cx);
-L_2219: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2219,cx->sp>1?cx->sp-1:0);goto L_42;K_2219:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2220: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2220,cx->sp>0?cx->sp-0:0);goto L_111;K_2220:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2221: Cell t1131=uf_mkp((void*)&uf_sl223);L_2222: pushc(cx,t1131);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2222,cx->sp>2?cx->sp-2:0);goto L_97;K_2222:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2223: pushp(cx,(void*)&&L_2357);
-L_2224: pushp(cx,(void*)&&L_2367);
-L_2225: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2225,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2225,cx->sp>0?cx->sp-0:0);goto *el;}K_2225:;}
-L_2226: Cell t1132=uf_mkp((void*)&uf_sl224);L_2227: pushc(cx,t1132);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2227,cx->sp>1?cx->sp-1:0);goto L_42;K_2227:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2228: Cell t1133=uf_mkp((void*)&uf_sl225);L_2229: Cell t1134=var_trans__fblbl;L_2230: Cell t1135=uf_mkp((void*)&uf_sl226);L_2231: pushc(cx,t1133);pushc(cx,t1134);pushc(cx,t1135);uf_cur_op="op_fmt";op_fmt(cx);
-L_2232: uf_cur_op="op_cat";op_cat(cx);
-L_2233: Cell t1136=uf_mkp((void*)&uf_sl227);L_2234: pushc(cx,t1136);uf_cur_op="op_cat";op_cat(cx);
-L_2235: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2235,cx->sp>1?cx->sp-1:0);goto L_42;K_2235:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2236: Cell t1137=var_trans__pi;L_2237: L_2238: L_2239: L_2240: L_2241: L_2242: var_trans__pfpi=t1137;var_trans__pfd=uf_mki(1LL);pushc(cx,t1137);pushi(cx,1LL);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_2242;cx->loops[fr].end=&&K_WE_2242;long _sp0=cx->sp;
-K_WC_2242:;{Cell _wc;{
-WC2242_L2382: Cell t0=var_trans__pfd;WC2242_L2383: WC2242_L2384: var_trans__rr=t0;pushc(cx,t0);WC2242_L2385: Cell t1=var_trans__rr;pushc(cx,t1);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_2242;
+L_1927: L_1928: L_1929: Cell _rv1008=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1008);return;}cx->csp--;const void*_r1009=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1008);if(!_r1009)return;goto *_r1009;}
+L_1930: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1930,cx->sp>0?cx->sp-0:0);goto L_566;K_1930:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1931: Cell t1010=uf_mkp((void*)&uf_sl192);L_1932: cx->locals[cx->local_base+0]=t1010;L_1933: pushc(cx,t1010);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1933,cx->sp>0?cx->sp-0:0);goto L_111;K_1933:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1934: Cell t1011=cx->locals[cx->local_base+0];L_1935: pushc(cx,t1011);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1935,cx->sp>2?cx->sp-2:0);goto L_97;K_1935:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1936: Cell t1012=pop(cx);Cell t1013=uf_cnot(t1012);L_1937: pushc(cx,t1013);pushp(cx,(void*)&&L_144);
+L_1938: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1938,cx->sp>0?cx->sp-0:0);goto *b;K_1938:;}}
+L_1939: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1939,cx->sp>0?cx->sp-0:0);goto L_127;K_1939:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1940: Cell t1014=uf_mkp((void*)&uf_sl193);L_1941: pushc(cx,t1014);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1941,cx->sp>1?cx->sp-1:0);goto L_42;K_1941:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1942: L_1943: L_1944: L_1945: L_1946: var_trans__didret=uf_mki(2LL);var_trans__rr=uf_mki(0LL);pushi(cx,2LL);pushi(cx,0LL);L_1947: Cell t1015=var_trans__rr;L_1948: Cell _rv1016=t1015;{if(cx->csp==0){pushc(cx,_rv1016);return;}cx->csp--;const void*_r1017=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1016);if(!_r1017)return;goto *_r1017;}
+L_1949: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1949,cx->sp>0?cx->sp-0:0);goto L_566;K_1949:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1950: Cell t1018=uf_mkp((void*)&uf_sl194);L_1951: cx->locals[cx->local_base+0]=t1018;L_1952: pushc(cx,t1018);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1952,cx->sp>0?cx->sp-0:0);goto L_111;K_1952:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1953: Cell t1019=cx->locals[cx->local_base+0];L_1954: pushc(cx,t1019);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1954,cx->sp>2?cx->sp-2:0);goto L_97;K_1954:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1955: Cell t1020=pop(cx);Cell t1021=uf_cnot(t1020);L_1956: pushc(cx,t1021);pushp(cx,(void*)&&L_144);
+L_1957: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1957,cx->sp>0?cx->sp-0:0);goto *b;K_1957:;}}
+L_1958: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1958,cx->sp>0?cx->sp-0:0);goto L_127;K_1958:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1959: Cell t1022=uf_mkp((void*)&uf_sl195);L_1960: pushc(cx,t1022);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1960,cx->sp>1?cx->sp-1:0);goto L_42;K_1960:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_1961: L_1962: L_1963: L_1964: L_1965: L_1966: L_1967: var_trans__cret=uf_mki(1LL);var_trans__didret=uf_mki(2LL);var_trans__rr=uf_mki(0LL);pushi(cx,1LL);pushi(cx,2LL);pushi(cx,0LL);L_1968: Cell t1023=var_trans__rr;L_1969: Cell _rv1024=t1023;{if(cx->csp==0){pushc(cx,_rv1024);return;}cx->csp--;const void*_r1025=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1024);if(!_r1025)return;goto *_r1025;}
+L_1970: Cell t1026=var_trans__douts;L_1971: pushc(cx,t1026);uf_cur_op="op_lpop";op_lpop(cx);
+L_1972: Cell t1027=pop(cx);L_1973: L_1974: Cell t1028=var_trans__pends;L_1975: var_trans__dchunk=t1027;pushc(cx,t1027);pushc(cx,t1027);pushc(cx,t1028);uf_cur_op="op_cat";op_cat(cx);
+L_1976: Cell t1029=pop(cx);L_1977: Cell t1030=var_trans__psnaps;L_1978: var_trans__cp=t1029;pushc(cx,t1029);pushc(cx,t1030);uf_cur_op="op_lpop";op_lpop(cx);
+L_1979: Cell t1031=pop(cx);L_1980: L_1981: Cell t1032=var_trans__cp;L_1982: var_trans__sv=t1031;pushc(cx,t1031);pushc(cx,t1031);pushc(cx,t1032);uf_cur_op="op_cat";op_cat(cx);
+L_1983: Cell t1033=var_trans__pends;L_1984: pushc(cx,t1033);uf_cur_op="op_cat";op_cat(cx);
+L_1985: Cell t1034=pop(cx);L_1986: var_trans__pends=t1034;pushc(cx,t1034);L_1987: L_1988: Cell _rv1035=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1035);return;}cx->csp--;const void*_r1036=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1035);if(!_r1036)return;goto *_r1036;}
+L_1989: Cell t1037=var_trans__didret;L_1990: L_1991: Cell t1038=uf_ceq(t1037,uf_mki(2LL));L_1992: pushc(cx,t1038);pushp(cx,(void*)&&L_2020);
+L_1993: pushp(cx,(void*)&&L_1998);
+L_1994: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_1994,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_1994,cx->sp>0?cx->sp-0:0);goto *el;}K_1994:;}
+L_1995: L_1996: L_1997: Cell _rv1039=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1039);return;}cx->csp--;const void*_r1040=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1039);if(!_r1040)return;goto *_r1040;}
+L_1998: Cell t1041=uf_mkp((void*)&uf_sl196);L_1999: pushc(cx,t1041);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_1999,cx->sp>1?cx->sp-1:0);goto L_42;K_1999:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2000: Cell t1042=var_trans__pends;L_2001: Cell t1043=uf_mkp((void*)&uf_sl197);L_2002: pushc(cx,t1042);pushc(cx,t1043);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2002,cx->sp>2?cx->sp-2:0);goto L_97;K_2002:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2003: Cell t1044=pop(cx);Cell t1045=uf_cnot(t1044);L_2004: pushc(cx,t1045);pushp(cx,(void*)&&L_2010);
+L_2005: pushp(cx,(void*)&&L_2017);
+L_2006: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2006,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2006,cx->sp>0?cx->sp-0:0);goto *el;}K_2006:;}
+L_2007: L_2008: L_2009: Cell _rv1046=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1046);return;}cx->csp--;const void*_r1047=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1046);if(!_r1047)return;goto *_r1047;}
+L_2010: Cell t1048=var_trans__pends;L_2011: pushc(cx,t1048);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2011,cx->sp>1?cx->sp-1:0);goto L_42;K_2011:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2012: Cell t1049=uf_mkp((void*)&uf_sl198);L_2013: L_2014: var_trans__pends=t1049;pushc(cx,t1049);L_2015: L_2016: Cell _rv1050=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1050);return;}cx->csp--;const void*_r1051=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1050);if(!_r1051)return;goto *_r1051;}
+L_2017: L_2018: L_2019: Cell _rv1052=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1052);return;}cx->csp--;const void*_r1053=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1052);if(!_r1053)return;goto *_r1053;}
+L_2020: Cell t1054=var_trans__pends;L_2021: Cell t1055=uf_mkp((void*)&uf_sl199);L_2022: pushc(cx,t1054);pushc(cx,t1055);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2022,cx->sp>2?cx->sp-2:0);goto L_97;K_2022:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2023: Cell t1056=pop(cx);Cell t1057=uf_cnot(t1056);L_2024: pushc(cx,t1057);pushp(cx,(void*)&&L_2030);
+L_2025: pushp(cx,(void*)&&L_2037);
+L_2026: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2026,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2026,cx->sp>0?cx->sp-0:0);goto *el;}K_2026:;}
+L_2027: L_2028: L_2029: Cell _rv1058=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1058);return;}cx->csp--;const void*_r1059=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1058);if(!_r1059)return;goto *_r1059;}
+L_2030: Cell t1060=var_trans__pends;L_2031: pushc(cx,t1060);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2031,cx->sp>1?cx->sp-1:0);goto L_42;K_2031:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2032: Cell t1061=uf_mkp((void*)&uf_sl200);L_2033: L_2034: var_trans__pends=t1061;pushc(cx,t1061);L_2035: L_2036: Cell _rv1062=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1062);return;}cx->csp--;const void*_r1063=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1062);if(!_r1063)return;goto *_r1063;}
+L_2037: L_2038: L_2039: Cell _rv1064=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1064);return;}cx->csp--;const void*_r1065=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1064);if(!_r1065)return;goto *_r1065;}
+L_2040: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2040,cx->sp>0?cx->sp-0:0);goto L_127;K_2040:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2041: Cell t1066=uf_mkp((void*)&uf_sl201);L_2042: cx->locals[cx->local_base+0]=t1066;L_2043: pushc(cx,t1066);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2043,cx->sp>0?cx->sp-0:0);goto L_111;K_2043:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2044: Cell t1067=cx->locals[cx->local_base+0];L_2045: pushc(cx,t1067);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2045,cx->sp>2?cx->sp-2:0);goto L_97;K_2045:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2046: Cell t1068=pop(cx);Cell t1069=uf_cnot(t1068);L_2047: pushc(cx,t1069);pushp(cx,(void*)&&L_144);
+L_2048: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2048,cx->sp>0?cx->sp-0:0);goto *b;K_2048:;}}
+L_2049: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2049,cx->sp>0?cx->sp-0:0);goto L_127;K_2049:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2050: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2050,cx->sp>0?cx->sp-0:0);goto L_566;K_2050:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2051: Cell t1070=uf_mkp((void*)&uf_sl202);L_2052: cx->locals[cx->local_base+0]=t1070;L_2053: pushc(cx,t1070);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2053,cx->sp>0?cx->sp-0:0);goto L_111;K_2053:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2054: Cell t1071=cx->locals[cx->local_base+0];L_2055: pushc(cx,t1071);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2055,cx->sp>2?cx->sp-2:0);goto L_97;K_2055:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2056: Cell t1072=pop(cx);Cell t1073=uf_cnot(t1072);L_2057: pushc(cx,t1073);pushp(cx,(void*)&&L_144);
+L_2058: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2058,cx->sp>0?cx->sp-0:0);goto *b;K_2058:;}}
+L_2059: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2059,cx->sp>0?cx->sp-0:0);goto L_127;K_2059:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2060: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2060,cx->sp>0?cx->sp-0:0);goto L_135;K_2060:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2061: Cell t1074=pop(cx);L_2062: Cell t1075=var_trans__inq;L_2063: var_trans__tlbl=t1074;pushc(cx,t1074);pushc(cx,t1075);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2063,cx->sp>1?cx->sp-1:0);goto L_22;K_2063:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2064: Cell t1076=var_trans__emode;L_2065: pushc(cx,t1076);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2065,cx->sp>1?cx->sp-1:0);goto L_22;K_2065:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2066: Cell t1077=var_trans__tlbl;L_2067: pushc(cx,t1077);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2067,cx->sp>1?cx->sp-1:0);goto L_22;K_2067:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2068: Cell t1078=var_trans__inq;L_2069: L_2070: Cell t1079=uf_ceq(t1078,uf_mki(1LL));L_2071: pushc(cx,t1079);pushp(cx,(void*)&&L_2105);
+L_2072: pushp(cx,(void*)&&L_2110);
+L_2073: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2073,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2073,cx->sp>0?cx->sp-0:0);goto *el;}K_2073:;}
+L_2074: Cell t1080=var_trans__psnaps;L_2075: Cell t1081=var_trans__pends;L_2076: pushc(cx,t1080);pushc(cx,t1081);uf_cur_op="op_push";op_push(cx);
+L_2077: Cell t1082=pop(cx);L_2078: Cell t1083=uf_mkp((void*)&uf_sl203);L_2079: L_2080: Cell t1084=var_trans__douts;L_2081: Cell t1085=uf_mkp((void*)&uf_sl204);L_2082: var_trans__psnaps=t1082;var_trans__pends=t1083;pushc(cx,t1082);pushc(cx,t1083);pushc(cx,t1084);pushc(cx,t1085);uf_cur_op="op_push";op_push(cx);
+L_2083: Cell t1086=pop(cx);L_2084: L_2085: L_2086: Cell t1087=uf_mkp((void*)&uf_sl205);L_2087: Cell t1088=var_trans__tlbl;L_2088: Cell t1089=uf_mkp((void*)&uf_sl206);L_2089: var_trans__douts=t1086;var_trans__inq=uf_mki(1LL);pushc(cx,t1086);pushi(cx,1LL);pushc(cx,t1087);pushc(cx,t1088);pushc(cx,t1089);uf_cur_op="op_fmt";op_fmt(cx);
+L_2090: uf_cur_op="op_cat";op_cat(cx);
+L_2091: Cell t1090=uf_mkp((void*)&uf_sl207);L_2092: pushc(cx,t1090);uf_cur_op="op_cat";op_cat(cx);
+L_2093: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2093,cx->sp>1?cx->sp-1:0);goto L_42;K_2093:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2094: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2094,cx->sp>0?cx->sp-0:0);goto L_1745;K_2094:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2095: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2095,cx->sp>0?cx->sp-0:0);goto L_1989;K_2095:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2096: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2096,cx->sp>0?cx->sp-0:0);goto L_111;K_2096:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2097: Cell t1091=uf_mkp((void*)&uf_sl208);L_2098: pushc(cx,t1091);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2098,cx->sp>2?cx->sp-2:0);goto L_97;K_2098:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2099: pushp(cx,(void*)&&L_2115);
+L_2100: pushp(cx,(void*)&&L_2153);
+L_2101: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2101,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2101,cx->sp>0?cx->sp-0:0);goto *el;}K_2101:;}
+L_2102: L_2103: L_2104: Cell _rv1092=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1092);return;}cx->csp--;const void*_r1093=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1092);if(!_r1093)return;goto *_r1093;}
+L_2105: L_2106: L_2107: var_trans__emode=uf_mki(2LL);pushi(cx,2LL);L_2108: L_2109: Cell _rv1094=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1094);return;}cx->csp--;const void*_r1095=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1094);if(!_r1095)return;goto *_r1095;}
+L_2110: L_2111: L_2112: var_trans__emode=uf_mki(0LL);pushi(cx,0LL);L_2113: L_2114: Cell _rv1096=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1096);return;}cx->csp--;const void*_r1097=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1096);if(!_r1097)return;goto *_r1097;}
+L_2115: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2115,cx->sp>0?cx->sp-0:0);goto L_135;K_2115:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2116: Cell t1098=pop(cx);L_2117: L_2118: var_trans__elbl=t1098;pushc(cx,t1098);pushc(cx,t1098);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2118,cx->sp>1?cx->sp-1:0);goto L_22;K_2118:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2119: Cell t1099=uf_mkp((void*)&uf_sl209);L_2120: Cell t1100=var_trans__elbl;L_2121: Cell t1101=uf_mkp((void*)&uf_sl210);L_2122: pushc(cx,t1099);pushc(cx,t1100);pushc(cx,t1101);uf_cur_op="op_fmt";op_fmt(cx);
+L_2123: uf_cur_op="op_cat";op_cat(cx);
+L_2124: Cell t1102=uf_mkp((void*)&uf_sl211);L_2125: pushc(cx,t1102);uf_cur_op="op_cat";op_cat(cx);
+L_2126: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2126,cx->sp>1?cx->sp-1:0);goto L_42;K_2126:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2127: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2127,cx->sp>0?cx->sp-0:0);goto L_127;K_2127:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2128: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2128,cx->sp>0?cx->sp-0:0);goto L_1745;K_2128:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2129: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2129,cx->sp>0?cx->sp-0:0);goto L_1989;K_2129:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2130: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2130,cx->sp>0?cx->sp-0:0);goto L_30;K_2130:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2131: Cell t1103=pop(cx);L_2132: var_trans__elbl=t1103;pushc(cx,t1103);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2132,cx->sp>0?cx->sp-0:0);goto L_30;K_2132:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2133: Cell t1104=pop(cx);L_2134: var_trans__tlbl=t1104;pushc(cx,t1104);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2134,cx->sp>0?cx->sp-0:0);goto L_30;K_2134:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2135: Cell t1105=pop(cx);L_2136: var_trans__emode=t1105;pushc(cx,t1105);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2136,cx->sp>0?cx->sp-0:0);goto L_1970;K_2136:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2137: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2137,cx->sp>0?cx->sp-0:0);goto L_30;K_2137:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2138: Cell t1106=pop(cx);L_2139: Cell t1107=var_trans__tlbl;L_2140: Cell t1108=var_trans__elbl;L_2141: Cell t1109=uf_mkp((void*)&uf_sl212);L_2142: var_trans__inq=t1106;pushc(cx,t1106);pushc(cx,t1107);pushc(cx,t1108);pushc(cx,t1109);uf_cur_op="op_fmt";op_fmt(cx);
+L_2143: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2143,cx->sp>1?cx->sp-1:0);goto L_42;K_2143:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2144: L_2145: L_2146: Cell t1110=var_trans__cret;L_2147: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1110);pushp(cx,(void*)&&L_2795);
+L_2148: pushp(cx,(void*)&&L_2792);
+L_2149: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2149,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2149,cx->sp>0?cx->sp-0:0);goto *el;}K_2149:;}
+L_2150: L_2151: L_2152: Cell _rv1111=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1111);return;}cx->csp--;const void*_r1112=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1111);if(!_r1112)return;goto *_r1112;}
+L_2153: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2153,cx->sp>0?cx->sp-0:0);goto L_30;K_2153:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2154: Cell t1113=pop(cx);L_2155: var_trans__tlbl=t1113;pushc(cx,t1113);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2155,cx->sp>0?cx->sp-0:0);goto L_30;K_2155:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2156: Cell t1114=pop(cx);L_2157: var_trans__emode=t1114;pushc(cx,t1114);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2157,cx->sp>0?cx->sp-0:0);goto L_1970;K_2157:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2158: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2158,cx->sp>0?cx->sp-0:0);goto L_30;K_2158:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2159: Cell t1115=pop(cx);L_2160: Cell t1116=var_trans__tlbl;L_2161: Cell t1117=uf_mkp((void*)&uf_sl213);L_2162: var_trans__inq=t1115;pushc(cx,t1115);pushc(cx,t1116);pushc(cx,t1117);uf_cur_op="op_fmt";op_fmt(cx);
+L_2163: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2163,cx->sp>1?cx->sp-1:0);goto L_42;K_2163:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2164: L_2165: L_2166: Cell t1118=var_trans__cret;L_2167: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1118);pushp(cx,(void*)&&L_2795);
+L_2168: pushp(cx,(void*)&&L_2792);
+L_2169: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2169,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2169,cx->sp>0?cx->sp-0:0);goto *el;}K_2169:;}
+L_2170: L_2171: L_2172: Cell _rv1119=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1119);return;}cx->csp--;const void*_r1120=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1119);if(!_r1120)return;goto *_r1120;}
+L_2173: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2173,cx->sp>0?cx->sp-0:0);goto L_127;K_2173:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2174: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2174,cx->sp>0?cx->sp-0:0);goto L_135;K_2174:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2175: Cell t1121=pop(cx);L_2176: var_trans__clbl=t1121;pushc(cx,t1121);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2176,cx->sp>0?cx->sp-0:0);goto L_135;K_2176:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2177: Cell t1122=pop(cx);L_2178: Cell t1123=var_trans__inq;L_2179: var_trans__blbl=t1122;pushc(cx,t1122);pushc(cx,t1123);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2179,cx->sp>1?cx->sp-1:0);goto L_22;K_2179:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2180: Cell t1124=var_trans__emode;L_2181: pushc(cx,t1124);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2181,cx->sp>1?cx->sp-1:0);goto L_22;K_2181:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2182: Cell t1125=var_trans__clbl;L_2183: pushc(cx,t1125);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2183,cx->sp>1?cx->sp-1:0);goto L_22;K_2183:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2184: Cell t1126=var_trans__blbl;L_2185: pushc(cx,t1126);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2185,cx->sp>1?cx->sp-1:0);goto L_22;K_2185:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2186: Cell t1127=var_trans__inq;L_2187: L_2188: Cell t1128=uf_ceq(t1127,uf_mki(1LL));L_2189: pushc(cx,t1128);pushp(cx,(void*)&&L_2105);
+L_2190: pushp(cx,(void*)&&L_2110);
+L_2191: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2191,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2191,cx->sp>0?cx->sp-0:0);goto *el;}K_2191:;}
+L_2192: Cell t1129=var_trans__psnaps;L_2193: Cell t1130=var_trans__pends;L_2194: pushc(cx,t1129);pushc(cx,t1130);uf_cur_op="op_push";op_push(cx);
+L_2195: Cell t1131=pop(cx);L_2196: Cell t1132=uf_mkp((void*)&uf_sl214);L_2197: L_2198: Cell t1133=var_trans__douts;L_2199: Cell t1134=uf_mkp((void*)&uf_sl215);L_2200: var_trans__psnaps=t1131;var_trans__pends=t1132;pushc(cx,t1131);pushc(cx,t1132);pushc(cx,t1133);pushc(cx,t1134);uf_cur_op="op_push";op_push(cx);
+L_2201: Cell t1135=pop(cx);L_2202: L_2203: L_2204: Cell t1136=var_trans__lstack;L_2205: Cell t1137=uf_mkp((void*)&uf_sl216);L_2206: var_trans__douts=t1135;var_trans__inq=uf_mki(1LL);pushc(cx,t1135);pushi(cx,1LL);pushc(cx,t1136);pushc(cx,t1137);uf_cur_op="op_push";op_push(cx);
+L_2207: Cell t1138=pop(cx);L_2208: Cell t1139=uf_mkp((void*)&uf_sl217);L_2209: Cell t1140=var_trans__clbl;L_2210: Cell t1141=uf_mkp((void*)&uf_sl218);L_2211: var_trans__lstack=t1138;pushc(cx,t1138);pushc(cx,t1139);pushc(cx,t1140);pushc(cx,t1141);uf_cur_op="op_fmt";op_fmt(cx);
+L_2212: uf_cur_op="op_cat";op_cat(cx);
+L_2213: Cell t1142=uf_mkp((void*)&uf_sl219);L_2214: pushc(cx,t1142);uf_cur_op="op_cat";op_cat(cx);
+L_2215: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2215,cx->sp>1?cx->sp-1:0);goto L_42;K_2215:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2216: Cell t1143=uf_mkp((void*)&uf_sl220);L_2217: cx->locals[cx->local_base+0]=t1143;L_2218: pushc(cx,t1143);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2218,cx->sp>0?cx->sp-0:0);goto L_111;K_2218:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2219: Cell t1144=cx->locals[cx->local_base+0];L_2220: pushc(cx,t1144);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2220,cx->sp>2?cx->sp-2:0);goto L_97;K_2220:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2221: Cell t1145=pop(cx);Cell t1146=uf_cnot(t1145);L_2222: pushc(cx,t1146);pushp(cx,(void*)&&L_144);
+L_2223: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2223,cx->sp>0?cx->sp-0:0);goto *b;K_2223:;}}
+L_2224: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2224,cx->sp>0?cx->sp-0:0);goto L_127;K_2224:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2225: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2225,cx->sp>0?cx->sp-0:0);goto L_566;K_2225:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2226: Cell t1147=uf_mkp((void*)&uf_sl221);L_2227: cx->locals[cx->local_base+0]=t1147;L_2228: pushc(cx,t1147);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2228,cx->sp>0?cx->sp-0:0);goto L_111;K_2228:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2229: Cell t1148=cx->locals[cx->local_base+0];L_2230: pushc(cx,t1148);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2230,cx->sp>2?cx->sp-2:0);goto L_97;K_2230:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2231: Cell t1149=pop(cx);Cell t1150=uf_cnot(t1149);L_2232: pushc(cx,t1150);pushp(cx,(void*)&&L_144);
+L_2233: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2233,cx->sp>0?cx->sp-0:0);goto *b;K_2233:;}}
+L_2234: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2234,cx->sp>0?cx->sp-0:0);goto L_127;K_2234:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2235: Cell t1151=uf_mkp((void*)&uf_sl222);L_2236: pushc(cx,t1151);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2236,cx->sp>1?cx->sp-1:0);goto L_42;K_2236:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2237: Cell t1152=uf_mkp((void*)&uf_sl223);L_2238: Cell t1153=var_trans__blbl;L_2239: Cell t1154=uf_mkp((void*)&uf_sl224);L_2240: pushc(cx,t1152);pushc(cx,t1153);pushc(cx,t1154);uf_cur_op="op_fmt";op_fmt(cx);
+L_2241: uf_cur_op="op_cat";op_cat(cx);
+L_2242: Cell t1155=uf_mkp((void*)&uf_sl225);L_2243: pushc(cx,t1155);uf_cur_op="op_cat";op_cat(cx);
+L_2244: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2244,cx->sp>1?cx->sp-1:0);goto L_42;K_2244:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2245: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2245,cx->sp>0?cx->sp-0:0);goto L_1745;K_2245:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2246: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2246,cx->sp>0?cx->sp-0:0);goto L_1989;K_2246:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2247: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2247,cx->sp>0?cx->sp-0:0);goto L_30;K_2247:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2248: Cell t1156=pop(cx);L_2249: var_trans__blbl=t1156;pushc(cx,t1156);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2249,cx->sp>0?cx->sp-0:0);goto L_30;K_2249:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2250: Cell t1157=pop(cx);L_2251: var_trans__clbl=t1157;pushc(cx,t1157);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2251,cx->sp>0?cx->sp-0:0);goto L_30;K_2251:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2252: Cell t1158=pop(cx);L_2253: var_trans__emode=t1158;pushc(cx,t1158);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2253,cx->sp>0?cx->sp-0:0);goto L_1970;K_2253:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2254: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2254,cx->sp>0?cx->sp-0:0);goto L_30;K_2254:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2255: Cell t1159=pop(cx);L_2256: Cell t1160=var_trans__clbl;L_2257: Cell t1161=var_trans__blbl;L_2258: Cell t1162=uf_mkp((void*)&uf_sl226);L_2259: var_trans__inq=t1159;pushc(cx,t1159);pushc(cx,t1160);pushc(cx,t1161);pushc(cx,t1162);uf_cur_op="op_fmt";op_fmt(cx);
+L_2260: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2260,cx->sp>1?cx->sp-1:0);goto L_42;K_2260:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2261: Cell t1163=var_trans__lstack;L_2262: pushc(cx,t1163);uf_cur_op="op_lpop";op_lpop(cx);
+L_2263: L_2264: L_2265: Cell t1164=var_trans__cret;L_2266: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1164);pushp(cx,(void*)&&L_2795);
+L_2267: pushp(cx,(void*)&&L_2792);
+L_2268: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2268,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2268,cx->sp>0?cx->sp-0:0);goto *el;}K_2268:;}
+L_2269: L_2270: L_2271: Cell _rv1165=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1165);return;}cx->csp--;const void*_r1166=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1165);if(!_r1166)return;goto *_r1166;}
+L_2272: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2272,cx->sp>0?cx->sp-0:0);goto L_127;K_2272:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2273: Cell t1167=uf_mkp((void*)&uf_sl227);L_2274: cx->locals[cx->local_base+0]=t1167;L_2275: pushc(cx,t1167);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2275,cx->sp>0?cx->sp-0:0);goto L_111;K_2275:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2276: Cell t1168=cx->locals[cx->local_base+0];L_2277: pushc(cx,t1168);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2277,cx->sp>2?cx->sp-2:0);goto L_97;K_2277:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2278: Cell t1169=pop(cx);Cell t1170=uf_cnot(t1169);L_2279: pushc(cx,t1170);pushp(cx,(void*)&&L_144);
+L_2280: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2280,cx->sp>0?cx->sp-0:0);goto *b;K_2280:;}}
+L_2281: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2281,cx->sp>0?cx->sp-0:0);goto L_127;K_2281:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2282: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2282,cx->sp>0?cx->sp-0:0);goto L_135;K_2282:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2283: Cell t1171=pop(cx);L_2284: var_trans__fclbl=t1171;pushc(cx,t1171);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2284,cx->sp>0?cx->sp-0:0);goto L_135;K_2284:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2285: Cell t1172=pop(cx);L_2286: var_trans__fblbl=t1172;pushc(cx,t1172);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2286,cx->sp>0?cx->sp-0:0);goto L_135;K_2286:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2287: Cell t1173=pop(cx);L_2288: var_trans__filbl=t1173;pushc(cx,t1173);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2288,cx->sp>0?cx->sp-0:0);goto L_111;K_2288:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2289: Cell t1174=uf_mkp((void*)&uf_sl228);L_2290: pushc(cx,t1174);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2290,cx->sp>2?cx->sp-2:0);goto L_97;K_2290:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2291: pushp(cx,(void*)&&L_2490);
+L_2292: pushp(cx,(void*)&&L_2496);
+L_2293: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2293,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2293,cx->sp>0?cx->sp-0:0);goto *el;}K_2293:;}
+L_2294: Cell t1175=var_trans__inq;L_2295: pushc(cx,t1175);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2295,cx->sp>1?cx->sp-1:0);goto L_22;K_2295:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2296: Cell t1176=var_trans__emode;L_2297: pushc(cx,t1176);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2297,cx->sp>1?cx->sp-1:0);goto L_22;K_2297:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2298: Cell t1177=var_trans__fclbl;L_2299: pushc(cx,t1177);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2299,cx->sp>1?cx->sp-1:0);goto L_22;K_2299:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2300: Cell t1178=var_trans__fblbl;L_2301: pushc(cx,t1178);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2301,cx->sp>1?cx->sp-1:0);goto L_22;K_2301:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2302: Cell t1179=var_trans__inq;L_2303: L_2304: Cell t1180=uf_ceq(t1179,uf_mki(1LL));L_2305: pushc(cx,t1180);pushp(cx,(void*)&&L_2105);
+L_2306: pushp(cx,(void*)&&L_2110);
+L_2307: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2307,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2307,cx->sp>0?cx->sp-0:0);goto *el;}K_2307:;}
+L_2308: Cell t1181=var_trans__psnaps;L_2309: Cell t1182=var_trans__pends;L_2310: pushc(cx,t1181);pushc(cx,t1182);uf_cur_op="op_push";op_push(cx);
+L_2311: Cell t1183=pop(cx);L_2312: Cell t1184=uf_mkp((void*)&uf_sl229);L_2313: L_2314: Cell t1185=var_trans__douts;L_2315: Cell t1186=uf_mkp((void*)&uf_sl230);L_2316: var_trans__psnaps=t1183;var_trans__pends=t1184;pushc(cx,t1183);pushc(cx,t1184);pushc(cx,t1185);pushc(cx,t1186);uf_cur_op="op_push";op_push(cx);
+L_2317: Cell t1187=pop(cx);L_2318: L_2319: L_2320: Cell t1188=var_trans__lstack;L_2321: Cell t1189=var_trans__filbl;L_2322: Cell t1190=uf_mkp((void*)&uf_sl231);L_2323: var_trans__douts=t1187;var_trans__inq=uf_mki(1LL);pushc(cx,t1187);pushi(cx,1LL);pushc(cx,t1188);pushc(cx,t1189);pushc(cx,t1190);uf_cur_op="op_fmt";op_fmt(cx);
+L_2324: uf_cur_op="op_push";op_push(cx);
+L_2325: Cell t1191=pop(cx);L_2326: Cell t1192=uf_mkp((void*)&uf_sl232);L_2327: Cell t1193=var_trans__fclbl;L_2328: Cell t1194=uf_mkp((void*)&uf_sl233);L_2329: var_trans__lstack=t1191;pushc(cx,t1191);pushc(cx,t1192);pushc(cx,t1193);pushc(cx,t1194);uf_cur_op="op_fmt";op_fmt(cx);
+L_2330: uf_cur_op="op_cat";op_cat(cx);
+L_2331: Cell t1195=uf_mkp((void*)&uf_sl234);L_2332: pushc(cx,t1195);uf_cur_op="op_cat";op_cat(cx);
+L_2333: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2333,cx->sp>1?cx->sp-1:0);goto L_42;K_2333:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2334: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2334,cx->sp>0?cx->sp-0:0);goto L_111;K_2334:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2335: Cell t1196=uf_mkp((void*)&uf_sl235);L_2336: pushc(cx,t1196);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2336,cx->sp>2?cx->sp-2:0);goto L_97;K_2336:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2337: pushp(cx,(void*)&&L_2558);
+L_2338: pushp(cx,(void*)&&L_2566);
+L_2339: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2339,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2339,cx->sp>0?cx->sp-0:0);goto *el;}K_2339:;}
+L_2340: Cell t1197=uf_mkp((void*)&uf_sl236);L_2341: pushc(cx,t1197);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2341,cx->sp>1?cx->sp-1:0);goto L_42;K_2341:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2342: Cell t1198=uf_mkp((void*)&uf_sl237);L_2343: Cell t1199=var_trans__fblbl;L_2344: Cell t1200=uf_mkp((void*)&uf_sl238);L_2345: pushc(cx,t1198);pushc(cx,t1199);pushc(cx,t1200);uf_cur_op="op_fmt";op_fmt(cx);
+L_2346: uf_cur_op="op_cat";op_cat(cx);
+L_2347: Cell t1201=uf_mkp((void*)&uf_sl239);L_2348: pushc(cx,t1201);uf_cur_op="op_cat";op_cat(cx);
+L_2349: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2349,cx->sp>1?cx->sp-1:0);goto L_42;K_2349:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2350: Cell t1202=var_trans__pi;L_2351: L_2352: L_2353: L_2354: L_2355: L_2356: var_trans__pfpi=t1202;var_trans__pfd=uf_mki(1LL);pushc(cx,t1202);pushi(cx,1LL);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_2356;cx->loops[fr].end=&&K_WE_2356;long _sp0=cx->sp;
+K_WC_2356:;{Cell _wc;{
+WC2356_L2581: Cell t0=var_trans__pfd;WC2356_L2582: WC2356_L2583: var_trans__rr=t0;pushc(cx,t0);WC2356_L2584: Cell t1=var_trans__rr;pushc(cx,t1);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_2356;
 {
-WB2242_L2387: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2242_2387,cx->sp>0?cx->sp-0:0);goto L_111;K_WB2242_2387:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB2242_L2388: Cell t0=uf_mkp((void*)&uf_sl238);WB2242_L2389: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2242_2389,cx->sp>2?cx->sp-2:0);goto L_97;K_WB2242_2389:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB2242_L2390: pushp(cx,(void*)&&L_2396);
-WB2242_L2391: pushp(cx,(void*)&&L_2406);
-WB2242_L2392: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_WB2242_2392,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_WB2242_2392,cx->sp>0?cx->sp-0:0);goto *el;}K_WB2242_2392:;}
-WB2242_L2393: }cx->sp=_sp0;goto K_WC_2242;}
-K_WE_2242:;cx->lsp=fr;}
-L_2243: Cell t1138=uf_mkp((void*)&uf_sl228);L_2244: cx->locals[cx->local_base+0]=t1138;L_2245: pushc(cx,t1138);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2245,cx->sp>0?cx->sp-0:0);goto L_111;K_2245:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2246: Cell t1139=cx->locals[cx->local_base+0];L_2247: pushc(cx,t1139);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2247,cx->sp>2?cx->sp-2:0);goto L_97;K_2247:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2248: Cell t1140=pop(cx);Cell t1141=uf_cnot(t1140);L_2249: pushc(cx,t1141);pushp(cx,(void*)&&L_144);
-L_2250: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2250,cx->sp>0?cx->sp-0:0);goto *b;K_2250:;}}
-L_2251: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2251,cx->sp>0?cx->sp-0:0);goto L_127;K_2251:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2252: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2252,cx->sp>0?cx->sp-0:0);goto L_1645;K_2252:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2253: Cell t1142=var_trans__pi;L_2254: L_2255: Cell t1143=var_trans__pfpi;L_2256: L_2257: var_trans__pi=t1143;var_trans__pfpi2=t1142;pushc(cx,t1142);pushc(cx,t1143);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2257,cx->sp>0?cx->sp-0:0);goto L_111;K_2257:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2258: Cell t1144=uf_mkp((void*)&uf_sl229);L_2259: pushc(cx,t1144);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2259,cx->sp>2?cx->sp-2:0);goto L_97;K_2259:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2260: pushp(cx,(void*)&&L_2443);
-L_2261: pushp(cx,(void*)&&L_2448);
-L_2262: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2262,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2262,cx->sp>0?cx->sp-0:0);goto *el;}K_2262:;}
-L_2263: Cell t1145=var_trans__pfpi2;L_2264: L_2265: var_trans__pi=t1145;pushc(cx,t1145);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2265,cx->sp>0?cx->sp-0:0);goto L_1889;K_2265:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2266: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2266,cx->sp>0?cx->sp-0:0);goto L_30;K_2266:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2267: Cell t1146=pop(cx);L_2268: var_trans__fblbl=t1146;pushc(cx,t1146);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2268,cx->sp>0?cx->sp-0:0);goto L_30;K_2268:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2269: Cell t1147=pop(cx);L_2270: var_trans__fclbl=t1147;pushc(cx,t1147);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2270,cx->sp>0?cx->sp-0:0);goto L_30;K_2270:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2271: Cell t1148=pop(cx);L_2272: var_trans__emode=t1148;pushc(cx,t1148);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2272,cx->sp>0?cx->sp-0:0);goto L_1870;K_2272:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2273: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2273,cx->sp>0?cx->sp-0:0);goto L_30;K_2273:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2274: Cell t1149=pop(cx);L_2275: Cell t1150=var_trans__fclbl;L_2276: Cell t1151=var_trans__fblbl;L_2277: Cell t1152=uf_mkp((void*)&uf_sl230);L_2278: var_trans__inq=t1149;pushc(cx,t1149);pushc(cx,t1150);pushc(cx,t1151);pushc(cx,t1152);uf_cur_op="op_fmt";op_fmt(cx);
-L_2279: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2279,cx->sp>1?cx->sp-1:0);goto L_42;K_2279:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2280: L_2281: L_2282: Cell t1153=var_trans__cret;L_2283: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1153);pushp(cx,(void*)&&L_2597);
-L_2284: pushp(cx,(void*)&&L_2594);
-L_2285: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2285,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2285,cx->sp>0?cx->sp-0:0);goto *el;}K_2285:;}
-L_2286: L_2287: L_2288: Cell _rv1154=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1154);return;}cx->csp--;const void*_r1155=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1154);if(!_r1155)return;goto *_r1155;}
-L_2289: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2289,cx->sp>0?cx->sp-0:0);goto L_127;K_2289:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2290: L_2291: L_2292: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2293: Cell t1156=var_trans__rr;L_2294: Cell _rv1157=t1156;{if(cx->csp==0){pushc(cx,_rv1157);return;}cx->csp--;const void*_r1158=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1157);if(!_r1158)return;goto *_r1158;}
-L_2295: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2295,cx->sp>0?cx->sp-0:0);goto L_111;K_2295:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2296: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2296,cx->sp>1?cx->sp-1:0);goto L_155;K_2296:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2297: pushp(cx,(void*)&&L_2303);
-L_2298: pushp(cx,(void*)&&L_2342);
-L_2299: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2299,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2299,cx->sp>0?cx->sp-0:0);goto *el;}K_2299:;}
-L_2300: L_2301: L_2302: Cell _rv1159=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1159);return;}cx->csp--;const void*_r1160=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1159);if(!_r1160)return;goto *_r1160;}
-L_2303: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2303,cx->sp>0?cx->sp-0:0);goto L_195;K_2303:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2304: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2304,cx->sp>0?cx->sp-0:0);goto L_111;K_2304:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2305: Cell t1161=pop(cx);L_2306: var_trans__nv=t1161;pushc(cx,t1161);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2306,cx->sp>0?cx->sp-0:0);goto L_127;K_2306:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2307: Cell t1162=var_trans__nv;L_2308: pushc(cx,t1162);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2308,cx->sp>1?cx->sp-1:0);goto L_215;K_2308:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2309: Cell t1163=pop(cx);L_2310: Cell t1164=uf_mkp((void*)&uf_sl231);L_2311: cx->locals[cx->local_base+0]=t1164;L_2312: var_trans__slot=t1163;pushc(cx,t1163);pushc(cx,t1164);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2312,cx->sp>0?cx->sp-0:0);goto L_111;K_2312:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2313: Cell t1165=cx->locals[cx->local_base+0];L_2314: pushc(cx,t1165);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2314,cx->sp>2?cx->sp-2:0);goto L_97;K_2314:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2315: Cell t1166=pop(cx);Cell t1167=uf_cnot(t1166);L_2316: pushc(cx,t1167);pushp(cx,(void*)&&L_144);
-L_2317: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2317,cx->sp>0?cx->sp-0:0);goto *b;K_2317:;}}
-L_2318: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2318,cx->sp>0?cx->sp-0:0);goto L_127;K_2318:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2319: Cell t1168=var_trans__slot;L_2320: pushc(cx,t1168);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2320,cx->sp>1?cx->sp-1:0);goto L_0;K_2320:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2321: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2321,cx->sp>0?cx->sp-0:0);goto L_571;K_2321:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2322: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2322,cx->sp>0?cx->sp-0:0);goto L_36;K_2322:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2323: Cell t1169=pop(cx);L_2324: L_2325: Cell t1170=uf_mkp((void*)&uf_sl232);L_2326: var_trans__slot2=t1169;pushc(cx,t1169);pushc(cx,t1169);pushc(cx,t1170);uf_cur_op="op_fmt";op_fmt(cx);
-L_2327: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2327,cx->sp>1?cx->sp-1:0);goto L_42;K_2327:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2328: Cell t1171=uf_mkp((void*)&uf_sl233);L_2329: cx->locals[cx->local_base+0]=t1171;L_2330: pushc(cx,t1171);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2330,cx->sp>0?cx->sp-0:0);goto L_111;K_2330:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2331: Cell t1172=cx->locals[cx->local_base+0];L_2332: pushc(cx,t1172);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2332,cx->sp>2?cx->sp-2:0);goto L_97;K_2332:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2333: Cell t1173=pop(cx);Cell t1174=uf_cnot(t1173);L_2334: pushc(cx,t1174);pushp(cx,(void*)&&L_144);
-L_2335: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2335,cx->sp>0?cx->sp-0:0);goto *b;K_2335:;}}
-L_2336: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2336,cx->sp>0?cx->sp-0:0);goto L_127;K_2336:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2337: L_2338: L_2339: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2340: Cell t1175=var_trans__rr;L_2341: Cell _rv1176=t1175;{if(cx->csp==0){pushc(cx,_rv1176);return;}cx->csp--;const void*_r1177=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1176);if(!_r1177)return;goto *_r1177;}
-L_2342: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2342,cx->sp>0?cx->sp-0:0);goto L_566;K_2342:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2343: Cell t1178=uf_mkp((void*)&uf_sl234);L_2344: cx->locals[cx->local_base+0]=t1178;L_2345: pushc(cx,t1178);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2345,cx->sp>0?cx->sp-0:0);goto L_111;K_2345:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2346: Cell t1179=cx->locals[cx->local_base+0];L_2347: pushc(cx,t1179);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2347,cx->sp>2?cx->sp-2:0);goto L_97;K_2347:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2348: Cell t1180=pop(cx);Cell t1181=uf_cnot(t1180);L_2349: pushc(cx,t1181);pushp(cx,(void*)&&L_144);
-L_2350: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2350,cx->sp>0?cx->sp-0:0);goto *b;K_2350:;}}
-L_2351: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2351,cx->sp>0?cx->sp-0:0);goto L_127;K_2351:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2352: L_2353: L_2354: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2355: Cell t1182=var_trans__rr;L_2356: Cell _rv1183=t1182;{if(cx->csp==0){pushc(cx,_rv1183);return;}cx->csp--;const void*_r1184=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1183);if(!_r1184)return;goto *_r1184;}
-L_2357: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2357,cx->sp>0?cx->sp-0:0);goto L_127;K_2357:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2358: Cell t1185=uf_mkp((void*)&uf_sl235);L_2359: pushc(cx,t1185);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2359,cx->sp>1?cx->sp-1:0);goto L_42;K_2359:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2360: Cell t1186=uf_mkp((void*)&uf_sl236);L_2361: pushc(cx,t1186);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2361,cx->sp>1?cx->sp-1:0);goto L_42;K_2361:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2362: L_2363: L_2364: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2365: Cell t1187=var_trans__rr;L_2366: Cell _rv1188=t1187;{if(cx->csp==0){pushc(cx,_rv1188);return;}cx->csp--;const void*_r1189=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1188);if(!_r1189)return;goto *_r1189;}
-L_2367: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2367,cx->sp>0?cx->sp-0:0);goto L_566;K_2367:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2368: Cell t1190=uf_mkp((void*)&uf_sl237);L_2369: cx->locals[cx->local_base+0]=t1190;L_2370: pushc(cx,t1190);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2370,cx->sp>0?cx->sp-0:0);goto L_111;K_2370:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2371: Cell t1191=cx->locals[cx->local_base+0];L_2372: pushc(cx,t1191);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2372,cx->sp>2?cx->sp-2:0);goto L_97;K_2372:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2373: Cell t1192=pop(cx);Cell t1193=uf_cnot(t1192);L_2374: pushc(cx,t1193);pushp(cx,(void*)&&L_144);
-L_2375: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2375,cx->sp>0?cx->sp-0:0);goto *b;K_2375:;}}
-L_2376: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2376,cx->sp>0?cx->sp-0:0);goto L_127;K_2376:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2377: L_2378: L_2379: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2380: Cell t1194=var_trans__rr;L_2381: Cell _rv1195=t1194;{if(cx->csp==0){pushc(cx,_rv1195);return;}cx->csp--;const void*_r1196=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1195);if(!_r1196)return;goto *_r1196;}
-L_2382: Cell t1197=var_trans__pfd;L_2383: L_2384: var_trans__rr=t1197;pushc(cx,t1197);L_2385: Cell t1198=var_trans__rr;L_2386: Cell _rv1199=t1198;{if(cx->csp==0){pushc(cx,_rv1199);return;}cx->csp--;const void*_r1200=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1199);if(!_r1200)return;goto *_r1200;}
-L_2387: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2387,cx->sp>0?cx->sp-0:0);goto L_111;K_2387:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2388: Cell t1201=uf_mkp((void*)&uf_sl238);L_2389: pushc(cx,t1201);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2389,cx->sp>2?cx->sp-2:0);goto L_97;K_2389:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2390: pushp(cx,(void*)&&L_2396);
-L_2391: pushp(cx,(void*)&&L_2406);
-L_2392: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2392,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2392,cx->sp>0?cx->sp-0:0);goto *el;}K_2392:;}
-L_2393: L_2394: L_2395: Cell _rv1202=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1202);return;}cx->csp--;const void*_r1203=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1202);if(!_r1203)return;goto *_r1203;}
-L_2396: Cell t1204=var_trans__pfd;L_2397: L_2398: Cell t1205=uf_cadd(t1204,uf_mki(1LL));L_2399: L_2400: var_trans__pfd=t1205;pushc(cx,t1205);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2400,cx->sp>0?cx->sp-0:0);goto L_127;K_2400:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2401: L_2402: L_2403: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2404: Cell t1206=var_trans__rr;L_2405: Cell _rv1207=t1206;{if(cx->csp==0){pushc(cx,_rv1207);return;}cx->csp--;const void*_r1208=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1207);if(!_r1208)return;goto *_r1208;}
-L_2406: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2406,cx->sp>0?cx->sp-0:0);goto L_111;K_2406:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2407: Cell t1209=uf_mkp((void*)&uf_sl239);L_2408: pushc(cx,t1209);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2408,cx->sp>2?cx->sp-2:0);goto L_97;K_2408:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2409: pushp(cx,(void*)&&L_2415);
-L_2410: pushp(cx,(void*)&&L_2437);
-L_2411: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2411,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2411,cx->sp>0?cx->sp-0:0);goto *el;}K_2411:;}
-L_2412: L_2413: L_2414: Cell _rv1210=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1210);return;}cx->csp--;const void*_r1211=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1210);if(!_r1211)return;goto *_r1211;}
-L_2415: Cell t1212=var_trans__pfd;L_2416: L_2417: Cell t1213=uf_csub(t1212,uf_mki(1LL));L_2418: L_2419: L_2420: var_trans__pfd=t1213;pushc(cx,t1213);pushc(cx,t1213);pushp(cx,(void*)&&L_2431);
-L_2421: pushp(cx,(void*)&&L_2426);
+WB2356_L2586: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2356_2586,cx->sp>0?cx->sp-0:0);goto L_111;K_WB2356_2586:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB2356_L2587: Cell t0=uf_mkp((void*)&uf_sl257);WB2356_L2588: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2356_2588,cx->sp>2?cx->sp-2:0);goto L_97;K_WB2356_2588:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB2356_L2589: pushp(cx,(void*)&&L_2595);
+WB2356_L2590: pushp(cx,(void*)&&L_2605);
+WB2356_L2591: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_WB2356_2591,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_WB2356_2591,cx->sp>0?cx->sp-0:0);goto *el;}K_WB2356_2591:;}
+WB2356_L2592: }cx->sp=_sp0;goto K_WC_2356;}
+K_WE_2356:;cx->lsp=fr;}
+L_2357: Cell t1203=uf_mkp((void*)&uf_sl240);L_2358: cx->locals[cx->local_base+0]=t1203;L_2359: pushc(cx,t1203);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2359,cx->sp>0?cx->sp-0:0);goto L_111;K_2359:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2360: Cell t1204=cx->locals[cx->local_base+0];L_2361: pushc(cx,t1204);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2361,cx->sp>2?cx->sp-2:0);goto L_97;K_2361:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2362: Cell t1205=pop(cx);Cell t1206=uf_cnot(t1205);L_2363: pushc(cx,t1206);pushp(cx,(void*)&&L_144);
+L_2364: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2364,cx->sp>0?cx->sp-0:0);goto *b;K_2364:;}}
+L_2365: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2365,cx->sp>0?cx->sp-0:0);goto L_127;K_2365:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2366: Cell t1207=var_trans__pfpi;L_2367: pushc(cx,t1207);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2367,cx->sp>1?cx->sp-1:0);goto L_22;K_2367:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2368: Cell t1208=var_trans__emode;L_2369: pushc(cx,t1208);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2369,cx->sp>1?cx->sp-1:0);goto L_22;K_2369:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2370: Cell t1209=var_trans__psnaps;L_2371: Cell t1210=var_trans__pends;L_2372: pushc(cx,t1209);pushc(cx,t1210);uf_cur_op="op_push";op_push(cx);
+L_2373: Cell t1211=pop(cx);L_2374: Cell t1212=uf_mkp((void*)&uf_sl241);L_2375: L_2376: Cell t1213=var_trans__douts;L_2377: Cell t1214=uf_mkp((void*)&uf_sl242);L_2378: var_trans__psnaps=t1211;var_trans__pends=t1212;pushc(cx,t1211);pushc(cx,t1212);pushc(cx,t1213);pushc(cx,t1214);uf_cur_op="op_push";op_push(cx);
+L_2379: Cell t1215=pop(cx);L_2380: L_2381: L_2382: var_trans__douts=t1215;var_trans__emode=uf_mki(2LL);pushc(cx,t1215);pushi(cx,2LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2382,cx->sp>0?cx->sp-0:0);goto L_1745;K_2382:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2383: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2383,cx->sp>0?cx->sp-0:0);goto L_30;K_2383:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2384: Cell t1216=pop(cx);L_2385: var_trans__emode=t1216;pushc(cx,t1216);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2385,cx->sp>0?cx->sp-0:0);goto L_30;K_2385:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2386: Cell t1217=pop(cx);L_2387: Cell t1218=var_trans__douts;L_2388: var_trans__pfpi=t1217;pushc(cx,t1217);pushc(cx,t1218);uf_cur_op="op_lpop";op_lpop(cx);
+L_2389: Cell t1219=pop(cx);L_2390: Cell t1220=var_trans__psnaps;L_2391: var_trans__fchunk=t1219;pushc(cx,t1219);pushc(cx,t1220);uf_cur_op="op_lpop";op_lpop(cx);
+L_2392: Cell t1221=pop(cx);L_2393: L_2394: Cell t1222=var_trans__pends;L_2395: var_trans__pfsv=t1221;pushc(cx,t1221);pushc(cx,t1221);pushc(cx,t1222);uf_cur_op="op_cat";op_cat(cx);
+L_2396: Cell t1223=pop(cx);L_2397: Cell t1224=var_trans__fchunk;L_2398: var_trans__pends=t1223;pushc(cx,t1223);pushc(cx,t1224);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2398,cx->sp>1?cx->sp-1:0);goto L_42;K_2398:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2399: Cell t1225=var_trans__pi;L_2400: L_2401: Cell t1226=var_trans__pfpi;L_2402: L_2403: Cell t1227=var_trans__emode;L_2404: var_trans__pi=t1226;var_trans__pfpi2=t1225;pushc(cx,t1225);pushc(cx,t1226);pushc(cx,t1227);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2404,cx->sp>1?cx->sp-1:0);goto L_22;K_2404:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2405: Cell t1228=var_trans__psnaps;L_2406: Cell t1229=var_trans__pends;L_2407: pushc(cx,t1228);pushc(cx,t1229);uf_cur_op="op_push";op_push(cx);
+L_2408: Cell t1230=pop(cx);L_2409: Cell t1231=uf_mkp((void*)&uf_sl243);L_2410: L_2411: Cell t1232=var_trans__douts;L_2412: Cell t1233=uf_mkp((void*)&uf_sl244);L_2413: var_trans__psnaps=t1230;var_trans__pends=t1231;pushc(cx,t1230);pushc(cx,t1231);pushc(cx,t1232);pushc(cx,t1233);uf_cur_op="op_push";op_push(cx);
+L_2414: Cell t1234=pop(cx);L_2415: L_2416: L_2417: var_trans__douts=t1234;var_trans__emode=uf_mki(2LL);pushc(cx,t1234);pushi(cx,2LL);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2417,cx->sp>0?cx->sp-0:0);goto L_111;K_2417:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2418: Cell t1235=uf_mkp((void*)&uf_sl245);L_2419: pushc(cx,t1235);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2419,cx->sp>2?cx->sp-2:0);goto L_97;K_2419:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2420: pushp(cx,(void*)&&L_2642);
+L_2421: pushp(cx,(void*)&&L_2647);
 L_2422: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2422,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2422,cx->sp>0?cx->sp-0:0);goto *el;}K_2422:;}
-L_2423: L_2424: L_2425: Cell _rv1214=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1214);return;}cx->csp--;const void*_r1215=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1214);if(!_r1215)return;goto *_r1215;}
-L_2426: L_2427: L_2428: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2429: Cell t1216=var_trans__rr;L_2430: Cell _rv1217=t1216;{if(cx->csp==0){pushc(cx,_rv1217);return;}cx->csp--;const void*_r1218=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1217);if(!_r1218)return;goto *_r1218;}
-L_2431: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2431,cx->sp>0?cx->sp-0:0);goto L_127;K_2431:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2432: L_2433: L_2434: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2435: Cell t1219=var_trans__rr;L_2436: Cell _rv1220=t1219;{if(cx->csp==0){pushc(cx,_rv1220);return;}cx->csp--;const void*_r1221=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1220);if(!_r1221)return;goto *_r1221;}
-L_2437: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2437,cx->sp>0?cx->sp-0:0);goto L_127;K_2437:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2438: L_2439: L_2440: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2441: Cell t1222=var_trans__rr;L_2442: Cell _rv1223=t1222;{if(cx->csp==0){pushc(cx,_rv1223);return;}cx->csp--;const void*_r1224=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1223);if(!_r1224)return;goto *_r1224;}
-L_2443: L_2444: L_2445: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2446: Cell t1225=var_trans__rr;L_2447: Cell _rv1226=t1225;{if(cx->csp==0){pushc(cx,_rv1226);return;}cx->csp--;const void*_r1227=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1226);if(!_r1227)return;goto *_r1227;}
-L_2448: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2448,cx->sp>0?cx->sp-0:0);goto L_566;K_2448:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2449: L_2450: L_2451: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2452: Cell t1228=var_trans__rr;L_2453: Cell _rv1229=t1228;{if(cx->csp==0){pushc(cx,_rv1229);return;}cx->csp--;const void*_r1230=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1229);if(!_r1230)return;goto *_r1230;}
-L_2454: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2454,cx->sp>0?cx->sp-0:0);goto L_127;K_2454:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2455: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2455,cx->sp>0?cx->sp-0:0);goto L_135;K_2455:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2456: Cell t1231=pop(cx);L_2457: var_trans__dflbl=t1231;pushc(cx,t1231);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2457,cx->sp>0?cx->sp-0:0);goto L_135;K_2457:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2458: Cell t1232=pop(cx);L_2459: var_trans__clbl=t1232;pushc(cx,t1232);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2459,cx->sp>0?cx->sp-0:0);goto L_135;K_2459:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2460: Cell t1233=pop(cx);L_2461: Cell t1234=uf_mkp((void*)&uf_sl240);L_2462: Cell t1235=var_trans__dflbl;L_2463: Cell t1236=uf_mkp((void*)&uf_sl241);L_2464: var_trans__blbl=t1233;pushc(cx,t1233);pushc(cx,t1234);pushc(cx,t1235);pushc(cx,t1236);uf_cur_op="op_fmt";op_fmt(cx);
-L_2465: uf_cur_op="op_cat";op_cat(cx);
-L_2466: Cell t1237=uf_mkp((void*)&uf_sl242);L_2467: pushc(cx,t1237);uf_cur_op="op_cat";op_cat(cx);
-L_2468: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2468,cx->sp>1?cx->sp-1:0);goto L_42;K_2468:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2469: Cell t1238=var_trans__inq;L_2470: pushc(cx,t1238);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2470,cx->sp>1?cx->sp-1:0);goto L_22;K_2470:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2471: Cell t1239=var_trans__emode;L_2472: pushc(cx,t1239);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2472,cx->sp>1?cx->sp-1:0);goto L_22;K_2472:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2473: Cell t1240=var_trans__dflbl;L_2474: pushc(cx,t1240);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2474,cx->sp>1?cx->sp-1:0);goto L_22;K_2474:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2475: Cell t1241=var_trans__clbl;L_2476: pushc(cx,t1241);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2476,cx->sp>1?cx->sp-1:0);goto L_22;K_2476:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2477: Cell t1242=var_trans__blbl;L_2478: pushc(cx,t1242);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2478,cx->sp>1?cx->sp-1:0);goto L_22;K_2478:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2479: Cell t1243=var_trans__inq;L_2480: L_2481: Cell t1244=uf_ceq(t1243,uf_mki(1LL));L_2482: pushc(cx,t1244);pushp(cx,(void*)&&L_2005);
-L_2483: pushp(cx,(void*)&&L_2010);
-L_2484: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2484,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2484,cx->sp>0?cx->sp-0:0);goto *el;}K_2484:;}
-L_2485: Cell t1245=var_trans__psnaps;L_2486: Cell t1246=var_trans__pends;L_2487: pushc(cx,t1245);pushc(cx,t1246);uf_cur_op="op_push";op_push(cx);
-L_2488: Cell t1247=pop(cx);L_2489: Cell t1248=uf_mkp((void*)&uf_sl243);L_2490: L_2491: Cell t1249=var_trans__douts;L_2492: Cell t1250=uf_mkp((void*)&uf_sl244);L_2493: var_trans__psnaps=t1247;var_trans__pends=t1248;pushc(cx,t1247);pushc(cx,t1248);pushc(cx,t1249);pushc(cx,t1250);uf_cur_op="op_push";op_push(cx);
-L_2494: Cell t1251=pop(cx);L_2495: L_2496: L_2497: Cell t1252=uf_mkp((void*)&uf_sl245);L_2498: Cell t1253=var_trans__blbl;L_2499: Cell t1254=uf_mkp((void*)&uf_sl246);L_2500: var_trans__douts=t1251;var_trans__inq=uf_mki(1LL);pushc(cx,t1251);pushi(cx,1LL);pushc(cx,t1252);pushc(cx,t1253);pushc(cx,t1254);uf_cur_op="op_fmt";op_fmt(cx);
-L_2501: uf_cur_op="op_cat";op_cat(cx);
-L_2502: Cell t1255=uf_mkp((void*)&uf_sl247);L_2503: pushc(cx,t1255);uf_cur_op="op_cat";op_cat(cx);
-L_2504: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2504,cx->sp>1?cx->sp-1:0);goto L_42;K_2504:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2505: Cell t1256=uf_mkp((void*)&uf_sl248);L_2506: Cell t1257=var_trans__dflbl;L_2507: Cell t1258=uf_mkp((void*)&uf_sl249);L_2508: pushc(cx,t1256);pushc(cx,t1257);pushc(cx,t1258);uf_cur_op="op_fmt";op_fmt(cx);
-L_2509: uf_cur_op="op_cat";op_cat(cx);
-L_2510: Cell t1259=uf_mkp((void*)&uf_sl250);L_2511: pushc(cx,t1259);uf_cur_op="op_cat";op_cat(cx);
-L_2512: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2512,cx->sp>1?cx->sp-1:0);goto L_42;K_2512:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2513: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2513,cx->sp>0?cx->sp-0:0);goto L_1645;K_2513:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2514: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2514,cx->sp>0?cx->sp-0:0);goto L_1889;K_2514:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2515: Cell t1260=uf_mkp((void*)&uf_sl251);L_2516: cx->locals[cx->local_base+0]=t1260;L_2517: pushc(cx,t1260);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2517,cx->sp>0?cx->sp-0:0);goto L_111;K_2517:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2518: Cell t1261=cx->locals[cx->local_base+0];L_2519: pushc(cx,t1261);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2519,cx->sp>2?cx->sp-2:0);goto L_97;K_2519:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2520: Cell t1262=pop(cx);Cell t1263=uf_cnot(t1262);L_2521: pushc(cx,t1263);pushp(cx,(void*)&&L_144);
-L_2522: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2522,cx->sp>0?cx->sp-0:0);goto *b;K_2522:;}}
-L_2523: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2523,cx->sp>0?cx->sp-0:0);goto L_127;K_2523:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2524: Cell t1264=uf_mkp((void*)&uf_sl252);L_2525: cx->locals[cx->local_base+0]=t1264;L_2526: pushc(cx,t1264);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2526,cx->sp>0?cx->sp-0:0);goto L_111;K_2526:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2527: Cell t1265=cx->locals[cx->local_base+0];L_2528: pushc(cx,t1265);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2528,cx->sp>2?cx->sp-2:0);goto L_97;K_2528:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2529: Cell t1266=pop(cx);Cell t1267=uf_cnot(t1266);L_2530: pushc(cx,t1267);pushp(cx,(void*)&&L_144);
-L_2531: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2531,cx->sp>0?cx->sp-0:0);goto *b;K_2531:;}}
-L_2532: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2532,cx->sp>0?cx->sp-0:0);goto L_127;K_2532:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2533: Cell t1268=uf_mkp((void*)&uf_sl253);L_2534: Cell t1269=var_trans__clbl;L_2535: Cell t1270=uf_mkp((void*)&uf_sl254);L_2536: pushc(cx,t1268);pushc(cx,t1269);pushc(cx,t1270);uf_cur_op="op_fmt";op_fmt(cx);
-L_2537: uf_cur_op="op_cat";op_cat(cx);
-L_2538: Cell t1271=uf_mkp((void*)&uf_sl255);L_2539: pushc(cx,t1271);uf_cur_op="op_cat";op_cat(cx);
-L_2540: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2540,cx->sp>1?cx->sp-1:0);goto L_42;K_2540:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2541: Cell t1272=var_trans__dflbl;L_2542: Cell t1273=uf_mkp((void*)&uf_sl256);L_2543: pushc(cx,t1272);pushc(cx,t1273);uf_cur_op="op_fmt";op_fmt(cx);
-L_2544: uf_cur_op="op_cat";op_cat(cx);
-L_2545: Cell t1274=uf_mkp((void*)&uf_sl257);L_2546: pushc(cx,t1274);uf_cur_op="op_cat";op_cat(cx);
-L_2547: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2547,cx->sp>1?cx->sp-1:0);goto L_42;K_2547:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2548: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2548,cx->sp>0?cx->sp-0:0);goto L_566;K_2548:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2549: Cell t1275=uf_mkp((void*)&uf_sl258);L_2550: pushc(cx,t1275);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2550,cx->sp>1?cx->sp-1:0);goto L_42;K_2550:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2551: Cell t1276=uf_mkp((void*)&uf_sl259);L_2552: cx->locals[cx->local_base+0]=t1276;L_2553: pushc(cx,t1276);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2553,cx->sp>0?cx->sp-0:0);goto L_111;K_2553:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2554: Cell t1277=cx->locals[cx->local_base+0];L_2555: pushc(cx,t1277);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2555,cx->sp>2?cx->sp-2:0);goto L_97;K_2555:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2556: Cell t1278=pop(cx);Cell t1279=uf_cnot(t1278);L_2557: pushc(cx,t1279);pushp(cx,(void*)&&L_144);
-L_2558: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2558,cx->sp>0?cx->sp-0:0);goto *b;K_2558:;}}
-L_2559: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2559,cx->sp>0?cx->sp-0:0);goto L_127;K_2559:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2560: Cell t1280=uf_mkp((void*)&uf_sl260);L_2561: cx->locals[cx->local_base+0]=t1280;L_2562: pushc(cx,t1280);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2562,cx->sp>0?cx->sp-0:0);goto L_111;K_2562:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2563: Cell t1281=cx->locals[cx->local_base+0];L_2564: pushc(cx,t1281);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2564,cx->sp>2?cx->sp-2:0);goto L_97;K_2564:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2565: Cell t1282=pop(cx);Cell t1283=uf_cnot(t1282);L_2566: pushc(cx,t1283);pushp(cx,(void*)&&L_144);
-L_2567: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2567,cx->sp>0?cx->sp-0:0);goto *b;K_2567:;}}
-L_2568: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2568,cx->sp>0?cx->sp-0:0);goto L_127;K_2568:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2569: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2569,cx->sp>0?cx->sp-0:0);goto L_30;K_2569:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2570: Cell t1284=pop(cx);L_2571: var_trans__blbl=t1284;pushc(cx,t1284);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2571,cx->sp>0?cx->sp-0:0);goto L_30;K_2571:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2572: Cell t1285=pop(cx);L_2573: var_trans__clbl=t1285;pushc(cx,t1285);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2573,cx->sp>0?cx->sp-0:0);goto L_30;K_2573:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2574: Cell t1286=pop(cx);L_2575: var_trans__dflbl=t1286;pushc(cx,t1286);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2575,cx->sp>0?cx->sp-0:0);goto L_30;K_2575:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2576: Cell t1287=pop(cx);L_2577: var_trans__emode=t1287;pushc(cx,t1287);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2577,cx->sp>0?cx->sp-0:0);goto L_1870;K_2577:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2578: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2578,cx->sp>0?cx->sp-0:0);goto L_30;K_2578:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2579: Cell t1288=pop(cx);L_2580: Cell t1289=var_trans__clbl;L_2581: Cell t1290=var_trans__blbl;L_2582: Cell t1291=uf_mkp((void*)&uf_sl261);L_2583: var_trans__inq=t1288;pushc(cx,t1288);pushc(cx,t1289);pushc(cx,t1290);pushc(cx,t1291);uf_cur_op="op_fmt";op_fmt(cx);
-L_2584: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2584,cx->sp>1?cx->sp-1:0);goto L_42;K_2584:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2585: L_2586: L_2587: Cell t1292=var_trans__cret;L_2588: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1292);pushp(cx,(void*)&&L_2597);
-L_2589: pushp(cx,(void*)&&L_2594);
-L_2590: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2590,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2590,cx->sp>0?cx->sp-0:0);goto *el;}K_2590:;}
-L_2591: L_2592: L_2593: Cell _rv1293=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1293);return;}cx->csp--;const void*_r1294=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1293);if(!_r1294)return;goto *_r1294;}
-L_2594: L_2595: L_2596: Cell _rv1295=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1295);return;}cx->csp--;const void*_r1296=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1295);if(!_r1296)return;goto *_r1296;}
-L_2597: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2597,cx->sp>0?cx->sp-0:0);goto L_135;K_2597:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2598: Cell t1297=pop(cx);L_2599: var_trans__wclbl=t1297;pushc(cx,t1297);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2599,cx->sp>0?cx->sp-0:0);goto L_135;K_2599:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2600: Cell t1298=pop(cx);L_2601: Cell t1299=var_trans__wclbl;L_2602: L_2603: Cell t1300=uf_mkp((void*)&uf_sl262);L_2604: var_trans__wblbl=t1298;pushc(cx,t1298);pushc(cx,t1299);pushc(cx,t1298);pushc(cx,t1300);uf_cur_op="op_fmt";op_fmt(cx);
-L_2605: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2605,cx->sp>1?cx->sp-1:0);goto L_42;K_2605:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2606: Cell t1301=var_trans__wclbl;L_2607: pushc(cx,t1301);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2607,cx->sp>1?cx->sp-1:0);goto L_22;K_2607:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2608: Cell t1302=var_trans__wblbl;L_2609: pushc(cx,t1302);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2609,cx->sp>1?cx->sp-1:0);goto L_22;K_2609:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2610: Cell t1303=var_trans__emode;L_2611: pushc(cx,t1303);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2611,cx->sp>1?cx->sp-1:0);goto L_22;K_2611:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2612: Cell t1304=var_trans__inq;L_2613: pushc(cx,t1304);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2613,cx->sp>1?cx->sp-1:0);goto L_22;K_2613:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2614: L_2615: L_2616: Cell t1305=var_trans__psnaps;L_2617: Cell t1306=var_trans__pends;L_2618: var_trans__emode=uf_mki(2LL);pushi(cx,2LL);pushc(cx,t1305);pushc(cx,t1306);uf_cur_op="op_push";op_push(cx);
-L_2619: Cell t1307=pop(cx);L_2620: Cell t1308=uf_mkp((void*)&uf_sl263);L_2621: L_2622: Cell t1309=var_trans__douts;L_2623: Cell t1310=uf_mkp((void*)&uf_sl264);L_2624: var_trans__psnaps=t1307;var_trans__pends=t1308;pushc(cx,t1307);pushc(cx,t1308);pushc(cx,t1309);pushc(cx,t1310);uf_cur_op="op_push";op_push(cx);
-L_2625: Cell t1311=pop(cx);L_2626: L_2627: L_2628: var_trans__douts=t1311;pushc(cx,t1311);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_2628;cx->loops[fr].end=&&K_WE_2628;long _sp0=cx->sp;
-K_WC_2628:;{Cell _wc;{
-WC2628_L2690: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2628_2690,cx->sp>0?cx->sp-0:0);goto L_111;K_WC2628_2690:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC2628_L2691: Cell t0=uf_mkp((void*)&uf_sl271);WC2628_L2692: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2628_2692,cx->sp>2?cx->sp-2:0);goto L_97;K_WC2628_2692:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC2628_L2693: Cell t1=pop(cx);Cell t2=uf_cnot(t1);WC2628_L2694: WC2628_L2695: var_trans__rr=t2;pushc(cx,t2);WC2628_L2696: Cell t3=var_trans__rr;pushc(cx,t3);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_2628;
+L_2423: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2423,cx->sp>0?cx->sp-0:0);goto L_30;K_2423:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2424: Cell t1236=pop(cx);L_2425: Cell t1237=var_trans__douts;L_2426: var_trans__emode=t1236;pushc(cx,t1236);pushc(cx,t1237);uf_cur_op="op_lpop";op_lpop(cx);
+L_2427: Cell t1238=pop(cx);L_2428: L_2429: var_trans__finc=t1238;pushc(cx,t1238);pushc(cx,t1238);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2429,cx->sp>1?cx->sp-1:0);goto L_22;K_2429:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2430: Cell t1239=var_trans__psnaps;L_2431: pushc(cx,t1239);uf_cur_op="op_lpop";op_lpop(cx);
+L_2432: Cell t1240=pop(cx);L_2433: L_2434: Cell t1241=var_trans__pends;L_2435: var_trans__pfsv2=t1240;pushc(cx,t1240);pushc(cx,t1240);pushc(cx,t1241);uf_cur_op="op_cat";op_cat(cx);
+L_2436: Cell t1242=pop(cx);L_2437: var_trans__pends=t1242;pushc(cx,t1242);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2437,cx->sp>0?cx->sp-0:0);goto L_30;K_2437:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2438: Cell t1243=pop(cx);L_2439: Cell t1244=var_trans__lstack;L_2440: L_2441: var_trans__finc=t1243;pushc(cx,t1243);pushc(cx,t1244);pushc(cx,var_trans__lstack);uf_cur_op="op_len";op_len(cx);
+L_2442: L_2443: Cell t1245=pop(cx);Cell t1246=uf_csub(t1245,uf_mki(1LL));L_2444: pushc(cx,t1246);uf_cur_op="op_get";op_get(cx);
+L_2445: Cell t1247=pop(cx);L_2446: Cell t1248=uf_mkp((void*)&uf_sl246);L_2447: L_2448: var_trans__finm=t1247;pushc(cx,t1247);pushc(cx,t1248);pushc(cx,t1247);uf_cur_op="op_cat";op_cat(cx);
+L_2449: Cell t1249=uf_mkp((void*)&uf_sl247);L_2450: pushc(cx,t1249);uf_cur_op="op_cat";op_cat(cx);
+L_2451: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2451,cx->sp>1?cx->sp-1:0);goto L_42;K_2451:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2452: Cell t1250=var_trans__flabels;L_2453: Cell t1251=var_trans__finm;L_2454: Cell t1252=uf_mkp((void*)&uf_sl248);L_2455: pushc(cx,t1250);pushc(cx,t1251);pushc(cx,t1252);uf_cur_op="op_cat";op_cat(cx);
+L_2456: Cell t1253=var_trans__finc;L_2457: pushc(cx,t1253);uf_cur_op="op_cat";op_cat(cx);
+L_2458: Cell t1254=uf_mkp((void*)&uf_sl249);L_2459: pushc(cx,t1254);uf_cur_op="op_cat";op_cat(cx);
+L_2460: uf_cur_op="op_cat";op_cat(cx);
+L_2461: Cell t1255=pop(cx);L_2462: Cell t1256=var_trans__pfpi2;L_2463: L_2464: var_trans__flabels=t1255;var_trans__pi=t1256;pushc(cx,t1255);pushc(cx,t1256);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2464,cx->sp>0?cx->sp-0:0);goto L_1989;K_2464:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2465: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2465,cx->sp>0?cx->sp-0:0);goto L_30;K_2465:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2466: Cell t1257=pop(cx);L_2467: var_trans__fblbl=t1257;pushc(cx,t1257);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2467,cx->sp>0?cx->sp-0:0);goto L_30;K_2467:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2468: Cell t1258=pop(cx);L_2469: var_trans__fclbl=t1258;pushc(cx,t1258);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2469,cx->sp>0?cx->sp-0:0);goto L_30;K_2469:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2470: Cell t1259=pop(cx);L_2471: var_trans__emode=t1259;pushc(cx,t1259);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2471,cx->sp>0?cx->sp-0:0);goto L_1970;K_2471:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2472: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2472,cx->sp>0?cx->sp-0:0);goto L_30;K_2472:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2473: Cell t1260=pop(cx);L_2474: Cell t1261=var_trans__fclbl;L_2475: Cell t1262=var_trans__fblbl;L_2476: Cell t1263=uf_mkp((void*)&uf_sl250);L_2477: var_trans__inq=t1260;pushc(cx,t1260);pushc(cx,t1261);pushc(cx,t1262);pushc(cx,t1263);uf_cur_op="op_fmt";op_fmt(cx);
+L_2478: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2478,cx->sp>1?cx->sp-1:0);goto L_42;K_2478:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2479: Cell t1264=var_trans__lstack;L_2480: pushc(cx,t1264);uf_cur_op="op_lpop";op_lpop(cx);
+L_2481: L_2482: L_2483: Cell t1265=var_trans__cret;L_2484: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1265);pushp(cx,(void*)&&L_2795);
+L_2485: pushp(cx,(void*)&&L_2792);
+L_2486: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2486,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2486,cx->sp>0?cx->sp-0:0);goto *el;}K_2486:;}
+L_2487: L_2488: L_2489: Cell _rv1266=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1266);return;}cx->csp--;const void*_r1267=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1266);if(!_r1267)return;goto *_r1267;}
+L_2490: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2490,cx->sp>0?cx->sp-0:0);goto L_127;K_2490:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2491: L_2492: L_2493: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2494: Cell t1268=var_trans__rr;L_2495: Cell _rv1269=t1268;{if(cx->csp==0){pushc(cx,_rv1269);return;}cx->csp--;const void*_r1270=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1269);if(!_r1270)return;goto *_r1270;}
+L_2496: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2496,cx->sp>0?cx->sp-0:0);goto L_111;K_2496:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2497: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2497,cx->sp>1?cx->sp-1:0);goto L_155;K_2497:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2498: pushp(cx,(void*)&&L_2504);
+L_2499: pushp(cx,(void*)&&L_2543);
+L_2500: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2500,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2500,cx->sp>0?cx->sp-0:0);goto *el;}K_2500:;}
+L_2501: L_2502: L_2503: Cell _rv1271=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1271);return;}cx->csp--;const void*_r1272=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1271);if(!_r1272)return;goto *_r1272;}
+L_2504: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2504,cx->sp>0?cx->sp-0:0);goto L_195;K_2504:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2505: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2505,cx->sp>0?cx->sp-0:0);goto L_111;K_2505:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2506: Cell t1273=pop(cx);L_2507: var_trans__nv=t1273;pushc(cx,t1273);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2507,cx->sp>0?cx->sp-0:0);goto L_127;K_2507:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2508: Cell t1274=var_trans__nv;L_2509: pushc(cx,t1274);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2509,cx->sp>1?cx->sp-1:0);goto L_215;K_2509:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2510: Cell t1275=pop(cx);L_2511: Cell t1276=uf_mkp((void*)&uf_sl251);L_2512: cx->locals[cx->local_base+0]=t1276;L_2513: var_trans__slot=t1275;pushc(cx,t1275);pushc(cx,t1276);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2513,cx->sp>0?cx->sp-0:0);goto L_111;K_2513:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2514: Cell t1277=cx->locals[cx->local_base+0];L_2515: pushc(cx,t1277);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2515,cx->sp>2?cx->sp-2:0);goto L_97;K_2515:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2516: Cell t1278=pop(cx);Cell t1279=uf_cnot(t1278);L_2517: pushc(cx,t1279);pushp(cx,(void*)&&L_144);
+L_2518: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2518,cx->sp>0?cx->sp-0:0);goto *b;K_2518:;}}
+L_2519: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2519,cx->sp>0?cx->sp-0:0);goto L_127;K_2519:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2520: Cell t1280=var_trans__slot;L_2521: pushc(cx,t1280);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2521,cx->sp>1?cx->sp-1:0);goto L_0;K_2521:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2522: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2522,cx->sp>0?cx->sp-0:0);goto L_571;K_2522:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2523: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2523,cx->sp>0?cx->sp-0:0);goto L_36;K_2523:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2524: Cell t1281=pop(cx);L_2525: L_2526: Cell t1282=uf_mkp((void*)&uf_sl252);L_2527: var_trans__slot2=t1281;pushc(cx,t1281);pushc(cx,t1281);pushc(cx,t1282);uf_cur_op="op_fmt";op_fmt(cx);
+L_2528: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2528,cx->sp>1?cx->sp-1:0);goto L_42;K_2528:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2529: Cell t1283=uf_mkp((void*)&uf_sl253);L_2530: cx->locals[cx->local_base+0]=t1283;L_2531: pushc(cx,t1283);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2531,cx->sp>0?cx->sp-0:0);goto L_111;K_2531:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2532: Cell t1284=cx->locals[cx->local_base+0];L_2533: pushc(cx,t1284);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2533,cx->sp>2?cx->sp-2:0);goto L_97;K_2533:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2534: Cell t1285=pop(cx);Cell t1286=uf_cnot(t1285);L_2535: pushc(cx,t1286);pushp(cx,(void*)&&L_144);
+L_2536: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2536,cx->sp>0?cx->sp-0:0);goto *b;K_2536:;}}
+L_2537: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2537,cx->sp>0?cx->sp-0:0);goto L_127;K_2537:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2538: L_2539: L_2540: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2541: Cell t1287=var_trans__rr;L_2542: Cell _rv1288=t1287;{if(cx->csp==0){pushc(cx,_rv1288);return;}cx->csp--;const void*_r1289=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1288);if(!_r1289)return;goto *_r1289;}
+L_2543: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2543,cx->sp>0?cx->sp-0:0);goto L_566;K_2543:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2544: Cell t1290=uf_mkp((void*)&uf_sl254);L_2545: cx->locals[cx->local_base+0]=t1290;L_2546: pushc(cx,t1290);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2546,cx->sp>0?cx->sp-0:0);goto L_111;K_2546:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2547: Cell t1291=cx->locals[cx->local_base+0];L_2548: pushc(cx,t1291);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2548,cx->sp>2?cx->sp-2:0);goto L_97;K_2548:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2549: Cell t1292=pop(cx);Cell t1293=uf_cnot(t1292);L_2550: pushc(cx,t1293);pushp(cx,(void*)&&L_144);
+L_2551: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2551,cx->sp>0?cx->sp-0:0);goto *b;K_2551:;}}
+L_2552: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2552,cx->sp>0?cx->sp-0:0);goto L_127;K_2552:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2553: L_2554: L_2555: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2556: Cell t1294=var_trans__rr;L_2557: Cell _rv1295=t1294;{if(cx->csp==0){pushc(cx,_rv1295);return;}cx->csp--;const void*_r1296=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1295);if(!_r1296)return;goto *_r1296;}
+L_2558: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2558,cx->sp>0?cx->sp-0:0);goto L_127;K_2558:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2559: Cell t1297=uf_mkp((void*)&uf_sl255);L_2560: pushc(cx,t1297);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2560,cx->sp>1?cx->sp-1:0);goto L_42;K_2560:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2561: L_2562: L_2563: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2564: Cell t1298=var_trans__rr;L_2565: Cell _rv1299=t1298;{if(cx->csp==0){pushc(cx,_rv1299);return;}cx->csp--;const void*_r1300=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1299);if(!_r1300)return;goto *_r1300;}
+L_2566: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2566,cx->sp>0?cx->sp-0:0);goto L_566;K_2566:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2567: Cell t1301=uf_mkp((void*)&uf_sl256);L_2568: cx->locals[cx->local_base+0]=t1301;L_2569: pushc(cx,t1301);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2569,cx->sp>0?cx->sp-0:0);goto L_111;K_2569:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2570: Cell t1302=cx->locals[cx->local_base+0];L_2571: pushc(cx,t1302);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2571,cx->sp>2?cx->sp-2:0);goto L_97;K_2571:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2572: Cell t1303=pop(cx);Cell t1304=uf_cnot(t1303);L_2573: pushc(cx,t1304);pushp(cx,(void*)&&L_144);
+L_2574: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2574,cx->sp>0?cx->sp-0:0);goto *b;K_2574:;}}
+L_2575: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2575,cx->sp>0?cx->sp-0:0);goto L_127;K_2575:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2576: L_2577: L_2578: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2579: Cell t1305=var_trans__rr;L_2580: Cell _rv1306=t1305;{if(cx->csp==0){pushc(cx,_rv1306);return;}cx->csp--;const void*_r1307=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1306);if(!_r1307)return;goto *_r1307;}
+L_2581: Cell t1308=var_trans__pfd;L_2582: L_2583: var_trans__rr=t1308;pushc(cx,t1308);L_2584: Cell t1309=var_trans__rr;L_2585: Cell _rv1310=t1309;{if(cx->csp==0){pushc(cx,_rv1310);return;}cx->csp--;const void*_r1311=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1310);if(!_r1311)return;goto *_r1311;}
+L_2586: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2586,cx->sp>0?cx->sp-0:0);goto L_111;K_2586:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2587: Cell t1312=uf_mkp((void*)&uf_sl257);L_2588: pushc(cx,t1312);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2588,cx->sp>2?cx->sp-2:0);goto L_97;K_2588:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2589: pushp(cx,(void*)&&L_2595);
+L_2590: pushp(cx,(void*)&&L_2605);
+L_2591: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2591,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2591,cx->sp>0?cx->sp-0:0);goto *el;}K_2591:;}
+L_2592: L_2593: L_2594: Cell _rv1313=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1313);return;}cx->csp--;const void*_r1314=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1313);if(!_r1314)return;goto *_r1314;}
+L_2595: Cell t1315=var_trans__pfd;L_2596: L_2597: Cell t1316=uf_cadd(t1315,uf_mki(1LL));L_2598: L_2599: var_trans__pfd=t1316;pushc(cx,t1316);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2599,cx->sp>0?cx->sp-0:0);goto L_127;K_2599:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2600: L_2601: L_2602: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2603: Cell t1317=var_trans__rr;L_2604: Cell _rv1318=t1317;{if(cx->csp==0){pushc(cx,_rv1318);return;}cx->csp--;const void*_r1319=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1318);if(!_r1319)return;goto *_r1319;}
+L_2605: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2605,cx->sp>0?cx->sp-0:0);goto L_111;K_2605:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2606: Cell t1320=uf_mkp((void*)&uf_sl258);L_2607: pushc(cx,t1320);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2607,cx->sp>2?cx->sp-2:0);goto L_97;K_2607:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2608: pushp(cx,(void*)&&L_2614);
+L_2609: pushp(cx,(void*)&&L_2636);
+L_2610: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2610,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2610,cx->sp>0?cx->sp-0:0);goto *el;}K_2610:;}
+L_2611: L_2612: L_2613: Cell _rv1321=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1321);return;}cx->csp--;const void*_r1322=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1321);if(!_r1322)return;goto *_r1322;}
+L_2614: Cell t1323=var_trans__pfd;L_2615: L_2616: Cell t1324=uf_csub(t1323,uf_mki(1LL));L_2617: L_2618: L_2619: var_trans__pfd=t1324;pushc(cx,t1324);pushc(cx,t1324);pushp(cx,(void*)&&L_2630);
+L_2620: pushp(cx,(void*)&&L_2625);
+L_2621: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2621,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2621,cx->sp>0?cx->sp-0:0);goto *el;}K_2621:;}
+L_2622: L_2623: L_2624: Cell _rv1325=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1325);return;}cx->csp--;const void*_r1326=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1325);if(!_r1326)return;goto *_r1326;}
+L_2625: L_2626: L_2627: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2628: Cell t1327=var_trans__rr;L_2629: Cell _rv1328=t1327;{if(cx->csp==0){pushc(cx,_rv1328);return;}cx->csp--;const void*_r1329=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1328);if(!_r1329)return;goto *_r1329;}
+L_2630: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2630,cx->sp>0?cx->sp-0:0);goto L_127;K_2630:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2631: L_2632: L_2633: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2634: Cell t1330=var_trans__rr;L_2635: Cell _rv1331=t1330;{if(cx->csp==0){pushc(cx,_rv1331);return;}cx->csp--;const void*_r1332=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1331);if(!_r1332)return;goto *_r1332;}
+L_2636: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2636,cx->sp>0?cx->sp-0:0);goto L_127;K_2636:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2637: L_2638: L_2639: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2640: Cell t1333=var_trans__rr;L_2641: Cell _rv1334=t1333;{if(cx->csp==0){pushc(cx,_rv1334);return;}cx->csp--;const void*_r1335=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1334);if(!_r1335)return;goto *_r1335;}
+L_2642: L_2643: L_2644: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2645: Cell t1336=var_trans__rr;L_2646: Cell _rv1337=t1336;{if(cx->csp==0){pushc(cx,_rv1337);return;}cx->csp--;const void*_r1338=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1337);if(!_r1338)return;goto *_r1338;}
+L_2647: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2647,cx->sp>0?cx->sp-0:0);goto L_566;K_2647:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2648: L_2649: L_2650: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2651: Cell t1339=var_trans__rr;L_2652: Cell _rv1340=t1339;{if(cx->csp==0){pushc(cx,_rv1340);return;}cx->csp--;const void*_r1341=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1340);if(!_r1341)return;goto *_r1341;}
+L_2653: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2653,cx->sp>0?cx->sp-0:0);goto L_127;K_2653:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2654: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2654,cx->sp>0?cx->sp-0:0);goto L_135;K_2654:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2655: Cell t1342=pop(cx);L_2656: var_trans__dflbl=t1342;pushc(cx,t1342);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2656,cx->sp>0?cx->sp-0:0);goto L_135;K_2656:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2657: Cell t1343=pop(cx);L_2658: var_trans__clbl=t1343;pushc(cx,t1343);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2658,cx->sp>0?cx->sp-0:0);goto L_135;K_2658:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2659: Cell t1344=pop(cx);L_2660: Cell t1345=uf_mkp((void*)&uf_sl259);L_2661: Cell t1346=var_trans__dflbl;L_2662: Cell t1347=uf_mkp((void*)&uf_sl260);L_2663: var_trans__blbl=t1344;pushc(cx,t1344);pushc(cx,t1345);pushc(cx,t1346);pushc(cx,t1347);uf_cur_op="op_fmt";op_fmt(cx);
+L_2664: uf_cur_op="op_cat";op_cat(cx);
+L_2665: Cell t1348=uf_mkp((void*)&uf_sl261);L_2666: pushc(cx,t1348);uf_cur_op="op_cat";op_cat(cx);
+L_2667: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2667,cx->sp>1?cx->sp-1:0);goto L_42;K_2667:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2668: Cell t1349=var_trans__inq;L_2669: pushc(cx,t1349);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2669,cx->sp>1?cx->sp-1:0);goto L_22;K_2669:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2670: Cell t1350=var_trans__emode;L_2671: pushc(cx,t1350);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2671,cx->sp>1?cx->sp-1:0);goto L_22;K_2671:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2672: Cell t1351=var_trans__dflbl;L_2673: pushc(cx,t1351);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2673,cx->sp>1?cx->sp-1:0);goto L_22;K_2673:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2674: Cell t1352=var_trans__clbl;L_2675: pushc(cx,t1352);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2675,cx->sp>1?cx->sp-1:0);goto L_22;K_2675:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2676: Cell t1353=var_trans__blbl;L_2677: pushc(cx,t1353);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2677,cx->sp>1?cx->sp-1:0);goto L_22;K_2677:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2678: Cell t1354=var_trans__inq;L_2679: L_2680: Cell t1355=uf_ceq(t1354,uf_mki(1LL));L_2681: pushc(cx,t1355);pushp(cx,(void*)&&L_2105);
+L_2682: pushp(cx,(void*)&&L_2110);
+L_2683: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2683,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2683,cx->sp>0?cx->sp-0:0);goto *el;}K_2683:;}
+L_2684: Cell t1356=var_trans__psnaps;L_2685: Cell t1357=var_trans__pends;L_2686: pushc(cx,t1356);pushc(cx,t1357);uf_cur_op="op_push";op_push(cx);
+L_2687: Cell t1358=pop(cx);L_2688: Cell t1359=uf_mkp((void*)&uf_sl262);L_2689: L_2690: Cell t1360=var_trans__douts;L_2691: Cell t1361=uf_mkp((void*)&uf_sl263);L_2692: var_trans__psnaps=t1358;var_trans__pends=t1359;pushc(cx,t1358);pushc(cx,t1359);pushc(cx,t1360);pushc(cx,t1361);uf_cur_op="op_push";op_push(cx);
+L_2693: Cell t1362=pop(cx);L_2694: L_2695: L_2696: Cell t1363=var_trans__lstack;L_2697: Cell t1364=uf_mkp((void*)&uf_sl264);L_2698: var_trans__douts=t1362;var_trans__inq=uf_mki(1LL);pushc(cx,t1362);pushi(cx,1LL);pushc(cx,t1363);pushc(cx,t1364);uf_cur_op="op_push";op_push(cx);
+L_2699: Cell t1365=pop(cx);L_2700: Cell t1366=uf_mkp((void*)&uf_sl265);L_2701: Cell t1367=var_trans__blbl;L_2702: Cell t1368=uf_mkp((void*)&uf_sl266);L_2703: var_trans__lstack=t1365;pushc(cx,t1365);pushc(cx,t1366);pushc(cx,t1367);pushc(cx,t1368);uf_cur_op="op_fmt";op_fmt(cx);
+L_2704: uf_cur_op="op_cat";op_cat(cx);
+L_2705: Cell t1369=uf_mkp((void*)&uf_sl267);L_2706: pushc(cx,t1369);uf_cur_op="op_cat";op_cat(cx);
+L_2707: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2707,cx->sp>1?cx->sp-1:0);goto L_42;K_2707:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2708: Cell t1370=uf_mkp((void*)&uf_sl268);L_2709: Cell t1371=var_trans__dflbl;L_2710: Cell t1372=uf_mkp((void*)&uf_sl269);L_2711: pushc(cx,t1370);pushc(cx,t1371);pushc(cx,t1372);uf_cur_op="op_fmt";op_fmt(cx);
+L_2712: uf_cur_op="op_cat";op_cat(cx);
+L_2713: Cell t1373=uf_mkp((void*)&uf_sl270);L_2714: pushc(cx,t1373);uf_cur_op="op_cat";op_cat(cx);
+L_2715: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2715,cx->sp>1?cx->sp-1:0);goto L_42;K_2715:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2716: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2716,cx->sp>0?cx->sp-0:0);goto L_1745;K_2716:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2717: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2717,cx->sp>0?cx->sp-0:0);goto L_1989;K_2717:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2718: Cell t1374=uf_mkp((void*)&uf_sl271);L_2719: cx->locals[cx->local_base+0]=t1374;L_2720: pushc(cx,t1374);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2720,cx->sp>0?cx->sp-0:0);goto L_111;K_2720:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2721: Cell t1375=cx->locals[cx->local_base+0];L_2722: pushc(cx,t1375);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2722,cx->sp>2?cx->sp-2:0);goto L_97;K_2722:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2723: Cell t1376=pop(cx);Cell t1377=uf_cnot(t1376);L_2724: pushc(cx,t1377);pushp(cx,(void*)&&L_144);
+L_2725: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2725,cx->sp>0?cx->sp-0:0);goto *b;K_2725:;}}
+L_2726: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2726,cx->sp>0?cx->sp-0:0);goto L_127;K_2726:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2727: Cell t1378=uf_mkp((void*)&uf_sl272);L_2728: cx->locals[cx->local_base+0]=t1378;L_2729: pushc(cx,t1378);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2729,cx->sp>0?cx->sp-0:0);goto L_111;K_2729:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2730: Cell t1379=cx->locals[cx->local_base+0];L_2731: pushc(cx,t1379);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2731,cx->sp>2?cx->sp-2:0);goto L_97;K_2731:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2732: Cell t1380=pop(cx);Cell t1381=uf_cnot(t1380);L_2733: pushc(cx,t1381);pushp(cx,(void*)&&L_144);
+L_2734: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2734,cx->sp>0?cx->sp-0:0);goto *b;K_2734:;}}
+L_2735: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2735,cx->sp>0?cx->sp-0:0);goto L_127;K_2735:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2736: Cell t1382=var_trans__clbl;L_2737: Cell t1383=uf_mkp((void*)&uf_sl273);L_2738: pushc(cx,t1382);pushc(cx,t1383);uf_cur_op="op_fmt";op_fmt(cx);
+L_2739: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2739,cx->sp>1?cx->sp-1:0);goto L_42;K_2739:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2740: Cell t1384=var_trans__dflbl;L_2741: Cell t1385=uf_mkp((void*)&uf_sl274);L_2742: pushc(cx,t1384);pushc(cx,t1385);uf_cur_op="op_fmt";op_fmt(cx);
+L_2743: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2743,cx->sp>1?cx->sp-1:0);goto L_42;K_2743:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2744: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2744,cx->sp>0?cx->sp-0:0);goto L_566;K_2744:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2745: Cell t1386=uf_mkp((void*)&uf_sl275);L_2746: pushc(cx,t1386);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2746,cx->sp>1?cx->sp-1:0);goto L_42;K_2746:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2747: Cell t1387=uf_mkp((void*)&uf_sl276);L_2748: cx->locals[cx->local_base+0]=t1387;L_2749: pushc(cx,t1387);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2749,cx->sp>0?cx->sp-0:0);goto L_111;K_2749:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2750: Cell t1388=cx->locals[cx->local_base+0];L_2751: pushc(cx,t1388);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2751,cx->sp>2?cx->sp-2:0);goto L_97;K_2751:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2752: Cell t1389=pop(cx);Cell t1390=uf_cnot(t1389);L_2753: pushc(cx,t1390);pushp(cx,(void*)&&L_144);
+L_2754: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2754,cx->sp>0?cx->sp-0:0);goto *b;K_2754:;}}
+L_2755: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2755,cx->sp>0?cx->sp-0:0);goto L_127;K_2755:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2756: Cell t1391=uf_mkp((void*)&uf_sl277);L_2757: cx->locals[cx->local_base+0]=t1391;L_2758: pushc(cx,t1391);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2758,cx->sp>0?cx->sp-0:0);goto L_111;K_2758:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2759: Cell t1392=cx->locals[cx->local_base+0];L_2760: pushc(cx,t1392);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2760,cx->sp>2?cx->sp-2:0);goto L_97;K_2760:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2761: Cell t1393=pop(cx);Cell t1394=uf_cnot(t1393);L_2762: pushc(cx,t1394);pushp(cx,(void*)&&L_144);
+L_2763: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2763,cx->sp>0?cx->sp-0:0);goto *b;K_2763:;}}
+L_2764: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2764,cx->sp>0?cx->sp-0:0);goto L_127;K_2764:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2765: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2765,cx->sp>0?cx->sp-0:0);goto L_30;K_2765:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2766: Cell t1395=pop(cx);L_2767: var_trans__blbl=t1395;pushc(cx,t1395);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2767,cx->sp>0?cx->sp-0:0);goto L_30;K_2767:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2768: Cell t1396=pop(cx);L_2769: var_trans__clbl=t1396;pushc(cx,t1396);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2769,cx->sp>0?cx->sp-0:0);goto L_30;K_2769:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2770: Cell t1397=pop(cx);L_2771: var_trans__dflbl=t1397;pushc(cx,t1397);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2771,cx->sp>0?cx->sp-0:0);goto L_30;K_2771:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2772: Cell t1398=pop(cx);L_2773: var_trans__emode=t1398;pushc(cx,t1398);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2773,cx->sp>0?cx->sp-0:0);goto L_1970;K_2773:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2774: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2774,cx->sp>0?cx->sp-0:0);goto L_30;K_2774:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2775: Cell t1399=pop(cx);L_2776: Cell t1400=var_trans__clbl;L_2777: Cell t1401=var_trans__blbl;L_2778: Cell t1402=uf_mkp((void*)&uf_sl278);L_2779: var_trans__inq=t1399;pushc(cx,t1399);pushc(cx,t1400);pushc(cx,t1401);pushc(cx,t1402);uf_cur_op="op_fmt";op_fmt(cx);
+L_2780: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2780,cx->sp>1?cx->sp-1:0);goto L_42;K_2780:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2781: Cell t1403=var_trans__lstack;L_2782: pushc(cx,t1403);uf_cur_op="op_lpop";op_lpop(cx);
+L_2783: L_2784: L_2785: Cell t1404=var_trans__cret;L_2786: var_trans__didret=uf_mki(0LL);pushi(cx,0LL);pushc(cx,t1404);pushp(cx,(void*)&&L_2795);
+L_2787: pushp(cx,(void*)&&L_2792);
+L_2788: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2788,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2788,cx->sp>0?cx->sp-0:0);goto *el;}K_2788:;}
+L_2789: L_2790: L_2791: Cell _rv1405=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1405);return;}cx->csp--;const void*_r1406=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1405);if(!_r1406)return;goto *_r1406;}
+L_2792: L_2793: L_2794: Cell _rv1407=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1407);return;}cx->csp--;const void*_r1408=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1407);if(!_r1408)return;goto *_r1408;}
+L_2795: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2795,cx->sp>0?cx->sp-0:0);goto L_135;K_2795:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2796: Cell t1409=pop(cx);L_2797: var_trans__wclbl=t1409;pushc(cx,t1409);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=2;uf_cspush(cx,&&K_2797,cx->sp>0?cx->sp-0:0);goto L_135;K_2797:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2798: Cell t1410=pop(cx);L_2799: Cell t1411=var_trans__wclbl;L_2800: L_2801: Cell t1412=uf_mkp((void*)&uf_sl279);L_2802: var_trans__wblbl=t1410;pushc(cx,t1410);pushc(cx,t1411);pushc(cx,t1410);pushc(cx,t1412);uf_cur_op="op_fmt";op_fmt(cx);
+L_2803: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2803,cx->sp>1?cx->sp-1:0);goto L_42;K_2803:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2804: Cell t1413=var_trans__wclbl;L_2805: pushc(cx,t1413);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2805,cx->sp>1?cx->sp-1:0);goto L_22;K_2805:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2806: Cell t1414=var_trans__wblbl;L_2807: pushc(cx,t1414);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2807,cx->sp>1?cx->sp-1:0);goto L_22;K_2807:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2808: Cell t1415=var_trans__emode;L_2809: pushc(cx,t1415);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2809,cx->sp>1?cx->sp-1:0);goto L_22;K_2809:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2810: Cell t1416=var_trans__inq;L_2811: pushc(cx,t1416);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2811,cx->sp>1?cx->sp-1:0);goto L_22;K_2811:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2812: L_2813: L_2814: Cell t1417=var_trans__psnaps;L_2815: Cell t1418=var_trans__pends;L_2816: var_trans__emode=uf_mki(2LL);pushi(cx,2LL);pushc(cx,t1417);pushc(cx,t1418);uf_cur_op="op_push";op_push(cx);
+L_2817: Cell t1419=pop(cx);L_2818: Cell t1420=uf_mkp((void*)&uf_sl280);L_2819: L_2820: Cell t1421=var_trans__douts;L_2821: Cell t1422=uf_mkp((void*)&uf_sl281);L_2822: var_trans__psnaps=t1419;var_trans__pends=t1420;pushc(cx,t1419);pushc(cx,t1420);pushc(cx,t1421);pushc(cx,t1422);uf_cur_op="op_push";op_push(cx);
+L_2823: Cell t1423=pop(cx);L_2824: L_2825: L_2826: var_trans__douts=t1423;pushc(cx,t1423);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_2826;cx->loops[fr].end=&&K_WE_2826;long _sp0=cx->sp;
+K_WC_2826:;{Cell _wc;{
+WC2826_L2888: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2826_2888,cx->sp>0?cx->sp-0:0);goto L_111;K_WC2826_2888:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC2826_L2889: Cell t0=uf_mkp((void*)&uf_sl288);WC2826_L2890: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2826_2890,cx->sp>2?cx->sp-2:0);goto L_97;K_WC2826_2890:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC2826_L2891: Cell t1=pop(cx);Cell t2=uf_cnot(t1);WC2826_L2892: WC2826_L2893: var_trans__rr=t2;pushc(cx,t2);WC2826_L2894: Cell t3=var_trans__rr;pushc(cx,t3);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_2826;
 {
-WB2628_L2698: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2628_2698,cx->sp>0?cx->sp-0:0);goto L_1645;K_WB2628_2698:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB2628_L2699: WB2628_L2700: WB2628_L2701: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB2628_L2702: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_2628;}
-K_WE_2628:;cx->lsp=fr;}
-L_2629: Cell t1312=var_trans__douts;L_2630: pushc(cx,t1312);uf_cur_op="op_lpop";op_lpop(cx);
-L_2631: Cell t1313=pop(cx);L_2632: Cell t1314=var_trans__psnaps;L_2633: var_trans__wchunk=t1313;pushc(cx,t1313);pushc(cx,t1314);uf_cur_op="op_lpop";op_lpop(cx);
-L_2634: Cell t1315=pop(cx);L_2635: L_2636: Cell t1316=var_trans__pends;L_2637: var_trans__wsv=t1315;pushc(cx,t1315);pushc(cx,t1315);pushc(cx,t1316);uf_cur_op="op_cat";op_cat(cx);
-L_2638: Cell t1317=pop(cx);L_2639: var_trans__pends=t1317;pushc(cx,t1317);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2639,cx->sp>0?cx->sp-0:0);goto L_30;K_2639:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2640: Cell t1318=pop(cx);L_2641: var_trans__inq=t1318;pushc(cx,t1318);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2641,cx->sp>0?cx->sp-0:0);goto L_30;K_2641:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2642: Cell t1319=pop(cx);L_2643: var_trans__emode=t1319;pushc(cx,t1319);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2643,cx->sp>0?cx->sp-0:0);goto L_30;K_2643:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2644: Cell t1320=pop(cx);L_2645: var_trans__wblbl=t1320;pushc(cx,t1320);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2645,cx->sp>0?cx->sp-0:0);goto L_30;K_2645:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2646: Cell t1321=pop(cx);L_2647: Cell t1322=var_trans__wblbl;L_2648: Cell t1323=uf_mkp((void*)&uf_sl265);L_2649: var_trans__wclbl=t1321;pushc(cx,t1321);pushc(cx,t1322);pushc(cx,t1323);uf_cur_op="op_fmt";op_fmt(cx);
-L_2650: Cell t1324=pop(cx);L_2651: Cell t1325=var_trans__wchunk;L_2652: Cell t1326=uf_mkp((void*)&uf_sl266);L_2653: var_trans__wb=t1324;pushc(cx,t1324);pushc(cx,t1325);pushc(cx,t1326);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2653,cx->sp>2?cx->sp-2:0);goto L_97;K_2653:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2654: Cell t1327=pop(cx);Cell t1328=uf_cnot(t1327);L_2655: pushc(cx,t1328);pushp(cx,(void*)&&L_2658);
-L_2656: pushp(cx,(void*)&&L_2675);
-L_2657: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2657,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2657,cx->sp>0?cx->sp-0:0);goto *el;}K_2657:;Cell _rv1329=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1329);return;}cx->csp--;const void*_r1330=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1329);if(!_r1330)return;goto *_r1330;}}
-L_2658: Cell t1331=var_trans__flabels;L_2659: Cell t1332=var_trans__wb;L_2660: pushc(cx,t1331);pushc(cx,t1332);uf_cur_op="op_cat";op_cat(cx);
-L_2661: Cell t1333=var_trans__wchunk;L_2662: pushc(cx,t1333);uf_cur_op="op_cat";op_cat(cx);
-L_2663: Cell t1334=uf_mkp((void*)&uf_sl267);L_2664: pushc(cx,t1334);uf_cur_op="op_cat";op_cat(cx);
-L_2665: Cell t1335=var_trans__wclbl;L_2666: Cell t1336=uf_mkp((void*)&uf_sl268);L_2667: pushc(cx,t1335);pushc(cx,t1336);uf_cur_op="op_fmt";op_fmt(cx);
-L_2668: uf_cur_op="op_cat";op_cat(cx);
-L_2669: Cell t1337=pop(cx);L_2670: L_2671: L_2672: var_trans__flabels=t1337;var_trans__didret=uf_mki(0LL);pushc(cx,t1337);pushi(cx,0LL);L_2673: L_2674: Cell _rv1338=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1338);return;}cx->csp--;const void*_r1339=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1338);if(!_r1339)return;goto *_r1339;}
-L_2675: Cell t1340=var_trans__flabels;L_2676: Cell t1341=var_trans__wb;L_2677: pushc(cx,t1340);pushc(cx,t1341);uf_cur_op="op_cat";op_cat(cx);
-L_2678: Cell t1342=uf_mkp((void*)&uf_sl269);L_2679: pushc(cx,t1342);uf_cur_op="op_cat";op_cat(cx);
-L_2680: Cell t1343=var_trans__wclbl;L_2681: Cell t1344=uf_mkp((void*)&uf_sl270);L_2682: pushc(cx,t1343);pushc(cx,t1344);uf_cur_op="op_fmt";op_fmt(cx);
-L_2683: uf_cur_op="op_cat";op_cat(cx);
-L_2684: Cell t1345=pop(cx);L_2685: L_2686: L_2687: var_trans__flabels=t1345;var_trans__didret=uf_mki(0LL);pushc(cx,t1345);pushi(cx,0LL);L_2688: L_2689: Cell _rv1346=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1346);return;}cx->csp--;const void*_r1347=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1346);if(!_r1347)return;goto *_r1347;}
-L_2690: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2690,cx->sp>0?cx->sp-0:0);goto L_111;K_2690:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2691: Cell t1348=uf_mkp((void*)&uf_sl271);L_2692: pushc(cx,t1348);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2692,cx->sp>2?cx->sp-2:0);goto L_97;K_2692:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2693: Cell t1349=pop(cx);Cell t1350=uf_cnot(t1349);L_2694: L_2695: var_trans__rr=t1350;pushc(cx,t1350);L_2696: Cell t1351=var_trans__rr;L_2697: Cell _rv1352=t1351;{if(cx->csp==0){pushc(cx,_rv1352);return;}cx->csp--;const void*_r1353=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1352);if(!_r1353)return;goto *_r1353;}
-L_2698: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2698,cx->sp>0?cx->sp-0:0);goto L_1645;K_2698:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2699: L_2700: L_2701: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2702: Cell t1354=var_trans__rr;L_2703: Cell _rv1355=t1354;{if(cx->csp==0){pushc(cx,_rv1355);return;}cx->csp--;const void*_r1356=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1355);if(!_r1356)return;goto *_r1356;}
-L_2704: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2704,cx->sp>0?cx->sp-0:0);goto L_127;K_2704:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2705: Cell t1357=uf_mkp((void*)&uf_sl272);L_2706: cx->locals[cx->local_base+0]=t1357;L_2707: pushc(cx,t1357);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2707,cx->sp>0?cx->sp-0:0);goto L_111;K_2707:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2708: Cell t1358=cx->locals[cx->local_base+0];L_2709: pushc(cx,t1358);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2709,cx->sp>2?cx->sp-2:0);goto L_97;K_2709:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2710: Cell t1359=pop(cx);Cell t1360=uf_cnot(t1359);L_2711: pushc(cx,t1360);pushp(cx,(void*)&&L_144);
-L_2712: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2712,cx->sp>0?cx->sp-0:0);goto *b;K_2712:;}}
-L_2713: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2713,cx->sp>0?cx->sp-0:0);goto L_127;K_2713:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2714: Cell t1361=uf_mkp((void*)&uf_sl273);L_2715: pushc(cx,t1361);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2715,cx->sp>1?cx->sp-1:0);goto L_42;K_2715:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2716: L_2717: L_2718: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2719: Cell t1362=var_trans__rr;L_2720: Cell _rv1363=t1362;{if(cx->csp==0){pushc(cx,_rv1363);return;}cx->csp--;const void*_r1364=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1363);if(!_r1364)return;goto *_r1364;}
-L_2721: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2721,cx->sp>0?cx->sp-0:0);goto L_127;K_2721:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2722: Cell t1365=uf_mkp((void*)&uf_sl274);L_2723: cx->locals[cx->local_base+0]=t1365;L_2724: pushc(cx,t1365);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2724,cx->sp>0?cx->sp-0:0);goto L_111;K_2724:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2725: Cell t1366=cx->locals[cx->local_base+0];L_2726: pushc(cx,t1366);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2726,cx->sp>2?cx->sp-2:0);goto L_97;K_2726:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2727: Cell t1367=pop(cx);Cell t1368=uf_cnot(t1367);L_2728: pushc(cx,t1368);pushp(cx,(void*)&&L_144);
-L_2729: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2729,cx->sp>0?cx->sp-0:0);goto *b;K_2729:;}}
-L_2730: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2730,cx->sp>0?cx->sp-0:0);goto L_127;K_2730:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2731: Cell t1369=uf_mkp((void*)&uf_sl275);L_2732: pushc(cx,t1369);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2732,cx->sp>1?cx->sp-1:0);goto L_42;K_2732:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2733: L_2734: L_2735: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2736: Cell t1370=var_trans__rr;L_2737: Cell _rv1371=t1370;{if(cx->csp==0){pushc(cx,_rv1371);return;}cx->csp--;const void*_r1372=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1371);if(!_r1372)return;goto *_r1372;}
-L_2738: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2738,cx->sp>0?cx->sp-0:0);goto L_127;K_2738:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2739: L_2740: L_2741: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_2741;cx->loops[fr].end=&&K_WE_2741;long _sp0=cx->sp;
-K_WC_2741:;{Cell _wc;{
-WC2741_L2746: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2741_2746,cx->sp>0?cx->sp-0:0);goto L_111;K_WC2741_2746:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC2741_L2747: Cell t0=uf_mkp((void*)&uf_sl276);WC2741_L2748: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2741_2748,cx->sp>2?cx->sp-2:0);goto L_97;K_WC2741_2748:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC2741_L2749: Cell t1=pop(cx);Cell t2=uf_cnot(t1);WC2741_L2750: WC2741_L2751: var_trans__rr=t2;pushc(cx,t2);WC2741_L2752: Cell t3=var_trans__rr;pushc(cx,t3);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_2741;
+WB2826_L2896: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2826_2896,cx->sp>0?cx->sp-0:0);goto L_1745;K_WB2826_2896:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB2826_L2897: WB2826_L2898: WB2826_L2899: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB2826_L2900: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_2826;}
+K_WE_2826:;cx->lsp=fr;}
+L_2827: Cell t1424=var_trans__douts;L_2828: pushc(cx,t1424);uf_cur_op="op_lpop";op_lpop(cx);
+L_2829: Cell t1425=pop(cx);L_2830: Cell t1426=var_trans__psnaps;L_2831: var_trans__wchunk=t1425;pushc(cx,t1425);pushc(cx,t1426);uf_cur_op="op_lpop";op_lpop(cx);
+L_2832: Cell t1427=pop(cx);L_2833: L_2834: Cell t1428=var_trans__pends;L_2835: var_trans__wsv=t1427;pushc(cx,t1427);pushc(cx,t1427);pushc(cx,t1428);uf_cur_op="op_cat";op_cat(cx);
+L_2836: Cell t1429=pop(cx);L_2837: var_trans__pends=t1429;pushc(cx,t1429);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2837,cx->sp>0?cx->sp-0:0);goto L_30;K_2837:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2838: Cell t1430=pop(cx);L_2839: var_trans__inq=t1430;pushc(cx,t1430);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2839,cx->sp>0?cx->sp-0:0);goto L_30;K_2839:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2840: Cell t1431=pop(cx);L_2841: var_trans__emode=t1431;pushc(cx,t1431);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2841,cx->sp>0?cx->sp-0:0);goto L_30;K_2841:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2842: Cell t1432=pop(cx);L_2843: var_trans__wblbl=t1432;pushc(cx,t1432);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2843,cx->sp>0?cx->sp-0:0);goto L_30;K_2843:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2844: Cell t1433=pop(cx);L_2845: Cell t1434=var_trans__wblbl;L_2846: Cell t1435=uf_mkp((void*)&uf_sl282);L_2847: var_trans__wclbl=t1433;pushc(cx,t1433);pushc(cx,t1434);pushc(cx,t1435);uf_cur_op="op_fmt";op_fmt(cx);
+L_2848: Cell t1436=pop(cx);L_2849: Cell t1437=var_trans__wchunk;L_2850: Cell t1438=uf_mkp((void*)&uf_sl283);L_2851: var_trans__wb=t1436;pushc(cx,t1436);pushc(cx,t1437);pushc(cx,t1438);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2851,cx->sp>2?cx->sp-2:0);goto L_97;K_2851:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2852: Cell t1439=pop(cx);Cell t1440=uf_cnot(t1439);L_2853: pushc(cx,t1440);pushp(cx,(void*)&&L_2856);
+L_2854: pushp(cx,(void*)&&L_2873);
+L_2855: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2855,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2855,cx->sp>0?cx->sp-0:0);goto *el;}K_2855:;Cell _rv1441=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1441);return;}cx->csp--;const void*_r1442=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1441);if(!_r1442)return;goto *_r1442;}}
+L_2856: Cell t1443=var_trans__flabels;L_2857: Cell t1444=var_trans__wb;L_2858: pushc(cx,t1443);pushc(cx,t1444);uf_cur_op="op_cat";op_cat(cx);
+L_2859: Cell t1445=var_trans__wchunk;L_2860: pushc(cx,t1445);uf_cur_op="op_cat";op_cat(cx);
+L_2861: Cell t1446=uf_mkp((void*)&uf_sl284);L_2862: pushc(cx,t1446);uf_cur_op="op_cat";op_cat(cx);
+L_2863: Cell t1447=var_trans__wclbl;L_2864: Cell t1448=uf_mkp((void*)&uf_sl285);L_2865: pushc(cx,t1447);pushc(cx,t1448);uf_cur_op="op_fmt";op_fmt(cx);
+L_2866: uf_cur_op="op_cat";op_cat(cx);
+L_2867: Cell t1449=pop(cx);L_2868: L_2869: L_2870: var_trans__flabels=t1449;var_trans__didret=uf_mki(0LL);pushc(cx,t1449);pushi(cx,0LL);L_2871: L_2872: Cell _rv1450=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1450);return;}cx->csp--;const void*_r1451=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1450);if(!_r1451)return;goto *_r1451;}
+L_2873: Cell t1452=var_trans__flabels;L_2874: Cell t1453=var_trans__wb;L_2875: pushc(cx,t1452);pushc(cx,t1453);uf_cur_op="op_cat";op_cat(cx);
+L_2876: Cell t1454=uf_mkp((void*)&uf_sl286);L_2877: pushc(cx,t1454);uf_cur_op="op_cat";op_cat(cx);
+L_2878: Cell t1455=var_trans__wclbl;L_2879: Cell t1456=uf_mkp((void*)&uf_sl287);L_2880: pushc(cx,t1455);pushc(cx,t1456);uf_cur_op="op_fmt";op_fmt(cx);
+L_2881: uf_cur_op="op_cat";op_cat(cx);
+L_2882: Cell t1457=pop(cx);L_2883: L_2884: L_2885: var_trans__flabels=t1457;var_trans__didret=uf_mki(0LL);pushc(cx,t1457);pushi(cx,0LL);L_2886: L_2887: Cell _rv1458=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1458);return;}cx->csp--;const void*_r1459=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1458);if(!_r1459)return;goto *_r1459;}
+L_2888: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2888,cx->sp>0?cx->sp-0:0);goto L_111;K_2888:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2889: Cell t1460=uf_mkp((void*)&uf_sl288);L_2890: pushc(cx,t1460);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2890,cx->sp>2?cx->sp-2:0);goto L_97;K_2890:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2891: Cell t1461=pop(cx);Cell t1462=uf_cnot(t1461);L_2892: L_2893: var_trans__rr=t1462;pushc(cx,t1462);L_2894: Cell t1463=var_trans__rr;L_2895: Cell _rv1464=t1463;{if(cx->csp==0){pushc(cx,_rv1464);return;}cx->csp--;const void*_r1465=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1464);if(!_r1465)return;goto *_r1465;}
+L_2896: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2896,cx->sp>0?cx->sp-0:0);goto L_1745;K_2896:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2897: L_2898: L_2899: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2900: Cell t1466=var_trans__rr;L_2901: Cell _rv1467=t1466;{if(cx->csp==0){pushc(cx,_rv1467);return;}cx->csp--;const void*_r1468=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1467);if(!_r1468)return;goto *_r1468;}
+L_2902: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2902,cx->sp>0?cx->sp-0:0);goto L_127;K_2902:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2903: Cell t1469=uf_mkp((void*)&uf_sl289);L_2904: cx->locals[cx->local_base+0]=t1469;L_2905: pushc(cx,t1469);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2905,cx->sp>0?cx->sp-0:0);goto L_111;K_2905:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2906: Cell t1470=cx->locals[cx->local_base+0];L_2907: pushc(cx,t1470);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2907,cx->sp>2?cx->sp-2:0);goto L_97;K_2907:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2908: Cell t1471=pop(cx);Cell t1472=uf_cnot(t1471);L_2909: pushc(cx,t1472);pushp(cx,(void*)&&L_144);
+L_2910: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2910,cx->sp>0?cx->sp-0:0);goto *b;K_2910:;}}
+L_2911: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2911,cx->sp>0?cx->sp-0:0);goto L_127;K_2911:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2912: Cell t1473=uf_mkp((void*)&uf_sl290);L_2913: pushc(cx,t1473);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2913,cx->sp>1?cx->sp-1:0);goto L_42;K_2913:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2914: L_2915: L_2916: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2917: Cell t1474=var_trans__rr;L_2918: Cell _rv1475=t1474;{if(cx->csp==0){pushc(cx,_rv1475);return;}cx->csp--;const void*_r1476=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1475);if(!_r1476)return;goto *_r1476;}
+L_2919: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2919,cx->sp>0?cx->sp-0:0);goto L_127;K_2919:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2920: Cell t1477=uf_mkp((void*)&uf_sl291);L_2921: cx->locals[cx->local_base+0]=t1477;L_2922: pushc(cx,t1477);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2922,cx->sp>0?cx->sp-0:0);goto L_111;K_2922:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2923: Cell t1478=cx->locals[cx->local_base+0];L_2924: pushc(cx,t1478);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2924,cx->sp>2?cx->sp-2:0);goto L_97;K_2924:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2925: Cell t1479=pop(cx);Cell t1480=uf_cnot(t1479);L_2926: pushc(cx,t1480);pushp(cx,(void*)&&L_144);
+L_2927: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2927,cx->sp>0?cx->sp-0:0);goto *b;K_2927:;}}
+L_2928: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2928,cx->sp>0?cx->sp-0:0);goto L_127;K_2928:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2929: Cell t1481=var_trans__lstack;L_2930: pushc(cx,t1481);uf_cur_op="op_len";op_len(cx);
+L_2931: Cell t1482=pop(cx);Cell t1483=uf_cnot(t1482);L_2932: pushc(cx,t1483);pushp(cx,(void*)&&L_2938);
+L_2933: pushp(cx,(void*)&&L_2945);
+L_2934: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2934,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2934,cx->sp>0?cx->sp-0:0);goto *el;}K_2934:;}
+L_2935: L_2936: L_2937: Cell _rv1484=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1484);return;}cx->csp--;const void*_r1485=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1484);if(!_r1485)return;goto *_r1485;}
+L_2938: Cell t1486=uf_mkp((void*)&uf_sl292);L_2939: pushc(cx,t1486);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2939,cx->sp>1?cx->sp-1:0);goto L_42;K_2939:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2940: L_2941: L_2942: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2943: Cell t1487=var_trans__rr;L_2944: Cell _rv1488=t1487;{if(cx->csp==0){pushc(cx,_rv1488);return;}cx->csp--;const void*_r1489=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1488);if(!_r1489)return;goto *_r1489;}
+L_2945: Cell t1490=var_trans__lstack;L_2946: L_2947: pushc(cx,t1490);pushc(cx,var_trans__lstack);uf_cur_op="op_len";op_len(cx);
+L_2948: L_2949: Cell t1491=pop(cx);Cell t1492=uf_csub(t1491,uf_mki(1LL));L_2950: pushc(cx,t1492);uf_cur_op="op_get";op_get(cx);
+L_2951: Cell t1493=pop(cx);L_2952: L_2953: Cell t1494=uf_mkp((void*)&uf_sl293);L_2954: var_trans__pctop=t1493;pushc(cx,t1493);pushc(cx,t1493);pushc(cx,t1494);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2954,cx->sp>2?cx->sp-2:0);goto L_97;K_2954:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2955: pushp(cx,(void*)&&L_2938);
+L_2956: pushp(cx,(void*)&&L_2961);
+L_2957: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2957,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2957,cx->sp>0?cx->sp-0:0);goto *el;}K_2957:;}
+L_2958: L_2959: L_2960: Cell _rv1495=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1495);return;}cx->csp--;const void*_r1496=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1495);if(!_r1496)return;goto *_r1496;}
+L_2961: Cell t1497=uf_mkp((void*)&uf_sl294);L_2962: Cell t1498=var_trans__pctop;L_2963: pushc(cx,t1497);pushc(cx,t1498);uf_cur_op="op_cat";op_cat(cx);
+L_2964: Cell t1499=uf_mkp((void*)&uf_sl295);L_2965: pushc(cx,t1499);uf_cur_op="op_cat";op_cat(cx);
+L_2966: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2966,cx->sp>1?cx->sp-1:0);goto L_42;K_2966:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2967: L_2968: L_2969: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2970: Cell t1500=var_trans__rr;L_2971: Cell _rv1501=t1500;{if(cx->csp==0){pushc(cx,_rv1501);return;}cx->csp--;const void*_r1502=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1501);if(!_r1502)return;goto *_r1502;}
+L_2972: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2972,cx->sp>0?cx->sp-0:0);goto L_127;K_2972:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2973: L_2974: L_2975: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_2975;cx->loops[fr].end=&&K_WE_2975;long _sp0=cx->sp;
+K_WC_2975:;{Cell _wc;{
+WC2975_L2980: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2975_2980,cx->sp>0?cx->sp-0:0);goto L_111;K_WC2975_2980:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC2975_L2981: Cell t0=uf_mkp((void*)&uf_sl296);WC2975_L2982: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2975_2982,cx->sp>2?cx->sp-2:0);goto L_97;K_WC2975_2982:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC2975_L2983: Cell t1=pop(cx);Cell t2=uf_cnot(t1);WC2975_L2984: WC2975_L2985: var_trans__rr=t2;pushc(cx,t2);WC2975_L2986: Cell t3=var_trans__rr;pushc(cx,t3);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_2975;
 {
-WB2741_L2754: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2741_2754,cx->sp>0?cx->sp-0:0);goto L_1645;K_WB2741_2754:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB2741_L2755: WB2741_L2756: WB2741_L2757: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB2741_L2758: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_2741;}
-K_WE_2741:;cx->lsp=fr;}
-L_2742: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2742,cx->sp>0?cx->sp-0:0);goto L_127;K_2742:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2743: L_2744: L_2745: Cell _rv1373=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1373);return;}cx->csp--;const void*_r1374=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1373);if(!_r1374)return;goto *_r1374;}
-L_2746: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2746,cx->sp>0?cx->sp-0:0);goto L_111;K_2746:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2747: Cell t1375=uf_mkp((void*)&uf_sl276);L_2748: pushc(cx,t1375);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2748,cx->sp>2?cx->sp-2:0);goto L_97;K_2748:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2749: Cell t1376=pop(cx);Cell t1377=uf_cnot(t1376);L_2750: L_2751: var_trans__rr=t1377;pushc(cx,t1377);L_2752: Cell t1378=var_trans__rr;L_2753: Cell _rv1379=t1378;{if(cx->csp==0){pushc(cx,_rv1379);return;}cx->csp--;const void*_r1380=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1379);if(!_r1380)return;goto *_r1380;}
-L_2754: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2754,cx->sp>0?cx->sp-0:0);goto L_1645;K_2754:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2755: L_2756: L_2757: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2758: Cell t1381=var_trans__rr;L_2759: Cell _rv1382=t1381;{if(cx->csp==0){pushc(cx,_rv1382);return;}cx->csp--;const void*_r1383=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1382);if(!_r1383)return;goto *_r1383;}
-L_2760: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2760,cx->sp>0?cx->sp-0:0);goto L_127;K_2760:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2761: L_2762: L_2763: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2764: Cell t1384=var_trans__rr;L_2765: Cell _rv1385=t1384;{if(cx->csp==0){pushc(cx,_rv1385);return;}cx->csp--;const void*_r1386=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1385);if(!_r1386)return;goto *_r1386;}
-L_2766: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2766,cx->sp>0?cx->sp-0:0);goto L_566;K_2766:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2767: Cell t1387=uf_mkp((void*)&uf_sl277);L_2768: cx->locals[cx->local_base+0]=t1387;L_2769: pushc(cx,t1387);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2769,cx->sp>0?cx->sp-0:0);goto L_111;K_2769:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2770: Cell t1388=cx->locals[cx->local_base+0];L_2771: pushc(cx,t1388);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2771,cx->sp>2?cx->sp-2:0);goto L_97;K_2771:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2772: Cell t1389=pop(cx);Cell t1390=uf_cnot(t1389);L_2773: pushc(cx,t1390);pushp(cx,(void*)&&L_144);
-L_2774: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2774,cx->sp>0?cx->sp-0:0);goto *b;K_2774:;}}
-L_2775: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2775,cx->sp>0?cx->sp-0:0);goto L_127;K_2775:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2776: L_2777: L_2778: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2779: Cell t1391=var_trans__rr;L_2780: Cell _rv1392=t1391;{if(cx->csp==0){pushc(cx,_rv1392);return;}cx->csp--;const void*_r1393=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1392);if(!_r1393)return;goto *_r1393;}
-L_2781: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2781,cx->sp>0?cx->sp-0:0);goto L_195;K_2781:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2782: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2782,cx->sp>0?cx->sp-0:0);goto L_111;K_2782:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2783: Cell t1394=pop(cx);L_2784: var_trans__fname=t1394;pushc(cx,t1394);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2784,cx->sp>0?cx->sp-0:0);goto L_127;K_2784:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2785: Cell t1395=uf_mkp((void*)&uf_sl278);L_2786: cx->locals[cx->local_base+0]=t1395;L_2787: pushc(cx,t1395);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2787,cx->sp>0?cx->sp-0:0);goto L_111;K_2787:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2788: Cell t1396=cx->locals[cx->local_base+0];L_2789: pushc(cx,t1396);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2789,cx->sp>2?cx->sp-2:0);goto L_97;K_2789:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2790: Cell t1397=pop(cx);Cell t1398=uf_cnot(t1397);L_2791: pushc(cx,t1398);pushp(cx,(void*)&&L_144);
-L_2792: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2792,cx->sp>0?cx->sp-0:0);goto *b;K_2792:;}}
-L_2793: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2793,cx->sp>0?cx->sp-0:0);goto L_127;K_2793:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2794: uf_cur_op="op_list";op_list(cx);
-L_2795: Cell t1399=pop(cx);L_2796: L_2797: L_2798: var_trans__pl=t1399;pushc(cx,t1399);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_2798;cx->loops[fr].end=&&K_WE_2798;long _sp0=cx->sp;
-K_WC_2798:;{Cell _wc;{
-WC2798_L2886: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2798_2886,cx->sp>0?cx->sp-0:0);goto L_111;K_WC2798_2886:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC2798_L2887: Cell t0=uf_mkp((void*)&uf_sl291);WC2798_L2888: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2798_2888,cx->sp>2?cx->sp-2:0);goto L_97;K_WC2798_2888:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC2798_L2889: Cell t1=pop(cx);Cell t2=uf_cnot(t1);WC2798_L2890: WC2798_L2891: var_trans__rr=t2;pushc(cx,t2);WC2798_L2892: Cell t3=var_trans__rr;pushc(cx,t3);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_2798;
+WB2975_L2988: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2975_2988,cx->sp>0?cx->sp-0:0);goto L_1745;K_WB2975_2988:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB2975_L2989: WB2975_L2990: WB2975_L2991: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB2975_L2992: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_2975;}
+K_WE_2975:;cx->lsp=fr;}
+L_2976: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2976,cx->sp>0?cx->sp-0:0);goto L_127;K_2976:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2977: L_2978: L_2979: Cell _rv1503=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1503);return;}cx->csp--;const void*_r1504=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1503);if(!_r1504)return;goto *_r1504;}
+L_2980: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2980,cx->sp>0?cx->sp-0:0);goto L_111;K_2980:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2981: Cell t1505=uf_mkp((void*)&uf_sl296);L_2982: pushc(cx,t1505);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2982,cx->sp>2?cx->sp-2:0);goto L_97;K_2982:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2983: Cell t1506=pop(cx);Cell t1507=uf_cnot(t1506);L_2984: L_2985: var_trans__rr=t1507;pushc(cx,t1507);L_2986: Cell t1508=var_trans__rr;L_2987: Cell _rv1509=t1508;{if(cx->csp==0){pushc(cx,_rv1509);return;}cx->csp--;const void*_r1510=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1509);if(!_r1510)return;goto *_r1510;}
+L_2988: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2988,cx->sp>0?cx->sp-0:0);goto L_1745;K_2988:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2989: L_2990: L_2991: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2992: Cell t1511=var_trans__rr;L_2993: Cell _rv1512=t1511;{if(cx->csp==0){pushc(cx,_rv1512);return;}cx->csp--;const void*_r1513=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1512);if(!_r1513)return;goto *_r1513;}
+L_2994: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2994,cx->sp>0?cx->sp-0:0);goto L_127;K_2994:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_2995: L_2996: L_2997: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2998: Cell t1514=var_trans__rr;L_2999: Cell _rv1515=t1514;{if(cx->csp==0){pushc(cx,_rv1515);return;}cx->csp--;const void*_r1516=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1515);if(!_r1516)return;goto *_r1516;}
+L_3000: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3000,cx->sp>0?cx->sp-0:0);goto L_566;K_3000:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3001: Cell t1517=uf_mkp((void*)&uf_sl297);L_3002: cx->locals[cx->local_base+0]=t1517;L_3003: pushc(cx,t1517);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3003,cx->sp>0?cx->sp-0:0);goto L_111;K_3003:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3004: Cell t1518=cx->locals[cx->local_base+0];L_3005: pushc(cx,t1518);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3005,cx->sp>2?cx->sp-2:0);goto L_97;K_3005:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3006: Cell t1519=pop(cx);Cell t1520=uf_cnot(t1519);L_3007: pushc(cx,t1520);pushp(cx,(void*)&&L_144);
+L_3008: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3008,cx->sp>0?cx->sp-0:0);goto *b;K_3008:;}}
+L_3009: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3009,cx->sp>0?cx->sp-0:0);goto L_127;K_3009:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3010: L_3011: L_3012: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_3013: Cell t1521=var_trans__rr;L_3014: Cell _rv1522=t1521;{if(cx->csp==0){pushc(cx,_rv1522);return;}cx->csp--;const void*_r1523=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1522);if(!_r1523)return;goto *_r1523;}
+L_3015: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3015,cx->sp>0?cx->sp-0:0);goto L_195;K_3015:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3016: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3016,cx->sp>0?cx->sp-0:0);goto L_111;K_3016:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3017: Cell t1524=pop(cx);L_3018: var_trans__fname=t1524;pushc(cx,t1524);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3018,cx->sp>0?cx->sp-0:0);goto L_127;K_3018:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3019: Cell t1525=uf_mkp((void*)&uf_sl298);L_3020: cx->locals[cx->local_base+0]=t1525;L_3021: pushc(cx,t1525);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3021,cx->sp>0?cx->sp-0:0);goto L_111;K_3021:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3022: Cell t1526=cx->locals[cx->local_base+0];L_3023: pushc(cx,t1526);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3023,cx->sp>2?cx->sp-2:0);goto L_97;K_3023:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3024: Cell t1527=pop(cx);Cell t1528=uf_cnot(t1527);L_3025: pushc(cx,t1528);pushp(cx,(void*)&&L_144);
+L_3026: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3026,cx->sp>0?cx->sp-0:0);goto *b;K_3026:;}}
+L_3027: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3027,cx->sp>0?cx->sp-0:0);goto L_127;K_3027:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3028: uf_cur_op="op_list";op_list(cx);
+L_3029: Cell t1529=pop(cx);L_3030: L_3031: L_3032: var_trans__pl=t1529;pushc(cx,t1529);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_3032;cx->loops[fr].end=&&K_WE_3032;long _sp0=cx->sp;
+K_WC_3032:;{Cell _wc;{
+WC3032_L3115: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC3032_3115,cx->sp>0?cx->sp-0:0);goto L_111;K_WC3032_3115:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC3032_L3116: Cell t0=uf_mkp((void*)&uf_sl311);WC3032_L3117: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC3032_3117,cx->sp>2?cx->sp-2:0);goto L_97;K_WC3032_3117:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC3032_L3118: Cell t1=pop(cx);Cell t2=uf_cnot(t1);WC3032_L3119: WC3032_L3120: var_trans__rr=t2;pushc(cx,t2);WC3032_L3121: Cell t3=var_trans__rr;pushc(cx,t3);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_3032;
 {
-WB2798_L2894: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2798_2894,cx->sp>0?cx->sp-0:0);goto L_111;K_WB2798_2894:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB2798_L2895: Cell t0=uf_mkp((void*)&uf_sl292);WB2798_L2896: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2798_2896,cx->sp>2?cx->sp-2:0);goto L_97;K_WB2798_2896:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB2798_L2897: pushp(cx,(void*)&&L_2903);
-WB2798_L2898: pushp(cx,(void*)&&L_2909);
-WB2798_L2899: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_WB2798_2899,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_WB2798_2899,cx->sp>0?cx->sp-0:0);goto *el;}K_WB2798_2899:;}
-WB2798_L2900: }cx->sp=_sp0;goto K_WC_2798;}
-K_WE_2798:;cx->lsp=fr;}
-L_2799: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2799,cx->sp>0?cx->sp-0:0);goto L_127;K_2799:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2800: uf_cur_op="op_dict";op_dict(cx);
-L_2801: Cell t1400=pop(cx);L_2802: L_2803: L_2804: Cell t1401=uf_mkp((void*)&uf_sl279);L_2805: L_2806: Cell t1402=var_trans__fname;L_2807: Cell t1403=uf_mkp((void*)&uf_sl280);L_2808: var_trans__vars=t1400;var_trans__cret=uf_mki(0LL);var_trans__qout=t1401;pushc(cx,t1400);pushi(cx,0LL);pushc(cx,t1401);pushc(cx,t1402);pushc(cx,t1403);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2808,cx->sp>2?cx->sp-2:0);goto L_97;K_2808:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2809: pushp(cx,(void*)&&L_2874);
-L_2810: pushp(cx,(void*)&&L_2879);
-L_2811: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2811,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2811,cx->sp>0?cx->sp-0:0);goto *el;}K_2811:;}
-L_2812: Cell t1404=var_trans__fname;L_2813: Cell t1405=uf_mkp((void*)&uf_sl281);L_2814: pushc(cx,t1404);pushc(cx,t1405);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2814,cx->sp>2?cx->sp-2:0);goto L_97;K_2814:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2815: Cell t1406=pop(cx);L_2816: Cell t1407=var_trans__pl;L_2817: var_trans__inmain=t1406;pushc(cx,t1406);pushc(cx,t1407);uf_cur_op="op_len";op_len(cx);
-L_2818: L_2819: Cell t1408=pop(cx);Cell t1409=uf_csub(t1408,uf_mki(1LL));L_2820: L_2821: Cell t1410=var_trans__inmain;L_2822: Cell t1411=uf_cnot(t1410);L_2823: L_2824: L_2825: var_trans__pfi=t1409;pushc(cx,t1409);pushc(cx,t1411);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_2825;cx->loops[fr].end=&&K_WE_2825;long _sp0=cx->sp;
-K_WC_2825:;{Cell _wc;{
-WC2825_L2937: Cell t0=var_trans__pfi;WC2825_L2938: WC2825_L2939: Cell t1=uf_ceq(t0,uf_mki(-1LL));WC2825_L2940: Cell t2=uf_cnot(t1);WC2825_L2941: WC2825_L2942: var_trans__rr=t2;pushc(cx,t2);WC2825_L2943: Cell t3=var_trans__rr;pushc(cx,t3);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_2825;
+WB3032_L3123: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB3032_3123,cx->sp>0?cx->sp-0:0);goto L_111;K_WB3032_3123:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB3032_L3124: Cell t0=uf_mkp((void*)&uf_sl312);WB3032_L3125: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB3032_3125,cx->sp>2?cx->sp-2:0);goto L_97;K_WB3032_3125:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB3032_L3126: pushp(cx,(void*)&&L_3132);
+WB3032_L3127: pushp(cx,(void*)&&L_3138);
+WB3032_L3128: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_WB3032_3128,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_WB3032_3128,cx->sp>0?cx->sp-0:0);goto *el;}K_WB3032_3128:;}
+WB3032_L3129: }cx->sp=_sp0;goto K_WC_3032;}
+K_WE_3032:;cx->lsp=fr;}
+L_3033: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3033,cx->sp>0?cx->sp-0:0);goto L_127;K_3033:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3034: uf_cur_op="op_dict";op_dict(cx);
+L_3035: Cell t1530=pop(cx);L_3036: var_trans__vars=t1530;pushc(cx,t1530);uf_cur_op="op_list";op_list(cx);
+L_3037: Cell t1531=pop(cx);L_3038: L_3039: L_3040: Cell t1532=uf_mkp((void*)&uf_sl299);L_3041: L_3042: Cell t1533=var_trans__fname;L_3043: Cell t1534=uf_mkp((void*)&uf_sl300);L_3044: var_trans__pparams=t1531;var_trans__cret=uf_mki(0LL);var_trans__qout=t1532;pushc(cx,t1531);pushi(cx,0LL);pushc(cx,t1532);pushc(cx,t1533);pushc(cx,t1534);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3044,cx->sp>2?cx->sp-2:0);goto L_97;K_3044:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3045: pushp(cx,(void*)&&L_3103);
+L_3046: pushp(cx,(void*)&&L_3108);
+L_3047: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3047,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_3047,cx->sp>0?cx->sp-0:0);goto *el;}K_3047:;}
+L_3048: Cell t1535=var_trans__fname;L_3049: Cell t1536=uf_mkp((void*)&uf_sl301);L_3050: pushc(cx,t1535);pushc(cx,t1536);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3050,cx->sp>2?cx->sp-2:0);goto L_97;K_3050:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3051: Cell t1537=pop(cx);L_3052: L_3053: L_3054: L_3055: Cell t1538=uf_cnot(t1537);L_3056: L_3057: L_3058: var_trans__inmain=t1537;var_trans__pfi=uf_mki(0LL);pushc(cx,t1537);pushi(cx,0LL);pushc(cx,t1538);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_3058;cx->loops[fr].end=&&K_WE_3058;long _sp0=cx->sp;
+K_WC_3058:;{Cell _wc;{
+WC3058_L3166: Cell t0=var_trans__pfi;WC3058_L3167: Cell t1=var_trans__pl;WC3058_L3168: pushc(cx,t0);pushc(cx,t1);uf_cur_op="op_len";op_len(cx);
+WC3058_L3169: Cell t2=pop(cx);Cell t3=pop(cx);Cell t4=uf_clt(t3,t2);WC3058_L3170: WC3058_L3171: var_trans__rr=t4;pushc(cx,t4);WC3058_L3172: Cell t5=var_trans__rr;pushc(cx,t5);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_3058;
 {
-WB2825_L2945: Cell t0=var_trans__pl;WB2825_L2946: Cell t1=var_trans__pfi;WB2825_L2947: pushc(cx,t0);pushc(cx,t1);uf_cur_op="op_get";op_get(cx);
-WB2825_L2948: Cell t2=pop(cx);WB2825_L2949: WB2825_L2950: var_trans__nv=t2;pushc(cx,t2);pushc(cx,t2);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2825_2950,cx->sp>1?cx->sp-1:0);goto L_215;K_WB2825_2950:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB2825_L2951: Cell t3=uf_mkp((void*)&uf_sl294);WB2825_L2952: pushc(cx,t3);uf_cur_op="op_fmt";op_fmt(cx);
-WB2825_L2953: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2825_2953,cx->sp>1?cx->sp-1:0);goto L_42;K_WB2825_2953:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB2825_L2954: Cell t4=var_trans__pfi;WB2825_L2955: WB2825_L2956: Cell t5=uf_csub(t4,uf_mki(1LL));WB2825_L2957: WB2825_L2958: WB2825_L2959: WB2825_L2960: var_trans__pfi=t5;var_trans__rr=uf_mki(0LL);pushc(cx,t5);pushi(cx,0LL);WB2825_L2961: Cell t6=var_trans__rr;pushc(cx,t6);}cx->sp=_sp0;goto K_WC_2825;}
-K_WE_2825:;cx->lsp=fr;}
-L_2826: Cell t1412=uf_mkp((void*)&uf_sl282);L_2827: cx->locals[cx->local_base+0]=t1412;L_2828: pushc(cx,t1412);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2828,cx->sp>0?cx->sp-0:0);goto L_111;K_2828:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2829: Cell t1413=cx->locals[cx->local_base+0];L_2830: pushc(cx,t1413);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2830,cx->sp>2?cx->sp-2:0);goto L_97;K_2830:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2831: Cell t1414=pop(cx);Cell t1415=uf_cnot(t1414);L_2832: pushc(cx,t1415);pushp(cx,(void*)&&L_144);
-L_2833: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2833,cx->sp>0?cx->sp-0:0);goto *b;K_2833:;}}
-L_2834: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2834,cx->sp>0?cx->sp-0:0);goto L_127;K_2834:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2835: L_2836: L_2837: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_2837;cx->loops[fr].end=&&K_WE_2837;long _sp0=cx->sp;
-K_WC_2837:;{Cell _wc;{
-WC2837_L2963: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2837_2963,cx->sp>0?cx->sp-0:0);goto L_111;K_WC2837_2963:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC2837_L2964: Cell t0=uf_mkp((void*)&uf_sl295);WC2837_L2965: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC2837_2965,cx->sp>2?cx->sp-2:0);goto L_97;K_WC2837_2965:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WC2837_L2966: Cell t1=pop(cx);Cell t2=uf_cnot(t1);WC2837_L2967: WC2837_L2968: var_trans__rr=t2;pushc(cx,t2);WC2837_L2969: Cell t3=var_trans__rr;pushc(cx,t3);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_2837;
+WB3058_L3174: Cell t0=var_trans__pl;WB3058_L3175: Cell t1=var_trans__pfi;WB3058_L3176: pushc(cx,t0);pushc(cx,t1);uf_cur_op="op_get";op_get(cx);
+WB3058_L3177: Cell t2=pop(cx);WB3058_L3178: WB3058_L3179: var_trans__nv=t2;pushc(cx,t2);pushc(cx,t2);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB3058_3179,cx->sp>1?cx->sp-1:0);goto L_215;K_WB3058_3179:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB3058_L3180: Cell t3=pop(cx);WB3058_L3181: Cell t4=var_trans__pparams;WB3058_L3182: WB3058_L3183: var_trans__slot=t3;pushc(cx,t3);pushc(cx,t4);pushc(cx,t3);uf_cur_op="op_push";op_push(cx);
+WB3058_L3184: Cell t5=pop(cx);WB3058_L3185: Cell t6=var_trans__slot;WB3058_L3186: Cell t7=uf_mkp((void*)&uf_sl314);WB3058_L3187: var_trans__pparams=t5;pushc(cx,t5);pushc(cx,t6);pushc(cx,t7);uf_cur_op="op_fmt";op_fmt(cx);
+WB3058_L3188: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB3058_3188,cx->sp>1?cx->sp-1:0);goto L_42;K_WB3058_3188:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB3058_L3189: Cell t8=var_trans__pfi;WB3058_L3190: WB3058_L3191: Cell t9=uf_cadd(t8,uf_mki(1LL));WB3058_L3192: WB3058_L3193: WB3058_L3194: WB3058_L3195: var_trans__pfi=t9;var_trans__rr=uf_mki(0LL);pushc(cx,t9);pushi(cx,0LL);WB3058_L3196: Cell t10=var_trans__rr;pushc(cx,t10);}cx->sp=_sp0;goto K_WC_3058;}
+K_WE_3058:;cx->lsp=fr;}
+L_3059: Cell t1539=uf_mkp((void*)&uf_sl302);L_3060: cx->locals[cx->local_base+0]=t1539;L_3061: pushc(cx,t1539);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3061,cx->sp>0?cx->sp-0:0);goto L_111;K_3061:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3062: Cell t1540=cx->locals[cx->local_base+0];L_3063: pushc(cx,t1540);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3063,cx->sp>2?cx->sp-2:0);goto L_97;K_3063:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3064: Cell t1541=pop(cx);Cell t1542=uf_cnot(t1541);L_3065: pushc(cx,t1542);pushp(cx,(void*)&&L_144);
+L_3066: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3066,cx->sp>0?cx->sp-0:0);goto *b;K_3066:;}}
+L_3067: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3067,cx->sp>0?cx->sp-0:0);goto L_127;K_3067:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3068: L_3069: L_3070: {long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_3070;cx->loops[fr].end=&&K_WE_3070;long _sp0=cx->sp;
+K_WC_3070:;{Cell _wc;{
+WC3070_L3198: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC3070_3198,cx->sp>0?cx->sp-0:0);goto L_111;K_WC3070_3198:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC3070_L3199: Cell t0=uf_mkp((void*)&uf_sl315);WC3070_L3200: pushc(cx,t0);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WC3070_3200,cx->sp>2?cx->sp-2:0);goto L_97;K_WC3070_3200:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WC3070_L3201: Cell t1=pop(cx);Cell t2=uf_cnot(t1);WC3070_L3202: WC3070_L3203: var_trans__rr=t2;pushc(cx,t2);WC3070_L3204: Cell t3=var_trans__rr;pushc(cx,t3);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_3070;
 {
-WB2837_L2971: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB2837_2971,cx->sp>0?cx->sp-0:0);goto L_1645;K_WB2837_2971:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB2837_L2972: WB2837_L2973: WB2837_L2974: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB2837_L2975: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_2837;}
-K_WE_2837:;cx->lsp=fr;}
-L_2838: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2838,cx->sp>0?cx->sp-0:0);goto L_127;K_2838:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2839: Cell t1416=var_trans__didret;L_2840: L_2841: Cell t1417=uf_ceq(t1416,uf_mki(2LL));L_2842: pushc(cx,t1417);pushp(cx,(void*)&&L_2864);
-L_2843: pushp(cx,(void*)&&L_2867);
-L_2844: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2844,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2844,cx->sp>0?cx->sp-0:0);goto *el;}K_2844:;}
-L_2845: Cell t1418=var_trans__qout;L_2846: Cell t1419=uf_mkp((void*)&uf_sl283);L_2847: pushc(cx,t1418);pushc(cx,t1419);uf_cur_op="op_fmt";op_fmt(cx);
-L_2848: uf_cur_op="op_print";op_print(cx);
-L_2849: Cell t1420=uf_mkp((void*)&uf_sl284);L_2850: L_2851: Cell t1421=var_trans__pends;L_2852: Cell t1422=uf_mkp((void*)&uf_sl285);L_2853: var_trans__qout=t1420;pushc(cx,t1420);pushc(cx,t1421);pushc(cx,t1422);uf_cur_op="op_fmt";op_fmt(cx);
-L_2854: uf_cur_op="op_print";op_print(cx);
-L_2855: Cell t1423=uf_mkp((void*)&uf_sl286);L_2856: L_2857: Cell t1424=var_trans__flabels;L_2858: Cell t1425=uf_mkp((void*)&uf_sl287);L_2859: var_trans__pends=t1423;pushc(cx,t1423);pushc(cx,t1424);pushc(cx,t1425);uf_cur_op="op_fmt";op_fmt(cx);
-L_2860: uf_cur_op="op_print";op_print(cx);
-L_2861: Cell t1426=uf_mkp((void*)&uf_sl288);L_2862: L_2863: var_trans__flabels=t1426;Cell _rv1427=t1426;{if(cx->csp==0){pushc(cx,_rv1427);return;}cx->csp--;const void*_r1428=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1427);if(!_r1428)return;goto *_r1428;}
-L_2864: L_2865: L_2866: Cell _rv1429=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1429);return;}cx->csp--;const void*_r1430=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1429);if(!_r1430)return;goto *_r1430;}
-L_2867: Cell t1431=var_trans__inmain;L_2868: pushc(cx,t1431);pushp(cx,(void*)&&L_2977);
-L_2869: pushp(cx,(void*)&&L_2984);
-L_2870: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2870,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2870,cx->sp>0?cx->sp-0:0);goto *el;}K_2870:;}
-L_2871: L_2872: L_2873: Cell _rv1432=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1432);return;}cx->csp--;const void*_r1433=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1432);if(!_r1433)return;goto *_r1433;}
-L_2874: Cell t1434=uf_mkp((void*)&uf_sl289);L_2875: pushc(cx,t1434);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2875,cx->sp>1?cx->sp-1:0);goto L_42;K_2875:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2876: L_2877: L_2878: Cell _rv1435=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1435);return;}cx->csp--;const void*_r1436=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1435);if(!_r1436)return;goto *_r1436;}
-L_2879: Cell t1437=var_trans__fname;L_2880: Cell t1438=uf_mkp((void*)&uf_sl290);L_2881: pushc(cx,t1437);pushc(cx,t1438);uf_cur_op="op_fmt";op_fmt(cx);
-L_2882: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2882,cx->sp>1?cx->sp-1:0);goto L_42;K_2882:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2883: L_2884: L_2885: Cell _rv1439=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1439);return;}cx->csp--;const void*_r1440=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1439);if(!_r1440)return;goto *_r1440;}
-L_2886: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2886,cx->sp>0?cx->sp-0:0);goto L_111;K_2886:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2887: Cell t1441=uf_mkp((void*)&uf_sl291);L_2888: pushc(cx,t1441);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2888,cx->sp>2?cx->sp-2:0);goto L_97;K_2888:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2889: Cell t1442=pop(cx);Cell t1443=uf_cnot(t1442);L_2890: L_2891: var_trans__rr=t1443;pushc(cx,t1443);L_2892: Cell t1444=var_trans__rr;L_2893: Cell _rv1445=t1444;{if(cx->csp==0){pushc(cx,_rv1445);return;}cx->csp--;const void*_r1446=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1445);if(!_r1446)return;goto *_r1446;}
-L_2894: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2894,cx->sp>0?cx->sp-0:0);goto L_111;K_2894:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2895: Cell t1447=uf_mkp((void*)&uf_sl292);L_2896: pushc(cx,t1447);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2896,cx->sp>2?cx->sp-2:0);goto L_97;K_2896:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2897: pushp(cx,(void*)&&L_2903);
-L_2898: pushp(cx,(void*)&&L_2909);
-L_2899: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2899,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2899,cx->sp>0?cx->sp-0:0);goto *el;}K_2899:;}
-L_2900: L_2901: L_2902: Cell _rv1448=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1448);return;}cx->csp--;const void*_r1449=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1448);if(!_r1449)return;goto *_r1449;}
-L_2903: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2903,cx->sp>0?cx->sp-0:0);goto L_127;K_2903:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2904: L_2905: L_2906: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2907: Cell t1450=var_trans__rr;L_2908: Cell _rv1451=t1450;{if(cx->csp==0){pushc(cx,_rv1451);return;}cx->csp--;const void*_r1452=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1451);if(!_r1452)return;goto *_r1452;}
-L_2909: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2909,cx->sp>0?cx->sp-0:0);goto L_111;K_2909:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2910: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2910,cx->sp>1?cx->sp-1:0);goto L_155;K_2910:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2911: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2911,cx->sp>0?cx->sp-0:0);goto L_111;K_2911:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2912: Cell t1453=uf_mkp((void*)&uf_sl293);L_2913: pushc(cx,t1453);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2913,cx->sp>2?cx->sp-2:0);goto L_97;K_2913:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2914: Cell t1454=pop(cx);Cell t1455=pop(cx);Cell t1456=uf_cadd(t1455,t1454);L_2915: pushc(cx,t1456);pushp(cx,(void*)&&L_2921);
-L_2916: pushp(cx,(void*)&&L_2927);
-L_2917: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_2917,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_2917,cx->sp>0?cx->sp-0:0);goto *el;}K_2917:;}
-L_2918: L_2919: L_2920: Cell _rv1457=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1457);return;}cx->csp--;const void*_r1458=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1457);if(!_r1458)return;goto *_r1458;}
-L_2921: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2921,cx->sp>0?cx->sp-0:0);goto L_127;K_2921:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2922: L_2923: L_2924: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2925: Cell t1459=var_trans__rr;L_2926: Cell _rv1460=t1459;{if(cx->csp==0){pushc(cx,_rv1460);return;}cx->csp--;const void*_r1461=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1460);if(!_r1461)return;goto *_r1461;}
-L_2927: Cell t1462=var_trans__pl;L_2928: pushc(cx,t1462);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2928,cx->sp>0?cx->sp-0:0);goto L_111;K_2928:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2929: uf_cur_op="op_push";op_push(cx);
-L_2930: Cell t1463=pop(cx);L_2931: var_trans__pl=t1463;pushc(cx,t1463);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2931,cx->sp>0?cx->sp-0:0);goto L_127;K_2931:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2932: L_2933: L_2934: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2935: Cell t1464=var_trans__rr;L_2936: Cell _rv1465=t1464;{if(cx->csp==0){pushc(cx,_rv1465);return;}cx->csp--;const void*_r1466=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1465);if(!_r1466)return;goto *_r1466;}
-L_2937: Cell t1467=var_trans__pfi;L_2938: L_2939: Cell t1468=uf_ceq(t1467,uf_mki(-1LL));L_2940: Cell t1469=uf_cnot(t1468);L_2941: L_2942: var_trans__rr=t1469;pushc(cx,t1469);L_2943: Cell t1470=var_trans__rr;L_2944: Cell _rv1471=t1470;{if(cx->csp==0){pushc(cx,_rv1471);return;}cx->csp--;const void*_r1472=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1471);if(!_r1472)return;goto *_r1472;}
-L_2945: Cell t1473=var_trans__pl;L_2946: Cell t1474=var_trans__pfi;L_2947: pushc(cx,t1473);pushc(cx,t1474);uf_cur_op="op_get";op_get(cx);
-L_2948: Cell t1475=pop(cx);L_2949: L_2950: var_trans__nv=t1475;pushc(cx,t1475);pushc(cx,t1475);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2950,cx->sp>1?cx->sp-1:0);goto L_215;K_2950:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2951: Cell t1476=uf_mkp((void*)&uf_sl294);L_2952: pushc(cx,t1476);uf_cur_op="op_fmt";op_fmt(cx);
-L_2953: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2953,cx->sp>1?cx->sp-1:0);goto L_42;K_2953:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2954: Cell t1477=var_trans__pfi;L_2955: L_2956: Cell t1478=uf_csub(t1477,uf_mki(1LL));L_2957: L_2958: L_2959: L_2960: var_trans__pfi=t1478;var_trans__rr=uf_mki(0LL);pushc(cx,t1478);pushi(cx,0LL);L_2961: Cell t1479=var_trans__rr;L_2962: Cell _rv1480=t1479;{if(cx->csp==0){pushc(cx,_rv1480);return;}cx->csp--;const void*_r1481=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1480);if(!_r1481)return;goto *_r1481;}
-L_2963: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2963,cx->sp>0?cx->sp-0:0);goto L_111;K_2963:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2964: Cell t1482=uf_mkp((void*)&uf_sl295);L_2965: pushc(cx,t1482);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2965,cx->sp>2?cx->sp-2:0);goto L_97;K_2965:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2966: Cell t1483=pop(cx);Cell t1484=uf_cnot(t1483);L_2967: L_2968: var_trans__rr=t1484;pushc(cx,t1484);L_2969: Cell t1485=var_trans__rr;L_2970: Cell _rv1486=t1485;{if(cx->csp==0){pushc(cx,_rv1486);return;}cx->csp--;const void*_r1487=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1486);if(!_r1487)return;goto *_r1487;}
-L_2971: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2971,cx->sp>0?cx->sp-0:0);goto L_1645;K_2971:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2972: L_2973: L_2974: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2975: Cell t1488=var_trans__rr;L_2976: Cell _rv1489=t1488;{if(cx->csp==0){pushc(cx,_rv1489);return;}cx->csp--;const void*_r1490=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1489);if(!_r1490)return;goto *_r1490;}
-L_2977: Cell t1491=uf_mkp((void*)&uf_sl296);L_2978: pushc(cx,t1491);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2978,cx->sp>1?cx->sp-1:0);goto L_42;K_2978:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2979: L_2980: L_2981: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2982: Cell t1492=var_trans__rr;L_2983: Cell _rv1493=t1492;{if(cx->csp==0){pushc(cx,_rv1493);return;}cx->csp--;const void*_r1494=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1493);if(!_r1494)return;goto *_r1494;}
-L_2984: Cell t1495=uf_mkp((void*)&uf_sl297);L_2985: pushc(cx,t1495);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_2985,cx->sp>1?cx->sp-1:0);goto L_42;K_2985:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_2986: L_2987: L_2988: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_2989: Cell t1496=var_trans__rr;L_2990: Cell _rv1497=t1496;{if(cx->csp==0){pushc(cx,_rv1497);return;}cx->csp--;const void*_r1498=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1497);if(!_r1498)return;goto *_r1498;}
-L_2991: pushp(cx,(void*)&&L_2995);
-L_2992: pushp(cx,(void*)&&L_3003);
-L_2993: {const void* bod=(const void*)pop(cx).i;const void* cnd=(const void*)pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;
-K_WT_2993:;cx->loops[fr].cont=&&K_WT_2993;cx->loops[fr].end=&&K_WE_2993;
-uf_cspush(cx,&&K_WC_2993,cx->sp>0?cx->sp-0:0);goto *cnd;K_WC_2993:;
-if(uf_zero(pop(cx)))goto K_WE_2993;
-uf_cspush(cx,&&K_WB_2993,cx->sp>0?cx->sp-0:0);goto *bod;K_WB_2993:;pop(cx);
-goto K_WT_2993;
-K_WE_2993:;cx->lsp=fr;}
-L_2994: Cell _rv1499=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1499);return;}cx->csp--;const void*_r1500=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1499);if(!_r1500)return;goto *_r1500;}
-L_2995: Cell t1501=var_trans__pi;L_2996: Cell t1502=var_trans__nt;L_2997: Cell t1503=uf_ceq(t1501,t1502);L_2998: Cell t1504=uf_cnot(t1503);L_2999: L_3000: var_trans__rr=t1504;pushc(cx,t1504);L_3001: Cell t1505=var_trans__rr;L_3002: Cell _rv1506=t1505;{if(cx->csp==0){pushc(cx,_rv1506);return;}cx->csp--;const void*_r1507=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1506);if(!_r1507)return;goto *_r1507;}
-L_3003: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3003,cx->sp>0?cx->sp-0:0);goto L_2781;K_3003:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3004: L_3005: L_3006: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_3007: Cell t1508=var_trans__rr;L_3008: Cell _rv1509=t1508;{if(cx->csp==0){pushc(cx,_rv1509);return;}cx->csp--;const void*_r1510=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1509);if(!_r1510)return;goto *_r1510;}
-L_3009: L_3010: L_3011: L_3012: L_3013: L_3014: L_3015: L_3016: L_3017: var_trans__inq=uf_mki(0LL);var_trans__emode=uf_mki(0LL);var_trans__didret=uf_mki(0LL);var_trans__cret=uf_mki(0LL);pushi(cx,0LL);pushi(cx,0LL);pushi(cx,0LL);pushi(cx,0LL);uf_cur_op="op_list";op_list(cx);
-L_3018: Cell t1511=pop(cx);L_3019: Cell t1512=uf_mkp((void*)&uf_sl298);L_3020: L_3021: var_trans__douts=t1511;var_trans__pends=t1512;pushc(cx,t1511);pushc(cx,t1512);uf_cur_op="op_list";op_list(cx);
-L_3022: Cell t1513=pop(cx);L_3023: Cell t1514=uf_mkp((void*)&uf_sl299);L_3024: L_3025: var_trans__psnaps=t1513;var_trans__flabels=t1514;pushc(cx,t1513);pushc(cx,t1514);pushp(cx,(void*)&uf_x0);
-L_3026: uf_cur_op="op_loadx";op_loadx(cx);
-L_3027: L_3028: Cell t1515=pop(cx);Cell t1516=uf_ceq(t1515,uf_mki(2LL));L_3029: Cell t1517=uf_cnot(t1516);L_3030: pushc(cx,t1517);pushp(cx,(void*)&&L_3133);
-L_3031: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3031,cx->sp>0?cx->sp-0:0);goto *b;K_3031:;}}
-L_3032: pushp(cx,(void*)&uf_x1);
-L_3033: uf_cur_op="op_loadx";op_loadx(cx);
-L_3034: L_3035: Cell t1518=pop(cx);Cell t1519=uf_cadd(t1518,uf_mki(8LL));L_3036: pushc(cx,t1519);uf_cur_op="op_loadx";op_loadx(cx);
-L_3037: Cell t1520=pop(cx);L_3038: L_3039: Cell t1521=uf_mkp((void*)&uf_sl300);L_3040: var_trans__path=t1520;pushc(cx,t1520);pushc(cx,t1520);pushc(cx,t1521);uf_cur_op="fopen";{Cell a1=pop(cx);Cell a0=pop(cx);void* r=((void*(*)(void*,void*))uf_im2)((void*)uf_sptr(a0),(void*)uf_sptr(a1));pushp(cx,r);}
-L_3041: Cell t1522=pop(cx);L_3042: L_3043: Cell t1523=uf_cnot(t1522);L_3044: var_trans__f=t1522;pushc(cx,t1522);pushc(cx,t1523);pushp(cx,(void*)&&L_3136);
-L_3045: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3045,cx->sp>0?cx->sp-0:0);goto *b;K_3045:;}}
-L_3046: Cell t1524=var_trans__f;L_3047: L_3048: L_3049: pushc(cx,t1524);pushi(cx,0LL);pushi(cx,2LL);uf_cur_op="fseek";{Cell a2=pop(cx);Cell a1=pop(cx);Cell a0=pop(cx);int r=((int(*)(void*,int64_t,int64_t))uf_im3)((void*)uf_sptr(a0),(int64_t)(a1.tag==T_FLOAT?(int64_t)uf_f(a1):a1.i),(int64_t)(a2.tag==T_FLOAT?(int64_t)uf_f(a2):a2.i));pushi(cx,(int64_t)r);}
-L_3050: Cell t1525=var_trans__f;L_3051: pushc(cx,t1525);uf_cur_op="ftell";{Cell a0=pop(cx);int r=((int(*)(void*))uf_im4)((void*)uf_sptr(a0));pushi(cx,(int64_t)r);}
-L_3052: Cell t1526=pop(cx);L_3053: Cell t1527=var_trans__f;L_3054: L_3055: L_3056: var_trans__srclen=t1526;pushc(cx,t1526);pushc(cx,t1527);pushi(cx,0LL);pushi(cx,0LL);uf_cur_op="fseek";{Cell a2=pop(cx);Cell a1=pop(cx);Cell a0=pop(cx);int r=((int(*)(void*,int64_t,int64_t))uf_im3)((void*)uf_sptr(a0),(int64_t)(a1.tag==T_FLOAT?(int64_t)uf_f(a1):a1.i),(int64_t)(a2.tag==T_FLOAT?(int64_t)uf_f(a2):a2.i));pushi(cx,(int64_t)r);}
-L_3057: Cell t1528=var_trans__srclen;L_3058: L_3059: Cell t1529=uf_cadd(t1528,uf_mki(16LL));L_3060: pushc(cx,t1529);uf_cur_op="op_buf";op_buf(cx);
-L_3061: Cell t1530=pop(cx);L_3062: L_3063: L_3064: Cell t1531=var_trans__srclen;L_3065: Cell t1532=var_trans__f;L_3066: var_trans__src=t1530;pushc(cx,t1530);pushc(cx,t1530);pushi(cx,1LL);pushc(cx,t1531);pushc(cx,t1532);uf_cur_op="fread";{Cell a3=pop(cx);Cell a2=pop(cx);Cell a1=pop(cx);Cell a0=pop(cx);int r=((int(*)(void*,int64_t,int64_t,void*))uf_im5)((void*)uf_sptr(a0),(int64_t)(a1.tag==T_FLOAT?(int64_t)uf_f(a1):a1.i),(int64_t)(a2.tag==T_FLOAT?(int64_t)uf_f(a2):a2.i),(void*)uf_sptr(a3));pushi(cx,(int64_t)r);}
-L_3067: Cell t1533=var_trans__f;L_3068: pushc(cx,t1533);uf_cur_op="fclose";{Cell a0=pop(cx);int r=((int(*)(void*))uf_im6)((void*)uf_sptr(a0));pushi(cx,(int64_t)r);}
-L_3069: uf_cur_op="op_list";op_list(cx);
-L_3070: Cell t1534=pop(cx);L_3071: L_3072: L_3073: L_3074: L_3075: var_trans__toks=t1534;var_trans__pos=uf_mki(0LL);pushc(cx,t1534);pushi(cx,0LL);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_3075;cx->loops[fr].end=&&K_WE_3075;long _sp0=cx->sp;
-K_WC_3075:;{Cell _wc;{
-WC3075_L281: pushp(cx,(void*)&&L_414);
-WC3075_L282: pushp(cx,(void*)&&L_438);
-WC3075_L283: {const void* bod=(const void*)pop(cx).i;const void* cnd=(const void*)pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;
-K_WT_WC3075_283:;cx->loops[fr].cont=&&K_WT_WC3075_283;cx->loops[fr].end=&&K_WE_WC3075_283;
-uf_cspush(cx,&&K_WC_WC3075_283,cx->sp>0?cx->sp-0:0);goto *cnd;K_WC_WC3075_283:;
-if(uf_zero(pop(cx)))goto K_WE_WC3075_283;
-uf_cspush(cx,&&K_WB_WC3075_283,cx->sp>0?cx->sp-0:0);goto *bod;K_WB_WC3075_283:;pop(cx);
-goto K_WT_WC3075_283;
-K_WE_WC3075_283:;cx->lsp=fr;}
-WC3075_L284: WC3075_L285: Cell t0=var_trans__pos;WC3075_L286: Cell t1=var_trans__srclen;WC3075_L287: Cell t2=uf_clt(t0,t1);pushc(cx,t2);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_3075;
+WB3070_L3206: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_WB3070_3206,cx->sp>0?cx->sp-0:0);goto L_1745;K_WB3070_3206:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB3070_L3207: WB3070_L3208: WB3070_L3209: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);WB3070_L3210: Cell t0=var_trans__rr;pushc(cx,t0);}cx->sp=_sp0;goto K_WC_3070;}
+K_WE_3070:;cx->lsp=fr;}
+L_3071: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3071,cx->sp>0?cx->sp-0:0);goto L_127;K_3071:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3072: pushp(cx,(void*)&&L_3096);
+L_3073: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3073,cx->sp>0?cx->sp-0:0);goto *b;K_3073:;}}
+L_3074: Cell t1543=var_trans__qout;L_3075: Cell t1544=uf_mkp((void*)&uf_sl303);L_3076: pushc(cx,t1543);pushc(cx,t1544);uf_cur_op="op_fmt";op_fmt(cx);
+L_3077: uf_cur_op="op_print";op_print(cx);
+L_3078: Cell t1545=uf_mkp((void*)&uf_sl304);L_3079: L_3080: Cell t1546=var_trans__pends;L_3081: Cell t1547=uf_mkp((void*)&uf_sl305);L_3082: var_trans__qout=t1545;pushc(cx,t1545);pushc(cx,t1546);pushc(cx,t1547);uf_cur_op="op_fmt";op_fmt(cx);
+L_3083: uf_cur_op="op_print";op_print(cx);
+L_3084: Cell t1548=uf_mkp((void*)&uf_sl306);L_3085: L_3086: Cell t1549=var_trans__flabels;L_3087: Cell t1550=uf_mkp((void*)&uf_sl307);L_3088: var_trans__pends=t1548;pushc(cx,t1548);pushc(cx,t1549);pushc(cx,t1550);uf_cur_op="op_fmt";op_fmt(cx);
+L_3089: uf_cur_op="op_print";op_print(cx);
+L_3090: Cell t1551=uf_mkp((void*)&uf_sl308);L_3091: L_3092: var_trans__flabels=t1551;Cell _rv1552=t1551;{if(cx->csp==0){pushc(cx,_rv1552);return;}cx->csp--;const void*_r1553=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1552);if(!_r1553)return;goto *_r1553;}
+L_3093: L_3094: L_3095: Cell _rv1554=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1554);return;}cx->csp--;const void*_r1555=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1554);if(!_r1555)return;goto *_r1555;}
+L_3096: Cell t1556=var_trans__inmain;L_3097: pushc(cx,t1556);pushp(cx,(void*)&&L_3212);
+L_3098: pushp(cx,(void*)&&L_3219);
+L_3099: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3099,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_3099,cx->sp>0?cx->sp-0:0);goto *el;}K_3099:;}
+L_3100: L_3101: L_3102: Cell _rv1557=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1557);return;}cx->csp--;const void*_r1558=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1557);if(!_r1558)return;goto *_r1558;}
+L_3103: Cell t1559=uf_mkp((void*)&uf_sl309);L_3104: pushc(cx,t1559);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3104,cx->sp>1?cx->sp-1:0);goto L_42;K_3104:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3105: L_3106: L_3107: Cell _rv1560=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1560);return;}cx->csp--;const void*_r1561=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1560);if(!_r1561)return;goto *_r1561;}
+L_3108: Cell t1562=var_trans__fname;L_3109: Cell t1563=uf_mkp((void*)&uf_sl310);L_3110: pushc(cx,t1562);pushc(cx,t1563);uf_cur_op="op_fmt";op_fmt(cx);
+L_3111: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3111,cx->sp>1?cx->sp-1:0);goto L_42;K_3111:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3112: L_3113: L_3114: Cell _rv1564=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1564);return;}cx->csp--;const void*_r1565=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1564);if(!_r1565)return;goto *_r1565;}
+L_3115: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3115,cx->sp>0?cx->sp-0:0);goto L_111;K_3115:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3116: Cell t1566=uf_mkp((void*)&uf_sl311);L_3117: pushc(cx,t1566);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3117,cx->sp>2?cx->sp-2:0);goto L_97;K_3117:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3118: Cell t1567=pop(cx);Cell t1568=uf_cnot(t1567);L_3119: L_3120: var_trans__rr=t1568;pushc(cx,t1568);L_3121: Cell t1569=var_trans__rr;L_3122: Cell _rv1570=t1569;{if(cx->csp==0){pushc(cx,_rv1570);return;}cx->csp--;const void*_r1571=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1570);if(!_r1571)return;goto *_r1571;}
+L_3123: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3123,cx->sp>0?cx->sp-0:0);goto L_111;K_3123:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3124: Cell t1572=uf_mkp((void*)&uf_sl312);L_3125: pushc(cx,t1572);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3125,cx->sp>2?cx->sp-2:0);goto L_97;K_3125:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3126: pushp(cx,(void*)&&L_3132);
+L_3127: pushp(cx,(void*)&&L_3138);
+L_3128: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3128,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_3128,cx->sp>0?cx->sp-0:0);goto *el;}K_3128:;}
+L_3129: L_3130: L_3131: Cell _rv1573=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1573);return;}cx->csp--;const void*_r1574=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1573);if(!_r1574)return;goto *_r1574;}
+L_3132: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3132,cx->sp>0?cx->sp-0:0);goto L_127;K_3132:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3133: L_3134: L_3135: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_3136: Cell t1575=var_trans__rr;L_3137: Cell _rv1576=t1575;{if(cx->csp==0){pushc(cx,_rv1576);return;}cx->csp--;const void*_r1577=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1576);if(!_r1577)return;goto *_r1577;}
+L_3138: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3138,cx->sp>0?cx->sp-0:0);goto L_111;K_3138:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3139: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3139,cx->sp>1?cx->sp-1:0);goto L_155;K_3139:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3140: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3140,cx->sp>0?cx->sp-0:0);goto L_111;K_3140:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3141: Cell t1578=uf_mkp((void*)&uf_sl313);L_3142: pushc(cx,t1578);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3142,cx->sp>2?cx->sp-2:0);goto L_97;K_3142:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3143: Cell t1579=pop(cx);Cell t1580=pop(cx);Cell t1581=uf_cadd(t1580,t1579);L_3144: pushc(cx,t1581);pushp(cx,(void*)&&L_3150);
+L_3145: pushp(cx,(void*)&&L_3156);
+L_3146: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3146,cx->sp>0?cx->sp-0:0);goto *th;}else{uf_cspush(cx,&&K_3146,cx->sp>0?cx->sp-0:0);goto *el;}K_3146:;}
+L_3147: L_3148: L_3149: Cell _rv1582=uf_mki(0LL);{if(cx->csp==0){pushc(cx,_rv1582);return;}cx->csp--;const void*_r1583=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1582);if(!_r1583)return;goto *_r1583;}
+L_3150: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3150,cx->sp>0?cx->sp-0:0);goto L_127;K_3150:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3151: L_3152: L_3153: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_3154: Cell t1584=var_trans__rr;L_3155: Cell _rv1585=t1584;{if(cx->csp==0){pushc(cx,_rv1585);return;}cx->csp--;const void*_r1586=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1585);if(!_r1586)return;goto *_r1586;}
+L_3156: Cell t1587=var_trans__pl;L_3157: pushc(cx,t1587);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3157,cx->sp>0?cx->sp-0:0);goto L_111;K_3157:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3158: uf_cur_op="op_push";op_push(cx);
+L_3159: Cell t1588=pop(cx);L_3160: var_trans__pl=t1588;pushc(cx,t1588);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3160,cx->sp>0?cx->sp-0:0);goto L_127;K_3160:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3161: L_3162: L_3163: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_3164: Cell t1589=var_trans__rr;L_3165: Cell _rv1590=t1589;{if(cx->csp==0){pushc(cx,_rv1590);return;}cx->csp--;const void*_r1591=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1590);if(!_r1591)return;goto *_r1591;}
+L_3166: Cell t1592=var_trans__pfi;L_3167: Cell t1593=var_trans__pl;L_3168: pushc(cx,t1592);pushc(cx,t1593);uf_cur_op="op_len";op_len(cx);
+L_3169: Cell t1594=pop(cx);Cell t1595=pop(cx);Cell t1596=uf_clt(t1595,t1594);L_3170: L_3171: var_trans__rr=t1596;pushc(cx,t1596);L_3172: Cell t1597=var_trans__rr;L_3173: Cell _rv1598=t1597;{if(cx->csp==0){pushc(cx,_rv1598);return;}cx->csp--;const void*_r1599=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1598);if(!_r1599)return;goto *_r1599;}
+L_3174: Cell t1600=var_trans__pl;L_3175: Cell t1601=var_trans__pfi;L_3176: pushc(cx,t1600);pushc(cx,t1601);uf_cur_op="op_get";op_get(cx);
+L_3177: Cell t1602=pop(cx);L_3178: L_3179: var_trans__nv=t1602;pushc(cx,t1602);pushc(cx,t1602);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3179,cx->sp>1?cx->sp-1:0);goto L_215;K_3179:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3180: Cell t1603=pop(cx);L_3181: Cell t1604=var_trans__pparams;L_3182: L_3183: var_trans__slot=t1603;pushc(cx,t1603);pushc(cx,t1604);pushc(cx,t1603);uf_cur_op="op_push";op_push(cx);
+L_3184: Cell t1605=pop(cx);L_3185: Cell t1606=var_trans__slot;L_3186: Cell t1607=uf_mkp((void*)&uf_sl314);L_3187: var_trans__pparams=t1605;pushc(cx,t1605);pushc(cx,t1606);pushc(cx,t1607);uf_cur_op="op_fmt";op_fmt(cx);
+L_3188: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3188,cx->sp>1?cx->sp-1:0);goto L_42;K_3188:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3189: Cell t1608=var_trans__pfi;L_3190: L_3191: Cell t1609=uf_cadd(t1608,uf_mki(1LL));L_3192: L_3193: L_3194: L_3195: var_trans__pfi=t1609;var_trans__rr=uf_mki(0LL);pushc(cx,t1609);pushi(cx,0LL);L_3196: Cell t1610=var_trans__rr;L_3197: Cell _rv1611=t1610;{if(cx->csp==0){pushc(cx,_rv1611);return;}cx->csp--;const void*_r1612=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1611);if(!_r1612)return;goto *_r1612;}
+L_3198: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3198,cx->sp>0?cx->sp-0:0);goto L_111;K_3198:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3199: Cell t1613=uf_mkp((void*)&uf_sl315);L_3200: pushc(cx,t1613);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3200,cx->sp>2?cx->sp-2:0);goto L_97;K_3200:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3201: Cell t1614=pop(cx);Cell t1615=uf_cnot(t1614);L_3202: L_3203: var_trans__rr=t1615;pushc(cx,t1615);L_3204: Cell t1616=var_trans__rr;L_3205: Cell _rv1617=t1616;{if(cx->csp==0){pushc(cx,_rv1617);return;}cx->csp--;const void*_r1618=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1617);if(!_r1618)return;goto *_r1618;}
+L_3206: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3206,cx->sp>0?cx->sp-0:0);goto L_1745;K_3206:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3207: L_3208: L_3209: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_3210: Cell t1619=var_trans__rr;L_3211: Cell _rv1620=t1619;{if(cx->csp==0){pushc(cx,_rv1620);return;}cx->csp--;const void*_r1621=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1620);if(!_r1621)return;goto *_r1621;}
+L_3212: Cell t1622=uf_mkp((void*)&uf_sl316);L_3213: pushc(cx,t1622);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3213,cx->sp>1?cx->sp-1:0);goto L_42;K_3213:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3214: L_3215: L_3216: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_3217: Cell t1623=var_trans__rr;L_3218: Cell _rv1624=t1623;{if(cx->csp==0){pushc(cx,_rv1624);return;}cx->csp--;const void*_r1625=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1624);if(!_r1625)return;goto *_r1625;}
+L_3219: Cell t1626=uf_mkp((void*)&uf_sl317);L_3220: pushc(cx,t1626);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3220,cx->sp>1?cx->sp-1:0);goto L_42;K_3220:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3221: L_3222: L_3223: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_3224: Cell t1627=var_trans__rr;L_3225: Cell _rv1628=t1627;{if(cx->csp==0){pushc(cx,_rv1628);return;}cx->csp--;const void*_r1629=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1628);if(!_r1629)return;goto *_r1629;}
+L_3226: pushp(cx,(void*)&&L_3230);
+L_3227: pushp(cx,(void*)&&L_3238);
+L_3228: {const void* bod=(const void*)pop(cx).i;const void* cnd=(const void*)pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;
+K_WT_3228:;cx->loops[fr].cont=&&K_WT_3228;cx->loops[fr].end=&&K_WE_3228;
+uf_cspush(cx,&&K_WC_3228,cx->sp>0?cx->sp-0:0);goto *cnd;K_WC_3228:;
+if(uf_zero(pop(cx)))goto K_WE_3228;
+uf_cspush(cx,&&K_WB_3228,cx->sp>0?cx->sp-0:0);goto *bod;K_WB_3228:;pop(cx);
+goto K_WT_3228;
+K_WE_3228:;cx->lsp=fr;}
+L_3229: Cell _rv1630=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1630);return;}cx->csp--;const void*_r1631=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1630);if(!_r1631)return;goto *_r1631;}
+L_3230: Cell t1632=var_trans__pi;L_3231: Cell t1633=var_trans__nt;L_3232: Cell t1634=uf_ceq(t1632,t1633);L_3233: Cell t1635=uf_cnot(t1634);L_3234: L_3235: var_trans__rr=t1635;pushc(cx,t1635);L_3236: Cell t1636=var_trans__rr;L_3237: Cell _rv1637=t1636;{if(cx->csp==0){pushc(cx,_rv1637);return;}cx->csp--;const void*_r1638=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1637);if(!_r1638)return;goto *_r1638;}
+L_3238: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3238,cx->sp>0?cx->sp-0:0);goto L_3015;K_3238:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3239: L_3240: L_3241: var_trans__rr=uf_mki(0LL);pushi(cx,0LL);L_3242: Cell t1639=var_trans__rr;L_3243: Cell _rv1640=t1639;{if(cx->csp==0){pushc(cx,_rv1640);return;}cx->csp--;const void*_r1641=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1640);if(!_r1641)return;goto *_r1641;}
+L_3244: L_3245: L_3246: L_3247: L_3248: L_3249: L_3250: L_3251: L_3252: var_trans__inq=uf_mki(0LL);var_trans__emode=uf_mki(0LL);var_trans__didret=uf_mki(0LL);var_trans__cret=uf_mki(0LL);pushi(cx,0LL);pushi(cx,0LL);pushi(cx,0LL);pushi(cx,0LL);uf_cur_op="op_list";op_list(cx);
+L_3253: Cell t1642=pop(cx);L_3254: Cell t1643=uf_mkp((void*)&uf_sl318);L_3255: L_3256: var_trans__douts=t1642;var_trans__pends=t1643;pushc(cx,t1642);pushc(cx,t1643);uf_cur_op="op_list";op_list(cx);
+L_3257: Cell t1644=pop(cx);L_3258: Cell t1645=uf_mkp((void*)&uf_sl319);L_3259: L_3260: var_trans__psnaps=t1644;var_trans__flabels=t1645;pushc(cx,t1644);pushc(cx,t1645);uf_cur_op="op_list";op_list(cx);
+L_3261: Cell t1646=pop(cx);L_3262: var_trans__lstack=t1646;pushc(cx,t1646);uf_cur_op="op_list";op_list(cx);
+L_3263: Cell t1647=pop(cx);L_3264: var_trans__svst=t1647;pushc(cx,t1647);pushp(cx,(void*)&uf_x0);
+L_3265: uf_cur_op="op_loadx";op_loadx(cx);
+L_3266: L_3267: Cell t1648=pop(cx);Cell t1649=uf_ceq(t1648,uf_mki(2LL));L_3268: Cell t1650=uf_cnot(t1649);L_3269: pushc(cx,t1650);pushp(cx,(void*)&&L_3372);
+L_3270: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3270,cx->sp>0?cx->sp-0:0);goto *b;K_3270:;}}
+L_3271: pushp(cx,(void*)&uf_x1);
+L_3272: uf_cur_op="op_loadx";op_loadx(cx);
+L_3273: L_3274: Cell t1651=pop(cx);Cell t1652=uf_cadd(t1651,uf_mki(8LL));L_3275: pushc(cx,t1652);uf_cur_op="op_loadx";op_loadx(cx);
+L_3276: Cell t1653=pop(cx);L_3277: L_3278: Cell t1654=uf_mkp((void*)&uf_sl320);L_3279: var_trans__path=t1653;pushc(cx,t1653);pushc(cx,t1653);pushc(cx,t1654);uf_cur_op="fopen";{Cell a1=pop(cx);Cell a0=pop(cx);void* r=((void*(*)(void*,void*))uf_im2)((void*)uf_sptr(a0),(void*)uf_sptr(a1));pushp(cx,r);}
+L_3280: Cell t1655=pop(cx);L_3281: L_3282: Cell t1656=uf_cnot(t1655);L_3283: var_trans__f=t1655;pushc(cx,t1655);pushc(cx,t1656);pushp(cx,(void*)&&L_3375);
+L_3284: {const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_3284,cx->sp>0?cx->sp-0:0);goto *b;K_3284:;}}
+L_3285: Cell t1657=var_trans__f;L_3286: L_3287: L_3288: pushc(cx,t1657);pushi(cx,0LL);pushi(cx,2LL);uf_cur_op="fseek";{Cell a2=pop(cx);Cell a1=pop(cx);Cell a0=pop(cx);int r=((int(*)(void*,int64_t,int64_t))uf_im3)((void*)uf_sptr(a0),(int64_t)(a1.tag==T_FLOAT?(int64_t)uf_f(a1):a1.i),(int64_t)(a2.tag==T_FLOAT?(int64_t)uf_f(a2):a2.i));pushi(cx,(int64_t)r);}
+L_3289: Cell t1658=var_trans__f;L_3290: pushc(cx,t1658);uf_cur_op="ftell";{Cell a0=pop(cx);int r=((int(*)(void*))uf_im4)((void*)uf_sptr(a0));pushi(cx,(int64_t)r);}
+L_3291: Cell t1659=pop(cx);L_3292: Cell t1660=var_trans__f;L_3293: L_3294: L_3295: var_trans__srclen=t1659;pushc(cx,t1659);pushc(cx,t1660);pushi(cx,0LL);pushi(cx,0LL);uf_cur_op="fseek";{Cell a2=pop(cx);Cell a1=pop(cx);Cell a0=pop(cx);int r=((int(*)(void*,int64_t,int64_t))uf_im3)((void*)uf_sptr(a0),(int64_t)(a1.tag==T_FLOAT?(int64_t)uf_f(a1):a1.i),(int64_t)(a2.tag==T_FLOAT?(int64_t)uf_f(a2):a2.i));pushi(cx,(int64_t)r);}
+L_3296: Cell t1661=var_trans__srclen;L_3297: L_3298: Cell t1662=uf_cadd(t1661,uf_mki(16LL));L_3299: pushc(cx,t1662);uf_cur_op="op_buf";op_buf(cx);
+L_3300: Cell t1663=pop(cx);L_3301: L_3302: L_3303: Cell t1664=var_trans__srclen;L_3304: Cell t1665=var_trans__f;L_3305: var_trans__src=t1663;pushc(cx,t1663);pushc(cx,t1663);pushi(cx,1LL);pushc(cx,t1664);pushc(cx,t1665);uf_cur_op="fread";{Cell a3=pop(cx);Cell a2=pop(cx);Cell a1=pop(cx);Cell a0=pop(cx);int r=((int(*)(void*,int64_t,int64_t,void*))uf_im5)((void*)uf_sptr(a0),(int64_t)(a1.tag==T_FLOAT?(int64_t)uf_f(a1):a1.i),(int64_t)(a2.tag==T_FLOAT?(int64_t)uf_f(a2):a2.i),(void*)uf_sptr(a3));pushi(cx,(int64_t)r);}
+L_3306: Cell t1666=var_trans__f;L_3307: pushc(cx,t1666);uf_cur_op="fclose";{Cell a0=pop(cx);int r=((int(*)(void*))uf_im6)((void*)uf_sptr(a0));pushi(cx,(int64_t)r);}
+L_3308: uf_cur_op="op_list";op_list(cx);
+L_3309: Cell t1667=pop(cx);L_3310: L_3311: L_3312: L_3313: L_3314: var_trans__toks=t1667;var_trans__pos=uf_mki(0LL);pushc(cx,t1667);pushi(cx,0LL);{long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_3314;cx->loops[fr].end=&&K_WE_3314;long _sp0=cx->sp;
+K_WC_3314:;{Cell _wc;{
+WC3314_L281: pushp(cx,(void*)&&L_414);
+WC3314_L282: pushp(cx,(void*)&&L_438);
+WC3314_L283: {const void* bod=(const void*)pop(cx).i;const void* cnd=(const void*)pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die("loops nested too deep");cx->loops[fr].cspl=cx->csp;
+K_WT_WC3314_283:;cx->loops[fr].cont=&&K_WT_WC3314_283;cx->loops[fr].end=&&K_WE_WC3314_283;
+uf_cspush(cx,&&K_WC_WC3314_283,cx->sp>0?cx->sp-0:0);goto *cnd;K_WC_WC3314_283:;
+if(uf_zero(pop(cx)))goto K_WE_WC3314_283;
+uf_cspush(cx,&&K_WB_WC3314_283,cx->sp>0?cx->sp-0:0);goto *bod;K_WB_WC3314_283:;pop(cx);
+goto K_WT_WC3314_283;
+K_WE_WC3314_283:;cx->lsp=fr;}
+WC3314_L284: WC3314_L285: Cell t0=var_trans__pos;WC3314_L286: Cell t1=var_trans__srclen;WC3314_L287: Cell t2=uf_clt(t0,t1);pushc(cx,t2);}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_3314;
 {
-WB3075_L289: Cell t0=var_trans__src;WB3075_L290: Cell t1=var_trans__pos;WB3075_L291: Cell t2=var_trans__srclen;WB3075_L292: pushc(cx,t0);pushc(cx,t1);pushc(cx,t2);uf_cur_op="op_slice";op_slice(cx);
-WB3075_L293: Cell t3=pop(cx);WB3075_L294: WB3075_L295: Cell t4=uf_mkp((void*)&uf_sl19);WB3075_L296: var_trans__rest=t3;pushc(cx,t3);pushc(cx,t3);pushc(cx,t4);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_WB3075_296,cx->sp>1?cx->sp-1:0);goto L_248;K_WB3075_296:;cx->local_base=cx->local_frames[--cx->local_fsp];
-WB3075_L297: Cell t5=pop(cx);WB3075_L298: WB3075_L299: WB3075_L300: Cell t6=uf_ceq(t5,uf_mki(-1LL));WB3075_L301: Cell t7=uf_cnot(t6);WB3075_L302: var_trans__ln=t5;pushc(cx,t5);pushc(cx,t7);pushp(cx,(void*)&&L_306);
-WB3075_L303: pushp(cx,(void*)&&L_313);
-WB3075_L304: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_WB3075_304,cx->sp>1?cx->sp-1:0);goto *th;}else{uf_cspush(cx,&&K_WB3075_304,cx->sp>0?cx->sp-0:0);goto *el;}K_WB3075_304:;}
-}cx->sp=_sp0;goto K_WC_3075;}
-K_WE_3075:;cx->lsp=fr;}
-L_3076: Cell t1535=var_trans__toks;L_3077: pushc(cx,t1535);uf_cur_op="op_len";op_len(cx);
-L_3078: Cell t1536=pop(cx);L_3079: L_3080: L_3081: L_3082: L_3083: L_3084: L_3085: L_3086: L_3087: var_trans__nt=t1536;var_trans__pi=uf_mki(0LL);var_trans__lbl=uf_mki(0LL);var_trans__fid=uf_mki(0LL);var_trans__inmain=uf_mki(0LL);pushc(cx,t1536);pushi(cx,0LL);pushi(cx,0LL);pushi(cx,0LL);pushi(cx,0LL);uf_cur_op="op_list";op_list(cx);
-L_3088: Cell t1537=pop(cx);L_3089: var_trans__ps=t1537;pushc(cx,t1537);uf_cur_op="op_list";op_list(cx);
-L_3090: Cell t1538=pop(cx);L_3091: Cell t1539=uf_mkp((void*)&uf_sl301);L_3092: var_trans__ls=t1538;pushc(cx,t1538);pushc(cx,t1539);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3092,cx->sp>1?cx->sp-1:0);goto L_42;K_3092:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3093: Cell t1540=uf_mkp((void*)&uf_sl302);L_3094: pushc(cx,t1540);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3094,cx->sp>1?cx->sp-1:0);goto L_42;K_3094:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3095: Cell t1541=uf_mkp((void*)&uf_sl303);L_3096: pushc(cx,t1541);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3096,cx->sp>1?cx->sp-1:0);goto L_42;K_3096:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3097: Cell t1542=uf_mkp((void*)&uf_sl304);L_3098: pushc(cx,t1542);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3098,cx->sp>1?cx->sp-1:0);goto L_42;K_3098:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3099: Cell t1543=uf_mkp((void*)&uf_sl305);L_3100: pushc(cx,t1543);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3100,cx->sp>1?cx->sp-1:0);goto L_42;K_3100:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3101: Cell t1544=uf_mkp((void*)&uf_sl306);L_3102: pushc(cx,t1544);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3102,cx->sp>1?cx->sp-1:0);goto L_42;K_3102:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3103: Cell t1545=uf_mkp((void*)&uf_sl307);L_3104: pushc(cx,t1545);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3104,cx->sp>1?cx->sp-1:0);goto L_42;K_3104:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3105: Cell t1546=uf_mkp((void*)&uf_sl308);L_3106: pushc(cx,t1546);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3106,cx->sp>1?cx->sp-1:0);goto L_42;K_3106:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3107: Cell t1547=uf_mkp((void*)&uf_sl309);L_3108: pushc(cx,t1547);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3108,cx->sp>1?cx->sp-1:0);goto L_42;K_3108:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3109: Cell t1548=uf_mkp((void*)&uf_sl310);L_3110: pushc(cx,t1548);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3110,cx->sp>1?cx->sp-1:0);goto L_42;K_3110:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3111: Cell t1549=uf_mkp((void*)&uf_sl311);L_3112: pushc(cx,t1549);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3112,cx->sp>1?cx->sp-1:0);goto L_42;K_3112:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3113: Cell t1550=uf_mkp((void*)&uf_sl312);L_3114: pushc(cx,t1550);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3114,cx->sp>1?cx->sp-1:0);goto L_42;K_3114:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3115: Cell t1551=uf_mkp((void*)&uf_sl313);L_3116: pushc(cx,t1551);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3116,cx->sp>1?cx->sp-1:0);goto L_42;K_3116:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3117: Cell t1552=uf_mkp((void*)&uf_sl314);L_3118: pushc(cx,t1552);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3118,cx->sp>1?cx->sp-1:0);goto L_42;K_3118:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3119: Cell t1553=uf_mkp((void*)&uf_sl315);L_3120: pushc(cx,t1553);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3120,cx->sp>1?cx->sp-1:0);goto L_42;K_3120:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3121: Cell t1554=uf_mkp((void*)&uf_sl316);L_3122: pushc(cx,t1554);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3122,cx->sp>1?cx->sp-1:0);goto L_42;K_3122:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3123: Cell t1555=uf_mkp((void*)&uf_sl317);L_3124: pushc(cx,t1555);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3124,cx->sp>1?cx->sp-1:0);goto L_42;K_3124:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3125: Cell t1556=uf_mkp((void*)&uf_sl318);L_3126: pushc(cx,t1556);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3126,cx->sp>1?cx->sp-1:0);goto L_42;K_3126:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3127: Cell t1557=uf_mkp((void*)&uf_sl319);L_3128: pushc(cx,t1557);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3128,cx->sp>1?cx->sp-1:0);goto L_42;K_3128:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3129: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3129,cx->sp>0?cx->sp-0:0);goto L_2991;K_3129:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3130: L_3131: pushi(cx,0LL);uf_cur_op="exit";{Cell a0=pop(cx);((void(*)(int64_t))uf_im8)((int64_t)(a0.tag==T_FLOAT?(int64_t)uf_f(a0):a0.i));}
-L_3132: Cell _rv1558=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1558);return;}cx->csp--;const void*_r1559=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1558);if(!_r1559)return;goto *_r1559;}
-L_3133: Cell t1560=uf_mkp((void*)&uf_sl320);L_3134: pushc(cx,t1560);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3134,cx->sp>0?cx->sp-0:0);goto L_107;K_3134:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3135: Cell _rv1561=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1561);return;}cx->csp--;const void*_r1562=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1561);if(!_r1562)return;goto *_r1562;}
-L_3136: Cell t1563=uf_mkp((void*)&uf_sl321);L_3137: pushc(cx,t1563);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3137,cx->sp>0?cx->sp-0:0);goto L_107;K_3137:;cx->local_base=cx->local_frames[--cx->local_fsp];
-L_3138: Cell _rv1564=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1564);return;}cx->csp--;const void*_r1565=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1564);if(!_r1565)return;goto *_r1565;}
-L_3139: Cell _rv1566=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1566);return;}cx->csp--;const void*_r1567=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1566);if(!_r1567)return;goto *_r1567;}
-L_3140: return;
+WB3314_L289: Cell t0=var_trans__src;WB3314_L290: Cell t1=var_trans__pos;WB3314_L291: Cell t2=var_trans__srclen;WB3314_L292: pushc(cx,t0);pushc(cx,t1);pushc(cx,t2);uf_cur_op="op_slice";op_slice(cx);
+WB3314_L293: Cell t3=pop(cx);WB3314_L294: WB3314_L295: Cell t4=uf_mkp((void*)&uf_sl19);WB3314_L296: var_trans__rest=t3;pushc(cx,t3);pushc(cx,t3);pushc(cx,t4);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=1;uf_cspush(cx,&&K_WB3314_296,cx->sp>1?cx->sp-1:0);goto L_248;K_WB3314_296:;cx->local_base=cx->local_frames[--cx->local_fsp];
+WB3314_L297: Cell t5=pop(cx);WB3314_L298: WB3314_L299: WB3314_L300: var_trans__ln=t5;pushc(cx,t5);Cell t6=uf_ceq(t5,uf_mki(-1LL));WB3314_L301: Cell t7=uf_cnot(t6);WB3314_L302: pushc(cx,t7);pushp(cx,(void*)&&L_306);
+WB3314_L303: pushp(cx,(void*)&&L_313);
+WB3314_L304: {const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){uf_cspush(cx,&&K_WB3314_304,cx->sp>1?cx->sp-1:0);goto *th;}else{uf_cspush(cx,&&K_WB3314_304,cx->sp>0?cx->sp-0:0);goto *el;}K_WB3314_304:;}
+}cx->sp=_sp0;goto K_WC_3314;}
+K_WE_3314:;cx->lsp=fr;}
+L_3315: Cell t1668=var_trans__toks;L_3316: pushc(cx,t1668);uf_cur_op="op_len";op_len(cx);
+L_3317: Cell t1669=pop(cx);L_3318: L_3319: L_3320: L_3321: L_3322: L_3323: L_3324: L_3325: L_3326: var_trans__nt=t1669;var_trans__pi=uf_mki(0LL);var_trans__lbl=uf_mki(0LL);var_trans__fid=uf_mki(0LL);var_trans__inmain=uf_mki(0LL);pushc(cx,t1669);pushi(cx,0LL);pushi(cx,0LL);pushi(cx,0LL);pushi(cx,0LL);uf_cur_op="op_list";op_list(cx);
+L_3327: Cell t1670=pop(cx);L_3328: var_trans__ps=t1670;pushc(cx,t1670);uf_cur_op="op_list";op_list(cx);
+L_3329: Cell t1671=pop(cx);L_3330: Cell t1672=uf_mkp((void*)&uf_sl321);L_3331: var_trans__ls=t1671;pushc(cx,t1671);pushc(cx,t1672);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3331,cx->sp>1?cx->sp-1:0);goto L_42;K_3331:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3332: Cell t1673=uf_mkp((void*)&uf_sl322);L_3333: pushc(cx,t1673);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3333,cx->sp>1?cx->sp-1:0);goto L_42;K_3333:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3334: Cell t1674=uf_mkp((void*)&uf_sl323);L_3335: pushc(cx,t1674);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3335,cx->sp>1?cx->sp-1:0);goto L_42;K_3335:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3336: Cell t1675=uf_mkp((void*)&uf_sl324);L_3337: pushc(cx,t1675);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3337,cx->sp>1?cx->sp-1:0);goto L_42;K_3337:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3338: Cell t1676=uf_mkp((void*)&uf_sl325);L_3339: pushc(cx,t1676);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3339,cx->sp>1?cx->sp-1:0);goto L_42;K_3339:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3340: Cell t1677=uf_mkp((void*)&uf_sl326);L_3341: pushc(cx,t1677);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3341,cx->sp>1?cx->sp-1:0);goto L_42;K_3341:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3342: Cell t1678=uf_mkp((void*)&uf_sl327);L_3343: pushc(cx,t1678);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3343,cx->sp>1?cx->sp-1:0);goto L_42;K_3343:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3344: Cell t1679=uf_mkp((void*)&uf_sl328);L_3345: pushc(cx,t1679);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3345,cx->sp>1?cx->sp-1:0);goto L_42;K_3345:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3346: Cell t1680=uf_mkp((void*)&uf_sl329);L_3347: pushc(cx,t1680);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3347,cx->sp>1?cx->sp-1:0);goto L_42;K_3347:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3348: Cell t1681=uf_mkp((void*)&uf_sl330);L_3349: pushc(cx,t1681);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3349,cx->sp>1?cx->sp-1:0);goto L_42;K_3349:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3350: Cell t1682=uf_mkp((void*)&uf_sl331);L_3351: pushc(cx,t1682);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3351,cx->sp>1?cx->sp-1:0);goto L_42;K_3351:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3352: Cell t1683=uf_mkp((void*)&uf_sl332);L_3353: pushc(cx,t1683);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3353,cx->sp>1?cx->sp-1:0);goto L_42;K_3353:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3354: Cell t1684=uf_mkp((void*)&uf_sl333);L_3355: pushc(cx,t1684);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3355,cx->sp>1?cx->sp-1:0);goto L_42;K_3355:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3356: Cell t1685=uf_mkp((void*)&uf_sl334);L_3357: pushc(cx,t1685);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3357,cx->sp>1?cx->sp-1:0);goto L_42;K_3357:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3358: Cell t1686=uf_mkp((void*)&uf_sl335);L_3359: pushc(cx,t1686);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3359,cx->sp>1?cx->sp-1:0);goto L_42;K_3359:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3360: Cell t1687=uf_mkp((void*)&uf_sl336);L_3361: pushc(cx,t1687);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3361,cx->sp>1?cx->sp-1:0);goto L_42;K_3361:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3362: Cell t1688=uf_mkp((void*)&uf_sl337);L_3363: pushc(cx,t1688);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3363,cx->sp>1?cx->sp-1:0);goto L_42;K_3363:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3364: Cell t1689=uf_mkp((void*)&uf_sl338);L_3365: pushc(cx,t1689);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3365,cx->sp>1?cx->sp-1:0);goto L_42;K_3365:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3366: Cell t1690=uf_mkp((void*)&uf_sl339);L_3367: pushc(cx,t1690);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3367,cx->sp>1?cx->sp-1:0);goto L_42;K_3367:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3368: cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3368,cx->sp>0?cx->sp-0:0);goto L_3226;K_3368:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3369: L_3370: pushi(cx,0LL);uf_cur_op="exit";{Cell a0=pop(cx);((void(*)(int64_t))uf_im8)((int64_t)(a0.tag==T_FLOAT?(int64_t)uf_f(a0):a0.i));}
+L_3371: Cell _rv1691=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1691);return;}cx->csp--;const void*_r1692=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1691);if(!_r1692)return;goto *_r1692;}
+L_3372: Cell t1693=uf_mkp((void*)&uf_sl340);L_3373: pushc(cx,t1693);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3373,cx->sp>0?cx->sp-0:0);goto L_107;K_3373:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3374: Cell _rv1694=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1694);return;}cx->csp--;const void*_r1695=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1694);if(!_r1695)return;goto *_r1695;}
+L_3375: Cell t1696=uf_mkp((void*)&uf_sl341);L_3376: pushc(cx,t1696);cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=0;uf_cspush(cx,&&K_3376,cx->sp>0?cx->sp-0:0);goto L_107;K_3376:;cx->local_base=cx->local_frames[--cx->local_fsp];
+L_3377: Cell _rv1697=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1697);return;}cx->csp--;const void*_r1698=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1697);if(!_r1698)return;goto *_r1698;}
+L_3378: Cell _rv1699=(cx->sp>(cx->csp>0?cx->rsps[cx->csp-1]:0)&&cx->sp>0)?cx->ds[cx->sp-1]:uf_mki(0);{if(cx->csp==0){pushc(cx,_rv1699);return;}cx->csp--;const void*_r1700=cx->cs[cx->csp];cx->sp=cx->rsps[cx->csp];pushc(cx,_rv1699);if(!_r1700)return;goto *_r1700;}
+L_3379: return;
 }
-int main(int argc,char**argv){uf_argc=argc;uf_argv=(void*)argv;uf_init_reflection();uf_init_locals();uf_init_lits(uf_lits,322);uf_gc_setroots(uf_vroots,74);uf_sb_on=0;
+int main(int argc,char**argv){nkr_argc=argc;nkr_argv=(void*)argv;uf_init_reflection();uf_init_locals();uf_init_lits(uf_lits,342);uf_gc_setroots(uf_vroots,92);uf_sb_on=0;
 uf_sb_policy="none";
 uf_device="cpu";
 {int _i;for(_i=0;_i<8;_i++)uf_sb_caps[_i]=1;}
@@ -5322,4 +5552,4 @@ uf_sb_caps[7]=1;
 uf_ws_nroots=0;
 uf_mod_allow_n=-1;
 uf_mod_deny_n=0;
-uf_gc_init();uflux_run(main_cx,0);return 0;}
+uf_gc_init();nkr_run(main_cx,0);return 0;}

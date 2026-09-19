@@ -1,0 +1,53 @@
+; nqueens.ent — N-queens by iterative backtracking (bench/SPEC.md)
+; N from argv[1] (default 11). Explicit-stack search: cols[r] is the placed
+; column of row r, nxt[r] the next column to try after backtracking. A
+; candidate (r, c) conflicts with row i when cols[i]==c or
+; |cols[i]-c|==|r-i| (written without abs as the two signed tests).
+; Identical algorithm in every language; prints "solutions: <count>".
+11 ^n!
+has_args 'setn if
+^n@ int array ^cols!
+^n@ 1 add int array ^nxt!
+0 ^cnt!
+^nxt@ 0 0 set
+0 ^d!
+'oc 'ob while
+"solutions: " print ^cnt@ print
+ret
+setn: 1 arg_index ^n! ret
+oc: ^d@ 0 gte ret
+ob:
+  ; find the next safe column at row d starting from nxt[d]
+  ^nxt@ ^d@ get ^c!
+  0 ^found!
+  'ac 'ab while
+  ^c@ ^n@ lt 'place 'back if_else
+  ret
+ac: ^found@ not ^c@ ^n@ lt and ret
+ab:
+  0 ^i! 1 ^sf!
+  'sc 'sb while
+  ^sf@ 'found1 'nextc if_else
+  ret
+sc: ^i@ ^d@ lt ^sf@ and ret
+sb:
+  ^cols@ ^i@ get ^ci!
+  ^ci@ ^c@ eq ^c1!
+  ^ci@ ^c@ sub ^i@ ^d@ sub eq ^c2!
+  ^ci@ ^c@ sub ^i@ ^d@ sub add 0 eq ^c3!
+  ^c1@ ^c2@ or ^c3@ or ^bad!
+  ^sf@ ^bad@ not and ^sf!
+  ^i@ 1 add ^i!
+  ret
+found1: 1 ^found! ret
+nextc: ^c@ 1 add ^c! ret
+place:
+  ^cols@ ^d@ ^c@ set
+  ^nxt@ ^d@ ^c@ 1 add set
+  ^d@ 1 add ^d!
+  ^nxt@ ^d@ 0 set
+  ^d@ ^n@ eq 'full 'plc if_else
+  ret
+full: ^cnt@ 1 add ^cnt! ^d@ 1 sub ^d! ret
+plc: ret
+back: ^d@ 1 sub ^d! ret

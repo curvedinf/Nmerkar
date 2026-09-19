@@ -1,5 +1,6 @@
 # Rust build artifacts
 comp/target/
+trans/target/
 
 # nkr compiler cache
 /tmp/uflux-cache/

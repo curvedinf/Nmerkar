@@ -1,0 +1,363 @@
+import c"printf"(ptr,...)->int
+import c"fprintf"(ptr,ptr,...)->int
+import c"fputc"(int,ptr)->int
+import c"ungetc"(int,ptr)->int
+import c"puts"(ptr)->int
+import c"putchar"(int)->int
+import c"getchar"()->int
+import c"fputs"(ptr,ptr)->int
+import c"fwrite"(ptr,int,int,ptr)->int
+import c"strlen"(ptr)->int
+import c"strcmp"(ptr,ptr)->int
+import c"strncmp"(ptr,ptr,int)->int
+import c"strcpy"(ptr,ptr)->ptr
+import c"strcat"(ptr,ptr)->ptr
+import c"exit"(int)->void
+import c"fread"(ptr,int,int,ptr)->int
+import c"fopen"(ptr,ptr)->ptr
+import c"fclose"(ptr)->int
+import c"fgetc"(ptr)->int
+import c"strstr"(ptr,ptr)->ptr
+extern "stdout"
+extern "stdin"
+extern "stderr"
+b64_read:
+^v0!
+^v0@ 0 eq 'i1 if
+^fr@ 'c3 'b4 if_else
+^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
+i1:
+_call k2 ^rv! 1 ^fr! 0 ret
+b4:
+_call k5 ^rv! 1 ^fr! 0 ret
+c3:
+0 ret
+k2: ^svst@ ^v0@ append ^svst! _call getchar ^pt! ^svst@ pop ^v0! ret ^pt@
+k5: ^svst@ ^v0@ append ^svst! ^v0@ _call fgetc ^pt! ^svst@ pop ^v0! ret ^pt@
+b64_encode:
+^v1!
+^v2!
+0 ^v3!
+0 ^v7!
+0 ^v8!
+0 ^v9!
+'c6 'b7 while
+^v3@ 0 eq not ^v2@ 0 eq not mul not not 'i29 if
+0 ^rv! 1 ^fr!
+^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
+c6:
+^fr@ not 1 and ret
+b7:
+0 ^v4! 
+'c8 'b9 while
+^v4@ 0 eq 'i15 if
+^v7@ 16 shl ^v5! 
+^v4@ 2 lt not 'i16 if
+^v4@ 3 lt not 'i17 if
+_call k18 ^v3! 
+_call k19 ^v3! 
+^v4@ 1 eq 'i20 'e21 if_else
+0 ret
+c8:
+^fr@ not ^v4@ 3 lt and ret
+b9:
+_call k10 ^v6! 
+^v6@ -1 eq 'i11 if
+^v4@ 0 eq 'i12 if
+^v4@ 1 eq 'i13 if
+^v4@ 2 eq 'i14 if
+^v4@ ^pt! ^v4@ 1 add ^v4! ^pt@ 
+0 ret
+i11:
+break
+0 ret
+i12:
+^v6@ ^v7! 
+0 ret
+i13:
+^v6@ ^v8! 
+0 ret
+i14:
+^v6@ ^v9! 
+0 ret
+i15:
+break
+0 ret
+i16:
+^v5@ ^v8@ 8 shl or ^v5! 
+0 ret
+i17:
+^v5@ ^v9@ or ^v5! 
+0 ret
+i20:
+_call k22 ^v3! 
+_call k23 ^v3! 
+0 ret
+e21:
+_call k24 ^v3! 
+^v4@ 2 eq 'i25 'e26 if_else
+0 ret
+i25:
+_call k27 ^v3! 
+0 ret
+e26:
+_call k28 ^v3! 
+0 ret
+i29:
+_call k30 
+0 ret
+k10: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! ^v1@ _call b64_read ^pt! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
+k18: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! ^v5@ shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr 63 and ^v3@ ^v2@ _call b64_emit6 ^pt! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
+k19: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! ^v5@ shr shr shr shr shr shr shr shr shr shr shr shr 63 and ^v3@ ^v2@ _call b64_emit6 ^pt! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
+k22: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! 61 ^v3@ ^v2@ _call b64_out ^pt! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
+k23: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! 61 ^v3@ ^v2@ _call b64_out ^pt! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
+k24: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! ^v5@ shr shr shr shr shr shr 63 and ^v3@ ^v2@ _call b64_emit6 ^pt! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
+k27: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! 61 ^v3@ ^v2@ _call b64_out ^pt! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
+k28: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! ^v5@ 63 and ^v3@ ^v2@ _call b64_emit6 ^pt! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
+k30: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! 10 _call putchar ^pt! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
+b64_decode:
+^v10!
+0 ^v13!
+0 ^v14!
+0 ^v15!
+'c31 'b32 while
+^fr@ 'c64 'b65 if_else
+^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
+c31:
+^fr@ not 1 and ret
+b32:
+_call k33 ^v11! 
+^v11@ -1 eq 'i34 if
+^v11@ 10 eq ^v11@ 13 eq or not not ^v11@ 32 eq or not not ^v11@ 9 eq or not not 'i35 if
+^v11@ 61 eq 'i36 'e37 if_else
+^fr@ 'c47 'b48 if_else
+0 ret
+i34:
+break
+0 ret
+i35:
+continue
+0 ret
+i36:
+^v15@ ^pt! ^v15@ 1 add ^v15! ^pt@ 
+0 ^v12! 
+0 ret
+e37:
+^v15@ 0 eq not 'i38 if
+^fr@ 'c40 'b41 if_else
+0 ret
+i38:
+_call k39 
+1 ^rv! 1 ^fr! 0 ret
+b46:
+0 ret
+c45:
+0 ret
+b41:
+_call k42 ^v12! 
+^v12@ 0 1 sub eq 'i43 if
+^fr@ 'c45 'b46 if_else
+0 ret
+i43:
+_call k44 
+1 ^rv! 1 ^fr! 0 ret
+c40:
+0 ret
+b61:
+0 ret
+c60:
+0 ret
+b63:
+0 ret
+c62:
+0 ret
+b48:
+^v14@ 6 shl ^v12@ or ^v14! 
+^v13@ ^pt! ^v13@ 1 add ^v13! ^pt@ 
+^v13@ 4 eq 'i49 if
+^fr@ 'c62 'b63 if_else
+0 ret
+i49:
+^v15@ 0 eq 'i50 if
+^v15@ 1 eq 'i54 if
+^v15@ 2 eq 'i57 if
+0 ^v13! 
+0 ^v14! 
+^v15@ 0 eq not 'i59 if
+^fr@ 'c60 'b61 if_else
+0 ret
+i50:
+_call k51 
+_call k52 
+_call k53 
+0 ret
+i54:
+_call k55 
+_call k56 
+0 ret
+i57:
+_call k58 
+0 ret
+i59:
+0 ^rv! 1 ^fr! 0 ret
+c47:
+0 ret
+b65:
+0 ^rv! 1 ^fr! 0 ret
+c64:
+0 ret
+k33: ^svst@ ^v10@ append ^svst! ^v10@ _call b64_read ^pt! ^svst@ pop ^v10! ret ^pt@
+k39: ^svst@ ^v10@ append ^svst! extern "stderr" load "base64: extra data after padding\n" 0 _call fprintf ^pt! ^svst@ pop ^v10! ret ^pt@
+k42: ^svst@ ^v10@ append ^svst! ^v11@ _call b64_index ^pt! ^svst@ pop ^v10! ret ^pt@
+k44: ^svst@ ^v10@ append ^svst! extern "stderr" load "base64: invalid input\n" 0 _call fprintf ^pt! ^svst@ pop ^v10! ret ^pt@
+k51: ^svst@ ^v10@ append ^svst! ^v14@ shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr 255 and _call putchar ^pt! ^svst@ pop ^v10! ret ^pt@
+k52: ^svst@ ^v10@ append ^svst! ^v14@ shr shr shr shr shr shr shr shr 255 and _call putchar ^pt! ^svst@ pop ^v10! ret ^pt@
+k53: ^svst@ ^v10@ append ^svst! ^v14@ 255 and _call putchar ^pt! ^svst@ pop ^v10! ret ^pt@
+k55: ^svst@ ^v10@ append ^svst! ^v14@ shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr 255 and _call putchar ^pt! ^svst@ pop ^v10! ret ^pt@
+k56: ^svst@ ^v10@ append ^svst! ^v14@ shr shr shr shr shr shr shr shr 255 and _call putchar ^pt! ^svst@ pop ^v10! ret ^pt@
+k58: ^svst@ ^v10@ append ^svst! ^v14@ shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr 255 and _call putchar ^pt! ^svst@ pop ^v10! ret ^pt@
+entry:
+list ^svst!
+0 ^v16!
+76 ^v17!
+1 ^v18!
+0 ^v20!
+'c66 'b67 while
+^fr@ 'c78 'b79 if_else
+0 _call exit
+ret
+c66:
+^fr@ not ^v18@ extern "nkr_argc" load lt and ret
+b67:
+^v18@ 8 mul extern "nkr_argv" load add load ^v19! 
+0 ^v19@ "" _call strstr add load 255 and 45 eq 1 ^v19@ "" _call strstr add load 255 and 100 eq mul not not 2 ^v19@ "" _call strstr add load 255 and 0 eq mul not not 'i68 if
+0 ^v19@ "" _call strstr add load 255 and 45 eq 1 ^v19@ "" _call strstr add load 255 and 119 eq mul not not 'i69 if
+_call k73 ^v20! 
+^v20@ not 'i74 if
+^fr@ 'c76 'b77 if_else
+0 ret
+i68:
+1 ^v16! 
+^v18@ ^pt! ^v18@ 1 add ^v18! ^pt@ 
+continue
+0 ret
+i69:
+2 ^v19@ "" _call strstr add load 255 and 0 eq not 'i70 if
+^v18@ ^pt! ^v18@ 1 add ^v18! ^pt@ 
+_call k72 ^v17! 
+^v18@ ^pt! ^v18@ 1 add ^v18! ^pt@ 
+continue
+0 ret
+i70:
+_call k71 ^v17! 
+^v18@ ^pt! ^v18@ 1 add ^v18! ^pt@ 
+continue
+0 ret
+i74:
+_call k75 
+1 _call exit
+0 ret
+b77:
+^v18@ ^pt! ^v18@ 1 add ^v18! ^pt@ 
+break
+0 ret
+c76:
+0 ret
+b83:
+_call k84 _call exit
+0 ret
+c82:
+0 ret
+b79:
+^v16@ 0 eq not 'i80 if
+^fr@ 'c82 'b83 if_else
+0 ret
+i80:
+_call k81 _call exit
+0 ret
+c78:
+0 ret
+k71: ^v19@ 2 add _call b64_num ^pt! ret ^pt@
+k72: ^v18@ 8 mul extern "nkr_argv" load add load _call b64_num ^pt! ret ^pt@
+k73: ^v19@ "r" _call fopen ^pt! ret ^pt@
+k75: extern "stderr" load "base64: %s: No such file or directory\n" ^v19@ 1 _call fprintf ^pt! ret ^pt@
+k81: ^v20@ _call b64_decode ^pt! ret ^pt@
+k84: ^v20@ ^v17@ _call b64_encode ^pt! ret ^pt@
+b64_table:
+"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" ^rv! 1 ^fr!
+^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
+b64_index:
+^v21!
+_call k85 ^v22!
+0 ^v23!
+'c86 'b87 while
+^fr@ 'c91 'b92 if_else
+^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
+c86:
+^fr@ not ^v23@ 64 lt and ret
+b87:
+^v23@ ^v22@ "" _call strstr add load 255 and ^v21@ eq 'i88 if
+^fr@ 'c89 'b90 if_else
+0 ret
+i88:
+^v23@ ^rv! 1 ^fr! 0 ret
+b90:
+^v23@ ^pt! ^v23@ 1 add ^v23! ^pt@ 
+0 ret
+c89:
+0 ret
+b92:
+0 1 sub ^rv! 1 ^fr! 0 ret
+c91:
+0 ret
+k85: ^svst@ ^v21@ append ^svst! _call b64_table ^pt! ^svst@ pop ^v21! ret ^pt@
+b64_out:
+^v24!
+^v25!
+^v26!
+_call k93 
+^v26@ 0 eq 'i94 if
+^fr@ 'c95 'b96 if_else
+^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
+i94:
+^v25@ 1 add ^rv! 1 ^fr! 0 ret
+b96:
+^v25@ 1 add ^v25! 
+^v25@ ^v26@ lt not 'i97 if
+^v25@ ^rv! 1 ^fr! 0 ret
+i97:
+_call k98 
+0 ^v25! 
+0 ret
+c95:
+0 ret
+k93: ^svst@ ^v24@ append ^svst! ^svst@ ^v25@ append ^svst! ^svst@ ^v26@ append ^svst! ^v24@ _call putchar ^pt! ^svst@ pop ^v26! ^svst@ pop ^v25! ^svst@ pop ^v24! ret ^pt@
+k98: ^svst@ ^v24@ append ^svst! ^svst@ ^v25@ append ^svst! ^svst@ ^v26@ append ^svst! 10 _call putchar ^pt! ^svst@ pop ^v26! ^svst@ pop ^v25! ^svst@ pop ^v24! ret ^pt@
+b64_emit6:
+^v27!
+^v28!
+^v29!
+_call k99 ^v30!
+_call k100 ^rv! 1 ^fr!
+^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
+k99: ^svst@ ^v27@ append ^svst! ^svst@ ^v28@ append ^svst! ^svst@ ^v29@ append ^svst! _call b64_table ^pt! ^svst@ pop ^v29! ^svst@ pop ^v28! ^svst@ pop ^v27! ret ^pt@
+k100: ^svst@ ^v27@ append ^svst! ^svst@ ^v28@ append ^svst! ^svst@ ^v29@ append ^svst! ^v27@ ^v30@ "" _call strstr add load 255 and ^v28@ ^v29@ _call b64_out ^pt! ^svst@ pop ^v29! ^svst@ pop ^v28! ^svst@ pop ^v27! ret ^pt@
+b64_num:
+^v31!
+0 ^v32!
+0 ^v33!
+0 ^v31@ "" _call strstr add load 255 and 45 eq 0 ^v31@ "" _call strstr add load 255 and 43 eq or not not 'i101 if
+^v32@ ^v31@ "" _call strstr add load 255 and ^v34! 
+'c102 'b103 while
+^v33@ ^rv! 1 ^fr!
+^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
+i101:
+1 ^v32! 
+0 ret
+c102:
+^fr@ not ^v34@ 48 lt not ^v34@ 57 gt not mul not not and ret
+b103:
+^v33@ 10 mul ^v34@ 48 sub add ^v33! 
+^v32@ ^pt! ^v32@ 1 add ^v32! ^pt@ 
+^v32@ ^v31@ "" _call strstr add load 255 and ^v34! 
+0 ret

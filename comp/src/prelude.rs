@@ -513,9 +513,19 @@ static int uf_spv_index(const char*name);
 static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_t bsz,void*R,size_t rsz,struct UFPC pc);
 #endif
 static inline int uf_rawptr(Cell c){ return c.tag==T_PTR&&c.i&&!uf_gc_find((void*)c.i); }
-static inline Cell uf_cadd(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,0,"add"); if(a.tag==T_INT&&uf_rawptr(b))return uf_mkp((void*)(a.i+b.i)); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i+b.i)); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i+b.i); return uf_mkf(x+y); }
-static inline Cell uf_csub(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,1,"sub"); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i-b.i)); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i-b.i); return uf_mkf(x-y); }
-static inline Cell uf_cmul(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,2,"mul"); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i*b.i); return uf_mkf(x*y); }
+/* char* semantics: string + int / int + string is data-pointer arithmetic */
+static inline Cell uf_stradd(Cell a,Cell b,int sub){
+  Cell s=a; Cell n=b; int flip=0;
+  if(b.tag==T_PTR&&b.i&&uf_is_str(b)&&a.tag==T_INT){ s=b; n=a; flip=1; }
+  if(!(s.tag==T_PTR&&s.i&&uf_is_str(s)&&n.tag==T_INT)) return uf_mki(-4200000001LL);
+  const char* p=uf_sptr(s);
+  int64_t off=sub? -n.i : n.i;
+  if(flip&&sub) return uf_mki(-4200000001LL);
+  return uf_mkp((void*)(p+off));
+}
+static inline Cell uf_cadd(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,0,"add"); if(a.tag==T_INT&&uf_rawptr(b))return uf_mkp((void*)(a.i+b.i)); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i+b.i)); Cell s=uf_stradd(a,b,0); if(s.i!=-4200000001LL)return s; } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i+b.i); return uf_mkf(x+y); }
+static inline Cell uf_csub(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,1,"sub"); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i-b.i)); Cell s=uf_stradd(a,b,1); if(s.i!=-4200000001LL)return s; } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i-b.i); return uf_mkf(x-y); }
+static inline Cell uf_cmul(Cell a,Cell b){ if(a.tag==T_INT&&a.i==1&&b.tag!=T_FLOAT&&!uf_numarr(b))return b; if(b.tag==T_INT&&b.i==1&&a.tag!=T_FLOAT&&!uf_numarr(a))return a; if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,2,"mul"); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i*b.i); return uf_mkf(x*y); }
 static inline Cell uf_cand(Cell a,Cell b){ return uf_mki(uf_i(a)&uf_i(b)); }
 static inline Cell uf_cshr(Cell a){ return uf_mki((int64_t)((uint64_t)uf_i(a)>>1)); }
 static inline Cell uf_cinc(Cell a){ double x=uf_to_number(a); if(isnan(x))return uf_mkf(NAN); if(a.tag==T_INT)return uf_mki(a.i+1); return uf_mkf(x+1.0); }
@@ -976,7 +986,7 @@ static void op_free(Ctx*cx){ Cell p=pop(cx); free(((void*)p.i)); }
 static void op_sizeof(Ctx*cx){ int64_t ty=pop(cx).i; pushi(cx,ty==3?1:8); }
 
 /* ================= fmt / print / scan ================= */
-static int uf_count(const char*f){ int c=0; for(;f&&*f;f++){ if(*f=='%'){ if(f[1]=='%'){ f++; } else { c++; if(f[1]=='*')c++; } } } return c; }
+static int uf_count(const char*f){ int c=0; for(;f&&*f;f++){ if(*f=='%'){ if(f[1]=='%'){ f++; } else { const char*q=f+1; while(*q&&strchr("-+ #0",*q))q++; c++; if(*q=='*')c++; } } } return c; }
 static char* uf_fmt(const char*f,Cell*a,int n){
   size_t cap=256,bi=0; char*buf=(char*)uf_alloc(cap,0); int ai=0;
   for(const char*p=f;*p;){
@@ -1084,7 +1094,6 @@ static void op_scan(Ctx*cx){
   }
   uf_dyn_push(&dl,uf_mki((int64_t)n)); UF_UNPROTECT(); pushp(cx,dl);
 }
-static int uf_vargc(Ctx*cx){ for(int t=0;t<cx->sp;t++){ Cell fc=cx->ds[cx->sp-1-t]; if(fc.tag==T_PTR&&((void*)fc.i)&&uf_count(uf_sptr(fc))==t) return t; } die("vararg call: format string not found"); return 0; }
 
 /* ================= list / dict / chan / atom ops ================= */
 static void op_list(Ctx*cx){ pushp(cx,uf_dyn_new(8)); }
@@ -1945,6 +1954,12 @@ static VkDeviceMemory uf_vk_dummy_mem;
 static VkPipeline uf_vk_pipe[sizeof(uf_spv_all)/sizeof(uf_spv_all[0])];
 static int uf_vk_ready, uf_vk_broken;
 static long uf_gpu_min(void){ const char*e=getenv("NKR_GPU_MIN"); long v=e?atol(e):65536; return v>0?v:65536; }
+/* v13.2: per-op arith offload floor. A fused region does O(ops) work per
+   element for ONE transfer — worth it on the GPU at any size. A single
+   per-op add/mul moves ~3×n×8 bytes for one op — on host-visible staging
+   (~2GB/s) that loses to the CPU fast path until n is large. Fused-region
+   and reduce paths keep the plain uf_gpu_min(). */
+static long uf_gpu_arith_min(void){ const char*e=getenv("NKR_GPU_ARITH_MIN"); long v=e?atol(e):(8L<<20); return v>0?v:(8L<<20); }
 static pthread_mutex_t uf_gpu_mu = PTHREAD_MUTEX_INITIALIZER;
 static int uf_spv_index(const char*name){ for(size_t i=0;i<sizeof(uf_spv_all)/sizeof(uf_spv_all[0]);i++) if(!strcmp(uf_spv_all[i].name,name))return (int)i; return -1; }
 
@@ -2161,6 +2176,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] submit\n");
   int ok = uf_vk_submit_wait();
   if(ok&&R&&rsz) memcpy(R,uf_vk_bpool.mapped+orr,rsz);
+  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] total=%.1fms\n",(uf_nowd()-_t0)*1e3);
   vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
   pthread_mutex_unlock(&uf_gpu_mu);
   return ok;
@@ -2224,6 +2240,65 @@ static Cell uf_gpu_task(Ctx*cx,int k,int n){
   UF_UNPROTECT();
   pthread_mutex_unlock(&uf_gpu_mu);
   return ok?uf_mkp(r):uf_gpu_decline();
+}
+
+/* ---- v13.2 fused region dispatch: one kernel launch for a straight-line
+   elementwise chain in plain (non-weave) code, with up to 4 outputs. Inputs
+   arrive explicitly as Cells (compiler-passed locals). Returns 1 and fills
+   outs[0..nout) on success; 0 = declined, caller falls back to the fused CPU
+   loop / per-op path. */
+static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
+  if(uf_vk_broken||n<1||n>7||nout<1||nout>4||n+nout>8) return 0;
+  Hdr* hs[7];
+  for(int j=0;j<n;j++){
+    if(!uf_numarr(ins[j])) return 0;
+    hs[j]=(Hdr*)(void*)ins[j].i;
+    if(hs[j]->ety!=1) return 0;
+    if(hs[j]->len!=hs[0]->len) return 0;
+  }
+  uint64_t len=hs[0]->len;
+  if(len<(uint64_t)uf_gpu_min()) return 0;
+  uf_vk_init();
+  if(!uf_vk_ready) return 0;
+  if(k<0||k>=(int)(sizeof(uf_spv_all)/sizeof(uf_spv_all[0]))) return 0;
+  pthread_mutex_lock(&uf_gpu_mu);
+  size_t bufsz=(size_t)len*8;
+  VkDeviceSize offs[8]; VkDeviceSize cur=0;
+  for(int j=0;j<n+nout;j++){ offs[j]=cur; cur=uf_vk_al(cur+(VkDeviceSize)bufsz); }
+  int ok=uf_vk_pool_reserve(cur);
+  Hdr* rs[4]; for(int j=0;j<nout;j++){ rs[j]=0; UF_PROTECT(&rs[j]); }
+  if(ok){
+    for(int j=0;j<nout;j++) rs[j]=uf_arr_like(hs[0],len);
+    for(int j=0;j<n;j++) memcpy(uf_vk_bpool.mapped+offs[j],uf_data(hs[j]),bufsz);
+    VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
+    VkDescriptorSet ds;
+    ok=vkAllocateDescriptorSets(uf_vk_dev,&dsai,&ds)==VK_SUCCESS;
+    if(ok){
+      VkWriteDescriptorSet w[8]; VkDescriptorBufferInfo bi[8];
+      memset(w,0,sizeof w); memset(bi,0,sizeof bi);
+      for(int j=0;j<n+nout;j++){ bi[j].buffer=uf_vk_bpool.buf; bi[j].offset=offs[j]; bi[j].range=bufsz;
+        w[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[j].dstSet=ds; w[j].dstBinding=(uint32_t)j; w[j].descriptorCount=1; w[j].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[j].pBufferInfo=&bi[j]; }
+      vkUpdateDescriptorSets(uf_vk_dev,n+nout,w,0,0);
+      struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)len;
+      VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      ok=vkBeginCommandBuffer(uf_vk_cb,&cbbi)==VK_SUCCESS;
+      if(ok){
+        vkCmdBindPipeline(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_pipe[k]);
+        vkCmdPushConstants(uf_vk_cb,uf_vk_playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
+        vkCmdBindDescriptorSets(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_playout,0,1,&ds,0,0);
+        uint64_t groups=(len+255)/256; if(!groups)groups=1;
+        vkCmdDispatch(uf_vk_cb,(uint32_t)(groups>0x7fffffff?0x7fffffff:groups),1,1);
+        vkEndCommandBuffer(uf_vk_cb);
+        ok=uf_vk_submit_wait();
+        if(ok) for(int j=0;j<nout;j++) memcpy(uf_data(rs[j]),uf_vk_bpool.mapped+offs[n+j],bufsz);
+      }
+      vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
+    }
+  }
+  for(int j=0;j<nout;j++) UF_UNPROTECT();
+  pthread_mutex_unlock(&uf_gpu_mu);
+  if(ok){ for(int j=0;j<nout;j++){ outs[j].tag=T_PTR; outs[j].i=(int64_t)(void*)rs[j]; } return 1; }
+  return 0;
 }
 
 /* ---- op shims (return a T_INT 0 Cell when declined; caller falls back) ---- */
@@ -2388,12 +2463,13 @@ static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn){
       : (op==2&&ha->tag==HT_MAT) ? ha->esz
       : (op==2&&hb->tag==HT_MAT) ? (hb->len/hb->esz)
       : (ha->len>hb->len?ha->len:hb->len);
-    if(work>=(uint64_t)uf_gpu_min()){
+    long _amin = (op==2&&(ha->tag==HT_MAT||hb->tag==HT_MAT)) ? uf_gpu_min() : uf_gpu_arith_min(); /* matmul is O(n²) — offload at any size */
+    if(work>=(uint64_t)_amin){
       Cell g=uf_gpu_arith(a,b,op);
       if(!(g.tag==T_INT&&g.i==0)){ UF_UNPROTECT(); UF_UNPROTECT(); return g; }
     }
   }
-  if((ha&&!hb&&ha->ety==1&&ha->len>=(uint64_t)uf_gpu_min())||(hb&&!ha&&hb->ety==1&&hb->len>=(uint64_t)uf_gpu_min())){
+  if((ha&&!hb&&ha->ety==1&&ha->len>=(uint64_t)uf_gpu_arith_min())||(hb&&!ha&&hb->ety==1&&hb->len>=(uint64_t)uf_gpu_arith_min())){
     Cell g=uf_gpu_arith(a,b,op);
     if(!(g.tag==T_INT&&g.i==0)){ UF_UNPROTECT(); UF_UNPROTECT(); return g; }
   }

@@ -385,6 +385,90 @@ pub fn emit_range(
                 kidx, nin
             ));
         }
+        // v13.2: elementwise region fusion (top-level flow only — regions in
+        // inlined loops / outlined bodies are not analyzed). One guarded block
+        // at the region head: GPU kernel try, then a raw f64 C loop, else the
+        // per-op code below runs. Success binds the live-out locals and jumps
+        // past the region instructions (which stay emitted as the decline path).
+        if prefix.is_empty() && depth == 0 && i + 1 < end {
+            if let Some(rg) = crate::compute::region_at(i) {
+                let n = rg.inputs.len();
+                let nk = rg.out_locals.len();
+                vflush(&mut e, &mut vstack, &mut vcache);
+                e.push_str("{uf_cur_op=\"region\";Cell _ri[");
+                e.push_str(&format!("{}", n));
+                e.push_str("]={");
+                for (k, inp) in rg.inputs.iter().enumerate() {
+                    if k > 0 { e.push_str(","); }
+                    match inp {
+                        crate::compute::RegionInput::Local(id) => {
+                            e.push_str(&format!("cx->locals[cx->local_base+{}]", id));
+                        }
+                        crate::compute::RegionInput::Global(name) => {
+                            e.push_str(&format!("var_{}", name));
+                        }
+                    }
+                }
+                e.push_str("};Cell _ro[");
+                e.push_str(&format!("{}", nk));
+                e.push_str("];int _fz=0;\n");
+                e.push_str("#ifdef NKR_GPU\n");
+                e.push_str(&format!(
+                    "if(uf_region_try({},(int){},(int){},_ri,_ro))_fz=1;\n",
+                    rg.kidx, n, nk
+                ));
+                e.push_str("#endif\n");
+                e.push_str("if(!_fz){Hdr*_h[7];uint64_t _n=~(uint64_t)0;int _ok=1;\n");
+                e.push_str(&format!(
+                    "for(int _j=0;_j<{};_j++){{_h[_j]=(_ri[_j].tag==T_PTR)?(Hdr*)(void*)_ri[_j].i:0;if(!_h[_j]||_h[_j]->ety!=1||_h[_j]->tag==HT_MAT){{_ok=0;break;}}if(_n==~(uint64_t)0)_n=_h[_j]->len;else if(_h[_j]->len!=_n)_ok=0;}}\n",
+                    n
+                ));
+                e.push_str("if(_ok&&_n){Hdr*_r[4];");
+                for j in 0..nk {
+                    e.push_str(&format!("_r[{j}]=uf_arr_like(_h[0],_n);UF_PROTECT(&_r[{j}]);", j = j));
+                }
+                e.push_str("\n");
+                for k in 0..n {
+                    e.push_str(&format!(
+                        "const double* __restrict _a{k}=(const double* __restrict)uf_data(_h[{k}]);",
+                        k = k
+                    ));
+                }
+                for j in 0..nk {
+                    e.push_str(&format!(
+                        "double* __restrict _o{j}=(double* __restrict)uf_data(_r[{j}]);",
+                        j = j
+                    ));
+                }
+                e.push_str("\nfor(uint64_t _i=0;_i<_n;_i++){");
+                for k in 0..n {
+                    e.push_str(&format!("double _v{0}=_a{0}[_i];", k));
+                }
+                for (j, cexpr) in rg.c_exprs.iter().enumerate() {
+                    e.push_str(&format!("_o{j}[_i]={ce};", j = j, ce = cexpr));
+                }
+                e.push_str("}");
+                for _ in 0..nk {
+                    e.push_str("UF_UNPROTECT();");
+                }
+                for j in 0..nk {
+                    e.push_str(&format!("_ro[{j}]=uf_mkp(_r[{j}]);", j = j));
+                }
+                e.push_str("_fz=1;}}\n");
+                e.push_str("if(_fz){");
+                for (j, id) in rg.out_locals.iter().enumerate() {
+                    e.push_str(&format!(
+                        "cx->locals[cx->local_base+{}]=_ro[{}];",
+                        id, j
+                    ));
+                }
+                e.push_str(&format!("goto {};}}}}\n", plab(prefix, rg.end_pc)));
+                // leave the block in `e`: the head instruction's normal
+                // emission path below appends to `e` and flushes it to `o`
+                // once — the block is the guarded fast path, the head (and
+                // region body) is the decline path
+            }
+        }
         match ins {
             Ins::PushI(v) => {
                 // Push literal directly: no C temp. This lets cc see constants
@@ -541,9 +625,14 @@ pub fn emit_range(
                         // the polymorphic paths (array/matrix dispatch inside
                         // uf_cadd/csub/mul/div) and can allocate. Pending vstack
                         // temps live only in C variables of nkr_run, invisible
-                        // to the GC — materialize them onto the rooted ds first
-                        // or a collection inside the helper can sweep them (v13.2).
-                        vflush(&mut e, &mut vstack, &mut vcache);
+                        // to the GC — materialize POINTER-BEARING entries onto
+                        // the rooted ds first or a collection inside the helper
+                        // can sweep them (v13.2). Scalar-only pending temps
+                        // cannot be collected: skip the flush (hot loops run
+                        // this path every iteration).
+                        if vstack.iter().any(|t| matches!(t.ty, VType::Unknown | VType::FloatArr)) {
+                            vflush(&mut e, &mut vstack, &mut vcache);
+                        }
                         vpush_cell(&mut e, &mut vstack, &mut vtmp,
                             &format!("{}({},{})", f, cell_of(&a), cell_of(&b)));
                     }
@@ -2378,6 +2467,10 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         }
     }
 
+    // v13.2: fused elementwise regions are NOT suppressed — the guarded block
+    // jumps past them on success; on decline the original instructions run
+    // (they are the fallback path). Emission happens in emit_range.
+    let _ = crate::compute::region_ranges();
     // Emit outlined body functions BEFORE nkr_run (one per body_start, even
     // if multiple call sites share it)
     let mut outlined_fns = String::new();
@@ -2440,8 +2533,11 @@ pub fn gen_call_ext(im: &Import, sym: &str) -> String {
     let fixed: Vec<&String> = im.params.iter().filter(|t| *t != "...").collect();
     let mut o = String::from("{");
     if vararg {
-        // printf-style: format string is fixed param 0 (ptr); count % directives
-        o.push_str("int c=uf_vargc(cx);Cell ex[8];if(c>8)die(\"vararg: too many args\");for(int k=c-1;k>=0;k--){ex[k]=pop(cx);if(ex[k].tag==2&&ex[k].i&&uf_is_str(ex[k]))ex[k].i=(int64_t)uf_sptr(ex[k]);}");
+        // printf-style variadic convention: the call site pushes
+        // [fixed params..., varargs..., arg-count] — the count is the
+        // topmost cell, so no stack scanning is needed (a scan can be
+        // hijacked by unrelated pointer cells left deeper on the stack).
+        o.push_str("int c=(int)uf_i(pop(cx));if(c<0||c>8)die(\"variadic call: top cell must be the vararg count (0-8); got a value outside that range — the call site is missing the count cell\");Cell ex[8];for(int k=c-1;k>=0;k--){ex[k]=pop(cx);if(ex[k].tag==2&&ex[k].i&&uf_is_str(ex[k]))ex[k].i=(int64_t)uf_sptr(ex[k]);}");
         for (k, _) in fixed.iter().enumerate().rev() {
             o.push_str(&format!("Cell a{}=pop(cx);", k));
         }

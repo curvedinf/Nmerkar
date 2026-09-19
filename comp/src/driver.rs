@@ -696,9 +696,12 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
     let mut gpu_links: Vec<String> = Vec::new();
     let mut gpu_prefix: Option<String> = None;
     let task_kernels = compute::analyze_tasks(&parsed);
-    let relevant = compute::program_gpu_relevant(&parsed) || !task_kernels.is_empty();
+    // v13.2 elementwise region fusion: works on CPU always, GPU when enabled
+    let region_kernels = compute::analyze_regions(&parsed);
+    let relevant = compute::program_gpu_relevant(&parsed) || !task_kernels.is_empty() || !region_kernels.is_empty();
     if relevant {
-        let extras: Vec<(String, String)> = task_kernels.iter().map(|k| (k.name.clone(), k.glsl.clone())).collect();
+        let mut extras: Vec<(String, String)> = task_kernels.iter().map(|k| (k.name.clone(), k.glsl.clone())).collect();
+        extras.extend(region_kernels.iter().map(|k| (k.name.clone(), k.glsl.clone())));
         if let Some((prefix, links)) = compute::gpu_enablement(&device_mode, &extras) {
             compute::register_task_kernels(task_kernels.clone());
             gpu_links = links;
@@ -706,6 +709,9 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
             gpu_prefix = Some(prefix);
         }
     }
+    // regions fuse on CPU regardless of GPU availability (gen guards the GPU
+    // try in #ifdef NKR_GPU); kidx only matters when the prefix defined it
+    compute::register_region_kernels(region_kernels);
     let mut csrc = gen(&parsed, &structs, debug);
     if let Some(prefix) = gpu_prefix {
         csrc = format!("{}{}", prefix, csrc);
@@ -745,7 +751,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
         let out = output.unwrap_or_else(|| "a.out".to_string());
         let tmpc = format!("{}.ufc.c", out);
         fs::write(&tmpc, &csrc).unwrap_or_else(|e| panic!("cannot write {}: {}", tmpc, e));
-        let mut cc_args: Vec<String> = if debug { vec!["-O0".into(), "-g".into()] } else { vec!["-O2".into()] };
+        let mut cc_args: Vec<String> = if debug { vec!["-O0".into(), "-g".into()] } else { vec!["-O3".into()] };
         cc_args.extend(["-w".into(), "-o".into(), out, tmpc.clone()]);
         let status = Command::new("cc")
             .args(&cc_args)
@@ -774,7 +780,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
     if !bin.exists() {
         let tmpc = cdir.join(format!("{:016x}.c", h));
         fs::write(&tmpc, &csrc).unwrap_or_else(|e| panic!("cannot write {}: {}", tmpc.display(), e));
-        let mut cc_args: Vec<String> = if debug { vec!["-O0".into(), "-g".into()] } else { vec!["-O2".into()] };
+        let mut cc_args: Vec<String> = if debug { vec!["-O0".into(), "-g".into()] } else { vec!["-O3".into()] };
         cc_args.extend(["-w".into(), "-o".into(), bins.clone()]);
         cc_args.push(tmpc.to_string_lossy().to_string());
         let status = Command::new("cc")

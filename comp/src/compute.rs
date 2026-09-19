@@ -495,3 +495,625 @@ pub fn task_kernel_at(pc: usize) -> Option<(usize, usize)> {
         ks.iter().position(|k| k.pc == pc).map(|i| (static_kernel_count() + i, ks[i].ninputs))
     })
 }
+
+// ---------------- elementwise region fusion (v13.2) ----------------
+// A maximal straight-line run of eligible instructions ANYWHERE (not just
+// weave task bodies) whose net effect is
+//     out := expr(in0[i], in1[i], ...)      (elementwise + - * / sqrt, consts)
+// is a fusable REGION: gen.rs emits one guarded fused C loop (CPU) plus one
+// fused kernel launch (GPU) at the region head, falling back to the original
+// per-op code whenever the runtime shapes don't cooperate. Same TExpr and
+// kernel shape as weave-task fusion — this generalizes it to plain code.
+
+#[derive(Clone, Debug)]
+pub struct RegionKernel {
+    pub pc: usize,          // first instruction of the region
+    pub end_pc: usize,      // first instruction AFTER the region (goto target)
+    pub inputs: Vec<RegionInput>, // region inputs (locals or globals)
+    pub exprs: Vec<(usize, TExpr)>, // live-out (local slot id, elementwise expr), 1..=4
+    pub name: String,
+    pub glsl: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum RegionInput {
+    Local(usize),
+    Global(String),
+}
+
+static REGION_KERNELS: std::sync::OnceLock<Vec<RegionKernel>> = std::sync::OnceLock::new();
+pub fn register_region_kernels(ks: Vec<RegionKernel>) {
+    let _ = REGION_KERNELS.set(ks);
+}
+
+/// Everything gen.rs needs to emit the fused block for a region at `pc`.
+pub struct RegionGen {
+    pub kidx: usize,             // kernel table index (after static + task kernels)
+    pub inputs: Vec<RegionInput>, // locals (cx->locals[base+id]) or globals (var_name)
+    pub end_pc: usize,           // goto target after the fused block
+    pub out_locals: Vec<usize>,  // local slot ids to bind (1..=4 live-outs)
+    pub c_exprs: Vec<String>,    // elementwise exprs as C over _v0.._v(n-1)
+}
+/// All registered (pc, end_pc) ranges — gen jumps over them when the fused
+/// block succeeds; the covered instructions remain the decline path.
+pub fn region_ranges() -> Vec<(usize, usize)> {
+    REGION_KERNELS
+        .get()
+        .map(|ks| ks.iter().map(|k| (k.pc, k.end_pc)).collect())
+        .unwrap_or_default()
+}
+pub fn region_at(pc: usize) -> Option<RegionGen> {
+    REGION_KERNELS.get().and_then(|ks| {
+        ks.iter().position(|k| k.pc == pc).map(|i| {
+            let base = static_kernel_count()
+                + TASK_KERNELS.get().map(|t| t.len()).unwrap_or(0);
+            RegionGen {
+                kidx: base + i,
+                inputs: ks[i].inputs.clone(),
+                end_pc: ks[i].end_pc,
+                out_locals: ks[i].exprs.iter().map(|(id, _)| *id).collect(),
+                c_exprs: ks[i].exprs.iter().map(|(_, e)| expr_to_c(e)).collect(),
+            }
+        })
+    })
+}
+
+fn expr_uses_input(e: &TExpr) -> bool {
+    match e {
+        TExpr::Input(_) => true,
+        TExpr::Const(_) => false,
+        TExpr::Add(a, b) | TExpr::Sub(a, b) | TExpr::Mul(a, b) | TExpr::Div(a, b) => {
+            expr_uses_input(a) || expr_uses_input(b)
+        }
+        TExpr::Sqrt(a) => expr_uses_input(a),
+    }
+}
+
+fn expr_has_div(e: &TExpr) -> bool {
+    match e {
+        TExpr::Input(_) | TExpr::Const(_) => false,
+        TExpr::Div(_, _) => true,
+        TExpr::Add(a, b) | TExpr::Sub(a, b) | TExpr::Mul(a, b) => expr_has_div(a) || expr_has_div(b),
+        TExpr::Sqrt(a) => expr_has_div(a),
+    }
+}
+
+/// TExpr as C over per-element locals _v0.._v(n-1) (mirrors expr_to_glsl).
+/// Division carries an inline zero-divisor check so the fused loop keeps the
+/// per-op `die("div: zero divisor")` semantics exactly (GNU statement expr).
+pub fn expr_to_c(e: &TExpr) -> String {
+    match e {
+        TExpr::Input(i) => format!("_v{}", i),
+        TExpr::Const(v) => format!("{:?}", v),
+        TExpr::Add(a, b) => format!("({} + {})", expr_to_c(a), expr_to_c(b)),
+        TExpr::Sub(a, b) => format!("({} - {})", expr_to_c(a), expr_to_c(b)),
+        TExpr::Mul(a, b) => format!("({} * {})", expr_to_c(a), expr_to_c(b)),
+        TExpr::Div(a, b) => format!(
+            "({} / ({{double _d={}; if(_d==0.0)die(\"div: zero divisor\"); _d;}}))",
+            expr_to_c(a),
+            expr_to_c(b)
+        ),
+        TExpr::Sqrt(a) => format!("sqrt({})", expr_to_c(a)),
+    }
+}
+
+/// GLSL for a multi-output elementwise kernel: bindings 0..n are inputs,
+/// n..n+k are outputs r_j[i] = expr_j[i]. Same header/layout as task_glsl.
+pub fn region_glsl(ninputs: usize, exprs: &[(usize, TExpr)]) -> String {
+    let mut s = String::new();
+    s.push_str("#version 450\n");
+    s.push_str("#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require\n");
+    s.push_str("#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n");
+    s.push_str("layout(local_size_x=256) in;\n");
+    s.push_str("layout(push_constant) uniform PC { int64_t n0, n1, n2, n3; float64_t s; int64_t rev; } pc;\n");
+    for i in 0..ninputs {
+        s.push_str(&format!("layout(std430, binding={}) buffer I{} {{ float64_t in{}[]; }};\n", i, i, i));
+    }
+    for j in 0..exprs.len() {
+        s.push_str(&format!("layout(std430, binding={}) buffer R{} {{ float64_t r{}[]; }};\n", ninputs + j, j, j));
+    }
+    s.push_str("void main() {\n");
+    s.push_str("  int i = int(gl_GlobalInvocationID.x);\n");
+    s.push_str("  if (int64_t(i) >= pc.n0) return;\n");
+    for (j, (_, e)) in exprs.iter().enumerate() {
+        s.push_str(&format!("  r{}[i] = {};\n", j, expr_to_glsl(e, &[])));
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// Analyze the whole program for fusable elementwise regions.
+pub fn analyze_regions(p: &crate::ast::Parsed) -> Vec<RegionKernel> {
+    use std::collections::HashSet;
+    let targets: HashSet<usize> = p.labels.values().copied().collect();
+    let dbg = std::env::var("UF_DEBUG_REGION").is_ok() || std::env::var("NKR_DEBUG_REGION").is_ok();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < p.ins.len() {
+        if let Some((end_pc, inputs, exprs)) = walk_one_region(p, i, &targets) {
+            let name = format!("region_{}", fnv(&format!("pc{}", i)));
+            let glsl = region_glsl(inputs.len(), &exprs);
+            if dbg {
+                let outs: Vec<String> = exprs.iter().map(|(id, _)| id.to_string()).collect();
+                eprintln!(
+                    "[region] pc {}..{} FUSED ({} inputs, outs [{}])",
+                    i, end_pc, inputs.len(), outs.join(",")
+                );
+            }
+            out.push(RegionKernel { pc: i, end_pc, inputs, exprs, name, glsl });
+            i = end_pc;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn slot_read_later(p: &crate::ast::Parsed, id: usize, name: &str, from: usize) -> bool {
+    use crate::ast::Ins;
+    for ins in &p.ins[from.min(p.ins.len())..] {
+        match ins {
+            Ins::LocalGetI(i) if *i == id => return true,
+            Ins::LocalGet(n) if n == name => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+// A region input as the analyzer sees it. Phantom marks the constant list
+// consumed by an unrolled array_reduce — filtered before registration.
+#[derive(Clone, PartialEq)]
+enum InSlot {
+    Loc(usize),
+    Glob(String),
+    Phantom,
+}
+
+/// Resolve the constant float list bound to local `list_slot` at or before
+/// instruction `before`: the slot's most recent LocalSetI must be fed by a
+/// literal-only ListLit ([ c0 c1 ... ] name!). Returns the constants in
+/// source order.
+fn const_list_of(p: &crate::ast::Parsed, list_slot: usize, before: usize) -> Option<Vec<f64>> {
+    use crate::ast::Ins;
+    let mut j = before;
+    while j > 0 {
+        j -= 1;
+        if let Ins::LocalSetI(id) = &p.ins[j] {
+            if *id != list_slot {
+                continue;
+            }
+            if j == 0 || !matches!(&p.ins[j - 1], Ins::ListLit) {
+                return None;
+            }
+            let mut k = j - 1;
+            while k > 0 && matches!(&p.ins[k - 1], Ins::PushF(_) | Ins::PushI(_)) {
+                k -= 1;
+            }
+            if k == 0 || !matches!(&p.ins[k - 1], Ins::ListStart) {
+                return None;
+            }
+            let mut out = Vec::new();
+            for ins in &p.ins[k..j - 1] {
+                match ins {
+                    Ins::PushF(v) => out.push(*v),
+                    Ins::PushI(v) => out.push(*v as f64),
+                    _ => return None,
+                }
+            }
+            if out.is_empty() || out.len() > 64 {
+                return None;
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Simulate one fold-body invocation symbolically: initial stack [acc, elem],
+/// eligible instructions only (arith, literals, GetV globals, simple local
+/// binds), terminating at Ret with exactly one value. Returns the new acc.
+fn simulate_fold_body(
+    p: &crate::ast::Parsed,
+    body_pc: usize,
+    acc: TExpr,
+    elem: f64,
+    inputs: &mut Vec<InSlot>,
+    ops: &mut usize,
+) -> Option<TExpr> {
+    use crate::ast::Ins;
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    enum BSlot {
+        Id(usize),
+        Name(String),
+    }
+    #[derive(Clone)]
+    enum V {
+        E(TExpr),
+        Opaque,
+    }
+    let mut stack: Vec<V> = vec![V::E(acc), V::E(TExpr::Const(elem))];
+    let mut locals: std::collections::HashMap<BSlot, V> = std::collections::HashMap::new();
+    let mut i = body_pc;
+    while i < p.ins.len() && i < body_pc + 128 {
+        match &p.ins[i] {
+            Ins::Ret => break,
+            Ins::Flush => {}
+            Ins::PushF(v) => stack.push(V::E(TExpr::Const(*v))),
+            Ins::PushI(v) => stack.push(V::E(TExpr::Const(*v as f64))),
+            Ins::GetV(v) => {
+                let slot = InSlot::Glob(v.clone());
+                let idx = inputs.iter().position(|s| *s == slot).unwrap_or_else(|| {
+                    inputs.push(slot);
+                    inputs.len() - 1
+                });
+                stack.push(V::E(TExpr::Input(idx)));
+            }
+            Ins::LocalGetI(id) => match locals.get(&BSlot::Id(*id)) {
+                Some(v) => stack.push(v.clone()),
+                None => return None,
+            },
+            Ins::LocalGet(n) => match locals.get(&BSlot::Name(n.clone())) {
+                Some(v) => stack.push(v.clone()),
+                None => return None,
+            },
+            Ins::LocalSetI(id) => match stack.pop() {
+                Some(V::E(e)) => {
+                    locals.insert(BSlot::Id(*id), V::E(e));
+                }
+                _ => return None,
+            },
+            Ins::LocalSet(n) => match stack.pop() {
+                Some(V::E(e)) => {
+                    locals.insert(BSlot::Name(n.clone()), V::E(e));
+                }
+                _ => return None,
+            },
+            Ins::Simple(h) => match *h {
+                "op_add" | "op_sub" | "op_mul" | "op_div" => {
+                    match (stack.pop(), stack.pop()) {
+                        (Some(V::E(be)), Some(V::E(ae))) => {
+                            stack.push(V::E(match *h {
+                                "op_add" => TExpr::Add(Box::new(ae), Box::new(be)),
+                                "op_sub" => TExpr::Sub(Box::new(ae), Box::new(be)),
+                                "op_mul" => TExpr::Mul(Box::new(ae), Box::new(be)),
+                                _ => TExpr::Div(Box::new(ae), Box::new(be)),
+                            }));
+                            *ops += 1;
+                        }
+                        _ => return None,
+                    }
+                }
+                "op_sqrt" => match stack.pop() {
+                    Some(V::E(ae)) => {
+                        stack.push(V::E(TExpr::Sqrt(Box::new(ae))));
+                        *ops += 1;
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        }
+        i += 1;
+    }
+    if stack.len() != 1 {
+        return None;
+    }
+    match stack.pop() {
+        Some(V::E(e)) => Some(e),
+        _ => None,
+    }
+}
+
+/// Renumber TExpr::Input indices after Phantom inputs are dropped; None if
+/// the expression still references a dropped input (should not happen).
+fn remap_input(e: &TExpr, map: &[Option<usize>]) -> Option<TExpr> {
+    match e {
+        TExpr::Input(i) => map.get(*i).copied().flatten().map(TExpr::Input),
+        TExpr::Const(v) => Some(TExpr::Const(*v)),
+        TExpr::Add(a, b) => Some(TExpr::Add(
+            Box::new(remap_input(a, map)?),
+            Box::new(remap_input(b, map)?),
+        )),
+        TExpr::Sub(a, b) => Some(TExpr::Sub(
+            Box::new(remap_input(a, map)?),
+            Box::new(remap_input(b, map)?),
+        )),
+        TExpr::Mul(a, b) => Some(TExpr::Mul(
+            Box::new(remap_input(a, map)?),
+            Box::new(remap_input(b, map)?),
+        )),
+        TExpr::Div(a, b) => Some(TExpr::Div(
+            Box::new(remap_input(a, map)?),
+            Box::new(remap_input(b, map)?),
+        )),
+        TExpr::Sqrt(a) => Some(TExpr::Sqrt(Box::new(remap_input(a, map)?))),
+    }
+}
+
+fn walk_one_region(
+    p: &crate::ast::Parsed,
+    start: usize,
+    targets: &std::collections::HashSet<usize>,
+) -> Option<(usize, Vec<RegionInput>, Vec<(usize, TExpr)>)> {
+    use crate::ast::Ins;
+    use std::collections::HashMap;
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    enum Slot {
+        Id(usize),
+        Name(String),
+    }
+    #[derive(Clone)]
+    enum V {
+        E(TExpr),
+        Opaque,
+    }
+    let mut stack: Vec<V> = Vec::new();
+    let mut locals: HashMap<Slot, V> = HashMap::new();
+    let mut inputs: Vec<InSlot> = Vec::new();
+    let mut written: Vec<Slot> = Vec::new();
+    let mut ops = 0usize;
+    let mut final_out: Option<Slot> = None;
+    // last point where the simulated stack was empty (a statement boundary).
+    // If the walk stops mid-statement (e.g. it absorbed the leading Gets of
+    // the NEXT statement before hitting an ineligible op), the region ends
+    // here instead — the trailing instructions simply re-run per-op.
+    let mut clean: Option<(usize, Vec<InSlot>, Vec<Slot>, usize, HashMap<Slot, V>, Option<Slot>)> =
+        None;
+    let mut i = start;
+    while i < p.ins.len() {
+        if i > start && targets.contains(&i) {
+            break;
+        }
+        // constant-list array_reduce unrolling: PushAddr(label) immediately
+        // followed by op_vfold whose list operand is a bound literal-only
+        // list expands to N body simulations (elem = each constant), giving
+        // one fused expression — the source keeps its fold shape.
+        if let Ins::PushAddr(l) = &p.ins[i] {
+            if matches!(p.ins.get(i + 1), Some(Ins::Simple("op_vfold"))) {
+                let listv = match stack.pop() {
+                    Some(V::E(e)) => e,
+                    _ => break,
+                };
+                let accv = match stack.pop() {
+                    Some(V::E(e)) => e,
+                    _ => break,
+                };
+                // the list operand must be a plain region input (a local)
+                let list_idx = match &listv {
+                    TExpr::Input(idx) => *idx,
+                    _ => break,
+                };
+                let list_slot = match inputs.get(list_idx) {
+                    Some(InSlot::Loc(id)) => *id,
+                    _ => break,
+                };
+                let consts = match const_list_of(p, list_slot, i) {
+                    Some(c) => c,
+                    None => break,
+                };
+                let body_pc = match p.labels.get(l) {
+                    Some(pc) => *pc,
+                    None => break,
+                };
+                // unroll: acc = body(acc, c_k) for each constant
+                let mut acc = accv;
+                let mut unfolded = false;
+                for c in consts {
+                    match simulate_fold_body(p, body_pc, acc.clone(), c, &mut inputs, &mut ops) {
+                        Some(next) => acc = next,
+                        None => break,
+                    }
+                    unfolded = true;
+                }
+                if !unfolded {
+                    break;
+                }
+                inputs[list_idx] = InSlot::Phantom;
+                stack.push(V::E(acc));
+                i += 2; // skip PushAddr + op_vfold
+                if stack.is_empty() {
+                    clean = Some((i, inputs.clone(), written.clone(), ops, locals.clone(), final_out.clone()));
+                }
+                continue;
+            }
+            break;
+        }
+        let stop;
+        match &p.ins[i] {
+            Ins::Flush => {
+                stop = false;
+            }
+            Ins::PushF(v) => {
+                stack.push(V::E(TExpr::Const(*v)));
+                stop = false;
+            }
+            Ins::PushI(v) => {
+                stack.push(V::E(TExpr::Const(*v as f64)));
+                stop = false;
+            }
+            Ins::GetV(v) => {
+                let slot = InSlot::Glob(v.clone());
+                let idx = inputs.iter().position(|s| *s == slot).unwrap_or_else(|| {
+                    inputs.push(slot);
+                    inputs.len() - 1
+                });
+                stack.push(V::E(TExpr::Input(idx)));
+                stop = false;
+            }
+            Ins::LocalGetI(id) => {
+                let slot = Slot::Id(*id);
+                match locals.get(&slot) {
+                    Some(v) => stack.push(v.clone()),
+                    None => {
+                        let idx = match inputs.iter().position(|s| *s == InSlot::Loc(*id)) {
+                            Some(idx) => idx,
+                            None => {
+                                inputs.push(InSlot::Loc(*id));
+                                inputs.len() - 1
+                            }
+                        };
+                        stack.push(V::E(TExpr::Input(idx)));
+                    }
+                }
+                stop = false;
+            }
+            Ins::LocalGet(n) => {
+                let slot = Slot::Name(n.clone());
+                match locals.get(&slot) {
+                    Some(v) => stack.push(v.clone()),
+                    None => break, // unresolved named read — don't fuse
+                }
+                stop = false;
+            }
+            Ins::Simple(h) => match *h {
+                "op_add" | "op_sub" | "op_mul" | "op_div" => {
+                    match (stack.pop(), stack.pop()) {
+                        (Some(V::E(be)), Some(V::E(ae))) => {
+                            stack.push(V::E(match *h {
+                                "op_add" => TExpr::Add(Box::new(ae), Box::new(be)),
+                                "op_sub" => TExpr::Sub(Box::new(ae), Box::new(be)),
+                                "op_mul" => TExpr::Mul(Box::new(ae), Box::new(be)),
+                                _ => TExpr::Div(Box::new(ae), Box::new(be)),
+                            }));
+                            ops += 1;
+                            stop = false;
+                        }
+                        _ => stop = true,
+                    }
+                }
+                "op_sqrt" => match stack.pop() {
+                    Some(V::E(ae)) => {
+                        stack.push(V::E(TExpr::Sqrt(Box::new(ae))));
+                        ops += 1;
+                        stop = false;
+                    }
+                    _ => stop = true,
+                },
+                _ => stop = true,
+            },
+            Ins::LocalSetI(id) => {
+                match stack.pop() {
+                    Some(V::E(e)) => {
+                        let slot = Slot::Id(*id);
+                        locals.insert(slot.clone(), V::E(e));
+                        if !written.contains(&slot) {
+                            written.push(slot.clone());
+                        }
+                        final_out = Some(slot);
+                        stop = false;
+                    }
+                    _ => stop = true,
+                }
+            }
+            Ins::LocalSet(n) => {
+                match stack.pop() {
+                    Some(V::E(e)) => {
+                        let slot = Slot::Name(n.clone());
+                        locals.insert(slot.clone(), V::E(e));
+                        if !written.contains(&slot) {
+                            written.push(slot.clone());
+                        }
+                        final_out = Some(slot);
+                        stop = false;
+                    }
+                    _ => stop = true,
+                }
+            }
+            _ => stop = true,
+        }
+        if stop {
+            break;
+        }
+        if stack.is_empty() {
+            clean = Some((i + 1, inputs.clone(), written.clone(), ops, locals.clone(), final_out.clone()));
+        }
+        i += 1;
+    }
+    let mut end_pc = i;
+    if !stack.is_empty() {
+        // stopped mid-statement: fall back to the last clean boundary
+        match clean {
+            Some((cp, cin, cwr, cops, clocals, cout)) => {
+                end_pc = cp;
+                inputs = cin;
+                written = cwr;
+                ops = cops;
+                locals = clocals;
+                final_out = cout;
+                stack.clear();
+            }
+            None => return None,
+        }
+    }
+    if std::env::var("NKR_DEBUG_REGION2").is_ok() {
+        eprintln!("[region?] start={} end={} stack={} ops={} inputs={}",
+            start, end_pc, stack.len(), ops, inputs.len());
+    }
+    if end_pc == start || !stack.is_empty() || ops == 0 || inputs.is_empty() {
+        return None;
+    }
+    // the region must end on a local bind (statement boundary after a Set)
+    if !matches!(&p.ins[end_pc - 1], Ins::LocalSetI(_) | Ins::LocalSet(_)) {
+        return None;
+    }
+    // live-outs: every slot written in the region that is read at or after
+    // end_pc, plus the final bind. Slots never read again are internal
+    // temporaries. (Cross-body slot-id collisions over-promote to live-out,
+    // which is safe — just an extra output.) Cap 4 outputs.
+    let mut live: Vec<Slot> = Vec::new();
+    for slot in &written {
+        let (id, name) = match slot {
+            Slot::Id(id) => (*id, ""),
+            Slot::Name(n) => (usize::MAX, n.as_str()),
+        };
+        if Some(slot) == final_out.as_ref() || slot_read_later(p, id, name, end_pc) {
+            if !live.contains(slot) {
+                live.push(slot.clone());
+            }
+        }
+    }
+    if live.is_empty() || live.len() > 4 {
+        return None;
+    }
+    let mut exprs: Vec<(usize, TExpr)> = Vec::new();
+    for slot in &live {
+        let id = match slot {
+            Slot::Id(id) => *id,
+            Slot::Name(_) => return None, // unresolved (label-body) bind — decline
+        };
+        let e = match locals.get(slot) {
+            Some(V::E(e)) => e.clone(),
+            _ => return None,
+        };
+        exprs.push((id, e));
+    }
+    if !exprs.iter().any(|(_, e)| expr_uses_input(e)) {
+        return None;
+    }
+    // drop Phantom inputs (consumed constant lists) and renumber
+    let mut real: Vec<RegionInput> = Vec::new();
+    let mut map: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
+    for s in &inputs {
+        match s {
+            InSlot::Phantom => map.push(None),
+            InSlot::Loc(id) => {
+                map.push(Some(real.len()));
+                real.push(RegionInput::Local(*id));
+            }
+            InSlot::Glob(name) => {
+                map.push(Some(real.len()));
+                real.push(RegionInput::Global(name.clone()));
+            }
+        }
+    }
+    if real.is_empty() || real.len() > 7 || real.len() + exprs.len() > 8 {
+        return None;
+    }
+    let exprs = exprs
+        .into_iter()
+        .map(|(id, e)| remap_input(&e, &map).map(|e| (id, e)))
+        .collect::<Option<Vec<_>>>()?;
+    Some((end_pc, real, exprs))
+}

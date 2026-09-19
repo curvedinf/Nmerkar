@@ -1,7 +1,7 @@
 #!/bin/bash
 # trans test suite — two pathways, all gated.
 #
-#  1. tests/*.c        round-trip: C -> trans -> uf -> run, gated against the
+#  1. tests/*.c        round-trip: C -> trans (Rust) -> nkr -> run, gated against the
 #                      system binary's stdout and exit code (echo/true/false/wc/yes)
 #  2. tests/ops/*.c    per-operation: transpile, compile with uf, run, gate on
 #                      exit code 0, empty stderr, and stdout == ops/<name>.out
@@ -9,10 +9,15 @@
 #
 # Every gate must pass: transpile rc 0 + empty stderr, compile rc 0 + empty
 # stderr, run rc (0 or reference), stdout match, stderr empty.
-UF=${UF:-../comp/target/release/nkr}
+TROOT=$(cd "$(dirname "$0")" && pwd)
+UF=${UF:-$TROOT/../comp/target/release/nkr}
+TRANS=${TRANS:-$TROOT/target/release/trans}
+[ -x "$TRANS" ] || { echo "trans binary missing; run: (cd trans && cargo build --release)"; exit 1; }
+[ -x "$UF" ] || { echo "nkr binary missing; run: (cd comp && cargo build --release)"; exit 1; }
 T=$(mktemp -d)
 PASS=0; FAIL=0
 
+cd "$TROOT"
 gate_fail() { echo "FAIL   $1: $2"; FAIL=$((FAIL+1)); }
 
 # ---- pathway 1: system-binary round-trips ----
@@ -23,7 +28,7 @@ for c in tests/*.c; do
   [ -x "$SYS" ] || SYS=/bin/$name
   ARGS=""
   [ -f "tests/$name.args" ] && ARGS=$(cat "tests/$name.args")
-  ./trans "$c" > "$T/$name.ent" 2>"$T/$name.terr"
+  "$TRANS" "$c" > "$T/$name.ent" 2>"$T/$name.terr"
   [ $? -ne 0 ] && { gate_fail "$name" "transpile rc!=0: $(head -c 120 "$T/$name.terr")"; continue; }
   [ -s "$T/$name.terr" ] && { gate_fail "$name" "transpiler stderr not empty"; continue; }
   $UF --device cpu -c "$T/$name.ent" -o "$T/$name.bin" 2>"$T/$name.cerr"
@@ -71,7 +76,7 @@ for c in tests/ops/*.c; do
   [ -f "$exp" ] || { gate_fail "$name" "missing .out file"; continue; }
   ARGS=""
   [ -f "tests/ops/$(basename "$c" .c).args" ] && ARGS=$(cat "tests/ops/$(basename "$c" .c).args")
-  ./trans "$c" > "$T/op.ent" 2>"$T/op.terr"
+  "$TRANS" "$c" > "$T/op.ent" 2>"$T/op.terr"
   [ $? -ne 0 ] && { gate_fail "$name" "transpile rc!=0: $(head -c 120 "$T/op.terr")"; continue; }
   [ -s "$T/op.terr" ] && { gate_fail "$name" "transpiler stderr not empty"; continue; }
   $UF --device cpu -c "$T/op.ent" -o "$T/op.bin" 2>"$T/op.cerr"

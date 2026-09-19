@@ -178,6 +178,12 @@ sample[N-1]: <%.6f>
 Sequential CPU implementations are bit-identical; GPU columns may differ on
 `premium_sum` within ±0.01% (reduction order).
 
+**Structure**: the formula, coefficients and outputs are pinned; the code
+shape is not. The Enmerkar implementation evaluates the polynomial once over
+the concatenated `[d1 d2]` vector and splits the result (identical doubles,
+same op order per element — outputs stay bit-identical while the 19
+coefficients appear once in source).
+
 ### CPU-only policy and GPU-on column (v13.1)
 
 The four legacy benchmarks (logextract, analytics, mandelbrot, spectralnorm)

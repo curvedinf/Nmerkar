@@ -704,9 +704,14 @@ USEing TU. Ships: `m.ufm`, `c.ufm`, `pthread.ufm`, `curl.ufm`, `sdl2.ufm`,
 - `import c"fn"(types)->ret` — declares an unprototyped C function; args cast
   at call site. Generated C aliases the symbol (`__asm__`), so libc names
   already prototyped by the prelude are safe to import. Varargs: declare fixed
-  params then `...` (e.g. `import c"printf"(ptr,...)->int`); format string is
-  deepest, varargs above. `->int` is C `int` (32-bit), sign-extended into the
-  64-bit cell.
+  params then `...` (e.g. `import c"printf"(ptr,...)->int`); at the call site
+  push [fixed params..., varargs..., vararg-count] — the count of variadic
+  arguments as the topmost int cell, e.g. `"x=%d" 7 1 _call printf`. The
+  runtime pops the count first, so it never scans the stack for the format
+  string (unrelated pointer cells deeper on the stack could otherwise be
+  misread as the format). A missing/malformed count cell fails at runtime with
+  `variadic call: top cell must be the vararg count`. `->int` is C `int`
+  (32-bit), sign-extended into the 64-bit cell.
 - `extern "symbol"` — pushes the address of a global C symbol for use with
   `load`/`store`. Runtime exposes `nkr_argc` and `nkr_argv` this way (though
   `argv` op 163 is preferred).
@@ -751,8 +756,16 @@ results trivially safe.
   a global list. Bodies holding cells (list/dict/arr/chan/obj) are scanned for
   children during marking; str/bitmap/bloom are leaf bytes.
 - **Roots**: each `Ctx`'s data and call stacks, all global variables (`^name`),
-  active local-variable frames, weave task results, chan queue contents.
-  Registers/C-stack are never roots (interpreter holds handles only inside cells).
+  the full locals array of every `Ctx` (v13.2 — the innermost frame is where
+  running code keeps its tensors; scanning conservatively past the frame
+  pointer only over-retains, never frees live data), weave task results,
+  chan queue contents, and per-thread temporary-root stacks (v13.2 — operands
+  and in-progress results held in C locals across an allocation are pushed
+  there by runtime ops via `UF_PROTECT`/`UF_UNPROTECT`, published with
+  release/acquire so a concurrent collection on another weave worker can never
+  miss or pop another thread's entry; dead threads' stacks are skipped).
+  Generated code materializes pending compiler temporaries onto the data stack
+  before polymorphic helper calls that may allocate.
 - **Untagged pointers** (`malloc`, `buffer`): never traced, never freed by GC.
 - **Trigger**: bytes allocated since last collection exceeds threshold (default:
   max(1 MiB, 2× live bytes)), and explicit `gc` op (50). Adjustable via
@@ -1095,9 +1108,12 @@ executors; MSP/mobile targets.
 
 ## C → Enmerkar transpiler (trans/)
 
-`trans/trans.en` is a C-subset → Enmerkar transpiler, self-hosted in Enmerkar (text
-encoding). Bootstrapped via `gen_trans.py`. Supported subset, libc IMPORT
-preamble, and coreutils test adaptations (`true`, `false`, `echo`, `yes`, `wc`)
+`trans/` is a C-subset → Enmerkar transpiler written as a standalone Rust
+crate (std-only; modules: lexer, parser, AST, emitter) emitting the text
+encoding. Supported subset, libc IMPORT preamble, emission model
+(quotation-label control flow, `kN` call wrappers for recursion-safe
+parameter save/restore, `^fr`/`^rv` early-return guards), and the gated
+test pathways (system-binary round-trips plus per-operation output gates)
 are documented in `trans/README.md`.
 
 ---
@@ -1227,6 +1243,44 @@ reads) decline fusion and run on CPU unchanged. Fused-task output is
 bit-identical to the CPU body. Concurrent tasks serialize their GPU work on an
 internal mutex. Reference: `comp/tests/t14_task_gpu.ent` (black-scholes chain:
 ~60 per-op launches collapse to 4 fused kernels; 7.3s → 0.42s at N=2M).
+
+**Elementwise region fusion (v13.2)**: the same analysis generalized to plain
+code. A maximal straight-line run of eligible instructions (local/global
+reads, local binds, float/int literals, `add/sub/mul/div/sqrt`) anywhere in
+the top-level flow is a **fusable region** when every value it produces is an
+elementwise function of its input tensors: up to 4 **live-out** locals (read
+after the region — intermediate locals never read again stay internal), with
+inputs up to 7 total buffers. `array_reduce` over a bound literal-only list
+whose body is pure elementwise arithmetic (globals allowed) is **unrolled at
+compile time** into the region expression — the source keeps its fold shape,
+the machine gets one pass. The compiler emits one guarded block at the region
+head: first a fused multi-output GPU kernel launch (one stage-in, whole chain
+on-device, one stage-out per output), then raw `double` C loops
+(restrict pointers, vectorizable — programs build with `cc -O3`), and only if
+both decline the original per-op code runs. Declines are static or runtime
+(inputs not same-length float64 tensors). Fused division carries an inline
+zero-divisor `die`, preserving the per-op semantics exactly; on the GPU the
+documented inf/nan divergence applies. Results are bit-identical to the
+per-op path: same ops, same order, no reassociation. Regions in inlined
+loops, outlined label bodies, or weave tasks are not analyzed (tasks have
+their own fusion). Debug: `NKR_DEBUG_REGION=1` prints fused regions;
+`NKR_DEBUG_REGION2=1` traces declined walks. Reference:
+`bench/src/blackscholes/blackscholes.ent` (the 19-coefficient polynomial as a
+constant-list fold — 120 instructions unroll into one fused loop/kernel).
+
+**Per-op staging pool (v13.2)**: launches stage through one persistent
+mapped HOST_VISIBLE (HOST_COHERENT when available) buffer, suballocated per
+launch via 256B-aligned offsets and grown on demand — no per-op
+`vkAllocateMemory`/`vkMapMemory` churn. Transfers remain synchronous
+(upload → dispatch → wait → download).
+
+**Per-op arith threshold (v13.2)**: a *single* add/sub/mul/div moves ~3×n×8
+bytes for one op of work — on host-visible staging that loses to the CPU
+typed fast path until n is large, so per-op arith offload additionally
+requires `NKR_GPU_ARITH_MIN` elements (env, default 8M; matmul keeps the
+plain `NKR_GPU_MIN` since it is O(n²) per transfer). Fused regions and
+reductions use the plain `NKR_GPU_MIN`: one transfer amortizes O(chain)
+work per element.
 
 **Determinism**: elementwise/broadcast results are bit-identical to the CPU;
 reductions and matmul may reassociate (benchmarks compare within tolerance;

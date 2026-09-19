@@ -6,7 +6,7 @@ Enmerkar: a language based on a managed hidden stack, compiled to C then native 
 
 ```
 comp/      Rust compiler (→ C → native). Std-only modules in src/ (11 files), no external crates.
-trans/     C→Enmerkar transpiler, self-hosted in Enmerkar (text encoding).
+trans/     C→Enmerkar transpiler (Rust crate, std-only; emits text encoding).
 examples/  Sample programs in both encodings.
 mods/      FFI binding manifests (.ufm).
 bench/     Cross-language benchmark suite.
@@ -15,7 +15,7 @@ README.md  Quickstart and project intro.
 SPEC_V11_PROPOSAL.md, WEAVE_SPEC_PROPOSAL.md  Design proposals.
 ```
 
-Compiler source map: `main.rs`/`nkrsb.rs` (thin bin roots), `driver.rs` (CLI/cache/cc + sandbox/compute wiring), `lex.rs` (lexers + glyph/mnemonic tables), `parse.rs` (parser, label resolution, WEAVE DAG, v13 label parameters/destructuring, strict arity check), `ast.rs` (types), `gen.rs` (C codegen + optimizations), `emit.rs` (encoding conversion), `prelude.rs` (embedded C runtime: GC, containers, opcodes, threading, coercion, smart print, sandbox gates, Vulkan offload), `sandbox.rs` (capability configs/policies), `compute.rs` (Vulkan compute backend + static shader library), `build.rs` (bakes NKR_SANDBOX_CONFIG).
+Compiler source map: `main.rs`/`nkrsb.rs` (thin bin roots), `driver.rs` (CLI/cache/cc + sandbox/compute wiring), `lex.rs` (lexers + glyph/mnemonic tables), `parse.rs` (parser, label resolution, WEAVE DAG, v13 label parameters/destructuring, strict arity check), `ast.rs` (types), `gen.rs` (C codegen + optimizations), `emit.rs` (encoding conversion), `prelude.rs` (embedded C runtime: GC, containers, opcodes, threading, coercion, smart print, sandbox gates, Vulkan offload + staging pool), `sandbox.rs` (capability configs/policies), `compute.rs` (Vulkan compute backend, static shader library, weave-task + elementwise-region fusion), `build.rs` (bakes NKR_SANDBOX_CONFIG).
 
 ## Build
 
@@ -46,6 +46,7 @@ Runtime flags: `--gc-threshold N`, `--gc-off`, `--mt`.
 
 - **Integration tests**: `comp/tests/t01_basic.ent` … `t09_weave.ent`, plus `t12_matrix.ent` (polymorphic matrices), `t13_compute.ent` (GPU offloading; run with `--gc-threshold 200000000`) and `t14_task_gpu.ent` (fused weave-task GPU kernels). One per feature area. Run: `nkr comp/tests/tNN_*.ent`
 - **Transpiler tests**: `bash trans/run_tests.sh` — two gated pathways: C→Enmerkar (`trans/trans`) → `nkr` → run, compared against system binaries (echo/true/false/wc/yes) or expected-output files (hello, mini_gen); and `trans/tests/ops/` per-operation gates (transpile+compile+run with rc/stdout/stderr checks). All 21 pass.
+- **GNU multi-file tools**: `bash trans/tests/gnu/run.sh` — six multi-file coreutils adaptations (cat, head, nl, tee, cksum, base64) transpiled in one multi-file invocation and gated against the system binaries; transpiled `.ent` exported to `examples/gnu/`.
 - **Benchmarks**: `cd bench && python3 run.py` (needs `.bench-venv/` with `transformers`; data in `bench/data/` is gitignored). Six benchmarks × 5 languages: logextract, analytics, mandelbrot, spectralnorm (all CPU-only; Enmerkar pinned with `--device cpu`) plus the GPU-oriented matmul and blackscholes with a GPU-on column (Enmerkar auto device; see `bench/SPEC.md`).
 
 ## Language & FFI Reference
@@ -59,6 +60,6 @@ Key gotchas not to re-derive: raw jumps (`jmp`/`jz`/`je`) and stack-manipulation
 - No CI/CD, no formatter/linter.
 - Experimental, under active development.
 - Dense glyphs optimized for Qwen3-0.6B tokenizer (single-token per glyph).
-- Transpiler is self-bootstrapped (`gen_trans.py` → `trans.ent` → `trans_bin.c`).
+- Transpiler is a Rust crate (`cd trans && cargo build --release` → `target/release/trans`); unit tests via `cargo test`, behavior via `bash trans/run_tests.sh`.
 - Compiler cache key includes its own binary mtime — rebuilding auto-invalidates old cached outputs.
 - **Any change to language semantics, opcodes, encodings, or behavior must be documented in `SPEC.md` in the same changeset.**

@@ -43,8 +43,7 @@ place:
   nxt@ d@ c@ 1 add set
   d++
   nxt@ d@ 0 set
-  d@ n@ eq 'full 'plc if_else
+  d@ n@ eq 'full if
   ret
 full: cnt++ d@ 1 sub d! ret
-plc: ret
 back: d@ 1 sub d! ret

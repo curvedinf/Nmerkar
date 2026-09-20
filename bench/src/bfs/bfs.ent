@@ -44,7 +44,7 @@ step:
 vis_c: j@ nb@ length lt ret
 vis_b:
   nb@ j@ get v!
-  dist@ v@ get 0 lt 'visit 'vskip if_else
+  dist@ v@ get 0 lt 'visit if
   j++
   ret
 visit:
@@ -52,15 +52,13 @@ visit:
   q@ tail@ v@ set
   tail++
   ret
-vskip: ret
 tally: i!
   dist@ i@ get d!
-  d@ 0 lt 'ts 'tc if_else
+  d@ 0 gte 'tc if
   ret
-ts: ret
 tc:
   r++
   d@ s+=
-  d@ m@ gt 'tmax 'ts if_else
+  d@ m@ gt 'tmax if
   ret
 tmax: d@ m! ret

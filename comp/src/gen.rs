@@ -1299,6 +1299,23 @@ pub fn emit_range(
                         }
                     }
                 }
+                if depth < 8 {
+                    if let Some((tbs, tbe, ebs, _)) = inline_ifs.get(&i).copied() {
+                        if ebs == usize::MAX {
+                            let c = vpop(&mut e, &mut vstack, &mut vtmp);
+                            let test = match c.ty {
+                                VType::Int | VType::Float => format!("({})!=0", c.expr),
+                                _ => format!("!uf_zero({})", cell_of(&c)),
+                            };
+                            let inner_t = format!("{}IT{}_", prefix, i);
+                            e.push_str(&format!("if({}){{\n", test));
+                            emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, inline_ifs, outlined_bodies, suppress, ext_idx, tbs, tbe, &inner_t, depth + 1, local_types, ins_body, reg, numeric, arr_ptr, shared_types, shared_hoist, true);
+                            e.push_str("}\n");
+                            o.push_str(&e);
+                            continue;
+                        }
+                    }
+                }
                 vflush(&mut e, &mut vstack, &mut vcache);
                 // v13: the body's declared arity sets the drain point (the
                 // caller's cells below the branch's arguments stay put)
@@ -2855,6 +2872,20 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
                         if inlinable_for(p, tbs, tbe) && inlinable_for(p, ebs, ebe) {
                             inline_ifs.insert(j, (tbs, tbe, ebs, ebe));
                             suppress.insert(j - 2);
+                            suppress.insert(j - 1);
+                        }
+                    }
+                }
+            }
+        }
+        if j >= 1 {
+            if let (Ins::PushAddr(l), Ins::If) = (&p.ins[j - 1], &p.ins[j]) {
+                if !targets.contains(&(j - 1)) && !trivial_loop_exit(p, l) {
+                    let tbs = resolve(l);
+                    if let Some(tbe) = for_body_range(&p.ins, tbs) {
+                        if inlinable_for(p, tbs, tbe) {
+                            // usize::MAX else range = no else branch
+                            inline_ifs.insert(j, (tbs, tbe, usize::MAX, usize::MAX));
                             suppress.insert(j - 1);
                         }
                     }

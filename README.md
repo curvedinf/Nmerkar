@@ -39,9 +39,9 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | spectralnorm | 370 | 350 | 487 | **258** | 390 |
 | matmul | **143** | 244 | 278 | 172 | 235 |
 | blackscholes | **675** | 764 | 834 | 748 | 749 |
-| nqueens | **259** | 309 | 349 | 267 | 274 |
-| bfs | 363 | 411 | 416 | **282** | 375 |
-| **total** | **2550** | 3906 | 4003 | 2585 | 3096 |
+| nqueens | **254** | 309 | 349 | 267 | 274 |
+| bfs | 353 | 411 | 416 | **282** | 375 |
+| **total** | **2535** | 3906 | 4003 | 2585 | 3096 |
 
 Token counts use the **Qwen3-0.6B** tokenizer (151,643 vocab). The first six
 benchmarks are data/tensor-shaped (Enmerkar's home turf); nqueens and bfs are

@@ -306,6 +306,11 @@ pub enum TExpr {
     // loop. Updates are pure over state + outer exprs and commit
     // simultaneously (SSA two-phase) to match label-loop semantics.
     State(usize),
+    // nested For domains: Dom(level) is the loop index of the level-th For
+    // (0 = outermost) at flat position p (row-major decomposition over the
+    // counts, inner count in pc.n1); DomLen(level) is that For's count.
+    Dom(usize),
+    DomLen(usize),
     // predicates evaluate to 1.0/0.0 (universal coercion semantics)
     Cmp(&'static str, Box<TExpr>, Box<TExpr>), // "lt" "gt" "lte" "gte" "eq"
     And(Box<TExpr>, Box<TExpr>),
@@ -337,6 +342,7 @@ pub fn expr_width(e: &TExpr) -> u32 {
         TExpr::Cat(_, _) => 2,
         TExpr::Idx(_) => 1,
         TExpr::State(_) => 0,
+        TExpr::Dom(_) | TExpr::DomLen(_) => 1,
         TExpr::Cmp(_, a, b) => expr_width(a).max(expr_width(b)).min(1),
         TExpr::And(a, b) => expr_width(a).max(expr_width(b)).min(1),
         TExpr::Not(a) => expr_width(a).min(1),
@@ -410,6 +416,10 @@ fn glsl_parts(e: &TExpr, idx: &str, ctr: &mut usize) -> (String, String) {
             (pa, va)
         }
         TExpr::Idx(k) => (String::new(), format!("float64_t(int64_t({})+{})", idx, k)),
+        TExpr::Dom(0) => (String::new(), format!("float64_t(int64_t({}) / pc.n1)", idx)),
+        TExpr::Dom(_) => (String::new(), format!("float64_t(int64_t({}) % pc.n1)", idx)),
+        TExpr::DomLen(0) => (String::new(), "float64_t(pc.n0 / pc.n1)".to_string()),
+        TExpr::DomLen(_) => (String::new(), "float64_t(pc.n1)".to_string()),
         TExpr::State(i) => (String::new(), format!("s{}", i)),
         TExpr::Cmp(op, a, b) => {
             let (pa, va) = sub(a, ctr); let (pb, vb) = sub(b, ctr);
@@ -773,6 +783,7 @@ fn expr_uses_input(e: &TExpr) -> bool {
         TExpr::At(a, _) => expr_uses_input(a),
         TExpr::Idx(_) => true, // consumes the dispatch domain
         TExpr::State(_) => false,
+        TExpr::Dom(_) | TExpr::DomLen(_) => true,
         TExpr::Cmp(_, a, b) => expr_uses_input(a) || expr_uses_input(b),
         TExpr::And(a, b) => expr_uses_input(a) || expr_uses_input(b),
         TExpr::Not(a) => expr_uses_input(a),
@@ -795,6 +806,7 @@ fn expr_has_div(e: &TExpr) -> bool {
         TExpr::At(a, _) => expr_has_div(a),
         TExpr::Idx(_) => false,
         TExpr::State(_) => false,
+        TExpr::Dom(_) | TExpr::DomLen(_) => false,
         TExpr::Cmp(_, a, b) => expr_has_div(a) || expr_has_div(b),
         TExpr::And(a, b) => expr_has_div(a) || expr_has_div(b),
         TExpr::Not(a) => expr_has_div(a),
@@ -837,6 +849,10 @@ fn expr_to_c_at(e: &TExpr, idx: &str) -> String {
         TExpr::At(a, Shift::K(k)) => expr_to_c_at(a, &format!("({})+{}", idx, k)),
         TExpr::At(a, Shift::Len) => expr_to_c_at(a, &format!("({})+(int64_t)_n", idx)),
         TExpr::Idx(k) => format!("(double)((int64_t)({})+{})", idx, k),
+        TExpr::Dom(0) => format!("(double)((int64_t)({}) / _dom1)", idx),
+        TExpr::Dom(_) => format!("(double)((int64_t)({}) % _dom1)", idx),
+        TExpr::DomLen(0) => "(double)(_n / _dom1)".to_string(),
+        TExpr::DomLen(_) => "(double)_dom1".to_string(),
         TExpr::State(i) => format!("s{}", i),
         TExpr::Cmp(op, a, b) => {
             let o = match *op { "lt" => "<", "gt" => ">", "lte" => "<=", "gte" => ">=", _ => "==" };
@@ -1167,6 +1183,8 @@ fn remap_input(e: &TExpr, map: &[Option<usize>]) -> Option<TExpr> {
         TExpr::At(a, s) => Some(TExpr::At(Box::new(remap_input(a, map)?), *s)),
         TExpr::Idx(k) => Some(TExpr::Idx(*k)),
         TExpr::State(i) => Some(TExpr::State(*i)),
+        TExpr::Dom(l) => Some(TExpr::Dom(*l)),
+        TExpr::DomLen(l) => Some(TExpr::DomLen(*l)),
         TExpr::Cmp(op, a, b) => Some(TExpr::Cmp(op, Box::new(remap_input(a, map)?), Box::new(remap_input(b, map)?))),
         TExpr::And(a, b) => Some(TExpr::And(Box::new(remap_input(a, map)?), Box::new(remap_input(b, map)?))),
         TExpr::Not(a) => Some(TExpr::Not(Box::new(remap_input(a, map)?))),
@@ -1281,7 +1299,7 @@ fn sim_scalar_label(
 fn expr_input_free(e: &TExpr) -> bool {
     match e {
         TExpr::Input(_) => false,
-        TExpr::Const(_) | TExpr::Idx(_) | TExpr::State(_) => true,
+        TExpr::Const(_) | TExpr::Idx(_) | TExpr::State(_) | TExpr::Dom(_) | TExpr::DomLen(_) => true,
         TExpr::Add(a, b) | TExpr::Sub(a, b) | TExpr::Mul(a, b) | TExpr::Div(a, b)
         | TExpr::Cat(a, b) | TExpr::And(a, b) => expr_input_free(a) && expr_input_free(b),
         TExpr::Sqrt(a) | TExpr::Not(a) | TExpr::At(a, _) => expr_input_free(a),
@@ -1302,6 +1320,7 @@ fn same_expr(a: &TExpr, b: &TExpr) -> bool {
         (Const(x), Const(y)) => x.to_bits() == y.to_bits(),
         (Idx(x), Idx(y)) => x == y,
         (State(x), State(y)) => x == y,
+        (Dom(x), Dom(y)) | (DomLen(x), DomLen(y)) => x == y,
         (Add(a1, b1), Add(a2, b2)) | (Sub(a1, b1), Sub(a2, b2))
         | (Mul(a1, b1), Mul(a2, b2)) | (Div(a1, b1), Div(a2, b2)) => {
             same_expr(a1, a2) && same_expr(b1, b2)
@@ -1361,6 +1380,8 @@ fn walk_one_region(
     // >0 while walking inside a for-loop domain (atomic-add deltas are
     // per-element scalars there — Sum fusion is sound only in this context)
     let mut for_depth: usize = 0;
+    // guard var per nesting level, outermost first (drives Dom/DomLen emission)
+    let mut dom_guards: Vec<String> = Vec::new();
     let mut end_at_for = false;
     let mut clean: Option<(usize, Vec<InSlot>, Vec<Slot>, usize, HashMap<Slot, V>, Option<Slot>, Vec<String>, Vec<(Slot, TExpr)>)> =
         None;
@@ -1472,7 +1493,12 @@ fn walk_one_region(
                                 let saved: Vec<V> = stack.clone();
                                 stack.clear();
                                 let mut flocals: HashMap<Slot, V> = locals.clone();
+                                let dom_guards_len0 = dom_guards.len();
+                                // single-level domains (nested bodies decline in the
+                                // sim) use the flat index; Dom(level) activates with
+                                // two-guard nested support
                                 flocals.insert(k_slot, V::E(TExpr::Idx(0)));
+                                dom_guards.push(guard.clone().unwrap_or_default());
                                 let mut j = bpc + 1;
                                 let mut okbody = for_depth < 4;
                                 if let Some(g) = &guard {
@@ -1494,14 +1520,12 @@ fn walk_one_region(
                                             None => { okbody = false; break 'forbody; }
                                         },
                                         Ins::GetV(nm) => {
-                                            // inlined region-local or already-walked shared expr only;
-                                            // fresh array inputs inside a for body decline (per-element
-                                            // scalar context required)
-                                            if let Some(v) = flocals.get(&Slot::Name(nm.clone())).or_else(|| locals.get(&Slot::Name(nm.clone()))) {
+                                            // an enclosing domain guard reads as that level's count;
+                                            // inlined locals / already-walked shareds resolve; else decline
+                                            if let Some(lvl) = dom_guards.iter().position(|g| g == nm) {
+                                                stack.push(V::E(TExpr::DomLen(lvl)));
+                                            } else if let Some(v) = flocals.get(&Slot::Name(nm.clone())).or_else(|| locals.get(&Slot::Name(nm.clone()))) {
                                                 stack.push(v.clone());
-                                            } else if let Some(g) = &guard {
-                                                if g == nm { stack.push(V::E(TExpr::Idx(0))); /* not meaningful */ okbody = false; break 'forbody; }
-                                                else { okbody = false; break 'forbody; }
                                             } else { okbody = false; break 'forbody; }
                                         }
                                         Ins::LocalSetI(id) => match stack.pop() {
@@ -1563,6 +1587,7 @@ fn walk_one_region(
                                     j += 1;
                                 }
                                 for_depth -= 1;
+                                dom_guards.truncate(dom_guards_len0);
                                 if okbody && guard.is_some() {
                                     // loop bodies return nothing: drop scratch values
                                     stack.clear();

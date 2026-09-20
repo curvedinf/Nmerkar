@@ -1303,6 +1303,114 @@ fn walk_one_region(
             Ins::Flush => {
                 stop = false;
             }
+            // v15: inline `_call f` when f is a straight-line scalar
+            // function (params from stack exprs, body arithmetic over
+            // params/consts/visible region locals, ret expr) — the
+            // foundation for control-flow kernels (mandelbrot's esc)
+            Ins::Call(l) => {
+                let mut inlined: Option<TExpr> = None;
+                if let Some(&tpc) = p.labels.get(l) {
+                    let arity = p.label_params.get(&tpc).map(|v| v.len()).unwrap_or(0);
+                    if arity > 0 && arity <= 4 && stack.len() >= arity {
+                        let mut args: Vec<TExpr> = Vec::new();
+                        for _ in 0..arity {
+                            match stack.pop() {
+                                Some(V::E(e)) => args.push(e),
+                                _ => break,
+                            }
+                        }
+                        if args.len() == arity {
+                            let mut fl: HashMap<Slot, V> = HashMap::new();
+                            let mut bound = 0usize;
+                            while bound < arity {
+                                match p.ins.get(tpc + bound) {
+                                    Some(Ins::LocalSetI(id)) => { fl.insert(Slot::Id(*id), V::E(args[arity - 1 - bound].clone())); bound += 1; }
+                                    Some(Ins::LocalSet(n)) => { fl.insert(Slot::Name(n.clone()), V::E(args[arity - 1 - bound].clone())); bound += 1; }
+                                    _ => break,
+                                }
+                            }
+                            if bound == arity {
+                                let mut j = tpc + arity;
+                                let mut fstack: Vec<TExpr> = Vec::new();
+                                let mut okbody = true;
+                                'body: while j < p.ins.len() {
+                                    match &p.ins[j] {
+                                        Ins::Ret => break,
+                                        Ins::Flush => {}
+                                        Ins::PushF(v) => fstack.push(TExpr::Const(*v)),
+                                        Ins::PushI(v) => fstack.push(TExpr::Const(*v as f64)),
+                                        Ins::LocalGetI(id) => match fl.get(&Slot::Id(*id)) {
+                                            Some(V::E(e)) => fstack.push(e.clone()),
+                                            _ => { okbody = false; break 'body; }
+                                        },
+                                        Ins::LocalGet(n) => match fl.get(&Slot::Name(n.clone())) {
+                                            Some(V::E(e)) => fstack.push(e.clone()),
+                                            _ => { okbody = false; break 'body; }
+                                        },
+                                        Ins::GetV(n) => match locals.get(&Slot::Name(n.clone())) {
+                                            Some(V::E(e)) => fstack.push(e.clone()),
+                                            _ => { okbody = false; break 'body; }
+                                        },
+                                        Ins::LocalSetI(id) => match fstack.pop() {
+                                            Some(e) => { fl.insert(Slot::Id(*id), V::E(e)); }
+                                            None => { okbody = false; break 'body; }
+                                        },
+                                        Ins::LocalSet(n) => match fstack.pop() {
+                                            Some(e) => { fl.insert(Slot::Name(n.clone()), V::E(e)); }
+                                            None => { okbody = false; break 'body; }
+                                        },
+                                        Ins::Simple(hh) => {
+                                            let r = if ["op_add","op_sub","op_mul","op_div"].contains(hh) {
+                                                match (fstack.pop(), fstack.pop()) {
+                                                    (Some(be), Some(ae)) => fuse_binop(hh, ae, be),
+                                                    _ => None,
+                                                }
+                                            } else if *hh == "op_sqrt" {
+                                                fstack.pop().map(|e| TExpr::Sqrt(Box::new(e)))
+                                            } else if ["op_lt","op_gt","op_lte","op_gte","op_eq"].contains(hh) {
+                                                match (fstack.pop(), fstack.pop()) {
+                                                    (Some(be), Some(ae)) => {
+                                                        let op = match *hh { "op_lt" => "lt", "op_gt" => "gt", "op_lte" => "lte", "op_gte" => "gte", _ => "eq" };
+                                                        Some(TExpr::Cmp(op, Box::new(ae), Box::new(be)))
+                                                    }
+                                                    _ => None,
+                                                }
+                                            } else if *hh == "op_and" {
+                                                match (fstack.pop(), fstack.pop()) {
+                                                    (Some(be), Some(ae)) => Some(TExpr::And(Box::new(ae), Box::new(be))),
+                                                    _ => None,
+                                                }
+                                            } else if *hh == "op_not" {
+                                                fstack.pop().map(|e| TExpr::Not(Box::new(e)))
+                                            } else { None };
+                                            match r {
+                                                Some(e) => { fstack.push(e); ops += 1; }
+                                                None => { okbody = false; break 'body; }
+                                            }
+                                        }
+                                        _ => { okbody = false; break 'body; }
+                                    }
+                                    j += 1;
+                                }
+                                // the parse rewrote `ret X` into flush+X+ret inside the
+                                // callee's own stream, so X is already on fstack
+                                if okbody && fstack.len() == 1 {
+                                    inlined = fstack.pop();
+                                }
+                            } else {
+                                // restore popped args on failed bind
+                                while let Some(e) = args.pop() { stack.push(V::E(e)); }
+                            }
+                        } else {
+                            while let Some(e) = args.pop() { stack.push(V::E(e)); }
+                        }
+                    }
+                }
+                match inlined {
+                    Some(e) => { stack.push(V::E(e)); ops += 1; stop = false; }
+                    None => stop = true,
+                }
+            }
             // v15: a literal-list bind (`ListStart Push* ListLit SetV`) at a
             // statement boundary constructs a constant list (typically the
             // coefficient vector of a fold) — opaque to the region, but the

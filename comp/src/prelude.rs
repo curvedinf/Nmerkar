@@ -421,6 +421,17 @@ static void uf_gc_collect(void){
   uf_gc_cache[0]=uf_gc_cache[1]=uf_gc_cache[2]=uf_gc_cache[3]=0;
   pthread_mutex_unlock(&uf_gc_mu);
 }
+/* v15: large GC blocks (tensor/array data) opt into THP — the kernel is in
+   madvise mode, so without this every multi-hundred-MB region output faults
+   at 4K granularity and the copy-back streams under TLB pressure. */
+#ifdef __linux__
+#include <sys/mman.h>
+static void uf_gc_thp(void* p, size_t sz){
+  if(sz >= (size_t)2<<20) madvise(p, sz, MADV_HUGEPAGE);
+}
+#else
+static void uf_gc_thp(void* p, size_t sz){ (void)p; (void)sz; }
+#endif
 static void* uf_gc_alloc(size_t sz, int align){
   sz = sz ? sz : 1;
   if(uf_gc_on && uf_gc_bytes_since + sz > uf_gc_threshold) uf_gc_collect();
@@ -428,6 +439,7 @@ static void* uf_gc_alloc(size_t sz, int align){
   if(align>0){ if(posix_memalign(&p,(size_t)align,sz))die("alloc failed"); }
   else { p=malloc(sz); }
   if(!p)die("out of memory");
+  uf_gc_thp(p,sz);
   memset(p,0,sz);
   Hdr* h=(Hdr*)p;
   h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
@@ -447,6 +459,7 @@ static void* uf_gc_alloc_nz(size_t sz, int align){
   if(align>0){ if(posix_memalign(&p,(size_t)align,sz))die("alloc failed"); }
   else { p=malloc(sz); }
   if(!p)die("out of memory");
+  uf_gc_thp(p,sz);
   memset(p,0,sizeof(Hdr));
   Hdr* h=(Hdr*)p;
   h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;

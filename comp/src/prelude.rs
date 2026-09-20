@@ -3224,7 +3224,7 @@ static void op_faddto(Ctx*cx){
     if(m->st[i]==0) break; /* not found */
     if(m->st[i]==1){
       Cell ek=m->keys[i];
-      Hdr*eh=uf_gc_find((void*)ek.i);
+      Hdr*eh=ek.tag==T_PTR?(Hdr*)(void*)ek.i:0;
       if(eh&&eh->tag==HT_STR&&eh->len==(uint64_t)flen&&
          memcmp(uf_sbytes((Str*)eh),fk,(size_t)flen)==0){
         if(m->vals[i].tag==T_INT&&v.tag==T_INT) m->vals[i].i+=v.i;
@@ -3235,11 +3235,7 @@ static void op_faddto(Ctx*cx){
     }
     i=(i+1)%m->cap;
   }
-  /* not found: create Str key + insert (must alloc for dict storage) */
-  Str* sk=(Str*)uf_gc_alloc(sizeof(Str),0);
-  sk->tag=HT_STR; sk->esz=1; sk->len=(uint64_t)flen; sk->mlen=0;
-  sk->mdata=fk; sk->gc_parent=uf_fsplit_parent; /* view into line (valid during callback) */
-  /* For dict storage, copy the key so it survives beyond the callback */
+  /* not found: copy the key so it survives beyond the callback */
   Str* sk2=(Str*)uf_gc_alloc(sizeof(Str)+flen+1,0);
   sk2->tag=HT_STR; sk2->esz=1; sk2->len=(uint64_t)flen; sk2->mlen=0;
   memcpy(sk2->data,fk,(size_t)flen); sk2->data[flen]=0;
@@ -3258,7 +3254,7 @@ static void op_finc(Ctx*cx){
     if(m->st[i]==0) break;
     if(m->st[i]==1){
       Cell ek=m->keys[i];
-      Hdr*eh=uf_gc_find((void*)ek.i);
+      Hdr*eh=ek.tag==T_PTR?(Hdr*)(void*)ek.i:0;
       if(eh&&eh->tag==HT_STR&&eh->len==(uint64_t)flen&&
          memcmp(uf_sbytes((Str*)eh),fk,(size_t)flen)==0){
         if(m->vals[i].tag==T_INT) m->vals[i].i++;
@@ -3268,10 +3264,6 @@ static void op_finc(Ctx*cx){
     }
     i=(i+1)%m->cap;
   }
-  Str* sk=(Str*)uf_gc_alloc(sizeof(Str),0);
-  sk->tag=HT_STR; sk->esz=1; sk->len=(uint64_t)flen; sk->mlen=0;
-  sk->mdata=fk; sk->gc_parent=uf_fsplit_parent; /* view (valid during callback) */
-  /* Copy key for persistent dict storage */
   Str* sk2=(Str*)uf_gc_alloc(sizeof(Str)+flen+1,0);
   sk2->tag=HT_STR; sk2->esz=1; sk2->len=(uint64_t)flen; sk2->mlen=0;
   memcpy(sk2->data,fk,(size_t)flen); sk2->data[flen]=0;

@@ -1099,10 +1099,10 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
         for i in 0..p.ins.len() {
             let is_add = matches!(&p.ins[i], Ins::Simple("op_add"));
             if !is_add { continue; }
-            let (pre_get, inc_one) = if i >= 1 && matches!(&p.ins[i-1], Ins::GetV(_)) {
-                (i - 1, false)
-            } else if i >= 2 && matches!(&p.ins[i-1], Ins::GetV(_)) && matches!(&p.ins[i-2], Ins::PushI(1)) {
+            let (pre_get, inc_one) = if i >= 2 && matches!(&p.ins[i-1], Ins::GetV(_)) && matches!(&p.ins[i-2], Ins::PushI(1)) {
                 (i - 1, true)
+            } else if i >= 1 && matches!(&p.ins[i-1], Ins::GetV(_)) {
+                (i - 1, false)
             } else {
                 continue;
             };
@@ -1126,10 +1126,12 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
         let mut new_body: Vec<usize> = Vec::with_capacity(p.ins.len());
         let mut w = 0;
         for r in 0..p.ins.len() {
+            // Labels on a Nop'd instruction (e.g. `full: x++` whose PushI(1)
+            // was folded into AtomicAdd) must land on the next kept pc, not 0.
+            newpc[r] = w;
             if !matches!(p.ins[r], Ins::Nop) {
                 p.ins[w] = p.ins[r].clone();
                 new_body.push(ins_body[r]);
-                newpc[r] = w;
                 w += 1;
             }
         }

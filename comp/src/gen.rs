@@ -395,6 +395,104 @@ fn shared_readonly_in(p: &Parsed, ks: impl IntoIterator<Item = usize>) -> Vec<St
     v
 }
 
+/// Shared Int/Float vars written in `ks`. Sequential TUs can keep them in C
+/// locals for the loop and write the cell back once at exit — the seqlock is
+/// unobservable with no other threads, and Int/Float cells are not GC roots.
+fn shared_written_scalars_in(
+    p: &Parsed,
+    ks: impl IntoIterator<Item = usize>,
+    shared_types: &HashMap<String, VType>,
+) -> Vec<String> {
+    let mut writes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for k in ks {
+        match &p.ins[k] {
+            Ins::SetV(n) | Ins::AtomicAdd(n, _) => {
+                if matches!(shared_types.get(n), Some(VType::Int) | Some(VType::Float)) {
+                    writes.insert(n.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut v: Vec<String> = writes.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// True when `ks` can jump to a body that is not inlined as C, so a
+/// register/shared-scalar cache would miss stores. Nested inlined
+/// while/for/if and their PushAddr operands are not escaping — they emit
+/// into the same C locals. Break/Cont land on the loop's K_WE writeback.
+fn range_has_escaping_ctl(
+    p: &Parsed,
+    ks: impl IntoIterator<Item = usize>,
+    inline_whiles: &HashMap<usize, (usize, usize, usize, usize)>,
+    inline_fors: &HashMap<usize, (usize, usize)>,
+    inline_ifs: &HashMap<usize, (usize, usize, usize, usize)>,
+) -> bool {
+    ks.into_iter().any(|k| match &p.ins[k] {
+        Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
+        Ins::Weave(_) | Ins::Send | Ins::Goto(_) => true,
+        Ins::While => !inline_whiles.contains_key(&k),
+        Ins::For => !inline_fors.contains_key(&k),
+        Ins::If | Ins::IfElse => !inline_ifs.contains_key(&k),
+        Ins::PushAddr(_) => {
+            match p.ins.get(k + 1) {
+                Some(Ins::If) | Some(Ins::IfElse) => !inline_ifs.contains_key(&(k + 1)),
+                Some(Ins::While) => !inline_whiles.contains_key(&(k + 1)),
+                Some(Ins::For) => !inline_fors.contains_key(&(k + 1)),
+                Some(Ins::PushAddr(_)) => match p.ins.get(k + 2) {
+                    Some(Ins::While) => !inline_whiles.contains_key(&(k + 2)),
+                    Some(Ins::IfElse) => !inline_ifs.contains_key(&(k + 2)),
+                    Some(Ins::For) => !inline_fors.contains_key(&(k + 2)),
+                    _ => true,
+                },
+                _ => true,
+            }
+        }
+        Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
+        _ => false,
+    })
+}
+
+fn emit_shared_mut_hoists(
+    e: &mut String,
+    names: &[String],
+    shared_types: &HashMap<String, VType>,
+    shared_hoist: &mut HashMap<String, (String, VType)>,
+    owned: &mut Vec<(String, String, VType)>,
+    tag: &str,
+) {
+    for name in names {
+        if shared_hoist.contains_key(name) { continue; }
+        let ty = shared_types.get(name).copied().unwrap_or(VType::Unknown);
+        let cell = format!("_shm{}_{}", tag, name);
+        match ty {
+            VType::Int => {
+                e.push_str(&format!("int64_t {}=uf_i(uf_sh_get(&var_{}));\n", cell, name));
+                shared_hoist.insert(name.clone(), (cell.clone(), VType::Int));
+                owned.push((name.clone(), cell, VType::Int));
+            }
+            VType::Float => {
+                e.push_str(&format!("double {}=uf_f(uf_sh_get(&var_{}));\n", cell, name));
+                shared_hoist.insert(name.clone(), (cell.clone(), VType::Float));
+                owned.push((name.clone(), cell, VType::Float));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn emit_shared_mut_writeback(e: &mut String, owned: &[(String, String, VType)]) {
+    for (name, expr, ty) in owned {
+        match ty {
+            VType::Int => e.push_str(&format!("uf_sh_set(&var_{},uf_mki({}));", name, expr)),
+            VType::Float => e.push_str(&format!("uf_sh_set(&var_{},uf_mkf({}));", name, expr)),
+            _ => {}
+        }
+    }
+}
+
 /// Hoist raw element pointers for IntArr/FloatArr locals that are not
 /// reassigned in `ks` (non-moving GC: the Cell slot keeps the object rooted).
 fn hoist_local_arr_ptrs(
@@ -953,11 +1051,14 @@ pub fn emit_range(
                                         e.push_str("{Cell _ff_acc=pop(cx),_ff_sep=pop(cx),_ff_p=pop(cx);const char*_E=uf_sptr(_ff_sep);if(!*_E)die(\"FSPLIT: empty separator\");size_t _el=strlen(_E);uf_fs_gate(uf_sptr(_ff_p),0);int _fd=open(uf_sptr(_ff_p),O_RDONLY);if(_fd<0)die(\"FSPLIT: cannot open file\");struct stat _st;if(fstat(_fd,&_st))die(\"FSPLIT: fstat\");int _mmap=S_ISREG(_st.st_mode)&&_st.st_size>0;char*_map=(char*)MAP_FAILED;char*_mp=0;char*_mend=0;FILE*_fp=0;if(_mmap){_map=(char*)mmap(0,(size_t)_st.st_size,PROT_READ,MAP_PRIVATE,_fd,0);if(_map==(char*)MAP_FAILED)_mmap=0;else{_mp=_map;_mend=_map+(size_t)_st.st_size;}}if(!_mmap){_fp=fdopen(_fd,\"r\");if(!_fp)die(\"FSPLIT: cannot open file\");_fd=-1;}char*_line=0;size_t _ncap=0;\n");
                                         let mut ff_arr: HashMap<String, String> = HashMap::new();
                                         let mut ff_sh: HashMap<String, (String, VType)> = HashMap::new();
+                                        let mut ff_mut: Vec<(String, String, VType)> = Vec::new();
                                         if !tu_has_threads(p) {
                                             let reach = reachable_from(p, bs..be);
                                             if !reachable_has_opaque_write(p, &reach) {
-                                                let names = shared_readonly_in(p, reach.into_iter());
+                                                let names = shared_readonly_in(p, reach.iter().copied());
                                                 emit_shared_hoists(&mut e, &names, shared_types, &mut ff_sh, &mut ff_arr, &format!("{}FF{}", prefix, i));
+                                                let mu = shared_written_scalars_in(p, reach.into_iter(), shared_types);
+                                                emit_shared_mut_hoists(&mut e, &mu, shared_types, &mut ff_sh, &mut ff_mut, &format!("{}FF{}", prefix, i));
                                             }
                                         }
                                         e.push_str("long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FF_C_");
@@ -970,7 +1071,9 @@ pub fn emit_range(
                                         e.push_str("pushc(cx,_ff_acc);pushi(cx,uf_fsplit_nfields);\n");
                                         let inner = format!("{}FF{}_", prefix, i);
                                         emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, inline_ifs, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &ff_arr, shared_types, &ff_sh, false);
-                                        e.push_str(&format!("K_FF_C_{}{}:;_ff_acc=pop(cx);cx->sp=_ff_base+1;}}K_FF_E_{}{}:;cx->lsp=fr;free(_line);if(_map!=(char*)MAP_FAILED)munmap(_map,(size_t)_st.st_size);if(_fp)fclose(_fp);else if(_fd>=0)close(_fd);uf_fsplit_line=0;pushc(cx,_ff_acc);}}\n", prefix, i, prefix, i));
+                                        e.push_str(&format!("K_FF_C_{}{}:;_ff_acc=pop(cx);cx->sp=_ff_base+1;}}K_FF_E_{}{}:;", prefix, i, prefix, i));
+                                        emit_shared_mut_writeback(&mut e, &ff_mut);
+                                        e.push_str("cx->lsp=fr;free(_line);if(_map!=(char*)MAP_FAILED)munmap(_map,(size_t)_st.st_size);if(_fp)fclose(_fp);else if(_fd>=0)close(_fd);uf_fsplit_line=0;pushc(cx,_ff_acc);}\n");
                                     } else if *h == "op_rangefold" {
                                         /* inlined RANGEFOLD: count loop + callback */
                                         e.push_str(&format!("{{Cell _rf_acc=pop(cx);int64_t _rf_cnt=uf_i(pop(cx));long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_RF_C_{}{};cx->loops[fr].end=&&K_RF_E_{}{};long _rf_base=cx->sp;for(int64_t _rf_k=0;_rf_k<_rf_cnt;_rf_k++){{pushc(cx,_rf_acc);pushi(cx,_rf_k);\n", prefix, i, prefix, i));
@@ -1028,43 +1131,8 @@ pub fn emit_range(
                         let inherited_sh: HashMap<String, (String, VType)> = shared_hoist.clone();
                         let mut reg: HashMap<usize, (String, VType)> = reg.clone();
                         {
-                            let trivial_exit = |tb: usize| -> bool {
-                                match for_body_range(&p.ins, tb) {
-                                    Some(tbe) => (tb..tbe).all(|k| {
-                                        matches!(p.ins[k], Ins::Break | Ins::Cont)
-                                    }),
-                                    None => false,
-                                }
-                            };
-                            let escapable = UF_DEBUG.load(Ordering::Relaxed) || (bs..be).any(|k| match &p.ins[k] {
-                                Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
-                                Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While => true,
-                                Ins::For => !inline_fors.contains_key(&k),
-                                Ins::If => {
-                                    if k > bs {
-                                        match &p.ins[k - 1] {
-                                            Ins::PushAddr(l) => {
-                                                match p.labels.get(l) {
-                                                    Some(&tb) => !trivial_exit(tb),
-                                                    None => true,
-                                                }
-                                            }
-                                            _ => true,
-                                        }
-                                    } else {
-                                        true
-                                    }
-                                }
-                                Ins::PushAddr(_) => {
-                                    match p.ins.get(k + 1) {
-                                        Some(Ins::If) => false,
-                                        Some(Ins::For) => !inline_fors.contains_key(&(k + 1)),
-                                        _ => true,
-                                    }
-                                }
-                                Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
-                                _ => false,
-                            });
+                            let escapable = UF_DEBUG.load(Ordering::Relaxed)
+                                || range_has_escaping_ctl(p, bs..be, inline_whiles, inline_fors, inline_ifs);
                             if !escapable {
                                 for k in bs..be {
                                     let id = match &p.ins[k] {
@@ -1092,32 +1160,22 @@ pub fn emit_range(
                         // hoists so nested loops reuse the same C locals.
                         let mut arr_ptr: HashMap<String, String> = inherited_arr.clone();
                         let mut shared_hoist: HashMap<String, (String, VType)> = inherited_sh.clone();
-                        let escapable2 = UF_DEBUG.load(Ordering::Relaxed) || (bs..be).any(|k| match &p.ins[k] {
-                            Ins::Break | Ins::Cont | Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
-                            Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While |
-                            Ins::If | Ins::IfElse => true,
-                            Ins::For => !inline_fors.contains_key(&k),
-                            Ins::PushAddr(_) => {
-                                match p.ins.get(k + 1) {
-                                    Some(Ins::If) => false,
-                                    Some(Ins::For) => inline_fors.contains_key(&(k + 1)),
-                                    _ => true,
-                                }
-                            }
-                            Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
-                            _ => false,
-                        });
+                        let escapable2 = UF_DEBUG.load(Ordering::Relaxed)
+                            || range_has_escaping_ctl(p, bs..be, inline_whiles, inline_fors, inline_ifs);
                         if !escapable2 {
                             hoist_local_arr_ptrs(p, bs..be, ins_body, local_types, &mut arr_ptr);
                         }
-                        let sh_names = if !tu_has_threads(p) {
+                        let mut owned_mut: Vec<(String, String, VType)> = Vec::new();
+                        let (sh_names, sh_muts) = if !tu_has_threads(p) {
                             let reach = reachable_from(p, bs..be);
                             if reachable_has_opaque_write(p, &reach) {
-                                Vec::new()
+                                (Vec::new(), Vec::new())
                             } else {
-                                shared_readonly_in(p, reach.into_iter())
+                                let ro = shared_readonly_in(p, reach.iter().copied());
+                                let mu = shared_written_scalars_in(p, reach.into_iter(), shared_types);
+                                (ro, mu)
                             }
-                        } else { Vec::new() };
+                        } else { (Vec::new(), Vec::new()) };
                         e.push_str(&format!("{{long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};long _sp0=cx->sp;\n", prefix, i, prefix, i));
                         // Only declare registers new to this loop scope;
                         // inherited ones are already in C locals from the parent.
@@ -1138,6 +1196,7 @@ pub fn emit_range(
                             }
                         }
                         emit_shared_hoists(&mut e, &sh_names, shared_types, &mut shared_hoist, &mut arr_ptr, &format!("{}{}", prefix, i));
+                        emit_shared_mut_hoists(&mut e, &sh_muts, shared_types, &mut shared_hoist, &mut owned_mut, &format!("{}{}", prefix, i));
                         e.push_str("{int64_t cnt=pop(cx).i;");
                         // If the body immediately stores the index into a
                         // register-cached Int local, assign uf_k directly
@@ -1164,6 +1223,7 @@ pub fn emit_range(
                                 _ => e.push_str(&format!("cx->locals[cx->local_base+{}]={};", id, name)),
                             }
                         }
+                        emit_shared_mut_writeback(&mut e, &owned_mut);
                         e.push_str("cx->lsp=fr;}}\n");
                     }
                     None => {
@@ -1437,23 +1497,21 @@ pub fn emit_range(
                         let inner_b = format!("{}WB{}_", prefix, i);
                         let cbe_trim = if cbe > cbs + 1 && matches!(p.ins[cbe - 1], Ins::PushI(_)) { cbe - 1 } else { cbe };
                         let bbe_trim = if bbe > bbs + 1 && matches!(p.ins[bbe - 1], Ins::PushI(_)) { bbe - 1 } else { bbe };
-                        // Register-cache typed locals across the loop: when the
-                        // inlined cond+body make no calls, take no indirect
-                        // jumps and nest no further control flow, Int/Float
-                        // slots can live in C locals for the loop's duration
-                        // and be written back once at loop exit.
-                        let mut reg: HashMap<usize, (String, VType)> = HashMap::new();
+                        // Register-cache typed locals across the loop. Nested
+                        // inlined while/for/if share this cache (inherited from
+                        // the parent, same as FOR) so n-queens' column search
+                        // keeps `c`/`found` in C locals instead of cx->locals[].
+                        let inherited: std::collections::HashSet<usize> = reg.keys().copied().collect();
+                        let mut reg: HashMap<usize, (String, VType)> = reg.clone();
                         {
-                            let mut esc_why = String::new();
-                            let escapable = UF_DEBUG.load(Ordering::Relaxed) || (cbs..cbe_trim).chain(bbs..bbe_trim).any(|k| match &p.ins[k] {
-                                Ins::Break | Ins::Cont | Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
-                                Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While | Ins::For |
-                                Ins::If | Ins::IfElse | Ins::PushAddr(_) => { esc_why = format!("{:?}", p.ins[k]); true }
-                                Ins::Simple(h) if *h == "op_ffold" || *h == "op_fsplit" => { esc_why = h.to_string(); true }
-                                _ => false,
-                            });
+                            let escapable = UF_DEBUG.load(Ordering::Relaxed)
+                                || range_has_escaping_ctl(
+                                    p,
+                                    (cbs..cbe_trim).chain(bbs..bbe_trim),
+                                    inline_whiles, inline_fors, inline_ifs,
+                                );
                             if std::env::var("NKR_DEBUG_REG").is_ok() {
-                                eprintln!("[reg] while@{} esc={} why={} range={}..{}+{}..{}", i, escapable, esc_why, cbs, cbe_trim, bbs, bbe_trim);
+                                eprintln!("[reg] while@{} esc={} range={}..{}+{}..{}", i, escapable, cbs, cbe_trim, bbs, bbe_trim);
                             }
                             if !escapable {
                                 for k in (cbs..cbe_trim).chain(bbs..bbe_trim) {
@@ -1464,16 +1522,12 @@ pub fn emit_range(
                                     if reg.contains_key(&id) { continue; }
                                     let key = ins_body[k] * 1000000 + id;
                                     let ty = local_types.get(&key).copied().unwrap_or(VType::Unknown);
-                                    let num = numeric.contains(&key);
                                     if std::env::var("NKR_DEBUG_REG").is_ok() {
-                                        eprintln!("[reg]   id={} key={} ty={:?} numeric={}", id, key, ty, num);
+                                        eprintln!("[reg]   id={} key={} ty={:?}", id, key, ty);
                                     }
                                     if ty == VType::Int || ty == VType::Float {
                                         reg.insert(id, (format!("_r{}", id), ty));
                                     } else if numeric.contains(&key) {
-                                        // Proven numeric-only slot: cache as a
-                                        // plain Cell C local (no pointers, so
-                                        // GC-safe), skipping the locals memory
                                         reg.insert(id, (format!("_r{}", id), VType::Unknown));
                                     }
                                 }
@@ -1486,26 +1540,29 @@ pub fn emit_range(
                         let inherited_arr: HashMap<String, String> = arr_ptr.clone();
                         let mut arr_ptr: HashMap<String, String> = inherited_arr.clone();
                         let mut shared_hoist: HashMap<String, (String, VType)> = shared_hoist.clone();
-                        let escapable2 = (cbs..cbe_trim).chain(bbs..bbe_trim).any(|k| match &p.ins[k] {
-                            Ins::Break | Ins::Cont | Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
-                            Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While | Ins::For |
-                            Ins::If | Ins::IfElse | Ins::PushAddr(_) => true,
-                            Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
-                            _ => false,
-                        });
+                        let escapable2 = UF_DEBUG.load(Ordering::Relaxed)
+                            || range_has_escaping_ctl(
+                                p,
+                                (cbs..cbe_trim).chain(bbs..bbe_trim),
+                                inline_whiles, inline_fors, inline_ifs,
+                            );
                         if !escapable2 {
                             hoist_local_arr_ptrs(p, (cbs..cbe_trim).chain(bbs..bbe_trim), ins_body, local_types, &mut arr_ptr);
                         }
-                        let sh_names = if !tu_has_threads(p) {
+                        let mut owned_mut: Vec<(String, String, VType)> = Vec::new();
+                        let (sh_names, sh_muts) = if !tu_has_threads(p) {
                             let reach = reachable_from(p, (cbs..cbe_trim).chain(bbs..bbe_trim));
                             if reachable_has_opaque_write(p, &reach) {
-                                Vec::new()
+                                (Vec::new(), Vec::new())
                             } else {
-                                shared_readonly_in(p, reach.into_iter())
+                                let ro = shared_readonly_in(p, reach.iter().copied());
+                                let mu = shared_written_scalars_in(p, reach.into_iter(), shared_types);
+                                (ro, mu)
                             }
-                        } else { Vec::new() };
+                        } else { (Vec::new(), Vec::new()) };
                         e.push_str(&format!("{{long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_{}{};cx->loops[fr].end=&&K_WE_{}{};long _sp0=cx->sp;\n", prefix, i, prefix, i));
                         for (id, (name, ty)) in &regs {
+                            if inherited.contains(id) { continue; }
                             match ty {
                                 VType::Int => e.push_str(&format!("int64_t {}=uf_i(cx->locals[cx->local_base+{}]);\n", name, id)),
                                 VType::Float => e.push_str(&format!("double {}=uf_f(cx->locals[cx->local_base+{}]);\n", name, id)),
@@ -1521,6 +1578,7 @@ pub fn emit_range(
                             }
                         }
                         emit_shared_hoists(&mut e, &sh_names, shared_types, &mut shared_hoist, &mut arr_ptr, &format!("{}{}", prefix, i));
+                        emit_shared_mut_hoists(&mut e, &sh_muts, shared_types, &mut shared_hoist, &mut owned_mut, &format!("{}{}", prefix, i));
                         e.push_str(&format!("K_WC_{}{}:;{{Cell _wc;{{\n", prefix, i));
                         // Emit the cond into a side buffer; if it ends with a
                         // plain typed value push, peel it into a direct C test
@@ -1598,12 +1656,14 @@ pub fn emit_range(
                             e.push_str(&format!("}}cx->sp=_sp0;goto K_WC_{}{};}}\nK_WE_{}{}:;", prefix, i, prefix, i));
                         }
                         for (id, (name, ty)) in &regs {
+                            if inherited.contains(id) { continue; }
                             match ty {
                                 VType::Int => e.push_str(&format!("cx->locals[cx->local_base+{}]=uf_mki({});", id, name)),
                                 VType::Float => e.push_str(&format!("cx->locals[cx->local_base+{}]=uf_mkf({});", id, name)),
                                 _ => e.push_str(&format!("cx->locals[cx->local_base+{}]={};", id, name)),
                             }
                         }
+                        emit_shared_mut_writeback(&mut e, &owned_mut);
                         e.push_str("cx->lsp=fr;}\n");
                         o.push_str(&e);
                         continue;
@@ -1645,6 +1705,27 @@ pub fn emit_range(
                 } else {
                     vpop(&mut e, &mut vstack, &mut vtmp)
                 };
+                // Sequential-loop scalar cache: a hoisted Int/Float lives in a
+                // C local; write the seqlock cell once at loop exit. Threaded
+                // TUs never populate those hoists (see tu_has_threads).
+                if let Some((expr, ty)) = shared_hoist.get(v) {
+                    match ty {
+                        VType::Int => {
+                            let rhs = if t.ty == VType::Int { t.expr.clone() } else { format!("uf_i({})", cell_of(&t)) };
+                            e.push_str(&format!("{}={};", expr, rhs));
+                            let _ = is_param_bind;
+                            o.push_str(&e);
+                            continue;
+                        }
+                        VType::Float => {
+                            e.push_str(&format!("{}={};", expr, f64_expr(&t)));
+                            let _ = is_param_bind;
+                            o.push_str(&e);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 // v14: shared writes are atomic and write-through (never
                 // cached — another thread may write between statements).
                 let cell_expr = match t.ty {
@@ -1690,6 +1771,31 @@ pub fn emit_range(
                 }
             }
             Ins::AtomicAdd(v, inc) => {
+                if let Some((expr, ty)) = shared_hoist.get(v) {
+                    if *ty == VType::Int {
+                        if *inc {
+                            e.push_str(&format!("{}++;", expr));
+                        } else {
+                            let d = vpop(&mut e, &mut vstack, &mut vtmp);
+                            let delta = if d.ty == VType::Int { d.expr.clone() } else { format!("uf_i({})", cell_of(&d)) };
+                            e.push_str(&format!("{}+={};", expr, delta));
+                        }
+                        vpush(&mut e, &mut vstack, &mut vtmp, expr, VType::Int);
+                        o.push_str(&e);
+                        continue;
+                    }
+                    if *ty == VType::Float {
+                        if *inc {
+                            e.push_str(&format!("{}+=1.0;", expr));
+                        } else {
+                            let d = vpop(&mut e, &mut vstack, &mut vtmp);
+                            e.push_str(&format!("{}+={};", expr, f64_expr(&d)));
+                        }
+                        vpush(&mut e, &mut vstack, &mut vtmp, expr, VType::Float);
+                        o.push_str(&e);
+                        continue;
+                    }
+                }
                 vflush(&mut e, &mut vstack, &mut vcache);
                 if *inc {
                     e.push_str(&format!(
@@ -2312,7 +2418,41 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                         type_stack.push((VType::Unknown, false));
                     }
                 }
-                Ins::AtomicAdd(_, _) => { type_stack.pop(); type_stack.push((VType::Unknown, true)); }
+                Ins::AtomicAdd(name, inc) => {
+                    // x++ is +1 (Int); x+= takes the delta's type. Mixed
+                    // Int/Float evidence promotes the shared cell to Float
+                    // (same as uf_sh_add). Poisoning on opaque deltas keeps
+                    // `0 uvt!` + float `uvt+=` from committing as Int.
+                    let delta_ty = if *inc {
+                        VType::Int
+                    } else {
+                        match type_stack.pop() {
+                            Some((t, opq)) => {
+                                if t != VType::Unknown {
+                                    t
+                                } else if opq {
+                                    shared_poison.insert(name.clone());
+                                    VType::Unknown
+                                } else {
+                                    VType::Unknown
+                                }
+                            }
+                            None => {
+                                shared_poison.insert(name.clone());
+                                VType::Unknown
+                            }
+                        }
+                    };
+                    if delta_ty != VType::Unknown {
+                        shared_ev.entry(name.clone()).or_default().push(delta_ty);
+                    }
+                    let result_ty = match shared_types.get(name).copied() {
+                        Some(t) if t != VType::Unknown => t,
+                        _ if delta_ty != VType::Unknown => delta_ty,
+                        _ => VType::Unknown,
+                    };
+                    type_stack.push((result_ty, result_ty == VType::Unknown));
+                }
                 Ins::Nop => {}
                 Ins::IncLocal(_) | Ins::AddLocal(_) | Ins::IncGlobal(_) | Ins::AddGlobal(_) => {}
                 Ins::Ret => {

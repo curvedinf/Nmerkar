@@ -730,7 +730,11 @@ pub fn region_glsl(ninputs: usize, exprs: &[(OutBind, TExpr)]) -> String {
     s.push_str("  int i = int(gl_GlobalInvocationID.x);\n");
     s.push_str("  if (int64_t(i) >= pc.n0) return;\n");
     for (j, (_, e)) in exprs.iter().enumerate() {
-        s.push_str(&format!("  r{}[i] = {};\n", j, expr_to_glsl(e, "i")));
+        /* precise forbids driver/compiler FMA contraction: the CPU path
+           evaluates separate mul+add, and contraction would diverge by 1 ulp
+           per element (visible in printed sums at large N) */
+        s.push_str(&format!("  precise float64_t _o{} = {};\n", j, expr_to_glsl(e, "i")));
+        s.push_str(&format!("  r{}[i] = _o{};\n", j, j));
     }
     s.push_str("}\n");
     s

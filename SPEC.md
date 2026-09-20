@@ -1390,7 +1390,11 @@ both decline the original per-op code runs. Declines are static or runtime
 (inputs not same-length float64 tensors). Fused division carries an inline
 zero-divisor `die`, preserving the per-op semantics exactly; on the GPU the
 documented inf/nan divergence applies. Results are bit-identical to the
-per-op path: same ops, same order, no reassociation. Regions in inlined
+per-op path through N=128M on this toolchain — same ops, same order, no
+reassociation, and output assignments carry `precise` to forbid FMA
+contraction — but SPIR-V compilers may still contract fp64 mul+add despite
+`precise` (observed ≤2 ulp per element on large chains at N≥256M, visible
+only in low-order printed digits). Regions in inlined
 
 **v15 concat/slice fusion**: `a b concat` of two same-length region
 expressions fuses as a 2n-wide selector (`pos < n ? a[pos] : b[pos-n]`) and

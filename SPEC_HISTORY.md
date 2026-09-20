@@ -8,6 +8,14 @@ new semantics or performance) are listed under the commit that made them.
 
 ## 2026-09-20 (post-v15) — fused-kernel generation: concat/slice regions
 
+- Region kernels — changed: output assignments emit `precise float64_t`
+  temporaries to forbid FMA contraction (the CPU path evaluates separate
+  mul+add). Compilers that honor it keep results bit-identical; compilers
+  that ignore `precise` for fp64 may contract anyway — documented as ≤2 ulp
+  per element on long chains (SPEC "Elementwise region fusion"). Larger-size
+  validation: matmul 4096 auto 1.16s vs cpu 11.9s (10×); blackscholes 256M
+  1.69s/4.86s, 512M 3.34s/9.69s.
+
 - Region fusion — changed: `concat` of two same-length region exprs fuses as
   a 2n-wide selector expression and the both-halves `slice` idiom (`x 0 n
   slice` / `x n n 2 mul slice`, shared scalar `n` == input length, runtime-

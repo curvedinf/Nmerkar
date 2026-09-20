@@ -301,7 +301,25 @@ pub enum TExpr {
     // value at domain position q is (double)(q + k) — the absorbed
     // `k n range` generator; dispatch length comes from a shared scalar
     Idx(i64),
+    // control-flow kernels (v15): mutable scalar state + a loop. State(i)
+    // reads slot i; While evaluates to `result` (over state) after the
+    // loop. Updates are pure over state + outer exprs and commit
+    // simultaneously (SSA two-phase) to match label-loop semantics.
+    State(usize),
+    // predicates evaluate to 1.0/0.0 (universal coercion semantics)
+    Cmp(&'static str, Box<TExpr>, Box<TExpr>), // "lt" "gt" "lte" "gte" "eq"
+    And(Box<TExpr>, Box<TExpr>),
+    Not(Box<TExpr>),
+    While {
+        inits: Vec<(STy, TExpr)>,
+        cond: Box<TExpr>,
+        updates: Vec<TExpr>,
+        result: Box<TExpr>,
+    },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum STy { F, I }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shift {
@@ -318,6 +336,17 @@ pub fn expr_width(e: &TExpr) -> u32 {
         TExpr::At(a, _) => expr_width(a).max(1).min(1), // slices are n-domain
         TExpr::Cat(_, _) => 2,
         TExpr::Idx(_) => 1,
+        TExpr::State(_) => 0,
+        TExpr::Cmp(_, a, b) => expr_width(a).max(expr_width(b)).min(1),
+        TExpr::And(a, b) => expr_width(a).max(expr_width(b)).min(1),
+        TExpr::Not(a) => expr_width(a).min(1),
+        TExpr::While { inits, cond, updates, result } => {
+            let mut w = expr_width(result);
+            for (_, e) in inits { w = w.max(expr_width(e)); }
+            w = w.max(expr_width(cond));
+            for e in updates { w = w.max(expr_width(e)); }
+            w.min(1)
+        }
         TExpr::Add(a, b) | TExpr::Sub(a, b) | TExpr::Mul(a, b) | TExpr::Div(a, b) => {
             expr_width(a).max(expr_width(b))
         }
@@ -335,27 +364,102 @@ pub struct TaskKernel {
 }
 
 fn expr_to_glsl(e: &TExpr, idx: &str) -> String {
-    // (idx is &str; shifted reads build a String index and recurse by ref)
+    let (pre, v) = glsl_parts(e, idx, &mut 0);
+    let _ = pre;
+    v
+}
+/// (prelude statements, value expression). While-loops must hoist: GLSL has
+/// no statement-expressions, so control flow emits as declarations before the
+/// assignment site and leaves its result in a temp.
+fn glsl_parts(e: &TExpr, idx: &str, ctr: &mut usize) -> (String, String) {
+    let sub = |x: &TExpr, ctr: &mut usize| glsl_parts(x, idx, ctr);
     match e {
-        TExpr::Input(i) => format!("in{}[{}]", i, idx),
-        TExpr::Const(v) => {
-            let s = format!("{:.17e}", v);
-            s
+        TExpr::Input(i) => (String::new(), format!("in{}[{}]", i, idx)),
+        TExpr::Const(v) => (String::new(), format!("{:.17e}", v)),
+        TExpr::Add(a, b) => {
+            let (pa, va) = sub(a, ctr); let (pb, vb) = sub(b, ctr);
+            (format!("{}{}", pa, pb), format!("({} + {})", va, vb))
         }
-        TExpr::Add(a, b) => format!("({} + {})", expr_to_glsl(a, idx), expr_to_glsl(b, idx)),
-        TExpr::Sub(a, b) => format!("({} - {})", expr_to_glsl(a, idx), expr_to_glsl(b, idx)),
-        TExpr::Mul(a, b) => format!("({} * {})", expr_to_glsl(a, idx), expr_to_glsl(b, idx)),
-        TExpr::Div(a, b) => format!("({} / {})", expr_to_glsl(a, idx), expr_to_glsl(b, idx)),
-        TExpr::Sqrt(a) => format!("sqrt({})", expr_to_glsl(a, idx)),
-        TExpr::Cat(a, b) => format!(
-            "(({})<int(pc.n0)? {} : {})",
-            idx,
-            expr_to_glsl(a, idx),
-            expr_to_glsl(b, &format!("({})-int(pc.n0)", idx))
-        ),
-        TExpr::At(a, Shift::K(k)) => expr_to_glsl(a, &format!("({})+{}", idx, k)),
-        TExpr::At(a, Shift::Len) => expr_to_glsl(a, &format!("({})+int(pc.n0)", idx)),
-        TExpr::Idx(k) => format!("float64_t(int64_t({})+{})", idx, k),
+        TExpr::Sub(a, b) => {
+            let (pa, va) = sub(a, ctr); let (pb, vb) = sub(b, ctr);
+            (format!("{}{}", pa, pb), format!("({} - {})", va, vb))
+        }
+        TExpr::Mul(a, b) => {
+            let (pa, va) = sub(a, ctr); let (pb, vb) = sub(b, ctr);
+            (format!("{}{}", pa, pb), format!("({} * {})", va, vb))
+        }
+        TExpr::Div(a, b) => {
+            let (pa, va) = sub(a, ctr); let (pb, vb) = sub(b, ctr);
+            (format!("{}{}", pa, pb), format!("({} / {})", va, vb))
+        }
+        TExpr::Sqrt(a) => {
+            let (pa, va) = sub(a, ctr);
+            (pa, format!("sqrt({})", va))
+        }
+        TExpr::Cat(a, b) => {
+            let (pa, va) = sub(a, ctr);
+            let (pb, vb) = glsl_parts(b, &format!("({})-int(pc.n0)", idx), ctr);
+            (format!("{}{}", pa, pb), format!("(({})<int(pc.n0)? {} : {})", idx, va, vb))
+        }
+        TExpr::At(a, Shift::K(k)) => {
+            let (pa, va) = glsl_parts(a, &format!("({})+{}", idx, k), ctr);
+            (pa, va)
+        }
+        TExpr::At(a, Shift::Len) => {
+            let (pa, va) = glsl_parts(a, &format!("({})+int(pc.n0)", idx), ctr);
+            (pa, va)
+        }
+        TExpr::Idx(k) => (String::new(), format!("float64_t(int64_t({})+{})", idx, k)),
+        TExpr::State(i) => (String::new(), format!("s{}", i)),
+        TExpr::Cmp(op, a, b) => {
+            let (pa, va) = sub(a, ctr); let (pb, vb) = sub(b, ctr);
+            let o = match *op { "lt" => "<", "gt" => ">", "lte" => "<=", "gte" => ">=", _ => "==" };
+            (format!("{}{}", pa, pb), format!("(({} {} {})?1.0:0.0)", va, o, vb))
+        }
+        TExpr::And(a, b) => {
+            let (pa, va) = sub(a, ctr); let (pb, vb) = sub(b, ctr);
+            (format!("{}{}", pa, pb), format!("((({})!=0.0 && ({})!=0.0)?1.0:0.0)", va, vb))
+        }
+        TExpr::Not(a) => {
+            let (pa, va) = sub(a, ctr);
+            (pa, format!("(({})==0.0?1.0:0.0)", va))
+        }
+        TExpr::While { inits, cond, updates, result } => {
+            let mut pre = String::new();
+            let mut initv = Vec::new();
+            for (ty, e0) in inits {
+                let (p, v) = sub(e0, ctr);
+                pre.push_str(&p);
+                initv.push(v);
+            }
+            for (i, (ty, _)) in inits.iter().enumerate() {
+                let t = match ty { STy::F => "float64_t", STy::I => "int64_t" };
+                pre.push_str(&format!("  {} s{}={};\n", t, i, initv[i]));
+            }
+            let (pc_, vc) = sub(cond, ctr);
+            pre.push_str(&pc_);
+            pre.push_str(&format!("  while({}){{\n", vc));
+            let mut updv = Vec::new();
+            for e0 in updates {
+                let (p, v) = sub(e0, ctr);
+                pre.push_str(&p);
+                updv.push(v);
+            }
+            for (i, e0) in updates.iter().enumerate() {
+                let t = match inits[i].0 { STy::F => "float64_t", STy::I => "int64_t" };
+                pre.push_str(&format!("  {} n{}={};\n", t, i, updv[i]));
+                let _ = e0;
+            }
+            for i in 0..updates.len() {
+                pre.push_str(&format!("  s{}=n{};\n", i, i));
+            }
+            pre.push_str("  }\n");
+            let (pr, vr) = sub(result, ctr);
+            pre.push_str(&pr);
+            let w = *ctr; *ctr += 1;
+            pre.push_str(&format!("  float64_t _w{}={};\n", w, vr));
+            (pre, format!("_w{}", w))
+        }
     }
 }
 
@@ -373,7 +477,9 @@ pub fn task_glsl(name: &str, ninputs: usize, expr: &TExpr) -> String {
     s.push_str("void main() {\n");
     s.push_str("  int i = int(gl_GlobalInvocationID.x);\n");
     s.push_str("  if (int64_t(i) >= pc.n0) return;\n");
-    s.push_str(&format!("  r[i] = {};\n", expr_to_glsl(expr, "i")));
+    let (pre, val) = glsl_parts(expr, "i", &mut 0);
+    s.push_str(&pre);
+    s.push_str(&format!("  r[i] = {};\n", val));
     s.push_str("}\n");
     let _ = name;
     s
@@ -662,6 +768,16 @@ fn expr_uses_input(e: &TExpr) -> bool {
         TExpr::Cat(a, b) => expr_uses_input(a) || expr_uses_input(b),
         TExpr::At(a, _) => expr_uses_input(a),
         TExpr::Idx(_) => true, // consumes the dispatch domain
+        TExpr::State(_) => false,
+        TExpr::Cmp(_, a, b) => expr_uses_input(a) || expr_uses_input(b),
+        TExpr::And(a, b) => expr_uses_input(a) || expr_uses_input(b),
+        TExpr::Not(a) => expr_uses_input(a),
+        TExpr::While { inits, cond, updates, result } => {
+            expr_uses_input(result)
+                || expr_uses_input(cond)
+                || inits.iter().any(|(_, e)| expr_uses_input(e))
+                || updates.iter().any(expr_uses_input)
+        }
     }
 }
 
@@ -674,6 +790,15 @@ fn expr_has_div(e: &TExpr) -> bool {
         TExpr::Cat(a, b) => expr_has_div(a) || expr_has_div(b),
         TExpr::At(a, _) => expr_has_div(a),
         TExpr::Idx(_) => false,
+        TExpr::State(_) => false,
+        TExpr::Cmp(_, a, b) => expr_has_div(a) || expr_has_div(b),
+        TExpr::And(a, b) => expr_has_div(a) || expr_has_div(b),
+        TExpr::Not(a) => expr_has_div(a),
+        TExpr::While { inits, cond, updates, result } => {
+            expr_has_div(result) || expr_has_div(cond)
+                || inits.iter().any(|(_, e)| expr_has_div(e))
+                || updates.iter().any(expr_has_div)
+        }
     }
 }
 
@@ -708,6 +833,32 @@ fn expr_to_c_at(e: &TExpr, idx: &str) -> String {
         TExpr::At(a, Shift::K(k)) => expr_to_c_at(a, &format!("({})+{}", idx, k)),
         TExpr::At(a, Shift::Len) => expr_to_c_at(a, &format!("({})+(int64_t)_n", idx)),
         TExpr::Idx(k) => format!("(double)((int64_t)({})+{})", idx, k),
+        TExpr::State(i) => format!("s{}", i),
+        TExpr::Cmp(op, a, b) => {
+            let o = match *op { "lt" => "<", "gt" => ">", "lte" => "<=", "gte" => ">=", _ => "==" };
+            format!("(({} {} {})?1.0:0.0)", expr_to_c_at(a, idx), o, expr_to_c_at(b, idx))
+        }
+        TExpr::And(a, b) => format!("((({})!=0.0 && ({})!=0.0)?1.0:0.0)", expr_to_c_at(a, idx), expr_to_c_at(b, idx)),
+        TExpr::Not(a) => format!("(({})==0.0?1.0:0.0)", expr_to_c_at(a, idx)),
+        TExpr::While { inits, cond, updates, result } => {
+            // GNU statement expression (same mechanism as the div guard)
+            let mut d = String::from("({");
+            for (i, (ty, e)) in inits.iter().enumerate() {
+                let t = match ty { STy::F => "double", STy::I => "int64_t" };
+                d.push_str(&format!("  {} s{}={};", t, i, expr_to_c_at(e, idx)));
+            }
+            d.push_str(&format!("  while(({})!=0.0){{", expr_to_c_at(cond, idx)));
+            for (i, e) in updates.iter().enumerate() {
+                let t = match inits[i].0 { STy::F => "double", STy::I => "int64_t" };
+                d.push_str(&format!("  {} n{}={};", t, i, expr_to_c_at(e, idx)));
+            }
+            for i in 0..updates.len() {
+                d.push_str(&format!("  s{}=n{};", i, i));
+            }
+            d.push_str("  }");
+            d.push_str(&format!("  ({});}})", expr_to_c_at(result, idx)));
+            d
+        }
     }
 }
 
@@ -733,7 +884,9 @@ pub fn region_glsl(ninputs: usize, exprs: &[(OutBind, TExpr)]) -> String {
         /* precise forbids driver/compiler FMA contraction: the CPU path
            evaluates separate mul+add, and contraction would diverge by 1 ulp
            per element (visible in printed sums at large N) */
-        s.push_str(&format!("  precise float64_t _o{} = {};\n", j, expr_to_glsl(e, "i")));
+        let (pre, val) = glsl_parts(e, "i", &mut 0);
+        s.push_str(&pre);
+        s.push_str(&format!("  precise float64_t _o{} = {};\n", j, val));
         s.push_str(&format!("  r{}[i] = _o{};\n", j, j));
     }
     s.push_str("}\n");
@@ -1008,6 +1161,19 @@ fn remap_input(e: &TExpr, map: &[Option<usize>]) -> Option<TExpr> {
         )),
         TExpr::At(a, s) => Some(TExpr::At(Box::new(remap_input(a, map)?), *s)),
         TExpr::Idx(k) => Some(TExpr::Idx(*k)),
+        TExpr::State(i) => Some(TExpr::State(*i)),
+        TExpr::Cmp(op, a, b) => Some(TExpr::Cmp(op, Box::new(remap_input(a, map)?), Box::new(remap_input(b, map)?))),
+        TExpr::And(a, b) => Some(TExpr::And(Box::new(remap_input(a, map)?), Box::new(remap_input(b, map)?))),
+        TExpr::Not(a) => Some(TExpr::Not(Box::new(remap_input(a, map)?))),
+        TExpr::While { inits, cond, updates, result } => Some(TExpr::While {
+            inits: inits
+                .iter()
+                .map(|(t, e)| remap_input(e, map).map(|e2| (*t, e2)))
+                .collect::<Option<Vec<_>>>()?,
+            cond: Box::new(remap_input(cond, map)?),
+            updates: updates.iter().map(|e| remap_input(e, map)).collect::<Option<Vec<_>>>()?,
+            result: Box::new(remap_input(result, map)?),
+        }),
     }
 }
 
@@ -1377,7 +1543,7 @@ fn walk_one_region(
                                             }
                                             TExpr::Sqrt(a) | TExpr::At(a, _) => go_idx(a, idxs),
                                             TExpr::Cat(a, b) => go_idx(a, idxs) || go_idx(b, idxs),
-                                            TExpr::Const(_) | TExpr::Idx(_) => false,
+                                            _ => false,
                                         }
                                     }
                                     let still_used = |name: &str| -> bool {

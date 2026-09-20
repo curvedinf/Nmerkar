@@ -72,7 +72,7 @@ and small-list allocation costs.
 | workload | CPU (`--device cpu`) | GPU (`--device vk0`) |
 |---|---|---|
 | matmul N=2048 | 1.56s | **0.26s** |
-| blackscholes N=32M | 0.70s | **0.40s** |
+| blackscholes N=32M | 0.69s | **0.37s** |
 
 Measured 2026-09-20 (v15 + concat/slice + range-generator region fusion,
 warm runs, `NK_VK_DEBUG` verified dispatch on the 7900 XTX). blackscholes
@@ -80,7 +80,7 @@ fuses end-to-end into ONE kernel with ZERO inputs: `range`/`concat`/slices
 are absorbed into the kernel expression (the kernel synthesizes index
 values on-device), so no list, tensor build, or staging-in exists at all.
 Auto device matches or beats `--device cpu` on every benchmark at every
-size; at N=128M auto is 2.0x faster than CPU.
+size; at N=128M auto is 2.1x faster than CPU.
 
 ## Quick start
 

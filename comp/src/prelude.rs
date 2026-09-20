@@ -2558,7 +2558,9 @@ static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
   VkDeviceSize offs[8]; VkDeviceSize cur=0;
   for(int j=0;j<n+nout;j++){ offs[j]=cur; cur=uf_vk_al(cur+(VkDeviceSize)bufsz); }
   int ok=uf_vk_pool_reserve(cur);
-  int use_dl=ok&&uf_vk_dl_reserve(cur);
+  /* generator regions (n==0) have a single streaming output: the device-
+     local twin only adds a VRAM->GTT copy, so run directly on the pool */
+  int use_dl=ok&&n>0&&uf_vk_dl_reserve(cur);
   VkBuffer cbuf=use_dl?uf_vk_dl.buf:uf_vk_bpool.buf;
   int dbg=getenv("NK_VK_DEBUG")!=0;
   double _t0=dbg?uf_nowd():0;

@@ -5,8 +5,7 @@
 ; list into one fused pass); discount D = e^(-rT) pinned (r=0.02, T=0.75).
 2000000 n!
 has_args 'setn if
-0 n@ range lst!
-lst@ float tensor kk!
+0 n@ range float tensor kk!
 kk@ 0.000001 mul 100.0 add ss!     ; S = 100 + 1e-6 k
 kk@ 0.0000005 mul 95.0 add ks!     ; K = 95 + 5e-7 k
 kk@ 0.0000001 mul 0.2 add st!      ; sigT = 0.2 + 1e-7 k

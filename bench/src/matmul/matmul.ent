@@ -8,9 +8,7 @@
 512 n!
 has_args 'setn if
 n@ n@ mul n2!
-0 n2@ range vals!
-[n@ n@] vals@ concat vals!
-vals@ float tensor kmat!
+[n@ n@] 0 n2@ range concat float tensor kmat!
 kmat@ 0.000001 mul 1.0 add a!
 1.0 kmat@ 0.000001 mul sub b!
 weave

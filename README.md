@@ -37,11 +37,11 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | analytics | **252** | 793 | 756 | 366 | 471 |
 | mandelbrot | 202 | 189 | 216 | **163** | 165 |
 | spectralnorm | 380 | 350 | 487 | **258** | 390 |
-| matmul | **153** | 244 | 278 | 172 | 235 |
-| blackscholes | **695** | 764 | 834 | 748 | 749 |
+| matmul | **145** | 244 | 278 | 172 | 235 |
+| blackscholes | **690** | 764 | 834 | 748 | 749 |
 | nqueens | **259** | 309 | 349 | 267 | 274 |
 | bfs | 363 | 411 | 416 | **282** | 375 |
-| **total** | 2607 | 3906 | 4003 | **2585** | 3096 |
+| **total** | 2594 | 3906 | 4003 | **2585** | 3096 |
 
 Token counts use the **Qwen3-0.6B** tokenizer (151,643 vocab). The first six
 benchmarks are data/tensor-shaped (Enmerkar's home turf); nqueens and bfs are

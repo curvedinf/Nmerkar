@@ -34,7 +34,7 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | | Enmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
 | logextract | **303** | 846 | 667 | 329 | 437 |
-| analytics | **262** | 793 | 756 | 366 | 471 |
+| analytics | **252** | 793 | 756 | 366 | 471 |
 | mandelbrot | 205 | 189 | 216 | **163** | 165 |
 | spectralnorm | 406 | 350 | 487 | **258** | 390 |
 | matmul | **153** | 244 | 278 | 172 | 235 |

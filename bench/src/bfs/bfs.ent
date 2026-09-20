@@ -27,11 +27,10 @@ setn: 1 arg_index n! ret
 bld: u!
   u@ 7 mul 3 add n@ rem v1!
   u@ 13 mul 11 add n@ rem v2!
-  list v1@ append v2@ append lst!
   u@ 3 rem 0 eq 'third 'put if_else
   ret
-third: lst@ u@ 1 add n@ rem append lst! adj@ u@ lst@ set ret
-put: adj@ u@ lst@ set ret
+third: adj@ u@ [v1@ v2@ u@ 1 add n@ rem] set ret
+put: adj@ u@ [v1@ v2@] set ret
 negf: i! dist@ i@ -1 set ret
 more: head@ tail@ lt ret
 step:

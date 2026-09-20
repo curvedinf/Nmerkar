@@ -34,14 +34,14 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | | Enmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
 | logextract | **310** | 846 | 667 | 329 | 437 |
-| analytics | **336** | 793 | 756 | 366 | 471 |
+| analytics | **262** | 793 | 756 | 366 | 471 |
 | mandelbrot | 205 | 189 | 216 | **163** | 165 |
 | spectralnorm | 406 | 350 | 487 | **258** | 390 |
 | matmul | **153** | 244 | 278 | 172 | 235 |
 | blackscholes | **695** | 764 | 834 | 748 | 749 |
 | nqueens | 275 | 309 | 349 | **267** | 274 |
-| bfs | 386 | 411 | 416 | **282** | 375 |
-| **total** | 2766 | 3906 | 4003 | **2585** | 3096 |
+| bfs | 382 | 411 | 416 | **282** | 375 |
+| **total** | 2688 | 3906 | 4003 | **2585** | 3096 |
 
 Token counts use the **Qwen3-0.6B** tokenizer (151,643 vocab). The first six
 benchmarks are data/tensor-shaped (Enmerkar's home turf); nqueens and bfs are
@@ -52,14 +52,14 @@ imperative control-flow shapes where Python's loops stay terse.
 | | Enmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
 | logextract 510 MB | 0.96 | **0.40** | 0.67 | 3.71 | 2.94 |
-| analytics 512 MB | 1.48 | **0.99** | 1.71 | 4.47 | 3.39 |
+| analytics 512 MB | 1.43 | **0.99** | 1.71 | 4.47 | 3.39 |
 | mandelbrot | 0.07 | **0.05** | 0.05 | 4.13 | 0.06 |
 | spectralnorm | 1.10 | 1.10 | **1.08** | 133.1 | 1.57 |
 | matmul N=512 | 0.03 | 0.04 | **0.02** | 0.15 | 0.14 |
 | blackscholes N=2M | 0.13 | **0.04** | 0.04 | 0.17 | 0.07 |
 | nqueens N=11 | 0.35 | **0.01** | 0.01 | 1.52 | 0.03 |
-| bfs n=1M | 0.94 | 0.11 | **0.09** | 1.68 | 0.25 |
-| **total (6 CPU benches)** | 3.77 | **2.61** | 3.57 | 145.8 | 8.17 |
+| bfs n=1M | 0.85 | 0.11 | **0.09** | 1.68 | 0.25 |
+| **total (6 CPU benches)** | 3.72 | **2.61** | 3.57 | 145.8 | 8.17 |
 
 ### GPU offloading (seconds, lower = faster)
 

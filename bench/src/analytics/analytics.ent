@@ -10,12 +10,9 @@ rows@ "total_rows: %d" format print
 rev@ "total_revenue: %.2f" format print
 rev@ rows@ div "avg_order: %.2f" format print
 units@ "total_units: %d" format print
-region_d@ 6 top_n rl!
-rl@ length 'rp for
-prod_d@ 5 top_n pl!
-pl@ length 'pp for
-country_d@ 3 top_n cl!
-cl@ length 'cp for
+region_d@ 6 top_n "region_%d: %s $%.2f" _call pr
+prod_d@ 5 top_n "product_%d: %s $%.2f" _call pr
+country_d@ 3 top_n "country_%d: %s $%.2f" _call pr
 ret
 row: acc! n!
   first@ 'reset 'accum if_else
@@ -32,15 +29,9 @@ accum:
   country_d@ 3 t@ field_add_to
   units@ 7 field_int add units!
   ret
-rp: k! rl@ k@ get p!
-  p@ 0 get nm! p@ 1 get v!
-  k@ 1 add nm@ v@ "region_%d: %s $%.2f" format print
-  ret 0
-pp: k! pl@ k@ get p!
-  p@ 0 get nm! p@ 1 get v!
-  k@ 1 add nm@ v@ "product_%d: %s $%.2f" format print
-  ret 0
-cp: k! cl@ k@ get p!
-  p@ 0 get nm! p@ 1 get v!
-  k@ 1 add nm@ v@ "country_%d: %s $%.2f" format print
+pr: lst! fmt!
+  lst@ length 'p for
+  ret
+p: k! lst@ k@ get e!
+  k@ 1 add e@ 0 get e@ 1 get fmt@ format print
   ret 0

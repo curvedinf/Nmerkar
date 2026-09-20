@@ -656,6 +656,18 @@ pub fn emit_range(
                 if !scalar_inputs {
                 let n = rg.inputs.len();
                 let nk = rg.out_locals.len();
+                // int-typed inputs can never take the float64 fused kernel —
+                // skip the per-iteration GPU try (the call overhead itself
+                // costs measurable time in hot loops)
+                let int_inputs = n > 0 && rg.inputs.iter().all(|inp| match inp {
+                    crate::compute::RegionInput::Local(id) => {
+                        let key = ins_body[i] * 1000000 + *id;
+                        matches!(local_types.get(&key), Some(VType::Int) | Some(VType::IntArr))
+                    }
+                    crate::compute::RegionInput::Global(name) => {
+                        matches!(shared_types.get(name), Some(VType::Int) | Some(VType::IntArr))
+                    }
+                });
                 vflush(&mut e, &mut vstack, &mut vcache);
                 e.push_str("{uf_cur_op=\"region\";Cell _ri[");
                 e.push_str(&format!("{}", n));
@@ -674,6 +686,7 @@ pub fn emit_range(
                 e.push_str("};Cell _ro[");
                 e.push_str(&format!("{}", nk));
                 e.push_str("];int _fz=0;\n");
+                if !int_inputs {
                 e.push_str("#ifdef NK_GPU\n");
                 // v15 Cat/At guard: slice-bound scalars (rg.guards) must equal
                 // the first input's length, and 2n must fit int32 (the shader
@@ -718,6 +731,7 @@ pub fn emit_range(
                     }
                 }
                 e.push_str("#endif\n");
+                }
                 if let Some(lenvar) = &rg.len_shared {
                     e.push_str(&format!(
                         "if(!_fz){{Cell _lv=uf_sh_get(&var_{});uint64_t _n=(_lv.tag==T_INT&&(uint64_t)_lv.i<0x7fffffff)?(uint64_t)_lv.i:0;int _ok=(_n>0);\n",
@@ -733,7 +747,7 @@ pub fn emit_range(
                 e.push_str("if(_ok&&_n){Hdr*_r[4];");
                 if rg.len_shared.is_some() {
                     for j in 0..nk {
-                        e.push_str(&format!("_r[{j}]=(Hdr*)uf_gc_alloc_nz(sizeof(Hdr)+_n*8,0);_r[{j}]->tag=HT_TENSOR;_r[{j}]->len=_n;_r[{j}]->esz=8;_r[{j}]->ety=1;UF_PROTECT(&_r[{j}]);", j = j));
+                        e.push_str(&format!("_r[{j}]=uf_gc_tensor_new(_n);UF_PROTECT(&_r[{j}]);", j = j));
                     }
                 } else {
                     for j in 0..nk {

@@ -368,6 +368,11 @@ static void uf_mark_obj(Hdr* h){
 struct WeaveJobS; static struct WeaveJobS* uf_active_job;
 static void uf_weave_mark(struct WeaveJobS* j);
 static void uf_gc_free_obj(Hdr* h){
+  /* v15: large ARR/TENSOR blocks are whole-block mmap'd (aligned VMA gets
+     real THP; malloc's offset mmap does not) — munmap instead of free */
+  if((h->gc_flags&GCF_MMAP)&&(h->tag==HT_TENSOR||h->tag==HT_ARR)){
+    munmap(h,sizeof(Hdr)+(size_t)h->len*(size_t)h->esz); return;
+  }
   switch(h->tag){
     case HT_MAP: case HT_SET: { Map* m=(Map*)h; free(m->keys); free(m->vals); free(m->st); break; }
     case HT_RING: { Ring* r=(Ring*)h; pthread_mutex_destroy(&r->mu); pthread_cond_destroy(&r->notfull); pthread_cond_destroy(&r->notempty); free(r->buf); break; }
@@ -463,6 +468,33 @@ static void* uf_gc_alloc_nz(size_t sz, int align){
   memset(p,0,sizeof(Hdr));
   Hdr* h=(Hdr*)p;
   h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
+  uf_gc_bytes_since += sz;
+  if(atomic_load(&uf_gc_mt)){ pthread_mutex_lock(&uf_gc_mu); h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); pthread_mutex_unlock(&uf_gc_mu); }
+  else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
+  return p;
+}
+/* v15: allocate the block for a large tensor/array result. >=2MB blocks use
+   a fresh page-aligned mmap with MADV_HUGEPAGE — the aligned VMA is the
+   case where madvise-mode THP actually delivers 2MB pages, removing the
+   4K fault storm on region copy-outs. Small blocks stay on malloc. The
+   caller MUST set tag/len/esz/ety (arr semantics) and not realloc. */
+static void* uf_gc_arr_block_t(size_t nb, uint64_t tag){
+  size_t sz=sizeof(Hdr)+nb;
+  if(uf_gc_on && uf_gc_bytes_since + sz > uf_gc_threshold) uf_gc_collect();
+  void* p;
+  int mapped=0;
+  /* only tags whose byte size reconstructs as len*esz (see free path);
+     HT_MAT's esz is a row count, so it stays on malloc */
+  if(sz>=(size_t)2<<20&&(tag==HT_TENSOR||tag==HT_ARR)){
+    p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(p!=MAP_FAILED){ madvise(p,sz,MADV_HUGEPAGE); mapped=1; }
+    else p=NULL;
+  }
+  if(!p){ p=malloc(sz); if(!p)die("out of memory"); }
+  memset(p,0,sizeof(Hdr));
+  Hdr* h=(Hdr*)p;
+  h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
+  if(mapped) h->gc_flags|=GCF_MMAP;
   uf_gc_bytes_since += sz;
   if(atomic_load(&uf_gc_mt)){ pthread_mutex_lock(&uf_gc_mu); h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); pthread_mutex_unlock(&uf_gc_mu); }
   else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
@@ -2071,11 +2103,12 @@ static void op_every(Ctx*cx){
 /* ================= vector ops + bitmap masks ================= */
 static double uf_el(Hdr*a,uint64_t i){ char*dt=uf_data(a); if(a->ety==1)return ((double*)dt)[i]; if(a->ety==3)return (double)((uint8_t*)dt)[i]; return (double)((int64_t*)dt)[i]; }
 static void uf_put_el(Hdr*a,uint64_t i,double d){ char*dt=uf_data(a); if(a->ety==1)((double*)dt)[i]=d; else if(a->ety==3)((uint8_t*)dt)[i]=(uint8_t)d; else ((int64_t*)dt)[i]=(int64_t)d; }
+static Hdr* uf_gc_tensor_new(uint64_t n){ Hdr*r=(Hdr*)uf_gc_arr_block_t((size_t)n*8,HT_TENSOR); r->tag=HT_TENSOR; r->len=n; r->esz=8; r->ety=1; return r; }
 static Hdr* uf_arr_like(Hdr*a,uint64_t n){
   /* HT_MAT: esz is rows, not element bytes — derive byte size from ety */
   uint64_t nb=(a->tag==HT_MAT)?(n*((a->ety==3)?1:8)):(n*a->esz);
   /* data is fully overwritten by every caller (elementwise ops, memcpy) — no zero-fill */
-  Hdr*r=(Hdr*)uf_gc_alloc_nz(sizeof(Hdr)+nb,0); r->tag=a->tag; r->len=n; r->esz=a->esz; r->ety=a->ety; return r;
+  Hdr*r=(Hdr*)uf_gc_arr_block_t(nb,a->tag); r->tag=a->tag; r->len=n; r->esz=a->esz; r->ety=a->ety; return r;
 }
 
 /* ================= GPU compute offloading (Vulkan, v13.1) =================

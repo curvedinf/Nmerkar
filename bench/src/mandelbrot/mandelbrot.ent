@@ -5,7 +5,7 @@
 has_args 'argn if
 0 cnt!
 n@ 'row for
-cnt@ "%d" format print
+cnt@ print
 ret
 argn:
   1 arg_index n!

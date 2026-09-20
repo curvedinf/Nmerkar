@@ -1467,7 +1467,6 @@ fn walk_one_region(
             // k = the element index (Idx). The body must simulate fully
             // (per-element scalars only: Idx, consts, inlined locals).
             Ins::For => {
-                if std::env::var("NK_DEBUG_REGION2").is_ok() { eprintln!("[for] arm at {} hit", i); }
                 if i >= 2 {
                     if let (Ins::PushAddr(bl), cnt_ins) = (&p.ins[i - 1], &p.ins[i - 2]) {
                         let bpc = p.labels.get(bl).copied();
@@ -1590,18 +1589,22 @@ fn walk_one_region(
                                             // nested domain: [cnt, PushAddr(inner), For] at j-2..j —
                                             // inline the inner body one level deep with k = Dom(level)
                                             let nested_ok = (|| {
-                                                let dbg2 = std::env::var("NK_DEBUG_REGION2").is_ok();
                                                 let (bl2, cnt2) = (&p.ins[j - 1], &p.ins[j - 2]);
                                                 let bl2 = match bl2 { Ins::PushAddr(x) => x, _ => return false };
                                                 let bpc2 = match p.labels.get(bl2) { Some(x) => *x, None => return false };
                                                 let g2 = match cnt2 { Ins::GetV(g) => Some(g.clone()), Ins::PushI(_) => None, _ => return false };
-                                                if !matches!(&p.ins[bpc2], Ins::LocalSetI(_) | Ins::LocalSet(_)) { if dbg2 { eprintln!("[for-nest] inner body first ins not a bind: {:?}", &p.ins[bpc2]); } return false; }
+                                                if !matches!(&p.ins[bpc2], Ins::LocalSetI(_) | Ins::LocalSet(_)) { return false; }
                                                 let k2: Slot = match &p.ins[bpc2] {
                                                     Ins::LocalSetI(id) => Slot::Id(*id),
                                                     Ins::LocalSet(nm) => Slot::Name(nm.clone()),
                                                     _ => return false,
                                                 };
-                                                if let Some(g) = &g2 { if !guards.contains(g) { guards.push(g.clone()); } }
+                                                // inner count ALWAYS pushes (both loops may share one
+                                                // var — the levels stay distinct; gen reads guards[1])
+                                                if let Some(g) = &g2 { guards.push(g.clone()); }
+                                                // the flat index now decomposes over two levels — rebind
+                                                // the OUTER k first so the inner sim captures Dom(0)
+                                                flocals.insert(k_slot.clone(), V::E(TExpr::Dom(dom_guards_len0)));
                                                 dom_guards.push(g2.clone().unwrap_or_default());
                                                 flocals.insert(k2, V::E(TExpr::Dom(dom_guards.len() - 1)));
                                                 let mut k = bpc2 + 1;
@@ -1756,14 +1759,10 @@ fn walk_one_region(
                                                 true
                                             })();
                                             if !nested_ok {
-                                                if std::env::var("NK_DEBUG_REGION2").is_ok() { eprintln!("[for-nest] nested sim failed"); }
                                                 okbody = false; break 'forbody;
                                             }
                                             // nested_ok consumed [j-2..j]; the outer sim advances
-                                            // past the inner For via the loop's j += 1. When nesting
-                                            // succeeded, rebind the OUTER k from Idx to Dom(outer level)
-                                            // — the flat index now decomposes over two levels.
-                                            flocals.insert(k_slot.clone(), V::E(TExpr::Dom(dom_guards_len0)));
+                                            // past the inner For via the loop's j += 1
                                         }
                                         _ => { okbody = false; break 'forbody; }
                                     }
@@ -1791,7 +1790,6 @@ fn walk_one_region(
                                     stop = true;
                                 }
                             } else {
-                                if std::env::var("NK_DEBUG_REGION2").is_ok() { eprintln!("[for] outer binds_check failed"); }
                                 poisoned.push(Slot::Name(String::new())); stop = true;
                             }
                         } else { stop = true; }

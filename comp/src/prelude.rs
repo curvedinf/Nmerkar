@@ -2586,7 +2586,7 @@ static void uf_memcpy_big(void* dst, const void* src, size_t n){
 #define uf_memcpy_big memcpy
 #endif
 
-static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
+static int uf_region_try_n1(int k,int n,uint64_t rlen,uint64_t rin,int nout,Cell*ins,Cell*outs){
   /* n==0: generator region (Idx expressions only) — rlen is the dispatch
      length from the region's length guard; outputs are fresh float64
      tensors. */
@@ -2640,7 +2640,7 @@ static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
       for(int j=0;j<n+nout;j++){ bi[j].buffer=cbuf; bi[j].offset=offs[j]; bi[j].range=bufsz;
         w[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[j].dstSet=ds; w[j].dstBinding=(uint32_t)j; w[j].descriptorCount=1; w[j].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[j].pBufferInfo=&bi[j]; }
       vkUpdateDescriptorSets(uf_vk_dev,n+nout,w,0,0);
-      struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)len;
+      struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)len; pc.n1=(int64_t)rin;
       VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
       ok=vkBeginCommandBuffer(uf_vk_cb,&cbbi)==VK_SUCCESS;
       if(ok){
@@ -2676,6 +2676,14 @@ static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
   pthread_mutex_unlock(&uf_gpu_mu);
   if(ok){ for(int j=0;j<nout;j++){ outs[j].tag=T_PTR; outs[j].i=(int64_t)(void*)rs[j]; } return 1; }
   return 0;
+}
+static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
+  return uf_region_try_n1(k,n,rlen,1,nout,ins,outs);
+}
+static int uf_region_try2(int k,int nout,uint64_t rlen,uint64_t rin,Cell*ins,Cell*outs){
+  /* nested-domain variant: pc.n0 = rlen (product), pc.n1 = rin (inner
+     count; 1 for flat domains) */
+  return uf_region_try_n1(k,0,rlen,rin,nout,ins,outs);
 }
 
 /* ---- op shims (return a T_INT 0 Cell when declined; caller falls back) ---- */

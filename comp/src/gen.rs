@@ -713,19 +713,28 @@ pub fn emit_range(
                     }
                     Some(lenvar) => {
                         // generator region: no array inputs; guards[0] is the
-                        // length var, further guards must equal it
+                        // length var. A second guard names the INNER loop count:
+                        // dispatch length = product, inner count passed to the
+                        // kernel (pc.n1) for Dom decomposition. Further guards
+                        // must equal the length.
                         e.push_str(&format!(
-                            "{{Cell _lv=uf_sh_get(&var_{});int _gd=(_lv.tag==T_INT&&_lv.i>0);uint64_t _rn=_gd?(uint64_t)_lv.i:0;",
+                            "{{Cell _lv=uf_sh_get(&var_{});int _gd=(_lv.tag==T_INT&&_lv.i>0);uint64_t _rn=_gd?(uint64_t)_lv.i:0;uint64_t _rin=1;",
                             lenvar
                         ));
-                        for g in rg.guards.iter().skip(1) {
+                        if rg.guards.len() >= 2 {
+                            e.push_str(&format!(
+                                "{{Cell _iv=uf_sh_get(&var_{});if(_iv.tag==T_INT&&_iv.i>0){{_rin=(uint64_t)_iv.i;_rn=_rn*_rin;}}else _gd=0;}}",
+                                rg.guards[1]
+                            ));
+                        }
+                        for g in rg.guards.iter().skip(2) {
                             e.push_str(&format!(
                                 "{{Cell _gv=uf_sh_get(&var_{});if(_gv.tag!=T_INT||(uint64_t)_gv.i!=_rn)_gd=0;}}",
                                 g
                             ));
                         }
                         e.push_str(&format!(
-                            "if(_gd&&(uint64_t)2*_rn<0x7fffffff&&uf_region_try({},0,(int){},(uint64_t)_rn,_ri,_ro))_fz=1;}}\n",
+                            "if(_gd&&_rn&&(uint64_t)2*_rn<0x7fffffff&&uf_region_try2({},(int){},(uint64_t)_rn,(uint64_t)_rin,_ri,_ro))_fz=1;}}\n",
                             rg.kidx, nk
                         ));
                     }
@@ -733,10 +742,17 @@ pub fn emit_range(
                 e.push_str("#endif\n");
                 }
                 if let Some(lenvar) = &rg.len_shared {
-                    e.push_str(&format!(
-                        "if(!_fz){{Cell _lv=uf_sh_get(&var_{});uint64_t _n=(_lv.tag==T_INT&&(uint64_t)_lv.i<0x7fffffff)?(uint64_t)_lv.i:0;int _ok=(_n>0);\n",
-                        lenvar
-                    ));
+                    if rg.guards.len() >= 2 {
+                        e.push_str(&format!(
+                            "if(!_fz){{Cell _lv=uf_sh_get(&var_{});Cell _iv=uf_sh_get(&var_{});int _ok=(_lv.tag==T_INT&&_iv.tag==T_INT&&_lv.i>0&&_iv.i>0);uint64_t _n=_ok?((uint64_t)_lv.i*(uint64_t)_iv.i):0;uint64_t _dom1=_ok?(uint64_t)_iv.i:1;\n",
+                            lenvar, rg.guards[1]
+                        ));
+                    } else {
+                        e.push_str(&format!(
+                            "if(!_fz){{Cell _lv=uf_sh_get(&var_{});uint64_t _n=(_lv.tag==T_INT&&(uint64_t)_lv.i<0x7fffffff)?(uint64_t)_lv.i:0;int _ok=(_n>0);uint64_t _dom1=1;\n",
+                            lenvar
+                        ));
+                    }
                 } else {
                     e.push_str("if(!_fz){Hdr*_h[7];uint64_t _n=~(uint64_t)0;int _ok=1;\n");
                     e.push_str(&format!(

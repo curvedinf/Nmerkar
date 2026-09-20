@@ -2257,10 +2257,26 @@ static int uf_vk_ensure_pipe(int k){
    and recreates the buffer BEFORE any data is staged, so nothing is lost.
    Region offsets are 256B-aligned (minStorageBufferOffsetAlignment ≤ 256). */
 #define UF_VK_ALIGN 256
-typedef struct { VkBuffer buf; VkDeviceMemory mem; char* mapped; VkDeviceSize cap; } UFCache;
+typedef struct { VkBuffer buf; VkDeviceMemory mem; char* mapped; VkDeviceSize cap; int coherent; } UFCache;
 static UFCache uf_vk_bpool;
 static VkFence uf_vk_fence;
 static VkDeviceSize uf_vk_al(VkDeviceSize s){ return (s+(UF_VK_ALIGN-1))&~((VkDeviceSize)UF_VK_ALIGN-1); }
+/* non-coherent cached pool: make CPU writes visible to the GPU / GPU writes
+   visible to the CPU. No-ops on a coherent heap. Offsets are pool-relative;
+   ranges are rounded out to UF_VK_ALIGN (>= any known nonCoherentAtomSize
+   multiple used here). */
+static void uf_vk_flush(VkDeviceSize off, VkDeviceSize sz){
+  if(uf_vk_bpool.coherent||!sz||!uf_vk_bpool.mem) return;
+  VkMappedMemoryRange r; memset(&r,0,sizeof r); r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  r.memory=uf_vk_bpool.mem; r.offset=off; r.size=uf_vk_al(sz);
+  vkFlushMappedMemoryRanges(uf_vk_dev,1,&r);
+}
+static void uf_vk_inval(VkDeviceSize off, VkDeviceSize sz){
+  if(uf_vk_bpool.coherent||!sz||!uf_vk_bpool.mem) return;
+  VkMappedMemoryRange r; memset(&r,0,sizeof r); r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  r.memory=uf_vk_bpool.mem; r.offset=off; r.size=uf_vk_al(sz);
+  vkInvalidateMappedMemoryRanges(uf_vk_dev,1,&r);
+}
 static int uf_vk_pool_reserve(VkDeviceSize total){
   if(uf_vk_bpool.cap>=total&&uf_vk_bpool.buf) return 1;
   VkDeviceSize want=uf_vk_al(total); VkDeviceSize min=64UL<<20; if(want<min)want=min;
@@ -2273,19 +2289,25 @@ static int uf_vk_pool_reserve(VkDeviceSize total){
   VkMemoryRequirements mr; vkGetBufferMemoryRequirements(uf_vk_dev,uf_vk_bpool.buf,&mr);
   VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(uf_vk_pd,&mp);
   int found=0; VkDeviceSize sz=mr.size>want?mr.size:want;
-  /* Prefer cached coherent host memory: region outputs are read back by the
-     CPU after the fence, and uncached coherent mappings make that memcpy
-     dominate otherwise. Fall back to coherent, then any host-visible type. */
-  for(int pass=0;pass<3&&!found;pass++)
+  /* Prefer cached host memory: region outputs are read back by the CPU after
+     the fence, and uncached coherent mappings cap that memcpy at PCIe-ish
+     speeds (~1.4GB/s here) while cached ones stream from DRAM. On AMD the
+     cached heap is typically NON-coherent, so accept it and use explicit
+     flush/invalidate barriers (uf_vk_flush/uf_vk_inval) — pass order:
+     cached+coherent, cached, coherent, any. */
+  int coherent=1;
+  for(int pass=0;pass<4&&!found;pass++)
     for(uint32_t i=0;i<mp.memoryTypeCount;i++){
       VkMemoryPropertyFlags f=mp.memoryTypes[i].propertyFlags;
-      int wantcached=pass==0, wantcoherent=pass<2;
+      int wantcached=(pass==0||pass==1), wantcoherent=(pass==0||pass==2);
       if((mp.memoryTypes[i].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
         &&(!wantcached||(f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
         &&(!wantcoherent||(mp.memoryTypes[i].propertyFlags&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
         &&(mr.memoryTypeBits&(1u<<i))){
         VkMemoryAllocateInfo ai; memset(&ai,0,sizeof ai); ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ai.allocationSize=sz; ai.memoryTypeIndex=i;
-        if(vkAllocateMemory(uf_vk_dev,&ai,0,&uf_vk_bpool.mem)==VK_SUCCESS){ found=1; break; }
+        if(vkAllocateMemory(uf_vk_dev,&ai,0,&uf_vk_bpool.mem)==VK_SUCCESS){ found=1; coherent=(f&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)?1:0;
+          if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk-pool] type=%u flags=0x%x cached=%d coherent=%d cap=%lluMB\n",i,(unsigned)f,(f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT)?1:0,coherent,(unsigned long long)(sz>>20));
+          break; }
       }
     }
   if(!found||vkBindBufferMemory(uf_vk_dev,uf_vk_bpool.buf,uf_vk_bpool.mem,0)!=VK_SUCCESS
@@ -2294,7 +2316,7 @@ static int uf_vk_pool_reserve(VkDeviceSize total){
     if(uf_vk_bpool.buf)vkDestroyBuffer(uf_vk_dev,uf_vk_bpool.buf,0);
     memset(&uf_vk_pool,0,sizeof uf_vk_pool); return 0;
   }
-  uf_vk_bpool.cap=sz;
+  uf_vk_bpool.cap=sz; uf_vk_bpool.coherent=coherent;
   if(!uf_vk_fence){ VkFenceCreateInfo fci; memset(&fci,0,sizeof fci); fci.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; vkCreateFence(uf_vk_dev,&fci,0,&uf_vk_fence); }
   return 1;
 }
@@ -2352,6 +2374,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   if(!uf_vk_pool_reserve(orr+uf_vk_al((VkDeviceSize)rsz))){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
   if(A&&asz) memcpy(uf_vk_bpool.mapped+oa,A,asz);
   if(B&&bsz) memcpy(uf_vk_bpool.mapped+ob,B,bsz);
+  uf_vk_flush(oa, (ob+(VkDeviceSize)bsz)-oa);
   int is_mm=(k==uf_spv_index("matmul") && pc.n1>0 && pc.n3>0);
   if(is_mm && !uf_vk_dl_reserve(orr+uf_vk_al((VkDeviceSize)rsz))) is_mm=0;
   VkBuffer cbuf=is_mm?uf_vk_dl.buf:uf_vk_bpool.buf;
@@ -2399,6 +2422,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   vkEndCommandBuffer(uf_vk_cb);
   if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] submit\n");
   int ok = uf_vk_submit_wait();
+  uf_vk_inval(orr, (VkDeviceSize)rsz);
   if(ok&&R&&rsz) memcpy(R,uf_vk_bpool.mapped+orr,rsz);
   if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] total=%.1fms\n",(uf_nowd()-_t0)*1e3);
   vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
@@ -2441,6 +2465,7 @@ static Cell uf_gpu_task(Ctx*cx,int k,int n){
   Hdr* r=ok?uf_arr_like(ins[0],len):0; UF_PROTECT(&r);
   if(ok){
     for(int j=0;j<n;j++) memcpy(uf_vk_bpool.mapped+offs[j],uf_data(ins[j]),bufsz);
+    uf_vk_flush(offs[0], (offs[n-1]+bufsz)-offs[0]);
     VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
     VkDescriptorSet ds;
     ok=vkAllocateDescriptorSets(uf_vk_dev,&dsai,&ds)==VK_SUCCESS;
@@ -2473,6 +2498,7 @@ static Cell uf_gpu_task(Ctx*cx,int k,int n){
         }
         vkEndCommandBuffer(uf_vk_cb);
         ok=uf_vk_submit_wait();
+        uf_vk_inval(offs[n], (VkDeviceSize)bufsz);
         if(ok) memcpy(uf_data(r),uf_vk_bpool.mapped+offs[n],bufsz);
       }
       vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
@@ -2519,10 +2545,14 @@ static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
   VkBuffer cbuf=use_dl?uf_vk_dl.buf:uf_vk_bpool.buf;
   int dbg=getenv("NK_VK_DEBUG")!=0;
   double _t0=dbg?uf_nowd():0;
+  double _tin=0,_tsub=0,_tout=0,_tm;
   Hdr* rs[4]; for(int j=0;j<nout;j++){ rs[j]=0; UF_PROTECT(&rs[j]); }
   if(ok){
+    if(dbg)_tm=uf_nowd();
     for(int j=0;j<nout;j++) rs[j]=uf_arr_like(hs[0],len);
     for(int j=0;j<n;j++) memcpy(uf_vk_bpool.mapped+offs[j],uf_data(hs[j]),bufsz);
+    uf_vk_flush(offs[0], (offs[n-1]+bufsz)-offs[0]);
+    if(dbg){_tin=uf_nowd()-_tm;_tm=uf_nowd();}
     VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
     VkDescriptorSet ds;
     ok=vkAllocateDescriptorSets(uf_vk_dev,&dsai,&ds)==VK_SUCCESS;
@@ -2555,12 +2585,15 @@ static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
         }
         vkEndCommandBuffer(uf_vk_cb);
         ok=uf_vk_submit_wait();
+        uf_vk_inval(offs[n], (offs[n+nout-1]+bufsz)-offs[n]);
+        if(dbg){_tsub=uf_nowd()-_tm;_tm=uf_nowd();}
         if(ok) for(int j=0;j<nout;j++) memcpy(uf_data(rs[j]),uf_vk_bpool.mapped+offs[n+j],bufsz);
+        if(dbg)_tout=uf_nowd()-_tm;
       }
       vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
     }
   }
-  if(dbg)fprintf(stderr,"[vk-region] n=%llu in=%d out=%d dl=%d total=%.1fms\n",(unsigned long long)len,n,nout,use_dl,(uf_nowd()-_t0)*1e3);
+  if(dbg)fprintf(stderr,"[vk-region] n=%llu in=%d out=%d dl=%d in=%.1fms sub=%.1fms out=%.1fms total=%.1fms\n",(unsigned long long)len,n,nout,use_dl,_tin*1e3,_tsub*1e3,_tout*1e3,(uf_nowd()-_t0)*1e3);
   for(int j=0;j<nout;j++) UF_UNPROTECT();
   pthread_mutex_unlock(&uf_gpu_mu);
   if(ok){ for(int j=0;j<nout;j++){ outs[j].tag=T_PTR; outs[j].i=(int64_t)(void*)rs[j]; } return 1; }

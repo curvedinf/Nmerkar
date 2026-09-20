@@ -198,7 +198,7 @@ Programs are terse (low token count), fast, and reliable — designed for LLM-au
 Cells are untyped 64-bit values at runtime — ints, floats, and pointers freely interconvert.
 Type inference happens at compile time where possible, but types are not enforced at the language level.
 
-The data stack is an implementation detail. Source code reasons about **named local/global variables**, **literal constants**, and **the return value of the immediately preceding op**.
+The data stack is an implementation detail. Source code reasons about **named local/shared variables**, **literal constants**, and **the return value of the immediately preceding op**.
 
 > **Maintenance:** When `nk` is updated, regenerate this file with `nk --skill` to refresh the opcode list.
 
@@ -474,7 +474,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 eprintln!("       --gc-threshold N   GC collection threshold in bytes (default: 1MB)");
                 eprintln!("       --gc-off            disable garbage collector entirely");
                 eprintln!("       --mt                force multi-threaded allocator (use mutex even if single-threaded)");
-                eprintln!("       --debug, -D         enable crash dump (stack trace + local/global var dump on runtime errors)");
+                eprintln!("       --debug, -D         enable crash dump (stack trace + local/shared var dump on runtime errors)");
                 eprintln!("       --                  pass remaining args to the program");
                 eprintln!("");
                 eprintln!("  sandbox flags (see SPEC.md — Sandboxing and capabilities):");

@@ -145,7 +145,7 @@ static void uf_crash_dump(Ctx*cx){
       fprintf(stderr,"\n");
     }
   }
-  fprintf(stderr,"  globals:\n");
+  fprintf(stderr,"  shared:\n");
   for(long i=0;i<uf_nvar_roots;i++){
     fprintf(stderr,"    %s = ", uf_vnames?uf_vnames[i]:"<?>");
     uf_dump_cell(*uf_var_roots[i]);

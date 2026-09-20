@@ -2,7 +2,7 @@
 
 Nmerkar is a language based on a **managed hidden stack**, compiled to C then native
 via `cc`, designed for LLM-authored one-off scripts (low token count, fast,
-reliable). Values flow through named local/global variables, literal constants,
+reliable). Values flow through named local/shared variables, literal constants,
 and the return value of the immediately preceding op. The data stack still exists
 as the runtime execution substrate, but it is managed by the compiler and runtime;
 the programmer never sees or manipulates it directly. Programs are postfix
@@ -1174,7 +1174,7 @@ positional arg is a file if it exists, otherwise inline source. Everything after
 **`--debug` / `-D`**: compiles in debug mode (`cc -O0 -g`). Disables local-variable
 register caching so locals are always memory-resident and accurate. On any fatal
 runtime error (`die()`), prints a crash dump to stderr with: call stack (label
-names + PCs), local variables per frame (names + values), and global variables
+names + PCs), local variables per frame (names + values), and shared variables
 (names + values). In normal mode, no metadata tables are emitted and `die()`
 behaves as before. Debug binaries are cached separately.
 
@@ -1342,20 +1342,20 @@ before `ret`) is a straight-line chain of elementwise arithmetic
 (add/sub/mul/div/sqrt) over its inputs — every intermediate explicitly bound
 with `x!` — is compiled into ONE fused float64 kernel: inputs staged in once,
 every op executed on-device, result staged out once. Tasks containing anything
-else (tensor construction, control flow, calls, non-eligible ops, global
+else (tensor construction, control flow, calls, non-eligible ops, shared
 reads) decline fusion and run on CPU unchanged. Fused-task output is
 bit-identical to the CPU body. Concurrent tasks serialize their GPU work on an
 internal mutex. Reference: `comp/tests/t14_task_gpu.n` (black-scholes chain:
 ~60 per-op launches collapse to 4 fused kernels; 7.3s → 0.42s at N=2M).
 
 **Elementwise region fusion**: the same analysis generalized to plain
-code. A maximal straight-line run of eligible instructions (local/global
+code. A maximal straight-line run of eligible instructions (local/shared
 reads, local binds, float/int literals, `add/sub/mul/div/sqrt`) anywhere in
 the top-level flow is a **fusable region** when every value it produces is an
 elementwise function of its input tensors: up to 4 **live-out** locals (read
 after the region — intermediate locals never read again stay internal), with
 inputs up to 7 total buffers. `array_reduce` over a bound literal-only list
-whose body is pure elementwise arithmetic (globals allowed) is **unrolled at
+whose body is pure elementwise arithmetic (shared vars allowed) is **unrolled at
 compile time** into the region expression — the source keeps its fold shape,
 the machine gets one pass. The compiler emits one guarded block at the region
 head: first a fused multi-output GPU kernel launch (one stage-in, whole chain

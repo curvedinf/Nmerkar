@@ -2561,6 +2561,31 @@ static Cell uf_gpu_task(Ctx*cx,int k,int n){
    arrive explicitly as Cells (compiler-passed locals). Returns 1 and fills
    outs[0..nout) on success; 0 = declined, caller falls back to the fused CPU
    loop / per-op path. */
+/* v15: parallel memcpy for multi-64MB staging transfers — the region
+   copy-in/copy-out was single-thread bound at ~4GB/s per core. */
+#ifdef NK_GPU
+typedef struct { char* dst; const char* src; size_t n; } UFPMC;
+static void* uf_pmc_fn(void* arg){
+  UFPMC* m=(UFPMC*)arg; memcpy(m->dst,m->src,m->n); return 0;
+}
+static void uf_memcpy_big(void* dst, const void* src, size_t n){
+  if(n < (size_t)64<<20 || getenv("NK_VK_NOPMC")){ memcpy(dst,src,n); return; }
+  enum { NTH = 4 };
+  UFPMC parts[NTH]; pthread_t th[NTH-1];
+  size_t chunk = n / NTH;
+  for(int k=0;k<NTH;k++){
+    parts[k].dst=(char*)dst+(size_t)k*chunk;
+    parts[k].src=(const char*)src+(size_t)k*chunk;
+    parts[k].n = (k==NTH-1) ? n-(size_t)(NTH-1)*chunk : chunk;
+    if(k<NTH-1) pthread_create(&th[k],0,uf_pmc_fn,&parts[k]);
+  }
+  uf_pmc_fn(&parts[NTH-1]);
+  for(int k=0;k<NTH-1;k++) pthread_join(th[k],0);
+}
+#else
+#define uf_memcpy_big memcpy
+#endif
+
 static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
   /* n==0: generator region (Idx expressions only) — rlen is the dispatch
      length from the region's length guard; outputs are fresh float64
@@ -2603,7 +2628,7 @@ static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
   if(ok){
     if(dbg)_tm=uf_nowd();
     for(int j=0;j<nout;j++) rs[j]=uf_arr_like(n?hs[0]:&tpl,len);
-    for(int j=0;j<n;j++) memcpy(uf_vk_bpool.mapped+offs[j],uf_data(hs[j]),bufsz);
+    for(int j=0;j<n;j++) uf_memcpy_big(uf_vk_bpool.mapped+offs[j],uf_data(hs[j]),bufsz);
     uf_vk_flush(offs[0], (offs[n-1]+bufsz)-offs[0]);
     if(dbg){_tin=uf_nowd()-_tm;_tm=uf_nowd();}
     VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
@@ -2640,7 +2665,7 @@ static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
         ok=uf_vk_submit_wait();
         uf_vk_inval(offs[n], (offs[n+nout-1]+bufsz)-offs[n]);
         if(dbg){_tsub=uf_nowd()-_tm;_tm=uf_nowd();}
-        if(ok) for(int j=0;j<nout;j++) memcpy(uf_data(rs[j]),uf_vk_bpool.mapped+offs[n+j],bufsz);
+        if(ok) for(int j=0;j<nout;j++) uf_memcpy_big(uf_data(rs[j]),uf_vk_bpool.mapped+offs[n+j],bufsz);
         if(dbg)_tout=uf_nowd()-_tm;
       }
       vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);

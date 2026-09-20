@@ -38,14 +38,14 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 |---|---|---|---|---|---|
 | logextract | **301** | 846 | 667 | 329 | 437 |
 | analytics | **241** | 793 | 756 | 366 | 471 |
-| mandelbrot | 0.06 | **0.07** | 216 | **163** | 165 |
-| spectralnorm | 1.09 | **1.11** | 487 | **258** | 390 |
+| mandelbrot | 179 | 189 | 216 | **163** | 165 |
+| spectralnorm | 376 | 350 | 487 | **333** | 390 |
 | matmul | **138** | 244 | 278 | 172 | 235 |
 | blackscholes | **664** | 764 | 834 | 748 | 749 |
 | nqueens | **257** | 309 | 349 | 267 | 274 |
 | bfs | **381** | 480 | 497 | 397 | 436 |
 | dynamicgraph | 349 | 436 | 423 | **303** | 369 |
-| **total** | 3.35 | **2.85** | 4507 | 3003 | 3526 |
+| **total** | **2886** | 4411 | 4507 | 3078 | 3526 |
 
 Token counts use the **Qwen3** tokenizer (151,643 vocab). The first six
 benchmarks are data/tensor-shaped (Nmerkar's home turf); nqueens stresses
@@ -59,28 +59,24 @@ and small-list allocation costs.
 | logextract 510 MB | 0.47 | **0.41** | 0.70 | 3.67 | 2.95 |
 | analytics 512 MB | 1.04 | **1.02** | 1.72 | 4.50 | 3.42 |
 | mandelbrot | 0.06 | **0.05** | 0.05 | 4.24 | 0.07 |
-| spectralnorm | 1.09 | 1.11 | **1.08** | 131.48 | 1.57 |
+| spectralnorm | 1.09 | 1.11 | **1.08** | 48.83 | 1.57 |
 | nqueens N=11 | 0.02 | 0.01 | **0.01** | 1.46 | 0.04 |
 | bfs CSR n=1M | 0.09 | **0.03** | 0.05 | 1.31 | 0.07 |
 | dynamicgraph n=1M | 0.44 | **0.16** | 0.30 | 1.51 | 0.39 |
 | matmul N=512 | 0.03 | 0.03 | **0.02** | 0.15 | 0.13 |
 | blackscholes N=2M | 0.05 | 0.04 | **0.04** | 0.17 | 0.07 |
-| **total** | 3.33 | **2.85** | 3.97 | 148.49 | 8.70 |
+| **total** | 3.33 | **2.85** | 3.97 | 65.84 | 8.70 |
+
+CPU is an AMD Ryzen 7900x3D.
 
 ### GPU offloading (seconds, lower = faster)
 
 | workload | CPU (`--device cpu`) | GPU (`--device vk0`) |
 |---|---|---|
 | matmul N=2048 | 1.56s | **0.26s** |
-| blackscholes N=32M | 0.61s | **0.24s** |
+| blackscholes N=32M | 0.61s | **0.21s** |
 
-Measured 2026-09-20 (v15 + concat/slice + range-generator region fusion,
-warm runs, `NK_VK_DEBUG` verified dispatch on the 7900 XTX). blackscholes
-fuses end-to-end into ONE kernel with ZERO inputs: `range`/`concat`/slices
-are absorbed into the kernel expression (the kernel synthesizes index
-values on-device), so no list, tensor build, or staging-in exists at all.
-Auto device matches or beats `--device cpu` on every benchmark at every
-size; at N=32M auto is 2.5x faster and at N=128M 2.7x faster than CPU.
+GPU is an AMD Radeon 7900 XTX.
 
 ## Quick start
 

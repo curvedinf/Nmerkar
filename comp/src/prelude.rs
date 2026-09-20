@@ -831,7 +831,7 @@ static void map_grow(Map*m){
 }
 static Map* uf_map_new(void){ Map*m=(Map*)uf_gc_alloc(sizeof(Map),0); m->tag=HT_MAP; m->len=0; m->cap=16; m->keys=(Cell*)uf_alloc(16*sizeof(Cell),0); m->vals=(Cell*)uf_alloc(16*sizeof(Cell),0); m->st=(unsigned char*)calloc(16,1); return m; }
 static void map_put(Map*m,Cell k,Cell v){ if((m->len+1)*10>=m->cap*7) map_grow(m); map_put_raw(m,k,v); }
-static int map_get(Map*m,Cell k,Cell*out){
+static inline int map_get(Map*m,Cell k,Cell*out){
   if(m->cap==0)return 0;
   uint64_t i=map_hash(k)%m->cap;
   for(;;){ if(m->st[i]==0)return 0; if(m->st[i]==1&&map_keyeq(m->keys[i],k)){ *out=m->vals[i]; return 1; } i=(i+1)%m->cap; }
@@ -847,13 +847,32 @@ static Dyn* uf_dyn_push2(Dyn*d,Cell c){ if(d->len>=d->cap){ Dyn*n=uf_dyn_new(d->
 static void uf_dyn_push(Dyn**pd,Cell c){ *pd=uf_dyn_push2(*pd,c); }
 static void uf_dyn_push_str(Dyn**pd,const char*s,size_t n){ Cell c=uf_str_new(s,n); uf_dyn_push(pd,c); }
 
-static Hdr* uf_handle(Cell h,const char* op){ if(h.tag!=T_PTR||!h.i)die("handle is null"); Hdr*a=uf_gc_find((void*)h.i); if(!a)die("not a managed handle"); (void)op; return a; }
+static Hdr* uf_handle(Cell h,const char* op){
+  if(h.tag!=T_PTR||!h.i)die("handle is null");
+  /* Non-moving GC: the object's tag is the type. uf_gc_find was a
+     use-after-free check that dominated dict/list GET in bfs (~1M map
+     probes + ~2.5M list indexes). A stale pointer now dies on a bad
+     tag instead of a set lookup. */
+  Hdr*a=(Hdr*)(void*)h.i;
+  switch(a->tag){
+    case HT_ARR: case HT_TENSOR: case HT_DYN: case HT_MAP: case HT_STR:
+    case HT_RING: case HT_ATOM: case HT_BUF: case HT_OBJ: case HT_BITMAP:
+    case HT_BLOOM: case HT_ITER: case HT_SET: case HT_MAT:
+      (void)op; return a;
+    default: die("not a managed handle");
+  }
+}
 /* GET: h k -> v */
 static inline void op_get(Ctx*cx){
   Cell k=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"GET");
   switch(a->tag){
     case HT_MAP: { Map*m=(Map*)a; Cell v; if(!map_get(m,k,&v))die("GET: missing key"); pushc(cx,v); return; }
-    case HT_DYN: case HT_ARR: case HT_TENSOR: case HT_MAT: pushc(cx,uf_cidx(h,k.i)); return;
+    case HT_DYN: {
+      Dyn*d=(Dyn*)a;
+      if(k.i<0||(uint64_t)k.i>=d->len)die("GET: index out of bounds");
+      pushc(cx,d->data[k.i]); return;
+    }
+    case HT_ARR: case HT_TENSOR: case HT_MAT: pushc(cx,uf_cidx(h,k.i)); return;
     case HT_STR: { Str*s=(Str*)a; if(k.i<0||k.i>=(int64_t)s->len)die("GET: index out of bounds"); pushi(cx,(uint8_t)uf_sbytes(s)[k.i]); return; }
     case HT_OBJ: { int64_t o=uf_obj_off(a,k); if(o<0||(uint64_t)o>=a->esz)die("GET: no such field"); pushc(cx,*(Cell*)(a->data+o)); return; }
     default: die("GET: unsupported handle");

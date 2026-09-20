@@ -6,6 +6,22 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-09-20 (post-v15) — fused-kernel generation: concat/slice regions
+
+- Region fusion — changed: `concat` of two same-length region exprs fuses as
+  a 2n-wide selector expression and the both-halves `slice` idiom (`x 0 n
+  slice` / `x n n 2 mul slice`, shared scalar `n` == input length, runtime-
+  guarded) fuses as a position shift; 2n intermediates never materialize or
+  cross the host bus. blackscholes 32M: 4 regions / ~5GB staging → 1 region
+  (1 input, 1 output); auto 0.83s vs cpu 1.12s (was 3.25s vs 2.04s).
+- Region fusion — changed: literal-list binds inside a region are skipped
+  opaquely; fold-callback bodies referenced only from the unrolled region no
+  longer promote operands to live-outs; empty-stack mid-statement stops fall
+  back to the last clean bind boundary; trailing no-op Flushes no longer end
+  regions. The CPU fallback loop uses the same expressions (this is why the
+  per-benchmark CPU column also got faster).
+- No opcode or encoding changes; no source changes required.
+
 ## v15 — 2026-09-20 (implicit loads + dense tag glyphs, this changeset)
 
 - `getv` (34, 😆) — changed: source syntax is now a **bare name** (implicit

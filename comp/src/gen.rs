@@ -675,10 +675,27 @@ pub fn emit_range(
                 e.push_str(&format!("{}", nk));
                 e.push_str("];int _fz=0;\n");
                 e.push_str("#ifdef NK_GPU\n");
-                e.push_str(&format!(
-                    "if(uf_region_try({},(int){},(int){},_ri,_ro))_fz=1;\n",
-                    rg.kidx, n, nk
-                ));
+                // v15 Cat/At guard: slice-bound scalars (rg.guards) must equal
+                // the first input's length, and 2n must fit int32 (the shader
+                // computes shifted positions in int); otherwise decline
+                if rg.guards.is_empty() {
+                    e.push_str(&format!(
+                        "if(uf_region_try({},(int){},(int){},_ri,_ro))_fz=1;\n",
+                        rg.kidx, n, nk
+                    ));
+                } else {
+                    e.push_str("{int _gd=(_ri[0].tag==T_PTR);uint64_t _rn=_gd?((Hdr*)(void*)_ri[0].i)->len:0;");
+                    for g in &rg.guards {
+                        e.push_str(&format!(
+                            "{{Cell _gv=uf_sh_get(&var_{});if(_gv.tag!=T_INT||(uint64_t)_gv.i!=_rn)_gd=0;}}",
+                            g
+                        ));
+                    }
+                    e.push_str(&format!(
+                        "if(_gd&&_rn&&(uint64_t)2*_rn<0x7fffffff&&uf_region_try({},(int){},(int){},_ri,_ro))_fz=1;}}\n",
+                        rg.kidx, n, nk
+                    ));
+                }
                 e.push_str("#endif\n");
                 e.push_str("if(!_fz){Hdr*_h[7];uint64_t _n=~(uint64_t)0;int _ok=1;\n");
                 e.push_str(&format!(

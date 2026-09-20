@@ -1391,6 +1391,19 @@ both decline the original per-op code runs. Declines are static or runtime
 zero-divisor `die`, preserving the per-op semantics exactly; on the GPU the
 documented inf/nan divergence applies. Results are bit-identical to the
 per-op path: same ops, same order, no reassociation. Regions in inlined
+
+**v15 concat/slice fusion**: `a b concat` of two same-length region
+expressions fuses as a 2n-wide selector (`pos < n ? a[pos] : b[pos-n]`) and
+the both-halves slice idiom (`x 0 n slice` / `x n n 2 mul slice`, where `n`
+is a shared scalar) fuses as a position shift — each output element simply
+evaluates both halves inline, so the 2n intermediates (the concat vector and
+its derivatives) never materialize and never cross the host bus. The slice
+scalars are guarded at runtime: the shared bound must equal the input
+length and `2n` must fit `int32`, otherwise the region declines to the
+per-op path. A literal-list bind (`[ c0 c1 … ] name!`) inside the region is
+skipped opaquely so surrounding statements still fuse, and fold-callback
+bodies that only the unrolled region references no longer promote their
+operands to region outputs.
 loops, outlined label bodies, or weave tasks are not analyzed (tasks have
 their own fusion). Debug: `NK_DEBUG_REGION=1` prints fused regions;
 `NK_DEBUG_REGION2=1` traces declined walks. Reference:

@@ -43,7 +43,7 @@ jc:
 jb:
   mi@ mj@ add mij!
   mij@ mij@ 1 add mul 2 div mi@ add 1 add mden!
-  src@ mj@ array_get 1.0 mden@ div mul ms@ add ms!
+  src@ mj@ array_get 1.0 mden@ div mul ms+=
   mj++ ret
 ; tm(dst,src,n): dst[i] = sum_j src[j] * eval_A(j,i)
 tm: dst! src! nn!
@@ -62,7 +62,7 @@ dc:
 db:
   tj@ ti@ add ji!
   ji@ ji@ 1 add mul 2 div tj@ add 1 add tden!
-  src@ tj@ array_get 1.0 tden@ div mul ts@ add ts!
+  src@ tj@ array_get 1.0 tden@ div mul ts+=
   tj++ ret
 dots: k!
   u@ k@ array_get v@ k@ array_get mul uvt+=

@@ -16,8 +16,7 @@ row: k!
   ret
 col: k!
   2.0 k@ mul n@ div 1.5 sub cx!
-  cx@ cy@ _call esc
-  cnt@ add cnt!
+  cx@ cy@ _call esc cnt+=
   ret
 ; esc(cx,cy): zr←zr²-zi²+cx, zi←2·zr·zi+cy for up to 50 iters;
 ; returns 1 if the point stayed bounded (zr²+zi²<=4), else 0.

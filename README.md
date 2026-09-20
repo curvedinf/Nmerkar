@@ -64,23 +64,23 @@ and small-list allocation costs.
 | bfs CSR n=1M | 0.09 | **0.03** | 0.05 | 1.31 | 0.07 |
 | dynamicgraph n=1M | 0.44 | **0.16** | 0.30 | 1.51 | 0.39 |
 | matmul N=512 | 0.03 | 0.03 | **0.02** | 0.15 | 0.13 |
-| blackscholes N=2M | 0.07 | 0.04 | **0.04** | 0.17 | 0.07 |
-| **total** | 3.35 | **2.85** | 3.97 | 148.49 | 8.70 |
+| blackscholes N=2M | 0.05 | 0.04 | **0.04** | 0.17 | 0.07 |
+| **total** | 3.33 | **2.85** | 3.97 | 148.49 | 8.70 |
 
 ### GPU offloading (seconds, lower = faster)
 
 | workload | CPU (`--device cpu`) | GPU (`--device vk0`) |
 |---|---|---|
-| matmul N=2048 | 1.59s | **0.26s** |
-| blackscholes N=32M | 1.12s | **0.82s** |
+| matmul N=2048 | 1.56s | **0.26s** |
+| blackscholes N=32M | 0.70s | **0.40s** |
 
-Measured 2026-09-20 (v15 + concat/slice region fusion, warm runs,
-`NK_VK_DEBUG` verified dispatch on the 7900 XTX). blackscholes now fuses to
-ONE kernel (1 input, 1 output): the `d1 d2 concat` / half-slice chain that
-previously forced 4 regions and ~5GB of host staging is absorbed into the
-kernel expression, so each output element evaluates both halves on-device.
+Measured 2026-09-20 (v15 + concat/slice + range-generator region fusion,
+warm runs, `NK_VK_DEBUG` verified dispatch on the 7900 XTX). blackscholes
+fuses end-to-end into ONE kernel with ZERO inputs: `range`/`concat`/slices
+are absorbed into the kernel expression (the kernel synthesizes index
+values on-device), so no list, tensor build, or staging-in exists at all.
 Auto device matches or beats `--device cpu` on every benchmark at every
-size; matmul remains the largest GPU win.
+size; at N=128M auto is 2.0x faster than CPU.
 
 ## Quick start
 

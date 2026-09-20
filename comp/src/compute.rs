@@ -298,6 +298,9 @@ pub enum TExpr {
     // intermediates never materialize.
     Cat(Box<TExpr>, Box<TExpr>),
     At(Box<TExpr>, Shift),
+    // value at domain position q is (double)(q + k) — the absorbed
+    // `k n range` generator; dispatch length comes from a shared scalar
+    Idx(i64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,6 +317,7 @@ pub fn expr_width(e: &TExpr) -> u32 {
         TExpr::Input(_) => 1,
         TExpr::At(a, _) => expr_width(a).max(1).min(1), // slices are n-domain
         TExpr::Cat(_, _) => 2,
+        TExpr::Idx(_) => 1,
         TExpr::Add(a, b) | TExpr::Sub(a, b) | TExpr::Mul(a, b) | TExpr::Div(a, b) => {
             expr_width(a).max(expr_width(b))
         }
@@ -351,6 +355,7 @@ fn expr_to_glsl(e: &TExpr, idx: &str) -> String {
         ),
         TExpr::At(a, Shift::K(k)) => expr_to_glsl(a, &format!("({})+{}", idx, k)),
         TExpr::At(a, Shift::Len) => expr_to_glsl(a, &format!("({})+int(pc.n0)", idx)),
+        TExpr::Idx(k) => format!("float64_t(int64_t({})+{})", idx, k),
     }
 }
 
@@ -612,6 +617,8 @@ pub struct RegionGen {
     pub end_pc: usize,           // goto target after the fused block
     pub out_locals: Vec<OutBind>, // live-out bindings (1..=4)
     pub guards: Vec<String>,     // shared vars that must equal input length at runtime
+    pub len_shared: Option<String>, // generator regions: shared var providing the
+                                    // dispatch length (guards[0] when inputs empty)
     pub c_exprs: Vec<String>,    // elementwise exprs as C over _a0.._a(n-1) at index _i
 }
 /// All registered (pc, end_pc) ranges — gen jumps over them when the fused
@@ -633,6 +640,11 @@ pub fn region_at(pc: usize) -> Option<RegionGen> {
                 end_pc: ks[i].end_pc,
                 out_locals: ks[i].exprs.iter().map(|(b, _)| b.clone()).collect(),
                 guards: ks[i].guards.clone(),
+                len_shared: if ks[i].inputs.is_empty() {
+                    ks[i].guards.first().cloned()
+                } else {
+                    None
+                },
                 c_exprs: ks[i].exprs.iter().map(|(_, e)| expr_to_c(e)).collect(),
             }
         })
@@ -649,6 +661,7 @@ fn expr_uses_input(e: &TExpr) -> bool {
         TExpr::Sqrt(a) => expr_uses_input(a),
         TExpr::Cat(a, b) => expr_uses_input(a) || expr_uses_input(b),
         TExpr::At(a, _) => expr_uses_input(a),
+        TExpr::Idx(_) => true, // consumes the dispatch domain
     }
 }
 
@@ -660,6 +673,7 @@ fn expr_has_div(e: &TExpr) -> bool {
         TExpr::Sqrt(a) => expr_has_div(a),
         TExpr::Cat(a, b) => expr_has_div(a) || expr_has_div(b),
         TExpr::At(a, _) => expr_has_div(a),
+        TExpr::Idx(_) => false,
     }
 }
 
@@ -693,6 +707,7 @@ fn expr_to_c_at(e: &TExpr, idx: &str) -> String {
         ),
         TExpr::At(a, Shift::K(k)) => expr_to_c_at(a, &format!("({})+{}", idx, k)),
         TExpr::At(a, Shift::Len) => expr_to_c_at(a, &format!("({})+(int64_t)_n", idx)),
+        TExpr::Idx(k) => format!("(double)((int64_t)({})+{})", idx, k),
     }
 }
 
@@ -988,6 +1003,7 @@ fn remap_input(e: &TExpr, map: &[Option<usize>]) -> Option<TExpr> {
             Box::new(remap_input(b, map)?),
         )),
         TExpr::At(a, s) => Some(TExpr::At(Box::new(remap_input(a, map)?), *s)),
+        TExpr::Idx(k) => Some(TExpr::Idx(*k)),
     }
 }
 
@@ -1199,6 +1215,58 @@ fn walk_one_region(
                 stop = false;
             }
             Ins::Simple(h) => match *h {
+                // v15: the `k n range float tensor` idiom (constant start,
+                // shared-scalar stop, float tensor) fuses as the Idx
+                // generator — the kernel synthesizes index values on-device
+                // (no list, no tensor build, no stage-in). Only this exact
+                // shape fuses: a bare range feeding anything else keeps its
+                // list semantics. The stop scalar becomes the region's
+                // length guard (guards[0] when there are no array inputs).
+                "op_range"
+                    if matches!(p.ins.get(i + 1), Some(Ins::PushI(1)))
+                        && matches!(p.ins.get(i + 2), Some(Ins::Simple("op_tensor"))) =>
+                {
+                    let stopv = stack.pop();
+                    let startv = stack.pop();
+                    match (startv, stopv) {
+                        (Some(V::E(se)), Some(V::E(ee))) => {
+                            let fused = match &se {
+                                TExpr::Const(c) if *c == c.trunc() && c.abs() < 1e15 => {
+                                    fn scalar_glob2(e: &TExpr, inputs: &[InSlot]) -> Option<String> {
+                                        match e {
+                                            TExpr::Input(j) => match inputs.get(*j) {
+                                                Some(InSlot::Glob(g)) => Some(g.clone()),
+                                                _ => None,
+                                            },
+                                            _ => None,
+                                        }
+                                    }
+                                    scalar_glob2(&ee, &inputs).map(|g| (TExpr::Idx(*c as i64), g))
+                                }
+                                _ => None,
+                            };
+                            match fused {
+                                Some((e, g)) => {
+                                    if !guards.contains(&g) {
+                                        guards.push(g.clone());
+                                    }
+                                    if let TExpr::Input(bi) = &ee {
+                                        if matches!(inputs.get(*bi), Some(InSlot::Glob(gn)) if *gn == g) {
+                                            inputs[*bi] = InSlot::Phantom;
+                                        }
+                                    }
+                                    stack.push(V::E(e));
+                                    ops += 1;
+                                    // skip range + PushI(1) + op_tensor
+                                    i += 2;
+                                    stop = false;
+                                }
+                                None => stop = true,
+                            }
+                        }
+                        _ => stop = true,
+                    }
+                }
                 "op_add" | "op_sub" | "op_mul" | "op_div" => {
                     match (stack.pop(), stack.pop()) {
                         (Some(V::E(be)), Some(V::E(ae))) => {
@@ -1305,7 +1373,7 @@ fn walk_one_region(
                                             }
                                             TExpr::Sqrt(a) | TExpr::At(a, _) => go_idx(a, idxs),
                                             TExpr::Cat(a, b) => go_idx(a, idxs) || go_idx(b, idxs),
-                                            TExpr::Const(_) => false,
+                                            TExpr::Const(_) | TExpr::Idx(_) => false,
                                         }
                                     }
                                     let still_used = |name: &str| -> bool {
@@ -1503,7 +1571,7 @@ fn walk_one_region(
             }
         }
     }
-    if real.is_empty() || real.len() > 7 || real.len() + exprs.len() > 8 {
+    if real.len() > 7 || real.len() + exprs.len() > 8 || (real.is_empty() && guards.is_empty()) {
         return None;
     }
     let exprs = exprs

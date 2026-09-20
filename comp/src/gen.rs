@@ -678,33 +678,67 @@ pub fn emit_range(
                 // v15 Cat/At guard: slice-bound scalars (rg.guards) must equal
                 // the first input's length, and 2n must fit int32 (the shader
                 // computes shifted positions in int); otherwise decline
-                if rg.guards.is_empty() {
-                    e.push_str(&format!(
-                        "if(uf_region_try({},(int){},(int){},_ri,_ro))_fz=1;\n",
-                        rg.kidx, n, nk
-                    ));
-                } else {
-                    e.push_str("{int _gd=(_ri[0].tag==T_PTR);uint64_t _rn=_gd?((Hdr*)(void*)_ri[0].i)->len:0;");
-                    for g in &rg.guards {
+                match &rg.len_shared {
+                    None if rg.guards.is_empty() => {
                         e.push_str(&format!(
-                            "{{Cell _gv=uf_sh_get(&var_{});if(_gv.tag!=T_INT||(uint64_t)_gv.i!=_rn)_gd=0;}}",
-                            g
+                            "if(uf_region_try({},(int){},(int){},(uint64_t)0,_ri,_ro))_fz=1;\n",
+                            rg.kidx, n, nk
                         ));
                     }
-                    e.push_str(&format!(
-                        "if(_gd&&_rn&&(uint64_t)2*_rn<0x7fffffff&&uf_region_try({},(int){},(int){},_ri,_ro))_fz=1;}}\n",
-                        rg.kidx, n, nk
-                    ));
+                    None => {
+                        e.push_str("{int _gd=(_ri[0].tag==T_PTR);uint64_t _rn=_gd?((Hdr*)(void*)_ri[0].i)->len:0;");
+                        for g in &rg.guards {
+                            e.push_str(&format!(
+                                "{{Cell _gv=uf_sh_get(&var_{});if(_gv.tag!=T_INT||(uint64_t)_gv.i!=_rn)_gd=0;}}",
+                                g
+                            ));
+                        }
+                        e.push_str(&format!(
+                            "if(_gd&&_rn&&(uint64_t)2*_rn<0x7fffffff&&uf_region_try({},(int){},(int){},(uint64_t)0,_ri,_ro))_fz=1;}}\n",
+                            rg.kidx, n, nk
+                        ));
+                    }
+                    Some(lenvar) => {
+                        // generator region: no array inputs; guards[0] is the
+                        // length var, further guards must equal it
+                        e.push_str(&format!(
+                            "{{Cell _lv=uf_sh_get(&var_{});int _gd=(_lv.tag==T_INT&&_lv.i>0);uint64_t _rn=_gd?(uint64_t)_lv.i:0;",
+                            lenvar
+                        ));
+                        for g in rg.guards.iter().skip(1) {
+                            e.push_str(&format!(
+                                "{{Cell _gv=uf_sh_get(&var_{});if(_gv.tag!=T_INT||(uint64_t)_gv.i!=_rn)_gd=0;}}",
+                                g
+                            ));
+                        }
+                        e.push_str(&format!(
+                            "if(_gd&&(uint64_t)2*_rn<0x7fffffff&&uf_region_try({},0,(int){},(uint64_t)_rn,_ri,_ro))_fz=1;}}\n",
+                            rg.kidx, nk
+                        ));
+                    }
                 }
                 e.push_str("#endif\n");
-                e.push_str("if(!_fz){Hdr*_h[7];uint64_t _n=~(uint64_t)0;int _ok=1;\n");
-                e.push_str(&format!(
-                    "for(int _j=0;_j<{};_j++){{_h[_j]=(_ri[_j].tag==T_PTR)?(Hdr*)(void*)_ri[_j].i:0;if(!_h[_j]||_h[_j]->ety!=1||_h[_j]->tag==HT_MAT){{_ok=0;break;}}if(_n==~(uint64_t)0)_n=_h[_j]->len;else if(_h[_j]->len!=_n)_ok=0;}}\n",
-                    n
-                ));
+                if let Some(lenvar) = &rg.len_shared {
+                    e.push_str(&format!(
+                        "if(!_fz){{Cell _lv=uf_sh_get(&var_{});uint64_t _n=(_lv.tag==T_INT&&(uint64_t)_lv.i<0x7fffffff)?(uint64_t)_lv.i:0;int _ok=(_n>0);\n",
+                        lenvar
+                    ));
+                } else {
+                    e.push_str("if(!_fz){Hdr*_h[7];uint64_t _n=~(uint64_t)0;int _ok=1;\n");
+                    e.push_str(&format!(
+                        "for(int _j=0;_j<{};_j++){{_h[_j]=(_ri[_j].tag==T_PTR)?(Hdr*)(void*)_ri[_j].i:0;if(!_h[_j]||_h[_j]->ety!=1||_h[_j]->tag==HT_MAT){{_ok=0;break;}}if(_n==~(uint64_t)0)_n=_h[_j]->len;else if(_h[_j]->len!=_n)_ok=0;}}\n",
+                        n
+                    ));
+                }
                 e.push_str("if(_ok&&_n){Hdr*_r[4];");
-                for j in 0..nk {
-                    e.push_str(&format!("_r[{j}]=uf_arr_like(_h[0],_n);UF_PROTECT(&_r[{j}]);", j = j));
+                if rg.len_shared.is_some() {
+                    for j in 0..nk {
+                        e.push_str(&format!("_r[{j}]=(Hdr*)uf_gc_alloc_nz(sizeof(Hdr)+_n*8,0);_r[{j}]->tag=HT_TENSOR;_r[{j}]->len=_n;_r[{j}]->esz=8;_r[{j}]->ety=1;UF_PROTECT(&_r[{j}]);", j = j));
+                    }
+                } else {
+                    for j in 0..nk {
+                        e.push_str(&format!("_r[{j}]=uf_arr_like(_h[0],_n);UF_PROTECT(&_r[{j}]);", j = j));
+                    }
                 }
                 e.push_str("\n");
                 for k in 0..n {

@@ -2515,8 +2515,12 @@ static Cell uf_gpu_task(Ctx*cx,int k,int n){
    arrive explicitly as Cells (compiler-passed locals). Returns 1 and fills
    outs[0..nout) on success; 0 = declined, caller falls back to the fused CPU
    loop / per-op path. */
-static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
-  if(uf_vk_broken||n<1||n>7||nout<1||nout>4||n+nout>8) return 0;
+static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
+  /* n==0: generator region (Idx expressions only) — rlen is the dispatch
+     length from the region's length guard; outputs are fresh float64
+     tensors. */
+  if(uf_vk_broken||n>7||nout<1||nout>4||n+nout>8) return 0;
+  if(n==0&&(rlen==0||rlen>=((uint64_t)1<<31))) return 0;
   Hdr* hs[7];
   for(int j=0;j<n;j++){
     if(!uf_numarr(ins[j])) return 0;
@@ -2524,7 +2528,7 @@ static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
     if(hs[j]->ety!=1) return 0;
     if(hs[j]->len!=hs[0]->len) return 0;
   }
-  uint64_t len=hs[0]->len;
+  uint64_t len=n?hs[0]->len:rlen;
   if(len<(uint64_t)uf_gpu_min()) return 0;
   /* Matrices must not take the elementwise fused kernel (mul is matmul). */
   for(int j=0;j<n;j++) if(hs[j]->tag==HT_MAT) return 0;
@@ -2546,10 +2550,11 @@ static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
   int dbg=getenv("NK_VK_DEBUG")!=0;
   double _t0=dbg?uf_nowd():0;
   double _tin=0,_tsub=0,_tout=0,_tm;
+  Hdr tpl; if(n==0){ memset(&tpl,0,sizeof tpl); tpl.tag=HT_TENSOR; tpl.esz=8; tpl.ety=1; tpl.len=len; }
   Hdr* rs[4]; for(int j=0;j<nout;j++){ rs[j]=0; UF_PROTECT(&rs[j]); }
   if(ok){
     if(dbg)_tm=uf_nowd();
-    for(int j=0;j<nout;j++) rs[j]=uf_arr_like(hs[0],len);
+    for(int j=0;j<nout;j++) rs[j]=uf_arr_like(n?hs[0]:&tpl,len);
     for(int j=0;j<n;j++) memcpy(uf_vk_bpool.mapped+offs[j],uf_data(hs[j]),bufsz);
     uf_vk_flush(offs[0], (offs[n-1]+bufsz)-offs[0]);
     if(dbg){_tin=uf_nowd()-_tm;_tm=uf_nowd();}

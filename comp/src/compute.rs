@@ -691,6 +691,10 @@ pub fn task_kernel_at(pc: usize) -> Option<(usize, usize)> {
 pub enum OutBind {
     Local(usize),
     Shared(String),
+    // scalar reduction over a for-domain: the shared slot receives
+    // slot += sum(per-element expr). Only fusable inside For domains where
+    // the delta is a per-element scalar by construction.
+    Sum(String),
 }
 
 #[derive(Clone, Debug)]
@@ -913,6 +917,7 @@ pub fn analyze_regions(p: &crate::ast::Parsed) -> Vec<RegionKernel> {
                 let outs: Vec<String> = exprs.iter().map(|(b, _)| match b {
                     OutBind::Local(id) => format!("L{}", id),
                     OutBind::Shared(n) => format!("S:{}", n),
+                    OutBind::Sum(n) => format!("SUM:{}", n),
                 }).collect();
                 eprintln!(
                     "[region] pc {}..{} FUSED ({} inputs, outs [{}])",
@@ -1351,7 +1356,13 @@ fn walk_one_region(
     // stop point — their walked binding is stale, so they must not become
     // region outputs
     let mut poisoned: Vec<Slot> = Vec::new();
-    let mut clean: Option<(usize, Vec<InSlot>, Vec<Slot>, usize, HashMap<Slot, V>, Option<Slot>, Vec<String>)> =
+    // (slot, per-element summand) accumulated inside For domains
+    let mut sums: Vec<(Slot, TExpr)> = Vec::new();
+    // >0 while walking inside a for-loop domain (atomic-add deltas are
+    // per-element scalars there — Sum fusion is sound only in this context)
+    let mut for_depth: usize = 0;
+    let mut end_at_for = false;
+    let mut clean: Option<(usize, Vec<InSlot>, Vec<Slot>, usize, HashMap<Slot, V>, Option<Slot>, Vec<String>, Vec<(Slot, TExpr)>)> =
         None;
     let mut i = start;
     while i < p.ins.len() {
@@ -1419,7 +1430,7 @@ fn walk_one_region(
                 // skip PushAddr (+ Flush when present) + op_vfold
                 i += if matches!(p.ins.get(i + 1), Some(Ins::Flush)) { 3 } else { 2 };
                 if stack.is_empty() {
-                    clean = Some((i, inputs.clone(), written.clone(), ops, locals.clone(), final_out.clone(), guards.clone()));
+                    clean = Some((i, inputs.clone(), written.clone(), ops, locals.clone(), final_out.clone(), guards.clone(), sums.clone()));
                 }
                 continue;
             }
@@ -1430,9 +1441,153 @@ fn walk_one_region(
             Ins::Flush => {
                 stop = false;
             }
-            // shared x++/x+= : atomic RMW — unmodeled; stop AND poison the
-            // slot (its walked binding is stale and must not fuse as an
-            // output; scalar reductions need Sum outputs, not yet built)
+            // v15 For domains: `n 'body for` with a scalar count becomes the
+            // dispatch domain; the body label (arity-1, binds k) inlines with
+            // k = the element index (Idx). The body must simulate fully
+            // (per-element scalars only: Idx, consts, inlined locals).
+            Ins::For => {
+                if i >= 2 {
+                    if let (Ins::PushAddr(bl), cnt_ins) = (&p.ins[i - 1], &p.ins[i - 2]) {
+                        let bpc = p.labels.get(bl).copied();
+                        // count: Const or a shared scalar (recorded as length guard)
+                        let (n_elems, guard): (Option<TExpr>, Option<String>) = match cnt_ins {
+                            Ins::PushI(v) => (Some(TExpr::Const(*v as f64)), None),
+                            Ins::GetV(g) => (None, Some(g.clone())),
+                            _ => (None, None),
+                        };
+                        if let Some(bpc) = bpc {
+                            // body label binds exactly one param (k)
+                            let binds_ok = matches!(
+                                (p.ins.get(bpc), p.ins.get(bpc + 1)),
+                                (Some(Ins::LocalSetI(_)) | Some(Ins::LocalSet(_)), Some(Ins::Ret)) | 
+                                (Some(Ins::LocalSetI(_)) | Some(Ins::LocalSet(_)), _)
+                            );
+                            if binds_ok {
+                                let k_slot: Slot = match &p.ins[bpc] {
+                                    Ins::LocalSetI(id) => Slot::Id(*id),
+                                    Ins::LocalSet(nm) => Slot::Name(nm.clone()),
+                                    _ => unreachable!(),
+                                };
+                                // simulate the body inline: k -> Idx(0)
+                                let saved: Vec<V> = stack.clone();
+                                stack.clear();
+                                let mut flocals: HashMap<Slot, V> = locals.clone();
+                                flocals.insert(k_slot, V::E(TExpr::Idx(0)));
+                                let mut j = bpc + 1;
+                                let mut okbody = for_depth < 4;
+                                if let Some(g) = &guard {
+                                    if !guards.contains(g) { guards.push(g.clone()); }
+                                }
+                                for_depth += 1;
+                                'forbody: while j < p.ins.len() {
+                                    match &p.ins[j] {
+                                        Ins::Ret => break,
+                                        Ins::Flush => {}
+                                        Ins::PushF(v) => stack.push(V::E(TExpr::Const(*v))),
+                                        Ins::PushI(v) => stack.push(V::E(TExpr::Const(*v as f64))),
+                                        Ins::LocalGetI(id) => match flocals.get(&Slot::Id(*id)) {
+                                            Some(v) => stack.push(v.clone()),
+                                            None => { okbody = false; break 'forbody; }
+                                        },
+                                        Ins::LocalGet(nm) => match flocals.get(&Slot::Name(nm.clone())) {
+                                            Some(v) => stack.push(v.clone()),
+                                            None => { okbody = false; break 'forbody; }
+                                        },
+                                        Ins::GetV(nm) => {
+                                            // inlined region-local or already-walked shared expr only;
+                                            // fresh array inputs inside a for body decline (per-element
+                                            // scalar context required)
+                                            if let Some(v) = flocals.get(&Slot::Name(nm.clone())).or_else(|| locals.get(&Slot::Name(nm.clone()))) {
+                                                stack.push(v.clone());
+                                            } else if let Some(g) = &guard {
+                                                if g == nm { stack.push(V::E(TExpr::Idx(0))); /* not meaningful */ okbody = false; break 'forbody; }
+                                                else { okbody = false; break 'forbody; }
+                                            } else { okbody = false; break 'forbody; }
+                                        }
+                                        Ins::LocalSetI(id) => match stack.pop() {
+                                            Some(v) => { flocals.insert(Slot::Id(*id), v); }
+                                            None => { okbody = false; break 'forbody; }
+                                        },
+                                        Ins::LocalSet(nm) | Ins::SetV(nm) => match stack.pop() {
+                                            Some(v) => { flocals.insert(Slot::Name(nm.clone()), v); }
+                                            None => { okbody = false; break 'forbody; }
+                                        },
+                                        Ins::AtomicAdd(an, ainc) => {
+                                            // per-element scalar delta inside the for body — Sum output
+                                            let delta = if *ainc { Some(V::E(TExpr::Const(1.0))) } else { stack.pop() };
+                                            match delta {
+                                                Some(V::E(e)) => {
+                                                    let slot = Slot::Name(an.clone());
+                                                    if let Some(pos) = sums.iter().position(|(s2, _)| s2 == &slot) {
+                                                        let prev = sums[pos].1.clone();
+                                                        sums[pos].1 = TExpr::Add(Box::new(prev), Box::new(e));
+                                                    } else {
+                                                        sums.push((slot.clone(), e));
+                                                    }
+                                                    flocals.remove(&slot);
+                                                }
+                                                _ => { poisoned.push(Slot::Name(an.clone())); okbody = false; break 'forbody; }
+                                            }
+                                        }
+                                        Ins::Simple(hh) => {
+                                            let r = if ["op_add","op_sub","op_mul","op_div"].contains(hh) {
+                                                match (stack.pop(), stack.pop()) {
+                                                    (Some(V::E(be)), Some(V::E(ae))) => fuse_binop(hh, ae, be),
+                                                    _ => None,
+                                                }
+                                            } else if *hh == "op_sqrt" {
+                                                match stack.pop() { Some(V::E(ae)) => Some(TExpr::Sqrt(Box::new(ae))), _ => None }
+                                            } else if ["op_lt","op_gt","op_lte","op_gte","op_eq"].contains(hh) {
+                                                match (stack.pop(), stack.pop()) {
+                                                    (Some(V::E(be)), Some(V::E(ae))) => {
+                                                        let op = match *hh { "op_lt" => "lt", "op_gt" => "gt", "op_lte" => "lte", "op_gte" => "gte", _ => "eq" };
+                                                        Some(TExpr::Cmp(op, Box::new(ae), Box::new(be)))
+                                                    }
+                                                    _ => None,
+                                                }
+                                            } else if *hh == "op_and" {
+                                                match (stack.pop(), stack.pop()) {
+                                                    (Some(V::E(be)), Some(V::E(ae))) => Some(TExpr::And(Box::new(ae), Box::new(be))),
+                                                    _ => None,
+                                                }
+                                            } else if *hh == "op_not" {
+                                                match stack.pop() { Some(V::E(ae)) => Some(TExpr::Not(Box::new(ae))), _ => None }
+                                            } else { None };
+                                            match r {
+                                                Some(e) => { stack.push(V::E(e)); ops += 1; }
+                                                None => { okbody = false; break 'forbody; }
+                                            }
+                                        }
+                                        _ => { okbody = false; break 'forbody; }
+                                    }
+                                    j += 1;
+                                }
+                                for_depth -= 1;
+                                if okbody && guard.is_some() {
+                                    // loop bodies return nothing: drop scratch values
+                                    stack.clear();
+                                    ops += 1;
+                                    // sums accumulate across the domain; anything reading
+                                    // them later is unmodeled — end the region AT the
+                                    // instruction after the For (consumed [cnt,addr,For])
+                                    if !sums.is_empty() {
+                                        i += 1;
+                                        end_at_for = true;
+                                        break;
+                                    }
+                                    i += 2;
+                                    clean = Some((i, inputs.clone(), written.clone(), ops, locals.clone(), final_out.clone(), guards.clone(), sums.clone()));
+                                    continue;
+                                } else {
+                                    stack = saved;
+                                    stop = true;
+                                }
+                            } else { poisoned.push(Slot::Name(String::new())); stop = true; }
+                        } else { stop = true; }
+                    } else { stop = true; }
+                } else { stop = true; }
+            }
+            // shared x++/x+= outside For domains: unmodeled; stop AND poison
             Ins::AtomicAdd(n, _) => {
                 poisoned.push(Slot::Name(n.clone()));
                 stop = true;
@@ -1693,6 +1848,10 @@ fn walk_one_region(
                 stop = false;
             }
             Ins::GetV(n) => {
+                if sums.iter().any(|(s2, _)| *s2 == Slot::Name(n.clone())) {
+                    // sum materializes only at region exit — decline
+                    stop = true;
+                } else {
                 let slot = Slot::Name(n.clone());
                 match locals.get(&slot) {
                     Some(v) => stack.push(v.clone()),
@@ -1709,6 +1868,7 @@ fn walk_one_region(
                     }
                 }
                 stop = false;
+                }
             }
             Ins::Simple(h) => match *h {
                 // v15: the `k n range float tensor` idiom (constant start,
@@ -1983,7 +2143,7 @@ fn walk_one_region(
             break;
         }
         if stack.is_empty() {
-            clean = Some((i + 1, inputs.clone(), written.clone(), ops, locals.clone(), final_out.clone(), guards.clone()));
+            clean = Some((i + 1, inputs.clone(), written.clone(), ops, locals.clone(), final_out.clone(), guards.clone(), sums.clone()));
         }
         i += 1;
     }
@@ -1996,10 +2156,10 @@ fn walk_one_region(
             &p.ins[end_pc - 1],
             Ins::LocalSetI(_) | Ins::LocalSet(_) | Ins::SetV(_)
         );
-    if !stack.is_empty() || !ends_on_bind {
+    if !end_at_for && (!stack.is_empty() || !ends_on_bind) {
         // stopped mid-statement: fall back to the last clean boundary
         match clean {
-            Some((cp, cin, cwr, cops, clocals, cout, cguards)) => {
+            Some((cp, cin, cwr, cops, clocals, cout, cguards, csums)) => {
                 end_pc = cp;
                 inputs = cin;
                 written = cwr;
@@ -2007,6 +2167,7 @@ fn walk_one_region(
                 locals = clocals;
                 final_out = cout;
                 guards = cguards;
+                sums = csums;
                 stack.clear();
             }
             None => return None,
@@ -2017,15 +2178,16 @@ fn walk_one_region(
         eprintln!("[region?] start={} end={} stack={} ops={} inputs={} ctx={:?}",
             start, end_pc, stack.len(), ops, inputs.len(), ctx);
     }
-    if end_pc == start || !stack.is_empty() || ops == 0 || inputs.is_empty() {
+    if end_pc == start || !stack.is_empty() || ops == 0 || (inputs.is_empty() && guards.is_empty()) {
         return None;
     }
-    // the region must end on a local bind (statement boundary after a Set);
-    // trailing Flushes at an empty-stack boundary are no-ops — trim them
+    // the region must end on a local bind (statement boundary after a Set)
+    // or on a fused For; trailing Flushes at an empty-stack boundary are
+    // no-ops — trim them
     while end_pc > start + 1 && matches!(&p.ins[end_pc - 1], Ins::Flush) {
         end_pc -= 1;
     }
-    if !matches!(&p.ins[end_pc - 1], Ins::LocalSetI(_) | Ins::LocalSet(_) | Ins::SetV(_)) {
+    if !end_at_for && !matches!(&p.ins[end_pc - 1], Ins::LocalSetI(_) | Ins::LocalSet(_) | Ins::SetV(_)) {
         if std::env::var("NK_DEBUG_REGION2").is_ok() {
             eprintln!("[region?] start={} bind-check failed at {}: {:?}", start, end_pc - 1, p.ins[end_pc - 1]);
         }
@@ -2054,10 +2216,20 @@ fn walk_one_region(
         let lv: Vec<String> = live.iter().map(|x| match x { Slot::Id(i)=>format!("L{}",i), Slot::Name(n)=>format!("S:{}",n) }).collect();
         eprintln!("[region?] start={} live={:?}", start, lv);
     }
-    if live.is_empty() || live.len() > 4 {
+    if (live.is_empty() && sums.is_empty()) || live.len() > 4 {
         return None;
     }
     let mut exprs: Vec<(OutBind, TExpr)> = Vec::new();
+    for (slot, e) in &sums {
+        if let Slot::Name(n) = slot {
+            // summed slots are not per-element outputs
+            live.retain(|s2| s2 != slot);
+            exprs.push((OutBind::Sum(n.clone()), e.clone()));
+        }
+    }
+    if exprs.len() > 4 {
+        return None;
+    }
     for slot in &live {
         let bind = match slot {
             Slot::Id(id) => OutBind::Local(*id),

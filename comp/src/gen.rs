@@ -797,6 +797,15 @@ pub fn emit_range(
                                 name, j
                             ));
                         }
+                        crate::compute::OutBind::Sum(name) => {
+                            // slot += sum of the per-element output (sequential
+                            // element order — same accumulation order as the
+                            // per-op atomic adds)
+                            e.push_str(&format!(
+                                "{{Hdr* _sh=(Hdr*)(void*)_ro[{}].i;if(_sh&&_sh->ety==1){{double _acc=0;double* _ad=(double*)uf_data(_sh);for(uint64_t _q=0;_q<_sh->len;_q++)_acc+=_ad[_q];uf_sh_set(&var_{},uf_cadd(uf_sh_get(&var_{}),uf_mkf(_acc)));}}}}",
+                                j, name, name
+                            ));
+                        }
                     }
                 }
                 e.push_str(&format!("goto {};}}}}\n", plab(prefix, rg.end_pc)));

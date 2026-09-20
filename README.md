@@ -52,23 +52,27 @@ imperative control-flow shapes where Python's loops stay terse.
 | | Enmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
 | logextract 510 MB | 0.96 | **0.40** | 0.67 | 3.71 | 2.94 |
-| analytics 512 MB | 1.51 | **0.99** | 1.71 | 4.47 | 3.39 |
+| analytics 512 MB | 1.48 | **0.99** | 1.71 | 4.47 | 3.39 |
 | mandelbrot | 0.07 | **0.05** | 0.05 | 4.13 | 0.06 |
-| spectralnorm | 1.11 | 1.10 | **1.08** | 133.1 | 1.57 |
+| spectralnorm | 1.10 | 1.10 | **1.08** | 133.1 | 1.57 |
 | matmul N=512 | 0.03 | 0.04 | **0.02** | 0.15 | 0.14 |
-| blackscholes N=2M | 0.15 | **0.04** | 0.04 | 0.17 | 0.07 |
-| nqueens N=11 | 0.36 | **0.01** | 0.01 | 1.52 | 0.03 |
-| bfs n=1M | 0.97 | 0.11 | **0.09** | 1.68 | 0.25 |
-| **total (6 CPU benches)** | 3.83 | **2.61** | 3.57 | 145.8 | 8.17 |
+| blackscholes N=2M | 0.13 | **0.04** | 0.04 | 0.17 | 0.07 |
+| nqueens N=11 | 0.35 | **0.01** | 0.01 | 1.52 | 0.03 |
+| bfs n=1M | 0.94 | 0.11 | **0.09** | 1.68 | 0.25 |
+| **total (6 CPU benches)** | 3.77 | **2.61** | 3.57 | 145.8 | 8.17 |
 
 ### GPU offloading (seconds, lower = faster)
 
 | workload | CPU (--device cpu) | GPU |
 |---|---|---|
-| matmul N=512 | **0.03s** | 0.07s |
-| matmul N=1024 | 0.26s | **0.12s** |
-| matmul N=2048 | 2.74s | **0.42s** |
-| blackscholes N=2M | **0.15s** | 0.66s |
+| matmul N=512 | **0.03s** | 0.05s |
+| matmul N=1024 | 0.21s | **0.11s** |
+| matmul N=2048 | 1.52s | **0.38s** |
+| blackscholes N=2M | **0.13s** | 0.66s |
+
+Default `auto` uses a static first-run estimate (work vs transfer vs init — no
+autotuning): N=512 matmul and N=2M blackscholes stay on CPU; N=1024/2048
+matmul use the GPU. `--device vk<N>` still forces the GPU column.
 
 ## Quick start
 
@@ -146,11 +150,13 @@ with other policies. You can customize the policy at runtime.
 
 ## Automatic GPU Acceleration
 
-When a Vulkan toolchain is present, Enmerkar by default automatically hardware 
-accelerates applicable segments of code.
+When a Vulkan toolchain is present, Enmerkar by default automatically hardware
+accelerates applicable segments of code. Default `auto` never times both
+backends: it picks CPU or GPU from a static estimate of work vs transfer vs
+init so the first run of a fresh binary is not slower than the faster pin.
 
 ```sh
-nkr bigmatmul.ent          # auto: uses the GPU when one exists
+nkr bigmatmul.ent          # auto: GPU when the static estimate says it wins
 nkr --device cpu prog.ent  # never offload
 nkr --device vk0 prog.ent  # pin a specific Vulkan device
 ```

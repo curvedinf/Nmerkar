@@ -1341,6 +1341,21 @@ element/work count clears `NKR_GPU_MIN` (env, default 65536); otherwise the CPU
 implementation runs. Any Vulkan failure degrades permanently to CPU — the GPU
 is a fast path, never a correctness dependency.
 
+**First-run CPU vs GPU (no autotuning)**: default `auto` never times both
+backends and never runs a calibration trial. It uses a **static** estimate of
+work vs host-visible transfer vs Vulkan init:
+
+- **matmul** (`mul` on two matrices): offload only when `rows·k·cols`
+  FLOPs clear `NKR_GPU_MATMUL_MIN` (env, default 400·2²⁰ ≈ 4.2e8, between
+  512³ and 768³). Smaller squares (README: N=512) stay on CPU on the first
+  run of a fresh binary; N=1024/2048 still go to the GPU.
+- **Fused regions / weave-task elementwise**: if Vulkan has not been
+  initialized yet, auto additionally requires `NKR_GPU_ARITH_MIN` elements
+  (default 8M). Black-scholes at N=2M therefore stays CPU on first run;
+  `--device vk<N>` still launches.
+- Pipelines are created **lazily** (only the kernels a launch actually
+  uses). `--device vk<N>` pins GPU and skips the auto estimate.
+
 **Weave-task compilation**: a weave task whose body (after its input binds,
 before `ret`) is a straight-line chain of elementwise arithmetic
 (add/sub/mul/div/sqrt) over its inputs — every intermediate explicitly bound
@@ -1385,10 +1400,11 @@ launch via 256B-aligned offsets and grown on demand — no per-op
 **Per-op arith threshold (v13.2)**: a *single* add/sub/mul/div moves ~3×n×8
 bytes for one op of work — on host-visible staging that loses to the CPU
 typed fast path until n is large, so per-op arith offload additionally
-requires `NKR_GPU_ARITH_MIN` elements (env, default 8M; matmul keeps the
-plain `NKR_GPU_MIN` since it is O(n²) per transfer). Fused regions and
-reductions use the plain `NKR_GPU_MIN`: one transfer amortizes O(chain)
-work per element.
+requires `NKR_GPU_ARITH_MIN` elements (env, default 8M). Matmul on `auto`
+uses `NKR_GPU_MATMUL_MIN` FLOPs (see first-run estimate above); a pinned
+`vk<N>` device still uses `NKR_GPU_MIN` so small squares can be forced
+onto the GPU. Fused regions and reductions use `NKR_GPU_MIN`, with the
+auto first-run `NKR_GPU_ARITH_MIN` extra floor when Vulkan is not yet up.
 
 **Determinism**: elementwise/broadcast results are bit-identical to the CPU;
 reductions and matmul may reassociate (benchmarks compare within tolerance;

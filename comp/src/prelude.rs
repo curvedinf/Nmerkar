@@ -2016,6 +2016,13 @@ static long uf_gpu_min(void){ const char*e=getenv("NKR_GPU_MIN"); long v=e?atol(
    (~2GB/s) that loses to the CPU fast path until n is large. Fused-region
    and reduce paths keep the plain uf_gpu_min(). */
 static long uf_gpu_arith_min(void){ const char*e=getenv("NKR_GPU_ARITH_MIN"); long v=e?atol(e):(8L<<20); return v>0?v:(8L<<20); }
+/* Static first-run matmul floor (no timing / no calibration): offload only
+   when ra*ca*cb FLOPs clear this. 512³=134M loses to the CPU even after
+   Vulkan is up (transfer+init); 1024³=1.07B wins. Default 400M sits between
+   512³ and 768³. Env NKR_GPU_MATMUL_MIN overrides. */
+static long uf_gpu_matmul_min(void){ const char*e=getenv("NKR_GPU_MATMUL_MIN"); long v=e?atol(e):(400L<<20); return v>0?v:(400L<<20); }
+/* auto = pick CPU when the static estimate says so; vk<N> pins GPU. */
+static int uf_dev_is_auto(void){ return !(uf_device[0]=='v' && uf_device[1]=='k'); }
 static pthread_mutex_t uf_gpu_mu = PTHREAD_MUTEX_INITIALIZER;
 static int uf_spv_index(const char*name){ for(size_t i=0;i<sizeof(uf_spv_all)/sizeof(uf_spv_all[0]);i++) if(!strcmp(uf_spv_all[i].name,name))return (int)i; return -1; }
 
@@ -2042,8 +2049,13 @@ static uint64_t uf_vk_free_mem(VkPhysicalDevice pd, int have_budget, int*discret
   return tot;
 }
 
+static void uf_vk_init_body(void);
 static void uf_vk_init(void){
   if(uf_vk_ready||uf_vk_broken) return;
+  static pthread_once_t once=PTHREAD_ONCE_INIT;
+  pthread_once(&once, uf_vk_init_body);
+}
+static void uf_vk_init_body(void){
   VkApplicationInfo app; memset(&app,0,sizeof app); app.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO; app.pApplicationName="enmerkar"; app.apiVersion=VK_API_VERSION_1_1;
   VkInstanceCreateInfo ci; memset(&ci,0,sizeof ci); ci.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ci.pApplicationInfo=&app;
   if(vkCreateInstance(&ci,0,&uf_vk_inst)!=VK_SUCCESS){ uf_vk_broken=1; return; }
@@ -2140,6 +2152,17 @@ static void uf_vk_init(void){
   }
   uf_vk_ready=1;
 }
+static int uf_vk_ensure_pipe(int k){
+  if(k<0||(size_t)k>=sizeof(uf_spv_all)/sizeof(uf_spv_all[0])) return 0;
+  if(uf_vk_pipe[k]) return 1;
+  VkShaderModuleCreateInfo sm; memset(&sm,0,sizeof sm); sm.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO; sm.codeSize=uf_spv_all[k].words*4; sm.pCode=uf_spv_all[k].code;
+  VkShaderModule mod;
+  if(vkCreateShaderModule(uf_vk_dev,&sm,0,&mod)!=VK_SUCCESS) return 0;
+  VkComputePipelineCreateInfo cp; memset(&cp,0,sizeof cp); cp.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO; cp.stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cp.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module=mod; cp.stage.pName="main"; cp.layout=uf_vk_playout;
+  int ok=vkCreateComputePipelines(uf_vk_dev,0,1,&cp,0,&uf_vk_pipe[k])==VK_SUCCESS;
+  vkDestroyShaderModule(uf_vk_dev,mod,0);
+  return ok;
+}
 
 /* v13.2 device buffer pool: ONE persistent HOST_VISIBLE (HOST_COHERENT when
    available) allocation, suballocated per launch via offsets and grown on
@@ -2161,7 +2184,8 @@ static int uf_vk_pool_reserve(VkDeviceSize total){
   if(uf_vk_bpool.buf) vkDestroyBuffer(uf_vk_dev,uf_vk_bpool.buf,0);
   if(uf_vk_bpool.mem){ vkUnmapMemory(uf_vk_dev,uf_vk_bpool.mem); vkFreeMemory(uf_vk_dev,uf_vk_bpool.mem,0); }
   memset(&uf_vk_pool,0,sizeof uf_vk_pool);
-  VkBufferCreateInfo bi; memset(&bi,0,sizeof bi); bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bi.size=want; bi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  VkBufferCreateInfo bi; memset(&bi,0,sizeof bi); bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bi.size=want;
+  bi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   if(vkCreateBuffer(uf_vk_dev,&bi,0,&uf_vk_bpool.buf)!=VK_SUCCESS) return 0;
   VkMemoryRequirements mr; vkGetBufferMemoryRequirements(uf_vk_dev,uf_vk_bpool.buf,&mr);
   VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(uf_vk_pd,&mp);
@@ -2186,6 +2210,37 @@ static int uf_vk_pool_reserve(VkDeviceSize total){
   if(!uf_vk_fence){ VkFenceCreateInfo fci; memset(&fci,0,sizeof fci); fci.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; vkCreateFence(uf_vk_dev,&fci,0,&uf_vk_fence); }
   return 1;
 }
+/* DEVICE_LOCAL twin of the staging pool — matmul reads each A/B element
+   O(n) times, so computing from VRAM beats BAR/host-visible. */
+static UFCache uf_vk_dl;
+static int uf_vk_dl_reserve(VkDeviceSize total){
+  if(uf_vk_dl.cap>=total&&uf_vk_dl.buf) return 1;
+  VkDeviceSize want=uf_vk_al(total); VkDeviceSize min=64UL<<20; if(want<min)want=min;
+  if(uf_vk_dl.buf) vkDestroyBuffer(uf_vk_dev,uf_vk_dl.buf,0);
+  if(uf_vk_dl.mem) vkFreeMemory(uf_vk_dev,uf_vk_dl.mem,0);
+  memset(&uf_vk_dl,0,sizeof uf_vk_dl);
+  VkBufferCreateInfo bi; memset(&bi,0,sizeof bi); bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bi.size=want;
+  bi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if(vkCreateBuffer(uf_vk_dev,&bi,0,&uf_vk_dl.buf)!=VK_SUCCESS) return 0;
+  VkMemoryRequirements mr; vkGetBufferMemoryRequirements(uf_vk_dev,uf_vk_dl.buf,&mr);
+  VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(uf_vk_pd,&mp);
+  int found=0; VkDeviceSize sz=mr.size>want?mr.size:want;
+  for(int pass=0;pass<2&&!found;pass++)
+    for(uint32_t i=0;i<mp.memoryTypeCount;i++){
+      VkMemoryPropertyFlags f=mp.memoryTypes[i].propertyFlags;
+      int ok = (mr.memoryTypeBits&(1u<<i)) && (f&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if(pass==0) ok = ok && !(f&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+      if(!ok) continue;
+      VkMemoryAllocateInfo ai; memset(&ai,0,sizeof ai); ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ai.allocationSize=sz; ai.memoryTypeIndex=i;
+      if(vkAllocateMemory(uf_vk_dev,&ai,0,&uf_vk_dl.mem)==VK_SUCCESS){ found=1; break; }
+    }
+  if(!found||vkBindBufferMemory(uf_vk_dev,uf_vk_dl.buf,uf_vk_dl.mem,0)!=VK_SUCCESS){
+    if(uf_vk_dl.mem)vkFreeMemory(uf_vk_dev,uf_vk_dl.mem,0);
+    if(uf_vk_dl.buf)vkDestroyBuffer(uf_vk_dev,uf_vk_dl.buf,0);
+    memset(&uf_vk_dl,0,sizeof uf_vk_dl); return 0;
+  }
+  uf_vk_dl.cap=sz; return 1;
+}
 /* submit the prebuilt command buffer and wait (persistent fence) */
 static int uf_vk_submit_wait(void){
   if(!uf_vk_fence) return 0;
@@ -2201,12 +2256,16 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   uf_vk_init();
   if(!uf_vk_ready) return 0;
   pthread_mutex_lock(&uf_gpu_mu);
+  if(!uf_vk_ensure_pipe(k)){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
   double _t0=uf_nowd();
   if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] bufs a=%zu b=%zu r=%zu\n",asz,bsz,rsz);
   VkDeviceSize oa=0, ob=uf_vk_al((VkDeviceSize)asz), orr=uf_vk_al(ob+(VkDeviceSize)bsz);
   if(!uf_vk_pool_reserve(orr+uf_vk_al((VkDeviceSize)rsz))){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
   if(A&&asz) memcpy(uf_vk_bpool.mapped+oa,A,asz);
   if(B&&bsz) memcpy(uf_vk_bpool.mapped+ob,B,bsz);
+  int is_mm=(k==uf_spv_index("matmul") && pc.n1>0 && pc.n3>0);
+  if(is_mm && !uf_vk_dl_reserve(orr+uf_vk_al((VkDeviceSize)rsz))) is_mm=0;
+  VkBuffer cbuf=is_mm?uf_vk_dl.buf:uf_vk_bpool.buf;
   VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
   VkDescriptorSet ds;
   VkResult ar=vkAllocateDescriptorSets(uf_vk_dev,&dsai,&ds);
@@ -2214,20 +2273,40 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   if(ar!=VK_SUCCESS){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
   VkWriteDescriptorSet w[3]; VkDescriptorBufferInfo bi[3];
   memset(w,0,sizeof w); memset(bi,0,sizeof bi);
-  bi[0].buffer=uf_vk_bpool.buf; bi[0].offset=oa; bi[0].range=asz?asz:16;
-  bi[1].buffer=(B&&bsz)?uf_vk_bpool.buf:uf_vk_dummy; bi[1].offset=(B&&bsz)?ob:0; bi[1].range=(B&&bsz)?bsz:16;
-  bi[2].buffer=uf_vk_bpool.buf; bi[2].offset=orr; bi[2].range=rsz?rsz:16;
+  bi[0].buffer=cbuf; bi[0].offset=oa; bi[0].range=asz?asz:16;
+  bi[1].buffer=(B&&bsz)?cbuf:uf_vk_dummy; bi[1].offset=(B&&bsz)?ob:0; bi[1].range=(B&&bsz)?bsz:16;
+  bi[2].buffer=cbuf; bi[2].offset=orr; bi[2].range=rsz?rsz:16;
   for(int i=0;i<3;i++){ w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet=ds; w[i].dstBinding=(uint32_t)i; w[i].descriptorCount=1; w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo=&bi[i]; }
   vkUpdateDescriptorSets(uf_vk_dev,3,w,0,0);
   if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] updated\n");
   VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] run k=%d n=%llu begin\n",k,(unsigned long long)n);
   vkBeginCommandBuffer(uf_vk_cb,&cbbi);
+  if(is_mm){
+    if(A&&asz){ VkBufferCopy c={oa,oa,(VkDeviceSize)asz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_bpool.buf,uf_vk_dl.buf,1,&c); }
+    if(B&&bsz){ VkBufferCopy c={ob,ob,(VkDeviceSize)bsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_bpool.buf,uf_vk_dl.buf,1,&c); }
+    VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
+  }
   vkCmdBindPipeline(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_pipe[k]);
   vkCmdPushConstants(uf_vk_cb,uf_vk_playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
   vkCmdBindDescriptorSets(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_playout,0,1,&ds,0,0);
-  uint64_t groups=(n+255)/256; if(!groups)groups=1;
-  vkCmdDispatch(uf_vk_cb,(uint32_t)(groups>0x7fffffff?0x7fffffff:groups),1,1);
+  /* tiled matmul shader is local_size 16×16; everyone else is 256×1 */
+  if(k==uf_spv_index("matmul") && pc.n1>0 && pc.n3>0){
+    uint32_t gx=(uint32_t)((pc.n3+15)/16), gy=(uint32_t)((pc.n1+15)/16);
+    if(!gx)gx=1; if(!gy)gy=1;
+    vkCmdDispatch(uf_vk_cb,gx,gy,1);
+  } else {
+    uint64_t groups=(n+255)/256; if(!groups)groups=1;
+    vkCmdDispatch(uf_vk_cb,(uint32_t)(groups>0x7fffffff?0x7fffffff:groups),1,1);
+  }
+  if(is_mm&&R&&rsz){
+    VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb,0,0,0,0);
+    VkBufferCopy c={orr,orr,(VkDeviceSize)rsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_dl.buf,uf_vk_bpool.buf,1,&c);
+  }
   vkEndCommandBuffer(uf_vk_cb);
   if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] submit\n");
   int ok = uf_vk_submit_wait();
@@ -2261,6 +2340,7 @@ static Cell uf_gpu_task(Ctx*cx,int k,int n){
   if(!uf_vk_ready) return uf_gpu_decline();
   if(k<0||k>=(int)(sizeof(uf_spv_all)/sizeof(uf_spv_all[0]))) return uf_gpu_decline();
   pthread_mutex_lock(&uf_gpu_mu);
+  if(!uf_vk_ensure_pipe(k)){ pthread_mutex_unlock(&uf_gpu_mu); return uf_gpu_decline(); }
   size_t bufsz=(size_t)len*8;
   VkDeviceSize offs[8]; VkDeviceSize cur=0;
   for(int j=0;j<=n;j++){ offs[j]=cur; cur=uf_vk_al(cur+(VkDeviceSize)bufsz); }
@@ -2314,10 +2394,17 @@ static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
   }
   uint64_t len=hs[0]->len;
   if(len<(uint64_t)uf_gpu_min()) return 0;
+  /* Matrices must not take the elementwise fused kernel (mul is matmul). */
+  for(int j=0;j<n;j++) if(hs[j]->tag==HT_MAT) return 0;
+  /* Static first-run estimate: skip GPU when init has not happened and n
+     is below the per-op arith floor (blackscholes N=2M stays CPU).
+     Pinned vk<N> still launches. */
+  if(uf_dev_is_auto() && !uf_vk_ready && len<(uint64_t)uf_gpu_arith_min()) return 0;
   uf_vk_init();
   if(!uf_vk_ready) return 0;
   if(k<0||k>=(int)(sizeof(uf_spv_all)/sizeof(uf_spv_all[0]))) return 0;
   pthread_mutex_lock(&uf_gpu_mu);
+  if(!uf_vk_ensure_pipe(k)){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
   size_t bufsz=(size_t)len*8;
   VkDeviceSize offs[8]; VkDeviceSize cur=0;
   for(int j=0;j<n+nout;j++){ offs[j]=cur; cur=uf_vk_al(cur+(VkDeviceSize)bufsz); }
@@ -2475,7 +2562,26 @@ static Hdr* uf_matmul(Hdr*ha,Hdr*hb){
   Hdr*r=uf_mat_new(ra,cb,ety); UF_PROTECT(&r);
   if(ety==1){
     const double*A=(const double*)uf_data(ha); const double*B=(const double*)uf_data(hb); double*C=(double*)uf_data(r);
-    for(uint64_t i=0;i<ra;i++) for(uint64_t k=0;k<ca;k++){ double aik=A[i*ca+k]; if(aik==0.0)continue; const double*Bk=B+k*cb; double*Ci=C+i*cb; for(uint64_t j=0;j<cb;j++) Ci[j]+=aik*Bk[j]; }
+    /* 64×64 tiles keep A/B/C panels in L1/L2; the old ikj loop is fine for
+       N≤512 but thrashes L3 at the GPU-table N=2048 size. */
+    const uint64_t BS=64;
+    for(uint64_t i0=0;i0<ra;i0+=BS){
+      uint64_t i1=i0+BS; if(i1>ra)i1=ra;
+      for(uint64_t k0=0;k0<ca;k0+=BS){
+        uint64_t k1=k0+BS; if(k1>ca)k1=ca;
+        for(uint64_t j0=0;j0<cb;j0+=BS){
+          uint64_t j1=j0+BS; if(j1>cb)j1=cb;
+          for(uint64_t i=i0;i<i1;i++){
+            double*Ci=C+i*cb;
+            for(uint64_t k=k0;k<k1;k++){
+              double aik=A[i*ca+k]; if(aik==0.0)continue;
+              const double*Bk=B+k*cb;
+              for(uint64_t j=j0;j<j1;j++) Ci[j]+=aik*Bk[j];
+            }
+          }
+        }
+      }
+    }
   } else {
     const int64_t*A=(const int64_t*)uf_data(ha); const int64_t*B=(const int64_t*)uf_data(hb); int64_t*C=(int64_t*)uf_data(r);
     for(uint64_t i=0;i<ra;i++) for(uint64_t k=0;k<ca;k++){ int64_t aik=A[i*ca+k]; if(!aik)continue; const int64_t*Bk=B+k*cb; int64_t*Ci=C+i*cb; for(uint64_t j=0;j<cb;j++) Ci[j]+=aik*Bk[j]; }
@@ -2519,7 +2625,20 @@ static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn){
       : (op==2&&ha->tag==HT_MAT) ? ha->esz
       : (op==2&&hb->tag==HT_MAT) ? (hb->len/hb->esz)
       : (ha->len>hb->len?ha->len:hb->len);
-    long _amin = (op==2&&(ha->tag==HT_MAT||hb->tag==HT_MAT)) ? uf_gpu_min() : uf_gpu_arith_min(); /* matmul is O(n²) — offload at any size */
+    long _amin;
+    if(op==2&&ha->tag==HT_MAT&&hb->tag==HT_MAT){
+      if(uf_dev_is_auto()){
+        uint64_t ra=ha->esz, ca=ha->len/ra, cb=hb->len/hb->esz;
+        work = ra*ca*cb; /* static FLOP estimate — never a timed trial */
+        _amin = uf_gpu_matmul_min();
+      } else {
+        _amin = uf_gpu_min(); /* --device vk<N>: honor the pin */
+      }
+    } else if(op==2&&(ha->tag==HT_MAT||hb->tag==HT_MAT)) {
+      _amin = uf_gpu_min();
+    } else {
+      _amin = uf_gpu_arith_min();
+    }
     if(work>=(uint64_t)_amin){
       Cell g=uf_gpu_arith(a,b,op);
       if(!(g.tag==T_INT&&g.i==0)){ UF_UNPROTECT(); UF_UNPROTECT(); return g; }
@@ -2677,23 +2796,31 @@ static void op_vgather(Ctx*cx){
 /* reductions */
 static void op_vsum(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VSUM");
 #ifdef NKR_GPU
-  if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()){ double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rsum",&_r)){ pushf(cx,_r); return; } }
+  if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
+     &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
+    double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rsum",&_r)){ pushf(cx,_r); return; } }
 #endif
  if(a->ety==1){ const double*A=(const double*)uf_data(a); double s=0; for(uint64_t i=0;i<a->len;i++)s+=A[i]; pushf(cx,s); return; }
  double s=0; for(uint64_t i=0;i<a->len;i++)s+=uf_el(a,i); if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
 static void op_vmean(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMEAN"); if(!a->len)die("VMEAN: empty arr");
 #ifdef NKR_GPU
-  if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()){ double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rsum",&_r)){ pushf(cx,_r/(double)a->len); return; } }
+  if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
+     &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
+    double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rsum",&_r)){ pushf(cx,_r/(double)a->len); return; } }
 #endif
  double s=0; for(uint64_t i=0;i<a->len;i++)s+=uf_el(a,i); pushf(cx,s/(double)a->len); }
 static void op_vmin(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMIN"); if(!a->len)die("VMIN: empty arr");
 #ifdef NKR_GPU
-  if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()){ double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rmin",&_r)){ pushf(cx,_r); return; } }
+  if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
+     &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
+    double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rmin",&_r)){ pushf(cx,_r); return; } }
 #endif
  double s=uf_el(a,0); for(uint64_t i=1;i<a->len;i++){double d=uf_el(a,i);if(d<s)s=d;} if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
 static void op_vmax(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMAX"); if(!a->len)die("VMAX: empty arr");
 #ifdef NKR_GPU
-  if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()){ double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rmax",&_r)){ pushf(cx,_r); return; } }
+  if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
+     &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
+    double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rmax",&_r)){ pushf(cx,_r); return; } }
 #endif
  double s=uf_el(a,0); for(uint64_t i=1;i<a->len;i++){double d=uf_el(a,i);if(d>s)s=d;} if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
 /* VMAP: arr fn_addr -> arr' ; VFOLD: arr init fn_addr -> acc */

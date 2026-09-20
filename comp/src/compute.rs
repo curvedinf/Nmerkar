@@ -67,7 +67,40 @@ fn shader_library() -> Vec<(&'static str, String)> {
         ("bsub", bbin("-")),
         ("bmul", bbin("*")),
         ("bdiv", bbin("/")),
-        ("matmul", format!("{}layout(std430, binding=0) buffer A {{ float64_t a[]; }};\nlayout(std430, binding=1) buffer B {{ float64_t b[]; }};\nlayout(std430, binding=2) buffer R {{ float64_t r[]; }};\nvoid main() {{ int64_t work = int64_t(gl_GlobalInvocationID.x); int64_t ra = pc.n1, ca = pc.n2, cb = pc.n3; if (work >= ra*cb) return; int row = int(work / cb), col = int(work % cb); float64_t s = 0.0LF; for (int k = 0; int64_t(k) < ca; k++) s += a[row*int(ca)+k] * b[k*int(cb)+col]; r[int(work)] = s; }}\n", header())),
+        // 16×16 tiled matmul: each workgroup streams K-tiles of A/B through
+        // shared memory so B is not read with a stride-cb gather per k.
+        // Dispatch is 2-D ((cb+15)/16, (ra+15)/16) — see uf_vk_run.
+        ("matmul", String::from(
+            "#version 450\n\
+             #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require\n\
+             #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n\
+             layout(local_size_x=16, local_size_y=16) in;\n\
+             layout(push_constant) uniform PC { int64_t n0, n1, n2, n3; float64_t s; int64_t rev; } pc;\n\
+             layout(std430, binding=0) buffer A { float64_t a[]; };\n\
+             layout(std430, binding=1) buffer B { float64_t b[]; };\n\
+             layout(std430, binding=2) buffer R { float64_t r[]; };\n\
+             shared float64_t As[16][16];\n\
+             shared float64_t Bs[16][16];\n\
+             void main() {\n\
+               int ra = int(pc.n1), ca = int(pc.n2), cb = int(pc.n3);\n\
+               int row = int(gl_GlobalInvocationID.y);\n\
+               int col = int(gl_GlobalInvocationID.x);\n\
+               int lx = int(gl_LocalInvocationID.x);\n\
+               int ly = int(gl_LocalInvocationID.y);\n\
+               float64_t acc = 0.0LF;\n\
+               int tiles = (ca + 15) / 16;\n\
+               for (int t = 0; t < tiles; t++) {\n\
+                 int a_col = t * 16 + lx;\n\
+                 int b_row = t * 16 + ly;\n\
+                 As[ly][lx] = (row < ra && a_col < ca) ? a[row * ca + a_col] : 0.0LF;\n\
+                 Bs[ly][lx] = (b_row < ca && col < cb) ? b[b_row * cb + col] : 0.0LF;\n\
+                 barrier();\n\
+                 for (int k = 0; k < 16; k++) acc += As[ly][k] * Bs[k][lx];\n\
+                 barrier();\n\
+               }\n\
+               if (row < ra && col < cb) r[row * cb + col] = acc;\n\
+             }\n",
+        )),
         ("matvec", format!("{}layout(std430, binding=0) buffer A {{ float64_t a[]; }};\nlayout(std430, binding=1) buffer B {{ float64_t b[]; }};\nlayout(std430, binding=2) buffer R {{ float64_t r[]; }};\nvoid main() {{ int64_t work = int64_t(gl_GlobalInvocationID.x); int64_t c = pc.n2; if (work >= pc.n1) return; int row = int(work); float64_t s = 0.0LF; for (int k = 0; int64_t(k) < c; k++) s += a[row*int(c)+k] * b[k]; r[row] = s; }}\n", header())),
         ("rsum", format!("{}layout(std430, binding=0) buffer A {{ float64_t a[]; }};\nlayout(std430, binding=2) buffer R {{ float64_t r[]; }};\nshared float64_t sh[{}];\nvoid main() {{ uint lid = gl_LocalInvocationID.x; int i = int(gl_GlobalInvocationID.x); float64_t v = (int64_t(i) < pc.n0) ? a[i] : 0.0LF; sh[lid] = v; barrier(); for (uint off = {}u >> 1u; off > 0u; off >>= 1u) {{ if (lid < off) sh[lid] += sh[lid + off]; barrier(); }} if (lid == 0u) r[int(gl_WorkGroupID.x)] = sh[0]; }}\n", header(), WG, WG)),
         ("rmin", format!("{}layout(std430, binding=0) buffer A {{ float64_t a[]; }};\nlayout(std430, binding=2) buffer R {{ float64_t r[]; }};\nshared float64_t sh[{}];\nvoid main() {{ uint lid = gl_LocalInvocationID.x; int i = int(gl_GlobalInvocationID.x); float64_t v = (int64_t(i) < pc.n0) ? a[i] : 1.0LF/0.0LF; sh[lid] = v; barrier(); for (uint off = {}u >> 1u; off > 0u; off >>= 1u) {{ if (lid < off) sh[lid] = sh[lid] < sh[lid + off] ? sh[lid] : sh[lid + off]; barrier(); }} if (lid == 0u) r[int(gl_WorkGroupID.x)] = sh[0]; }}\n", header(), WG, WG)),

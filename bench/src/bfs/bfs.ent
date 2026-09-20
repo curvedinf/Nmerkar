@@ -37,7 +37,7 @@ step:
   q@ head@ get u!
   dist@ u@ get du!
   adj@ u@ get nb!
-  head@ 1 add head!
+  head++
   0 j!
   'vis_c 'vis_b while
   ret
@@ -45,12 +45,12 @@ vis_c: j@ nb@ length lt ret
 vis_b:
   nb@ j@ get v!
   dist@ v@ get 0 lt 'visit 'vskip if_else
-  j@ 1 add j!
+  j++
   ret
 visit:
   dist@ v@ du@ 1 add set
   q@ tail@ v@ set
-  tail@ 1 add tail!
+  tail++
   ret
 vskip: ret
 tally: i!
@@ -59,8 +59,8 @@ tally: i!
   ret
 ts: ret
 tc:
-  r@ 1 add r!
-  s@ d@ add s!
+  r++
+  d@ s+=
   d@ m@ gt 'tmax 'ts if_else
   ret
 tmax: d@ m! ret

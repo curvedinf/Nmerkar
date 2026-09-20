@@ -97,6 +97,66 @@ pub fn emit_text(toks: &[Tok]) -> String {
 
 // text -> dense: custom glyphs; labels/vars become v-space slots, assigned
 // deterministically by first use (names already of the form v<N> keep slot N)
+fn lrun_u(mut v: u64) -> String {
+    let mut ds = vec![l_glyph((v % 64) as u32)];
+    v /= 64;
+    while v > 0 {
+        ds.push(l_glyph((v % 64) as u32));
+        v /= 64;
+    }
+    ds.iter().rev().collect()
+}
+
+/// Encode an f64 as SPEC l-space (`lrun '.' lrun`) when the reconstruction
+/// `ip + frac` is bit-identical. Otherwise the caller keeps LIT+ASCII.
+fn emit_lfloat(v: f64) -> Option<String> {
+    if !v.is_finite() {
+        return None;
+    }
+    let bits = v.to_bits();
+    let neg = v.is_sign_negative();
+    let a = v.abs();
+    let mut scale = 1.0f64;
+    for k in 0..=10 {
+        let n = (a * scale).round();
+        if n >= 9007199254740992.0 {
+            break;
+        }
+        let recon = n / scale;
+        let r = if neg { -recon } else { recon };
+        if r.to_bits() == bits {
+            let ni = n as u64;
+            let mut p = 1u64;
+            for _ in 0..k {
+                p = p.saturating_mul(64);
+            }
+            let ip = ni / p;
+            let fp = ni % p;
+            let mut s = String::new();
+            if neg {
+                s.push('-');
+            }
+            s.push_str(&lrun_u(ip));
+            s.push('.');
+            if k == 0 {
+                s.push(l_glyph(0));
+            } else {
+                let mut digits = Vec::with_capacity(k);
+                let mut x = fp;
+                for _ in 0..k {
+                    digits.push(l_glyph((x % 64) as u32));
+                    x /= 64;
+                }
+                digits.reverse();
+                s.extend(digits);
+            }
+            return Some(s);
+        }
+        scale *= 64.0;
+    }
+    None
+}
+
 pub fn emit_dense(toks: &[Tok]) -> String {
     fn is_slot(n: &str) -> Option<u32> {
         n.strip_prefix('v').and_then(|d| d.parse::<u32>().ok()).filter(|&i| i < 64)
@@ -155,8 +215,13 @@ pub fn emit_dense(toks: &[Tok]) -> String {
                     }
                 }
                 Tok::PushF(v) => {
-                    o.push(glyph_of(0)); // LIT
-                    o.push_str(&format!("{:?}", v));
+                    if let Some(ls) = emit_lfloat(*v) {
+                        sep_l(o);
+                        o.push_str(&ls);
+                    } else {
+                        o.push(glyph_of(0)); // LIT + ASCII, for values l-space cannot round-trip
+                        o.push_str(&format!("{:?}", v));
+                    }
                 }
                 Tok::PushS(s) => o.push_str(&format!("\"{}\"", escape_str(s))),
                 Tok::Jump(op, l) => {

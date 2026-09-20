@@ -121,6 +121,8 @@ lrun   := one or more l-space atoms, big-endian
 - Leading `-`: negates (v13: always a sign — see Inline math symbols below).
 - `LIT` also accepts ASCII decimal/hex (`0x..`)/float literals (including
   negatives) and type keywords, and also accepts an l-run number after it.
+- `--to-dense` emits a float as l-space `lrun '.' lrun` when `ip + frac` is
+  bit-identical to the f64; otherwise it uses `LIT` plus an ASCII literal.
 - Two adjacent l-runs fold into one number; generators must put whitespace
   between distinct numeric literals.
 

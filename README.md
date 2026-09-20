@@ -58,7 +58,7 @@ imperative control-flow shapes where Python's loops stay terse.
 | matmul N=512 | 0.03 | 0.04 | **0.02** | 0.15 | 0.14 |
 | blackscholes N=2M | 0.13 | **0.04** | 0.04 | 0.17 | 0.07 |
 | nqueens N=11 | 0.25 | **0.01** | 0.01 | 1.52 | 0.03 |
-| bfs n=1M | 0.83 | 0.11 | **0.09** | 1.68 | 0.25 |
+| bfs n=1M | 0.66 | 0.11 | **0.09** | 1.68 | 0.25 |
 | **total (6 CPU benches)** | 3.71 | **2.61** | 3.57 | 145.8 | 8.17 |
 
 ### GPU offloading (seconds, lower = faster)

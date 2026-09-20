@@ -805,10 +805,12 @@ static int64_t uf_obj_off(Hdr* a, Cell k){
 /* ================= uniform container protocol ================= */
 static uint64_t uf_fnv(const void*p,size_t n){ const unsigned char*s=(const unsigned char*)p; uint64_t h=1469598103934665603ULL; for(size_t i=0;i<n;i++){ h^=s[i]; h*=1099511628211ULL; } return h; }
 static uint64_t map_hash(Cell k){
+  if(k.tag==T_INT) return (uint64_t)k.i; /* identity — dense 0..n-1 keys (bfs) */
   if(k.tag==T_PTR&&k.i){ Hdr*h=uf_gc_find((void*)k.i); if(h){ if(h->tag==HT_STR)return uf_fnv(uf_sbytes((Str*)h),h->len); return uf_fnv(&k.i,8); } return uf_fnv((void*)k.i,strlen((char*)k.i)); }
   return uf_fnv(&k.i,8);
 }
 static int map_keyeq(Cell a,Cell b){
+  if(a.tag==T_INT&&b.tag==T_INT) return a.i==b.i;
   if(a.tag==T_PTR&&b.tag==T_PTR&&a.i&&b.i){
     Hdr*ha=uf_gc_find((void*)a.i); Hdr*hb=uf_gc_find((void*)b.i);
     if(ha&&hb){ if(ha->tag==HT_STR&&hb->tag==HT_STR){ if(ha->len!=hb->len)return 0; return memcmp(uf_sbytes((Str*)ha),uf_sbytes((Str*)hb),ha->len)==0; } return a.i==b.i; }
@@ -3225,7 +3227,10 @@ static void op_faddto(Ctx*cx){
       Hdr*eh=uf_gc_find((void*)ek.i);
       if(eh&&eh->tag==HT_STR&&eh->len==(uint64_t)flen&&
          memcmp(uf_sbytes((Str*)eh),fk,(size_t)flen)==0){
-        m->vals[i]=uf_cadd(m->vals[i],v); return; /* found: add */
+        if(m->vals[i].tag==T_INT&&v.tag==T_INT) m->vals[i].i+=v.i;
+        else if(m->vals[i].tag==T_FLOAT&&v.tag==T_FLOAT) m->vals[i]=uf_mkf(uf_f(m->vals[i])+uf_f(v));
+        else m->vals[i]=uf_cadd(m->vals[i],v);
+        return; /* found: add */
       }
     }
     i=(i+1)%m->cap;
@@ -3256,7 +3261,9 @@ static void op_finc(Ctx*cx){
       Hdr*eh=uf_gc_find((void*)ek.i);
       if(eh&&eh->tag==HT_STR&&eh->len==(uint64_t)flen&&
          memcmp(uf_sbytes((Str*)eh),fk,(size_t)flen)==0){
-        m->vals[i]=uf_cadd(m->vals[i],uf_mki(1)); return;
+        if(m->vals[i].tag==T_INT) m->vals[i].i++;
+        else m->vals[i]=uf_cadd(m->vals[i],uf_mki(1));
+        return;
       }
     }
     i=(i+1)%m->cap;

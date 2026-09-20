@@ -3142,7 +3142,7 @@ static void op_fsplit(Ctx*cx){
     uf_fsplit_nfields=0;
     char* cur=uf_fsplit_line;
     while(uf_fsplit_nfields<128){
-      char* sp=strstr(cur,E);
+      char* sp=el==1?(char*)memchr(cur,E[0],strlen(cur)):strstr(cur,E);
       if(!sp){
         uf_fsplit_offsets[uf_fsplit_nfields*2]=(int64_t)(cur-uf_fsplit_line);
         uf_fsplit_offsets[uf_fsplit_nfields*2+1]=(int64_t)strlen(cur);

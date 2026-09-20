@@ -662,7 +662,7 @@ No file-handle object type; every op is self-contained.
 | 172 | 🌫 | `mmap` | path → str | read-only zero-copy string; GC-unmapped on sweep. All string ops work |
 | 173 | 😦 | `file_each_line` | path fn_addr → | call fn (line → flag) per line; stops early when fn returns 0 (was `feach`) |
 | 174 | 🚼 | `file_fold_lines` | path init fn_addr → acc | streaming reduce; fn (acc line → acc) (was `ffold`) |
-| 175 | 🤵 | `file_split_lines` | path sep init fn_addr → acc | streaming split; fields via `field_get`/`field_int`/`field_float`/`field_slice`/`field_byte` (was `fsplit`) |
+| 175 | 🤵 | `file_split_lines` | path sep init fn_addr → acc | streaming split of a regular file or pipe/stdin (`/dev/stdin`); fields via `field_get`/`field_int`/`field_float`/`field_slice`/`field_byte` (was `fsplit`) |
 | 176 | 🌬 | `field_get` | field_idx → str | zero-copy field view (current file_split_lines line) (was `fget`) |
 | 177 | 😧 | `field_int` | field_idx → int | parse field directly, no alloc (was `fatoi`) |
 | 178 | 🚾 | `field_float` | field_idx → float | parse field directly, no alloc (was `fatof`) |

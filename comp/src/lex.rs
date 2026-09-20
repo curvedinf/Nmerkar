@@ -182,7 +182,7 @@ pub fn op_usage(name: &str) -> &'static str {
         "SUB" => "a b → a-b",
         "MUL" => "a b → a*b",
         "AND" => "a b → a&b",
-        "SHR" => "a → a>>1",
+        "SHR" => "a b → logical a>>b | ints only",
         "INC" => "a → a+1",
         "DEC" => "a → a-1",
         "POW" => "a b → a^b | C/Python pow",

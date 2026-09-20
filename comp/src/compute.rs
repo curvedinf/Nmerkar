@@ -1467,6 +1467,7 @@ fn walk_one_region(
             // k = the element index (Idx). The body must simulate fully
             // (per-element scalars only: Idx, consts, inlined locals).
             Ins::For => {
+                if std::env::var("NK_DEBUG_REGION2").is_ok() { eprintln!("[for] arm at {} hit", i); }
                 if i >= 2 {
                     if let (Ins::PushAddr(bl), cnt_ins) = (&p.ins[i - 1], &p.ins[i - 2]) {
                         let bpc = p.labels.get(bl).copied();
@@ -1497,7 +1498,7 @@ fn walk_one_region(
                                 // single-level domains (nested bodies decline in the
                                 // sim) use the flat index; Dom(level) activates with
                                 // two-guard nested support
-                                flocals.insert(k_slot, V::E(TExpr::Idx(0)));
+                                flocals.insert(k_slot.clone(), V::E(TExpr::Idx(0)));
                                 dom_guards.push(guard.clone().unwrap_or_default());
                                 let mut j = bpc + 1;
                                 let mut okbody = for_depth < 4;
@@ -1582,6 +1583,188 @@ fn walk_one_region(
                                                 None => { okbody = false; break 'forbody; }
                                             }
                                         }
+                                        Ins::PushAddr(_) => {
+                                            // operand of the following For/While — consumed there
+                                        }
+                                        Ins::For if j >= 2 => {
+                                            // nested domain: [cnt, PushAddr(inner), For] at j-2..j —
+                                            // inline the inner body one level deep with k = Dom(level)
+                                            let nested_ok = (|| {
+                                                let dbg2 = std::env::var("NK_DEBUG_REGION2").is_ok();
+                                                let (bl2, cnt2) = (&p.ins[j - 1], &p.ins[j - 2]);
+                                                let bl2 = match bl2 { Ins::PushAddr(x) => x, _ => return false };
+                                                let bpc2 = match p.labels.get(bl2) { Some(x) => *x, None => return false };
+                                                let g2 = match cnt2 { Ins::GetV(g) => Some(g.clone()), Ins::PushI(_) => None, _ => return false };
+                                                if !matches!(&p.ins[bpc2], Ins::LocalSetI(_) | Ins::LocalSet(_)) { if dbg2 { eprintln!("[for-nest] inner body first ins not a bind: {:?}", &p.ins[bpc2]); } return false; }
+                                                let k2: Slot = match &p.ins[bpc2] {
+                                                    Ins::LocalSetI(id) => Slot::Id(*id),
+                                                    Ins::LocalSet(nm) => Slot::Name(nm.clone()),
+                                                    _ => return false,
+                                                };
+                                                if let Some(g) = &g2 { if !guards.contains(g) { guards.push(g.clone()); } }
+                                                dom_guards.push(g2.clone().unwrap_or_default());
+                                                flocals.insert(k2, V::E(TExpr::Dom(dom_guards.len() - 1)));
+                                                let mut k = bpc2 + 1;
+                                                while k < p.ins.len() {
+                                                    match &p.ins[k] {
+                                                        Ins::Ret => break,
+                                                        Ins::Flush => {}
+                                                        Ins::PushF(v) => stack.push(V::E(TExpr::Const(*v))),
+                                                        Ins::PushI(v) => stack.push(V::E(TExpr::Const(*v as f64))),
+                                                        Ins::LocalGetI(id) => match flocals.get(&Slot::Id(*id)) {
+                                                            Some(v) => stack.push(v.clone()),
+                                                            None => return false,
+                                                        },
+                                                        Ins::LocalGet(nm) => match flocals.get(&Slot::Name(nm.clone())) {
+                                                            Some(v) => stack.push(v.clone()),
+                                                            None => return false,
+                                                        },
+                                                        Ins::GetV(nm) => {
+                                                            if let Some(lvl) = dom_guards.iter().position(|g| g == nm) {
+                                                                stack.push(V::E(TExpr::DomLen(lvl)));
+                                                            } else if let Some(v) = flocals.get(&Slot::Name(nm.clone())).or_else(|| locals.get(&Slot::Name(nm.clone()))) {
+                                                                stack.push(v.clone());
+                                                            } else { return false; }
+                                                        }
+                                                        Ins::LocalSetI(id) => match stack.pop() { Some(v) => { flocals.insert(Slot::Id(*id), v); }, None => return false },
+                                                        Ins::LocalSet(nm) | Ins::SetV(nm) => match stack.pop() { Some(v) => { flocals.insert(Slot::Name(nm.clone()), v); }, None => return false },
+                                                        Ins::AtomicAdd(an, ainc) => {
+                                                            let delta = if *ainc { Some(V::E(TExpr::Const(1.0))) } else { stack.pop() };
+                                                            match delta {
+                                                                Some(V::E(e)) => {
+                                                                    let slot = Slot::Name(an.clone());
+                                                                    if let Some(pos) = sums.iter().position(|(s2, _)| s2 == &slot) {
+                                                                        let prev = sums[pos].1.clone();
+                                                                        sums[pos].1 = TExpr::Add(Box::new(prev), Box::new(e));
+                                                                    } else {
+                                                                        sums.push((slot.clone(), e));
+                                                                    }
+                                                                    flocals.remove(&slot);
+                                                                }
+                                                                _ => return false,
+                                                            }
+                                                        }
+                                                        Ins::Call(cl) => {
+                                                            // reuse the walker's scalar call-inlining by simulating inline
+                                                            // (single level, no nested whiles here)
+                                                            if let Some(&tpc2) = p.labels.get(cl) {
+                                                                let arity2 = p.label_params.get(&tpc2).map(|v| v.len()).unwrap_or(0);
+                                                                if arity2 == 0 || arity2 > 4 || stack.len() < arity2 { return false; }
+                                                                let mut args: Vec<TExpr> = Vec::new();
+                                                                for _ in 0..arity2 {
+                                                                    match stack.pop() { Some(V::E(e)) => args.push(e), _ => return false }
+                                                                }
+                                                                let mut fl2: HashMap<Slot, V> = HashMap::new();
+                                                                let mut b2 = 0usize;
+                                                                while b2 < arity2 {
+                                                                    match p.ins.get(tpc2 + b2) {
+                                                                        Some(Ins::LocalSetI(id)) => { fl2.insert(Slot::Id(*id), V::E(args[arity2 - 1 - b2].clone())); b2 += 1; }
+                                                                        Some(Ins::LocalSet(nm)) => { fl2.insert(Slot::Name(nm.clone()), V::E(args[arity2 - 1 - b2].clone())); b2 += 1; }
+                                                                        _ => break,
+                                                                    }
+                                                                }
+                                                                if b2 == arity2 {
+                                                                    let mut m = tpc2 + arity2;
+                                                                    let mut f2stack: Vec<TExpr> = Vec::new();
+                                                                    let ok2 = (|| {
+                                                                        while m < p.ins.len() {
+                                                                            match &p.ins[m] {
+                                                                                Ins::Ret => break,
+                                                                                Ins::Flush => {}
+                                                                                Ins::PushF(v) => f2stack.push(TExpr::Const(*v)),
+                                                                                Ins::PushI(v) => f2stack.push(TExpr::Const(*v as f64)),
+                                                                                Ins::LocalGetI(id) => match fl2.get(&Slot::Id(*id)) { Some(V::E(e)) => f2stack.push(e.clone()), _ => return false },
+                                                                                Ins::LocalGet(nm) => match fl2.get(&Slot::Name(nm.clone())) { Some(V::E(e)) => f2stack.push(e.clone()), _ => return false },
+                                                                                Ins::GetV(nm) => {
+                                                                                    if let Some(lvl) = dom_guards.iter().position(|g| g == nm) {
+                                                                                        f2stack.push(TExpr::DomLen(lvl));
+                                                                                    } else if let Some(V::E(e)) = fl2.get(&Slot::Name(nm.clone())) {
+                                                                                        f2stack.push(e.clone());
+                                                                                    } else if let Some(V::E(e)) = flocals.get(&Slot::Name(nm.clone())).or_else(|| locals.get(&Slot::Name(nm.clone()))) {
+                                                                                        f2stack.push(e.clone());
+                                                                                    } else { return false }
+                                                                                }
+                                                                                Ins::LocalSetI(id) => match f2stack.pop() { Some(e) => { fl2.insert(Slot::Id(*id), V::E(e)); }, None => return false },
+                                                                                Ins::LocalSet(nm) => match f2stack.pop() { Some(e) => { fl2.insert(Slot::Name(nm.clone()), V::E(e)); }, None => return false },
+                                                                                Ins::Simple(hh) => {
+                                                                                    let r = if ["op_add","op_sub","op_mul","op_div"].contains(hh) {
+                                                                                        match (f2stack.pop(), f2stack.pop()) {
+                                                                                            (Some(be), Some(ae)) => fuse_binop(hh, ae, be),
+                                                                                            _ => None,
+                                                                                        }
+                                                                                    } else if *hh == "op_sqrt" {
+                                                                                        f2stack.pop().map(|e| TExpr::Sqrt(Box::new(e)))
+                                                                                    } else if ["op_lt","op_gt","op_lte","op_gte","op_eq"].contains(hh) {
+                                                                                        match (f2stack.pop(), f2stack.pop()) {
+                                                                                            (Some(be), Some(ae)) => {
+                                                                                                let op = match *hh { "op_lt" => "lt", "op_gt" => "gt", "op_lte" => "lte", "op_gte" => "gte", _ => "eq" };
+                                                                                                Some(TExpr::Cmp(op, Box::new(ae), Box::new(be)))
+                                                                                            }
+                                                                                            _ => None,
+                                                                                        }
+                                                                                    } else if *hh == "op_and" {
+                                                                                        match (f2stack.pop(), f2stack.pop()) {
+                                                                                            (Some(be), Some(ae)) => Some(TExpr::And(Box::new(ae), Box::new(be))),
+                                                                                            _ => None,
+                                                                                        }
+                                                                                    } else if *hh == "op_not" {
+                                                                                        f2stack.pop().map(|e| TExpr::Not(Box::new(e)))
+                                                                                    } else { None };
+                                                                                    match r { Some(e) => f2stack.push(e), None => return false }
+                                                                                }
+                                                                                _ => return false,
+                                                                            }
+                                                                            m += 1;
+                                                                        }
+                                                                        f2stack.len() == 1
+                                                                    })();
+                                                                    if ok2 { stack.push(V::E(f2stack.pop().unwrap())); } else { return false }
+                                                                } else { return false }
+                                                            } else { return false }
+                                                        }
+                                                        Ins::Simple(hh) => {
+                                                            let r = if ["op_add","op_sub","op_mul","op_div"].contains(hh) {
+                                                                match (stack.pop(), stack.pop()) {
+                                                                    (Some(V::E(be)), Some(V::E(ae))) => fuse_binop(hh, ae, be),
+                                                                    _ => None,
+                                                                }
+                                                            } else if *hh == "op_sqrt" {
+                                                                match stack.pop() { Some(V::E(ae)) => Some(TExpr::Sqrt(Box::new(ae))), _ => None }
+                                                            } else if ["op_lt","op_gt","op_lte","op_gte","op_eq"].contains(hh) {
+                                                                match (stack.pop(), stack.pop()) {
+                                                                    (Some(V::E(be)), Some(V::E(ae))) => {
+                                                                        let op = match *hh { "op_lt" => "lt", "op_gt" => "gt", "op_lte" => "lte", "op_gte" => "gte", _ => "eq" };
+                                                                        Some(TExpr::Cmp(op, Box::new(ae), Box::new(be)))
+                                                                    }
+                                                                    _ => None,
+                                                                }
+                                                            } else if *hh == "op_and" {
+                                                                match (stack.pop(), stack.pop()) {
+                                                                    (Some(V::E(be)), Some(V::E(ae))) => Some(TExpr::And(Box::new(ae), Box::new(be))),
+                                                                    _ => None,
+                                                                }
+                                                            } else if *hh == "op_not" {
+                                                                match stack.pop() { Some(V::E(ae)) => Some(TExpr::Not(Box::new(ae))), _ => None }
+                                                            } else { None };
+                                                            match r { Some(e) => { stack.push(V::E(e)); ops += 1; }, None => return false }
+                                                        }
+                                                        _ => return false,
+                                                    }
+                                                    k += 1;
+                                                }
+                                                dom_guards.pop();
+                                                true
+                                            })();
+                                            if !nested_ok {
+                                                if std::env::var("NK_DEBUG_REGION2").is_ok() { eprintln!("[for-nest] nested sim failed"); }
+                                                okbody = false; break 'forbody;
+                                            }
+                                            // nested_ok consumed [j-2..j]; the outer sim advances
+                                            // past the inner For via the loop's j += 1. When nesting
+                                            // succeeded, rebind the OUTER k from Idx to Dom(outer level)
+                                            // — the flat index now decomposes over two levels.
+                                            flocals.insert(k_slot.clone(), V::E(TExpr::Dom(dom_guards_len0)));
+                                        }
                                         _ => { okbody = false; break 'forbody; }
                                     }
                                     j += 1;
@@ -1607,7 +1790,10 @@ fn walk_one_region(
                                     stack = saved;
                                     stop = true;
                                 }
-                            } else { poisoned.push(Slot::Name(String::new())); stop = true; }
+                            } else {
+                                if std::env::var("NK_DEBUG_REGION2").is_ok() { eprintln!("[for] outer binds_check failed"); }
+                                poisoned.push(Slot::Name(String::new())); stop = true;
+                            }
                         } else { stop = true; }
                     } else { stop = true; }
                 } else { stop = true; }

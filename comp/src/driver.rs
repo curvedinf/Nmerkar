@@ -12,9 +12,14 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::process::Command;
+use std::sync::OnceLock;
 
 // baked sandbox config (from build.rs; empty string = unrestricted build)
 include!(concat!(env!("OUT_DIR"), "/baked_sb.rs"));
+
+// A CLI-selected compiler backtrace must not leak into the generated
+// program's environment. Preserve the caller's original value for restore.
+static ORIGINAL_RUST_BACKTRACE: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
 
 // ---------------- directory discovery ----------------
 
@@ -387,6 +392,24 @@ ucase:
     )
 }
 
+/// Enable Rust compiler backtraces before normal CLI parsing can panic.
+/// Stop at `--`: everything after it belongs to the compiled program.
+pub fn configure_compiler_backtrace(args: &[String]) {
+    let mut mode = None;
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "--" => break,
+            "--compiler-backtrace" => mode = Some("1"),
+            "--compiler-backtrace=full" => mode = Some("full"),
+            _ => {}
+        }
+    }
+    if let Some(value) = mode {
+        ORIGINAL_RUST_BACKTRACE.get_or_init(|| std::env::var_os("RUST_BACKTRACE"));
+        std::env::set_var("RUST_BACKTRACE", value);
+    }
+}
+
 pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
@@ -428,6 +451,10 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
             "--gc-off" => gc_off = true,
             "--mt" => force_mt = true,
             "--debug" | "-D" => debug = true,
+            "--compiler-backtrace" | "--compiler-backtrace=full" => {},
+            s if s.starts_with("--compiler-backtrace=") => {
+                panic!("--compiler-backtrace accepts no value or `full`");
+            }
             "--emit-c" => emit_c = true,
             "--emit-text" => emit_text_f = true,
             "--emit-dense" => emit_dense_f = true,
@@ -469,6 +496,9 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 eprintln!("       nk -c input.n... [-o output] [--emit-c|--emit-text|--emit-dense]");
                 eprintln!("       nk --to-text prog.nd | --to-dense prog.n   convert encodings (writes prog.n/.nd)");
                 eprintln!("       nk -s | --skill                    print agent SKILL.md template");
+                eprintln!("");
+                eprintln!("  compiler diagnostics:");
+                eprintln!("       --compiler-backtrace[=full]  show a Rust compiler backtrace on panic");
                 eprintln!("");
                 eprintln!("  runtime flags (baked into compiled binary):");
                 eprintln!("       --gc-threshold N   GC collection threshold in bytes (default: 1MB)");
@@ -788,9 +818,19 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         }
         let _ = fs::remove_file(&tmpc);
     }
-    let status = Command::new(&bins)
-        .args(&run_args)
-        .status()
+    let mut program = Command::new(&bins);
+    program.args(&run_args);
+    if let Some(original) = ORIGINAL_RUST_BACKTRACE.get() {
+        match original {
+            Some(value) => {
+                program.env("RUST_BACKTRACE", value);
+            }
+            None => {
+                program.env_remove("RUST_BACKTRACE");
+            }
+        }
+    }
+    let status = program.status()
         .unwrap_or_else(|e| panic!("failed to run {}: {}", bins, e));
     if status.code().is_none() {
         use std::os::unix::process::ExitStatusExt;

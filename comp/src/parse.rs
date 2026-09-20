@@ -1592,8 +1592,8 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         // arithmetic / logic
         "op_add" | "op_sub" | "op_mul" | "op_and" | "op_pow" | "op_div" | "op_rem"
         | "op_eq" | "op_seq" | "op_sne" | "op_lt" | "op_gt" | "op_lte" | "op_gte"
-        | "op_or" | "op_xor" | "op_shl" => (2, 1),
-        "op_sqrt" | "op_shr" | "op_inc" | "op_dec" | "op_not" | "op_bnot" => (1, 1),
+        | "op_or" | "op_xor" | "op_shl" | "op_shr" => (2, 1),
+        "op_sqrt" | "op_inc" | "op_dec" | "op_not" | "op_bnot" => (1, 1),
         // containers
         "op_get" | "op_getq" | "op_orelse" | "op_has" | "op_contains" => (2, 1),
         "op_set" => (3, 0),

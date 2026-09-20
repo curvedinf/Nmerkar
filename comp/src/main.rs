@@ -13,6 +13,8 @@ mod prelude;
 mod sandbox;
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    driver::configure_compiler_backtrace(&args);
     let baked = driver::NK_BAKED_SB;
-    driver::run(std::env::args().collect(), baked, false);
+    driver::run(args, baked, false);
 }

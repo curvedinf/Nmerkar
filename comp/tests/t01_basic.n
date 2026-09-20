@@ -8,6 +8,7 @@
 5 3 or print
 5 3 xor print
 1 4 shl print
+256 3 shr print
 5 bnot print
 2.5 2.0 div print
 2 3 pow print

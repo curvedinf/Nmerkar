@@ -351,7 +351,7 @@ below. Glyph assignments are 1:1 and final in `comp/src/lex.rs`.
 | 7 | 🤐 | `sub` | a b → a−b | |
 | 8 | 🌂 | `mul` | a b → a*b | |
 | 9 | 😂 | `and` | a b → a&b | |
-| 10 | 🚃 | `shr` | a → a>>1 | |
+| 10 | 🚃 | `shr` | a b → logical a>>b | ints only; b<0 or b≥64: dies |
 | 11 | 🤑 | `inc` | a → a+1 | |
 | 12 | 🌃 | `dec` | a → a−1 | |
 | 13 | 🪔 | `pow` | a b → a^b | C/Python pow; coerces, returns float |
@@ -1195,6 +1195,12 @@ CLI modes: `nk prog.nd` (compile + run, cached binary in `$TMPDIR/nk-cache/`);
 `--emit-dense` (encoding conversion); `--to-text`/`--to-dense` (convert). First
 positional arg is a file if it exists, otherwise inline source. Everything after
 `--` is forwarded as program argv.
+
+**`--compiler-backtrace` / `--compiler-backtrace=full`**: enables the Rust
+compiler's short or full panic backtrace, respectively. This diagnoses failures
+inside `nk`/`nks`; it does not affect the generated program. The flag is handled
+before normal CLI parsing so argument-parsing panics are covered. A matching
+string after `--` remains a program argument and does not enable backtraces.
 
 **`--debug` / `-D`**: compiles in debug mode (`cc -O0 -g`). Disables local-variable
 register caching so locals are always memory-resident and accurate. On any fatal

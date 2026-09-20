@@ -6,6 +6,11 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-09-20 (post-v15) — binary right shift
+
+- `shr` (10, 🚃) — changed from unary shift-by-one to binary logical
+  right shift by a runtime count, matching `shl`; counts outside 0..63 die.
+
 ## 2026-09-20 (post-v15) — fused-kernel generation: concat/slice regions
 
 - Region kernels — changed: output assignments emit `precise float64_t`

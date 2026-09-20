@@ -14,10 +14,12 @@ mod prelude;
 mod sandbox;
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    driver::configure_compiler_backtrace(&args);
     let baked = if driver::NK_BAKED_SB.trim().is_empty() {
         include_str!("../sandbox.ufs")
     } else {
         driver::NK_BAKED_SB
     };
-    driver::run(std::env::args().collect(), baked, true);
+    driver::run(args, baked, true);
 }

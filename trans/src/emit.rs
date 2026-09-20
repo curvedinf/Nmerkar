@@ -428,26 +428,6 @@ impl Emitter {
                 buf.code.push_str(&format!("{slot}! "));
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                if *op == BinOp::Shr {
-                    // Runtime `shr` is unary (x>>1): only constant shift
-                    // counts are translatable, as repeated shr.
-                    let n = match &rhs.kind {
-                        ExprKind::Int(text) => text.parse::<u32>().ok(),
-                        _ => None,
-                    };
-                    let Some(n) = n else {
-                        return Err(Error::new(
-                            rhs.line,
-                            rhs.col,
-                            "shift count must be a constant (runtime shr is unary)",
-                        ));
-                    };
-                    self.expr(buf, lhs, ctx)?;
-                    for _ in 0..n {
-                        buf.code.push_str("shr ");
-                    }
-                    return Ok(());
-                }
                 self.expr(buf, lhs, ctx)?;
                 self.expr(buf, rhs, ctx)?;
                 buf.code.push_str(&format!("{} ", binop_mnemonic(*op)));

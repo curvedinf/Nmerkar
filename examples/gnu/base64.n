@@ -51,8 +51,8 @@ v4 0 eq 'i12 if
 v7 16 shl v5! 
 v4 2 lt not 'i13 if
 v4 3 lt not 'i14 if
-v5 shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr 63 and v3 v2 _call b64_emit6 v3! 
-v5 shr shr shr shr shr shr shr shr shr shr shr shr 63 and v3 v2 _call b64_emit6 v3! 
+v5 18 shr 63 and v3 v2 _call b64_emit6 v3!
+v5 12 shr 63 and v3 v2 _call b64_emit6 v3!
 v4 1 eq 'i15 'e16 if_else
 0 ret
 c6:
@@ -91,7 +91,7 @@ i15:
 61 v3 v2 _call b64_out v3! 
 0 ret
 e16:
-v5 shr shr shr shr shr shr 63 and v3 v2 _call b64_emit6 v3! 
+v5 6 shr 63 and v3 v2 _call b64_emit6 v3!
 v4 2 eq 'i17 'e18 if_else
 0 ret
 i17:
@@ -175,16 +175,16 @@ v15 0 eq not 'i38 if
 fr 'c39 'b40 if_else
 0 ret
 i35:
-v14 shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr 255 and _call putchar 
-v14 shr shr shr shr shr shr shr shr 255 and _call putchar 
+v14 16 shr 255 and _call putchar
+v14 8 shr 255 and _call putchar
 v14 255 and _call putchar 
 0 ret
 i36:
-v14 shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr 255 and _call putchar 
-v14 shr shr shr shr shr shr shr shr 255 and _call putchar 
+v14 16 shr 255 and _call putchar
+v14 8 shr 255 and _call putchar
 0 ret
 i37:
-v14 shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr shr 255 and _call putchar 
+v14 16 shr 255 and _call putchar
 0 ret
 i38:
 0 rv! 1 fr! 0 ret

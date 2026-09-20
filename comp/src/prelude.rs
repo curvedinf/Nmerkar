@@ -628,7 +628,7 @@ static inline Cell uf_cadd(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf
 static inline Cell uf_csub(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,1,"sub"); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i-b.i)); Cell s=uf_stradd(a,b,1); if(s.i!=-4200000001LL)return s; } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i-b.i); return uf_mkf(x-y); }
 static inline Cell uf_cmul(Cell a,Cell b){ if(a.tag==T_INT&&a.i==1&&b.tag!=T_FLOAT&&!uf_numarr(b))return b; if(b.tag==T_INT&&b.i==1&&a.tag!=T_FLOAT&&!uf_numarr(a))return a; if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,2,"mul"); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i*b.i); return uf_mkf(x*y); }
 static inline Cell uf_cand(Cell a,Cell b){ return uf_mki(uf_i(a)&uf_i(b)); }
-static inline Cell uf_cshr(Cell a){ return uf_mki((int64_t)((uint64_t)uf_i(a)>>1)); }
+static inline Cell uf_cshr(Cell a,Cell b){ if(a.tag==T_FLOAT||b.tag==T_FLOAT||a.tag==T_PTR||b.tag==T_PTR)die("SHR: ints only"); if(b.i<0||b.i>=64)die("SHR: shift out of range"); return uf_mki((int64_t)((uint64_t)a.i>>b.i)); }
 static inline Cell uf_cinc(Cell a){ double x=uf_to_number(a); if(isnan(x))return uf_mkf(NAN); if(a.tag==T_INT)return uf_mki(a.i+1); return uf_mkf(x+1.0); }
 static inline Cell uf_cdec(Cell a){ double x=uf_to_number(a); if(isnan(x))return uf_mkf(NAN); if(a.tag==T_INT)return uf_mki(a.i-1); return uf_mkf(x-1.0); }
 /* Division and remainder are *not* inlined by the C compiler. If they were,
@@ -731,7 +731,7 @@ static void op_lte(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_clte(a,b)); }
 static void op_gte(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_cgte(a,b)); }
 static void op_drop(Ctx*cx){ (void)pop(cx); }
 static void op_shutdown(Ctx*cx){ (void)cx; if(uf_active_job) atomic_store(&((WeaveJob*)uf_active_job)->shutdown,1); }
-static void op_shr(Ctx*cx){ pushc(cx,uf_cshr(pop(cx))); }
+static void op_shr(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_cshr(a,b)); }
 static void op_inc(Ctx*cx){ pushc(cx,uf_cinc(pop(cx))); }
 static void op_dec(Ctx*cx){ pushc(cx,uf_cdec(pop(cx))); }
 

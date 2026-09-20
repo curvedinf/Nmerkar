@@ -33,6 +33,6 @@ eb:
   zr@ zr@ mul zi@ zi@ mul sub cx@ add nzr!
   zr@ zi@ 2.0 mul mul cy@ add zi!
   nzr@ zr!
-  it@ inc it!
+  it++
   0
   ret

@@ -1,49 +1,49 @@
 ; build int array [0..9]
 0 10 range lst!
-lst@ length int array a!
-lst@ length 'cp for
-a@ 2 scalar_add sum print
-a@ sum print
-a@ mean print
-a@ min print
-a@ max print
-a@ a2!
-a2@ array_add sum print
-a@ a2!
-a2@ array_mul sum print
-a@ 1 scalar_add a1!
-a1@ a1@ array_div sum print
-a@ 5 scalar_eq bitmap_count print
-a@ 4 scalar_gt bitmap_count print
-a@ 4 scalar_gt a@ 7 scalar_lt bitmap_and bitmap_count print
-a@ 4 scalar_gt a@ 7 scalar_lt bitmap_or bitmap_count print
-a@ a4!
-a4@ a4@ 4 scalar_gt array_gather sum print
-a@ 5 scalar_gte bitmap_not bitmap_count print
-a@ 'sq array_map sum print
-a@ 0 'acc array_reduce print
+lst length int array a!
+lst length 'cp for
+a 2 scalar_add sum print
+a sum print
+a mean print
+a min print
+a max print
+a a2!
+a2 array_add sum print
+a a2!
+a2 array_mul sum print
+a 1 scalar_add a1!
+a1 a1 array_div sum print
+a 5 scalar_eq bitmap_count print
+a 4 scalar_gt bitmap_count print
+a 4 scalar_gt a 7 scalar_lt bitmap_and bitmap_count print
+a 4 scalar_gt a 7 scalar_lt bitmap_or bitmap_count print
+a a4!
+a4 a4 4 scalar_gt array_gather sum print
+a 5 scalar_gte bitmap_not bitmap_count print
+a 'sq array_map sum print
+a 0 'acc array_reduce print
 ; float arr
-lst@ length float array f!
-lst@ length 'cp2 for
-f@ 0.5 scalar_add sum print
-f@ mean print
+lst length float array f!
+lst length 'cp2 for
+f 0.5 scalar_add sum print
+f mean print
 ; vargsort / vsearchsorted / vwhere
 list 30 append 10 append 20 append s3!
-s3@ length int array b!
-s3@ length 'cp3 for
-b@ array_argsort idx!
-idx@ 0 get print
-b@ 15 array_search_sorted print
-b@ b1!
-b1@ b1@ b1@ 1 scalar_lt array_where sum print
+s3 length int array b!
+s3 length 'cp3 for
+b array_argsort idx!
+idx 0 get print
+b 15 array_search_sorted print
+b b1!
+b1 b1 b1 1 scalar_lt array_where sum print
 ; sort arr
-b@ sort sb!
-sb@ 0 get print
-sb@ 2 get print
+b sort sb!
+sb 0 get print
+sb 2 get print
 ret
 ; --- quotation bodies ---
-cp: k! lst@ k@ get v! a@ k@ v@ set ret
-sq: x! ret x@ x@ mul
-acc: a! b! ret a@ b@ add
-cp2: k! lst@ k@ get v! f@ k@ v@ set ret
-cp3: k! s3@ k@ get v! b@ k@ v@ set ret
+cp: k! lst k get v! a k v set ret
+sq: x! ret x x mul
+acc: a! b! ret a b add
+cp2: k! lst k get v! f k v set ret
+cp3: k! s3 k get v! b k v set ret

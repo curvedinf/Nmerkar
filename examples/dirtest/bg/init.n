@@ -7,11 +7,11 @@
 
 ; publish the channel handle so main.n can _call bg_chan to get it
 pub bg_chan:
-  cq@ ret
+  cq ret
 
 cond:
-  cq@ dequeue msg! msg@
+  cq dequeue msg! msg
   ret
 body:
-  msg@ "bg got: %s" format print
+  msg "bg got: %s" format print
   0 ret

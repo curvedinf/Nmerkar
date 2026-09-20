@@ -85,6 +85,13 @@ pub fn opcode_index(c: char) -> Option<usize> {
     let cp = c as u32;
     OP_GLYPHS.iter().position(|&g| g == cp)
 }
+
+// v15 syntax glyphs (not runtime opcodes; single-token in Qwen3-0.6B):
+pub const GLYPH_LABEL_DEF: char = '\u{1F3F7}'; // 🏷 dense label-definition marker
+pub const GLYPH_TAG_SIZEOF: char = '\u{1F4CF}'; // 📏 compile-time `size_of Struct`
+pub const GLYPH_TAG_OFFSET: char = '\u{1F4CD}'; // 📍 compile-time `offset Struct.field`
+pub const GLYPH_TAG_OBJSIZE: char = '\u{1F4E6}'; // 📦 `_obj` struct-size immediate
+pub const GLYPH_TAG_CAST: char = '\u{1F3AD}';    // 🎭 `_cast` struct-id immediate
 // Kept for emit.rs compatibility (dense glyph for an opcode by name).
 pub fn op_glyph_of(name: &str) -> char {
     glyph_of(op_index(name).expect("op_index"))
@@ -399,6 +406,9 @@ impl Lexer {
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
     }
+    fn at(&self, off: usize) -> Option<char> {
+        self.chars.get(self.pos + off).copied()
+    }
     fn next(&mut self) -> Option<char> {
         let c = self.peek();
         if c.is_some() {
@@ -438,6 +448,13 @@ impl Lexer {
             }
         }
         s
+    }
+    // v15 immediate-tag operand: ASCII struct/type name
+    fn tag_name(&mut self, what: &str) -> String {
+        match self.peek() {
+            Some(c) if c.is_ascii_alphabetic() => self.lex_ident(),
+            _ => self.err(&format!("{} needs an ASCII struct/type name", what)),
+        }
     }
     fn lex_string(&mut self) -> String {
         // assumes current char is '"'
@@ -641,11 +658,42 @@ impl Lexer {
                 if g == Some('!') || g.map_or(false, |c| opcode_index(c) == Some(33)) {
                     self.pos += 1;
                     out.push(Tok::LocalSet(name));
-                } else if g == Some('@') || g.map_or(false, |c| opcode_index(c) == Some(34)) {
+                } else if g == Some('+') && self.at(1) == Some('+') {
+                    // v15: dense name++ / name+= round-trip (emit writes them)
+                    self.pos += 2;
+                    out.push(Tok::IncLocal(name));
+                } else if g == Some('+') && self.at(1) == Some('=') {
+                    self.pos += 2;
+                    out.push(Tok::AddLocal(name));
+                } else if g == Some(GLYPH_LABEL_DEF) {
                     self.pos += 1;
-                    out.push(Tok::LocalGet(name));
-                } else {
                     out.push(Tok::LabelDef(name));
+                } else {
+                    // v15: bare names load implicitly (`@` varget removed)
+                    out.push(Tok::LocalGet(name));
+                }
+                continue;
+            }
+            // ---- v15 immediate tags: compile-time struct-name operands ----
+            if c == GLYPH_TAG_SIZEOF || c == GLYPH_TAG_OFFSET || c == GLYPH_TAG_OBJSIZE || c == GLYPH_TAG_CAST {
+                self.prev_ret = false;
+                self.pos += 1;
+                self.skip_ws();
+                let sym = self.tag_name("tag operand");
+                if c == GLYPH_TAG_SIZEOF {
+                    out.push(Tok::Ident(format!("@sizeof:{}", sym)));
+                } else if c == GLYPH_TAG_OFFSET {
+                    if self.peek() == Some('.') {
+                        self.pos += 1;
+                        let field = self.tag_name("offset field");
+                        out.push(Tok::Ident(format!("@offset:{}.{}", sym, field)));
+                    } else {
+                        out.push(Tok::Ident(format!("@offset:{}", sym)));
+                    }
+                } else if c == GLYPH_TAG_OBJSIZE {
+                    out.push(Tok::Ident(format!("@objsize:{}", sym)));
+                } else {
+                    out.push(Tok::Ident(format!("@cast:{}", sym)));
                 }
                 continue;
             }
@@ -705,29 +753,7 @@ impl Lexer {
                     }
                     continue;
                 }
-                '@' => {
-                    // dense-mode sentinel idents (@objsize:Name, @cast:Name,
-                    // @sizeof:Name, @offset:Name.field) — the `_obj`-style
-                    // immediate ops read a struct name and the emitter writes
-                    // it back as a @-sentinel
-                    self.pos += 1;
-                    let mut word = String::new();
-                    while let Some(c2) = self.peek() {
-                        if c2.is_ascii_alphabetic() || c2 == ':' || c2 == '.' {
-                            word.push(c2);
-                            self.pos += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    if word.starts_with("objsize:") || word.starts_with("cast:")
-                        || word.starts_with("sizeof:") || word.starts_with("offset:")
-                    {
-                        out.push(Tok::Ident(format!("@{}", word)));
-                        continue;
-                    }
-                    self.err("bare '@' must directly follow a v-run or start a sentinel");
-                }
+                '@' => self.err("'@' is removed (v15) — variables load implicitly (write the bare name); immediate tags are 📏 📍 📦 🎭"),
                 '!' => self.err("bare '!' must directly follow a v-run"),
                 _ => {}
             }
@@ -1449,10 +1475,7 @@ impl TextLexer {
             }
             if let Some(name) = tok.strip_suffix('@') {
                 if !name.is_empty() && !tok.starts_with('@') {
-                    self.pos += 1;
-                    check_ident(name, "variable");
-                    out.push(Tok::LocalGet(name.to_string()));
-                    continue;
+                    self.err("@ varget is removed (v15) — bare names load implicitly; just write the name");
                 }
             }
             // name++ / ^name++ : increment variable by 1
@@ -1695,6 +1718,11 @@ impl TextLexer {
                         out.push(Tok::PushI(id));
                     } else if let Some(t) = parse_text_num(&tok) {
                         out.push(t);
+                    } else if tok.starts_with('@') {
+                        // v15: '@'-prefixed idents are compiler-internal
+                        // sentinels (@flush, @sizeof:Name, …) — never valid
+                        // in text source
+                        self.err("'@' tokens are not valid in text source — write `size_of Name`-style immediates (`_size_of`, `_offset`, `_obj`, `_cast`)");
                     } else if is_bad_ident(&tok) {
                         self.err(&format!("identifier '{}' — identifiers may not start with '_'", tok));
                     } else {

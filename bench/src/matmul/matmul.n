@@ -7,17 +7,17 @@
 ; dispatches it as a GPU matmul kernel launch; --device cpu runs it inline.
 512 n!
 has_args 'setn if
-n@ n@ mul n2!
-[n@ n@] 0 n2@ range concat float tensor kmat!
-kmat@ 0.000001 mul 1.0 add a!
-1.0 kmat@ 0.000001 mul sub b!
+n n mul n2!
+[n n] 0 n2 range concat float tensor kmat!
+kmat 0.000001 mul 1.0 add a!
+1.0 kmat 0.000001 mul sub b!
 weave
   task mmul:
-    ret a@ b@ mul
+    ret a b mul
 run mmul
 c!
-"c[0,0]: " print c@ 0 get "%.6f" format print
-"c[N-1,N-1]: " print c@ n2@ 1 sub get "%.6f" format print
-"checksum: " print c@ sum "%.2f" format print
+"c[0,0]: " print c 0 get "%.6f" format print
+"c[N-1,N-1]: " print c n2 1 sub get "%.6f" format print
+"checksum: " print c sum "%.2f" format print
 ret
 setn: 1 arg_index n! ret

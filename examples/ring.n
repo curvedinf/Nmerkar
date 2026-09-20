@@ -6,9 +6,9 @@ weave                 ; begin task-DAG definition
   task one:           ; task `one` — no inputs
     ret 21            ; task result = 21
   task two: one!      ; task `two` depends on `one`, binding its result to one
-    ret one@ 2 mul    ; task result = one * 2 = 42
+    ret one 2 mul    ; task result = one * 2 = 42
 run two               ; execute the DAG rooted at `two`; result lands on the stack
 print                 ; prints the weave result (42)
-ch@ dequeue print     ; join the spawned thread: dequeue its result (42) and print
+ch dequeue print     ; join the spawned thread: dequeue its result (42) and print
 sender:               ; spawned thread body
   ret 42              ; return value is enqueued to ch, then ch closes

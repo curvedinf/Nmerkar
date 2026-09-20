@@ -1,6 +1,6 @@
 # AGENTS.md — Nmerkar
 
-Nmerkar: a language based on a managed hidden stack, compiled to C then native via `cc`. Designed for LLM-authored scripts (low token count, fast, reliable). Current revision is **v14.1** — **not backward compatible** with v13 (shared vars are plain names, see SPEC "Shared variables"). Full language spec in `SPEC.md` (current specification only; per-operation history is in `SPEC_HISTORY.md`); v13 design rationale in `SPEC_V13_PROPOSAL.md`.
+Nmerkar: a language based on a managed hidden stack, compiled to C then native via `cc`. Designed for LLM-authored scripts (low token count, fast, reliable). Current revision is **v15** — **not backward compatible** with v14.1 (bare names are implicit loads — the `@` varget suffix is gone; dense label defs need the 🏷 marker; dense struct immediates use the 📏 📍 📦 🎭 tag glyphs, see SPEC "Names, labels, and variables" and "Dense tag glyphs"). Full language spec in `SPEC.md` (current specification only; per-operation history is in `SPEC_HISTORY.md`); v13 design rationale in `SPEC_V13_PROPOSAL.md`.
 
 ## Repository Layout
 
@@ -15,7 +15,7 @@ README.md  Quickstart and project intro.
 SPEC_V11_PROPOSAL.md, WEAVE_SPEC_PROPOSAL.md  Design proposals.
 ```
 
-Compiler source map: `main.rs`/`nks.rs` (thin bin roots), `driver.rs` (CLI/cache/cc + sandbox/compute wiring), `lex.rs` (lexers + glyph/mnemonic tables), `parse.rs` (parser, label resolution, WEAVE DAG, label parameters/destructuring, strict arity check, v14 scope pass: shared-var declaration + name-collision checks + atomic RMW rewrite, v14.1 strictness pass: static strict/loose taint + implicit-coercion rejection, `_cast` literal folding), `ast.rs` (types), `gen.rs` (C codegen + optimizations), `emit.rs` (encoding conversion), `prelude.rs` (embedded C runtime: GC, containers, opcodes, threading, coercion, smart print, sandbox gates, Vulkan offload + staging pool), `sandbox.rs` (capability configs/policies), `compute.rs` (Vulkan compute backend, static shader library, weave-task + elementwise-region fusion), `build.rs` (bakes NK_SANDBOX_CONFIG).
+Compiler source map: `main.rs`/`nks.rs` (thin bin roots), `driver.rs` (CLI/cache/cc + sandbox/compute wiring), `lex.rs` (lexers + glyph/mnemonic tables), `parse.rs` (parser, label resolution, WEAVE DAG, label parameters/destructuring, strict arity check, v14 scope pass: shared-var declaration + name-collision checks + atomic RMW rewrite, v15 implicit-load resolution (bare Ident → macro-or-load), v14.1 strictness pass: static strict/loose taint + implicit-coercion rejection, `_cast` literal folding), `ast.rs` (types), `gen.rs` (C codegen + optimizations), `emit.rs` (encoding conversion), `prelude.rs` (embedded C runtime: GC, containers, opcodes, threading, coercion, smart print, sandbox gates, Vulkan offload + staging pool), `sandbox.rs` (capability configs/policies), `compute.rs` (Vulkan compute backend, static shader library, weave-task + elementwise-region fusion), `build.rs` (bakes NK_SANDBOX_CONFIG).
 
 ## Build
 
@@ -51,7 +51,7 @@ Runtime flags: `--gc-threshold N`, `--gc-off`, `--mt`.
 
 ## Language & FFI Reference
 
-All semantics, control flow, variable scoping (v14: `x!`/`x@` locals with pass-through assignment; shared vars are plain names declared by a top-level assignment — atomic, thread-safe), structured concurrency (`spawn`/`channel`/`weave`), container protocol, string escapes, module system (`USE`/`import`/`extern`/`MOD`/`PUB`), directory mode, universal coercion, strictness (`strict`/`loose`, SPEC "Strictness"), casting (`_cast` static / `cast` dynamic, SPEC "Casting"), and smart `print` are in **`SPEC.md`**. Opcode→glyph/mnemonic tables are in `comp/src/lex.rs` (`OP_NAMES`, `OP_GLYPHS`, `text_mnemonic`).
+All semantics, control flow, variable scoping (v15: `x!` stores with pass-through, bare names are implicit loads, `x@` is removed; shared vars are plain names declared by a top-level assignment — atomic, thread-safe), structured concurrency (`spawn`/`channel`/`weave`), container protocol, string escapes, module system (`USE`/`import`/`extern`/`MOD`/`PUB`), directory mode, universal coercion, strictness (`strict`/`loose`, SPEC "Strictness"), casting (`_cast` static / `cast` dynamic, SPEC "Casting"), and smart `print` are in **`SPEC.md`**. Opcode→glyph/mnemonic tables are in `comp/src/lex.rs` (`OP_NAMES`, `OP_GLYPHS`, `text_mnemonic`).
 
 Key gotchas not to re-derive: string escapes limited to `\n \t \r \0 \\ \"`. Linking is always `-lpthread -lm` plus `-l<name>` per `USE`. Immediate-operand opcodes (`_call`, `_addr`, `_syscall`, `_lit`, `_str`, `_size_of`, `_offset`, `_obj`, `_cast`, `_array`, `_tensor`) are `_`-prefixed in text mode — they consume the next source token at compile time. Every label body must end with `ret`. Identifiers may not start with `_`.
 

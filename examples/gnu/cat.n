@@ -27,31 +27,31 @@ v1!
 1 v4!
 0 v5!
 0 v6!
-v1@ 4 and v7!
-v1@ 1 and v8!
-v1@ 8 and v9!
+v1 4 and v7!
+v1 1 and v8!
+v1 8 and v9!
 'c1 'b2 while
 0 rv! 1 fr!
-fr@ rv@ mul frv! 0 fr! ret frv@
+fr rv mul frv! 0 fr! ret frv
 c1:
-fr@ not 1 and ret
+fr not 1 and ret
 b2:
-v0@ _call cat_get v2! 
-v2@ -1 eq 'i3 if
-v2@ 10 eq v4@ 0 eq not mul not not 'i4 if
-v3@ 0 eq not v7@ 0 eq not mul not not 'i7 if
+v0 _call cat_get v2! 
+v2 -1 eq 'i3 if
+v2 10 eq v4 0 eq not mul not not 'i4 if
+v3 0 eq not v7 0 eq not mul not not 'i7 if
 0 v5! 
-v2@ v1@ _call cat_render 
-v2@ 10 eq 'i8 'e9 if_else
+v2 v1 _call cat_render 
+v2 10 eq 'i8 'e9 if_else
 0 ret
 i3:
 break
 0 ret
 i4:
-v9@ 0 eq not v5@ 0 eq not mul not not 'i5 if
+v9 0 eq not v5 0 eq not mul not not 'i5 if
 1 v5! 
-v7@ 0 eq not v8@ 0 eq mul not not 'i6 if
-v2@ v1@ _call cat_render 
+v7 0 eq not v8 0 eq mul not not 'i6 if
+v2 v1 _call cat_render 
 1 v4! 
 1 v3! 
 continue
@@ -60,12 +60,12 @@ i5:
 continue
 0 ret
 i6:
-v6@ 1 add v6! 
-"%6d\t" v6@ 1 _call printf 
+v6 1 add v6! 
+"%6d\t" v6 1 _call printf 
 0 ret
 i7:
-v6@ 1 add v6! 
-"%6d\t" v6@ 1 _call printf 
+v6 1 add v6! 
+"%6d\t" v6 1 _call printf 
 0 ret
 i8:
 1 v3! 
@@ -81,163 +81,163 @@ entry:
 0 v12!
 0 v13!
 'c10 'b11 while
-fr@ 'c26 'b27 if_else
+fr 'c26 'b27 if_else
 0 _call exit
 ret
 c10:
-fr@ not v11@ extern "nk_argc" load lt and ret
+fr not v11 extern "nk_argc" load lt and ret
 b11:
-v11@ 8 mul extern "nk_argv" load add load v14! 
-v13@ 0 eq 0 v14@ "" _call strstr add load 255 and 45 eq mul not not 1 v14@ "" _call strstr add load 255 and 0 eq not mul not not 'i12 if
-fr@ 'c17 'b18 if_else
+v11 8 mul extern "nk_argv" load add load v14! 
+v13 0 eq 0 v14 "" _call strstr add load 255 and 45 eq mul not not 1 v14 "" _call strstr add load 255 and 0 eq not mul not not 'i12 if
+fr 'c17 'b18 if_else
 0 ret
 i12:
-1 v14@ "" _call strstr add load 255 and 45 eq 2 v14@ "" _call strstr add load 255 and 0 eq mul not not 'i13 if
-v14@ v10@ _call cat_parse_arg v10! 
-v10@ 0 1 sub eq 'i14 if
-fr@ 'c15 'b16 if_else
+1 v14 "" _call strstr add load 255 and 45 eq 2 v14 "" _call strstr add load 255 and 0 eq mul not not 'i13 if
+v14 v10 _call cat_parse_arg v10! 
+v10 0 1 sub eq 'i14 if
+fr 'c15 'b16 if_else
 0 ret
 i13:
 1 v13! 
-v11@ pt! v11@ 1 add v11! frv! pt@ 
+v11 pt! v11 1 add v11! frv! pt 
 continue
 0 ret
 i14:
-extern "stderr" load "cat: invalid option -- %s\n" v14@ 1 add 1 _call fprintf 
+extern "stderr" load "cat: invalid option -- %s\n" v14 1 add 1 _call fprintf 
 1 _call exit
 0 ret
 b16:
-v11@ pt! v11@ 1 add v11! frv! pt@ 
+v11 pt! v11 1 add v11! frv! pt 
 continue
 0 ret
 c15:
 0 ret
 b23:
-v15@ v10@ _call cat_file 
-v15@ _call fclose 
+v15 v10 _call cat_file 
+v15 _call fclose 
 0 ret
 c22:
 0 ret
 b25:
-v11@ pt! v11@ 1 add v11! frv! pt@ 
+v11 pt! v11 1 add v11! frv! pt 
 0 ret
 c24:
 0 ret
 b18:
 1 v12! 
-0 v14@ "" _call strstr add load 255 and 45 eq 1 v14@ "" _call strstr add load 255 and 0 eq mul not not 'i19 'e20 if_else
-fr@ 'c24 'b25 if_else
+0 v14 "" _call strstr add load 255 and 45 eq 1 v14 "" _call strstr add load 255 and 0 eq mul not not 'i19 'e20 if_else
+fr 'c24 'b25 if_else
 0 ret
 i19:
-0 v10@ _call cat_file 
+0 v10 _call cat_file 
 0 ret
 e20:
-v14@ "r" _call fopen v15! 
-v15@ not 'i21 if
-fr@ 'c22 'b23 if_else
+v14 "r" _call fopen v15! 
+v15 not 'i21 if
+fr 'c22 'b23 if_else
 0 ret
 i21:
-extern "stderr" load "cat: %s: No such file or directory\n" v14@ 1 _call fprintf 
+extern "stderr" load "cat: %s: No such file or directory\n" v14 1 _call fprintf 
 1 _call exit
 0 ret
 c17:
 0 ret
 b27:
-v12@ 0 eq 'i28 if
+v12 0 eq 'i28 if
 0 _call exit
 0 ret
 i28:
-0 v10@ _call cat_file 
+0 v10 _call cat_file 
 0 ret
 c26:
 0 ret
 cat_set_flag:
 v16!
 v17!
-v16@ v17@ or rv! 1 fr!
-fr@ rv@ mul frv! 0 fr! ret frv@
+v16 v17 or rv! 1 fr!
+fr rv mul frv! 0 fr! ret frv
 cat_parse_short:
 v18!
 v19!
-v18@ 98 eq 'i29 if
-fr@ 'c30 'b31 if_else
-fr@ rv@ mul frv! 0 fr! ret frv@
+v18 98 eq 'i29 if
+fr 'c30 'b31 if_else
+fr rv mul frv! 0 fr! ret frv
 i29:
-v19@ 1 4 or _call cat_set_flag rv! 1 fr! 0 ret
+v19 1 4 or _call cat_set_flag rv! 1 fr! 0 ret
 b58:
 0 1 sub rv! 1 fr! 0 ret
 c57:
 0 ret
 b55:
-v18@ 117 eq 'i56 if
-fr@ 'c57 'b58 if_else
+v18 117 eq 'i56 if
+fr 'c57 'b58 if_else
 0 ret
 i56:
-v19@ rv! 1 fr! 0 ret
+v19 rv! 1 fr! 0 ret
 c54:
 0 ret
 b52:
-v18@ 116 eq 'i53 if
-fr@ 'c54 'b55 if_else
+v18 116 eq 'i53 if
+fr 'c54 'b55 if_else
 0 ret
 i53:
-v19@ 16 32 or _call cat_set_flag rv! 1 fr! 0 ret
+v19 16 32 or _call cat_set_flag rv! 1 fr! 0 ret
 c51:
 0 ret
 b49:
-v18@ 101 eq 'i50 if
-fr@ 'c51 'b52 if_else
+v18 101 eq 'i50 if
+fr 'c51 'b52 if_else
 0 ret
 i50:
-v19@ 2 32 or _call cat_set_flag rv! 1 fr! 0 ret
+v19 2 32 or _call cat_set_flag rv! 1 fr! 0 ret
 c48:
 0 ret
 b46:
-v18@ 65 eq 'i47 if
-fr@ 'c48 'b49 if_else
+v18 65 eq 'i47 if
+fr 'c48 'b49 if_else
 0 ret
 i47:
-v19@ 2 16 or 32 or _call cat_set_flag rv! 1 fr! 0 ret
+v19 2 16 or 32 or _call cat_set_flag rv! 1 fr! 0 ret
 c45:
 0 ret
 b43:
-v18@ 118 eq 'i44 if
-fr@ 'c45 'b46 if_else
+v18 118 eq 'i44 if
+fr 'c45 'b46 if_else
 0 ret
 i44:
-v19@ 32 _call cat_set_flag rv! 1 fr! 0 ret
+v19 32 _call cat_set_flag rv! 1 fr! 0 ret
 c42:
 0 ret
 b40:
-v18@ 84 eq 'i41 if
-fr@ 'c42 'b43 if_else
+v18 84 eq 'i41 if
+fr 'c42 'b43 if_else
 0 ret
 i41:
-v19@ 16 _call cat_set_flag rv! 1 fr! 0 ret
+v19 16 _call cat_set_flag rv! 1 fr! 0 ret
 c39:
 0 ret
 b37:
-v18@ 115 eq 'i38 if
-fr@ 'c39 'b40 if_else
+v18 115 eq 'i38 if
+fr 'c39 'b40 if_else
 0 ret
 i38:
-v19@ 8 _call cat_set_flag rv! 1 fr! 0 ret
+v19 8 _call cat_set_flag rv! 1 fr! 0 ret
 c36:
 0 ret
 b34:
-v18@ 110 eq 'i35 if
-fr@ 'c36 'b37 if_else
+v18 110 eq 'i35 if
+fr 'c36 'b37 if_else
 0 ret
 i35:
-v19@ 4 _call cat_set_flag rv! 1 fr! 0 ret
+v19 4 _call cat_set_flag rv! 1 fr! 0 ret
 c33:
 0 ret
 b31:
-v18@ 69 eq 'i32 if
-fr@ 'c33 'b34 if_else
+v18 69 eq 'i32 if
+fr 'c33 'b34 if_else
 0 ret
 i32:
-v19@ 2 _call cat_set_flag rv! 1 fr! 0 ret
+v19 2 _call cat_set_flag rv! 1 fr! 0 ret
 c30:
 0 ret
 cat_parse_arg:
@@ -245,46 +245,46 @@ v20!
 v21!
 1 v22!
 'c59 'b60 while
-fr@ 'c64 'b65 if_else
-fr@ rv@ mul frv! 0 fr! ret frv@
+fr 'c64 'b65 if_else
+fr rv mul frv! 0 fr! ret frv
 c59:
-fr@ not v22@ v20@ "" _call strstr add load 255 and 0 eq not and ret
+fr not v22 v20 "" _call strstr add load 255 and 0 eq not and ret
 b60:
-v22@ v20@ "" _call strstr add load 255 and v21@ _call cat_parse_short v21! 
-v21@ 0 1 sub eq 'i61 if
-fr@ 'c62 'b63 if_else
+v22 v20 "" _call strstr add load 255 and v21 _call cat_parse_short v21! 
+v21 0 1 sub eq 'i61 if
+fr 'c62 'b63 if_else
 0 ret
 i61:
 0 1 sub rv! 1 fr! 0 ret
 b63:
-v22@ pt! v22@ 1 add v22! frv! pt@ 
+v22 pt! v22 1 add v22! frv! pt 
 0 ret
 c62:
 0 ret
 b65:
-v21@ rv! 1 fr! 0 ret
+v21 rv! 1 fr! 0 ret
 c64:
 0 ret
 cat_get:
 v23!
-v23@ 0 eq 'i66 if
-fr@ 'c67 'b68 if_else
-fr@ rv@ mul frv! 0 fr! ret frv@
+v23 0 eq 'i66 if
+fr 'c67 'b68 if_else
+fr rv mul frv! 0 fr! ret frv
 i66:
 _call getchar rv! 1 fr! 0 ret
 b68:
-v23@ _call fgetc rv! 1 fr! 0 ret
+v23 _call fgetc rv! 1 fr! 0 ret
 c67:
 0 ret
 cat_render:
 v24!
 v25!
-v25@ 32 and v26!
-v24@ 10 eq 'i69 if
-fr@ 'c71 'b72 if_else
-fr@ rv@ mul frv! 0 fr! ret frv@
+v25 32 and v26!
+v24 10 eq 'i69 if
+fr 'c71 'b72 if_else
+fr rv mul frv! 0 fr! ret frv
 i69:
-v25@ 2 and 0 eq not 'i70 if
+v25 2 and 0 eq not 'i70 if
 10 _call putchar 
 0 rv! 1 fr! 0 ret
 i70:
@@ -292,17 +292,17 @@ i70:
 0 ret
 b91:
 "M-" 0 _call printf 
-v27@ _call putchar 
+v27 _call putchar 
 0 rv! 1 fr! 0 ret
 c90:
 0 ret
 b88:
-v27@ 32 lt 'i89 if
-fr@ 'c90 'b91 if_else
+v27 32 lt 'i89 if
+fr 'c90 'b91 if_else
 0 ret
 i89:
 "M-^" 0 _call printf 
-v27@ 64 add _call putchar 
+v27 64 add _call putchar 
 0 rv! 1 fr! 0 ret
 c87:
 0 ret
@@ -311,13 +311,13 @@ b93:
 c92:
 0 ret
 b84:
-v24@ 126 gt 'i85 if
-fr@ 'c92 'b93 if_else
+v24 126 gt 'i85 if
+fr 'c92 'b93 if_else
 0 ret
 i85:
-v24@ 128 sub v27! 
-v27@ 127 eq 'i86 if
-fr@ 'c87 'b88 if_else
+v24 128 sub v27! 
+v27 127 eq 'i86 if
+fr 'c87 'b88 if_else
 0 ret
 i86:
 "M-^?" 0 _call printf 
@@ -325,27 +325,27 @@ i86:
 c83:
 0 ret
 b81:
-v24@ 32 lt 'i82 if
-fr@ 'c83 'b84 if_else
+v24 32 lt 'i82 if
+fr 'c83 'b84 if_else
 0 ret
 i82:
 94 _call putchar 
-v24@ 64 add _call putchar 
+v24 64 add _call putchar 
 0 rv! 1 fr! 0 ret
 c80:
 0 ret
 b95:
-v24@ _call putchar 
+v24 _call putchar 
 0 rv! 1 fr! 0 ret
 c94:
 0 ret
 b77:
-v26@ 0 eq not 'i78 if
-fr@ 'c94 'b95 if_else
+v26 0 eq not 'i78 if
+fr 'c94 'b95 if_else
 0 ret
 i78:
-v24@ 127 eq 'i79 if
-fr@ 'c80 'b81 if_else
+v24 127 eq 'i79 if
+fr 'c80 'b81 if_else
 0 ret
 i79:
 "^?" 0 _call printf 
@@ -353,11 +353,11 @@ i79:
 c76:
 0 ret
 b72:
-v24@ 9 eq 'i73 if
-fr@ 'c76 'b77 if_else
+v24 9 eq 'i73 if
+fr 'c76 'b77 if_else
 0 ret
 i73:
-v25@ 16 and 0 eq not 'i74 'e75 if_else
+v25 16 and 0 eq not 'i74 'e75 if_else
 0 rv! 1 fr! 0 ret
 i74:
 "^I" 0 _call printf 

@@ -1,39 +1,39 @@
 ; time
 now t!
-t@ type_of print
-t@ "unix" format_time print
+t type_of print
+t "unix" format_time print
 "1700000000.5" "unix" parse_time "unix" format_time print
 ; bloom
 100 bloom b!
-b@ 42 bloom_add
-b@ "hello" bloom_add
-b@ 42 bloom_test print
-b@ "hello" bloom_test print
-b@ 43 bloom_test print
-b@ type_of print
+b 42 bloom_add
+b "hello" bloom_add
+b 42 bloom_test print
+b "hello" bloom_test print
+b 43 bloom_test print
+b type_of print
 ; slurp / spit / argv
 "tests/out.txt" "abc123" write_file
 "tests/out.txt" read_file print
 argv length print
 ; mmap
 "tests/log.txt" mmap m!
-m@ type_of print
-m@ "ERROR" find 0 gt print
-m@ length print
+m type_of print
+m "ERROR" find 0 gt print
+m length print
 ; feach / ffold
 "tests/log.txt" 'pl file_each_line
 0 c!
 "tests/log.txt" 0 'countf file_fold_lines print
 ; fmatch
 "tests/log.txt" "ERROR.*timeout" file_match_lines fc!
-fc@ dequeue print
-fc@ dequeue print
+fc dequeue print
+fc dequeue print
 ; bfs / dfs / wfind
 dict g!
-g@ 1 list 2 append 3 append set
-g@ 2 list 4 append set
-g@ 3 list 4 append set
-g@ 4 list set
+g 1 list 2 append 3 append set
+g 2 list 4 append set
+g 3 list 4 append set
+g 4 list set
 1 'nb bfs length print
 1 'nb dfs length print
 1 'nb 'is4 find_first print
@@ -42,8 +42,8 @@ g@ 4 list set
 "tests/fem.txt" read_file print
 ret
 ; --- quotation bodies ---
-pl: line! line@ "L: %s\n" format print ret 1
-countf: acc! line! ret acc@ inc
-nb: n! ret g@ n@ get_or_zero
+pl: line! line "L: %s\n" format print ret 1
+countf: acc! line! ret acc inc
+nb: n! ret g n get_or_zero
 is4: ret 4 eq
 strf: ret "%d" format

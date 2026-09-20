@@ -10,9 +10,9 @@ list 3 append 1 append 2 append sort 0 get print
 7 42 orelse print
 ; group/agg/unique/flat/chunk
 0 10 range 'pmod group_by g!
-g@ 0 get length print
-g@ 'gsum aggregate a!
-a@ 1 get print
+g 0 get length print
+g 'gsum aggregate a!
+a 1 get print
 list 1 append 2 append 2 append 3 append 1 append unique length print
 list list 1 append 2 append append list 3 append append 4 append flatten length print
 0 7 range 3 chunk length print
@@ -22,5 +22,5 @@ ret
 even: 2 rem 0 eq ret
 big: 5 gt ret
 pmod: 3 rem ret
-gsum: lst! lst@ length n! n@ int array a! n@ 'cp for a@ sum ret
-cp: k! lst@ k@ get v! a@ k@ v@ set ret
+gsum: lst! lst length n! n int array a! n 'cp for a sum ret
+cp: k! lst k get v! a k v set ret

@@ -50,16 +50,16 @@ import c"exit"(int)->void
 
 ; snd: fd txt ->   (send string handle on socket fd; FFI sees char*)
 snd: txt! stkfd!
-txt@ length tlen!
-stkfd@ txt@ tlen@ 0 _call send ret
+txt length tlen!
+stkfd txt tlen 0 _call send ret
 
 ; parse POST body "u=<name>&m=<text>" and enqueue [1 "name: text"]
 dopar:
-req@ "\r\n\r\n" split 1 get body!
-body@ "&" split kv!
-kv@ 0 get "=" split 1 get "+" " " replace_all u!
-kv@ 1 get "=" split 1 get "+" " " replace_all "\n" " " replace_all m!
-ev@ list 1 append u@ ": " concat m@ concat append enqueue
+req "\r\n\r\n" split 1 get body!
+body "&" split kv!
+kv 0 get "=" split 1 get "+" " " replace_all u!
+kv 1 get "=" split 1 get "+" " " replace_all "\n" " " replace_all m!
+ev list 1 append u ": " concat m concat append enqueue
 0 ret
 
 ; ---- connection handler (spawned per accept; serialized via hs) -------
@@ -69,53 +69,53 @@ ev@ list 1 append u@ ": " concat m@ concat append enqueue
 ; Content-Length bytes of body. Browsers send POST headers and body in
 ; separate TCP segments. Uses if/if_else/while (v13 structured control flow).
 connh:
-pend@ f!
+pend f!
 8192 buffer tb!
-f@ tb@ 8000 0 _call recv n!
-n@ 0 lt 'nfail 'padcheck if_else          ; n<0 -> recv error; n>=0 -> process
+f tb 8000 0 _call recv n!
+n 0 lt 'nfail 'padcheck if_else          ; n<0 -> recv error; n>=0 -> process
 0 ret
 
 nfail:                                   ; n < 0 -> recv error, release
-hs@ 0 enqueue 0 ret
+hs 0 enqueue 0 ret
 
 ; recv loop: keep processing until request is complete or connection closed.
 ; reread flag: 1 = need more data (loop again), 0 = done (exit loop)
 padcheck:
-tb@ 0 n@ slice req!
+tb 0 n slice req!
 1 reread!
 'rcond 'rbody while
 'route try                              ; malformed request -> still release
-done@ not 'closefd if                  ; route didn't handle it -> close
-hs@ 0 enqueue 0 ret                     ; release accept loop
+done not 'closefd if                  ; route didn't handle it -> close
+hs 0 enqueue 0 ret                     ; release accept loop
 
 rcond:
-  reread@ ret                           ; while pops this test value
+  reread ret                           ; while pops this test value
 
 rbody:
-  req@ "\r\n\r\n" find hoff!
-  hoff@ 0 lt 'needmore 'hcheck if_else   ; hoff<0 -> need more; hoff>=0 -> check CL
+  req "\r\n\r\n" find hoff!
+  hoff 0 lt 'needmore 'hcheck if_else   ; hoff<0 -> need more; hoff>=0 -> check CL
   0 ret
 
 hcheck:                                  ; headers complete — check Content-Length
-  req@ "Content-Length:" find cloff!
-  cloff@ 0 lt 'allread 'havecl if_else   ; cloff<0 -> no CL, process; cloff>=0 -> parse
+  req "Content-Length:" find cloff!
+  cloff 0 lt 'allread 'havecl if_else   ; cloff<0 -> no CL, process; cloff>=0 -> parse
   0 ret
 
 havecl:
-  req@ cloff@ 16 add hoff@ slice clpart!
-  clpart@ "\r" split 0 get trim clstr!
+  req cloff 16 add hoff slice clpart!
+  clpart "\r" split 0 get trim clstr!
   0 clen!
-  clstr@ length 'dgt for
-  hoff@ 4 add clen@ add total!
-  n@ total@ lt 'needmore 'allread if_else ; n<total -> need more; n>=total -> done
+  clstr length 'dgt for
+  hoff 4 add clen add total!
+  n total lt 'needmore 'allread if_else ; n<total -> need more; n>=total -> done
   0 ret
 
-dgt: i! clstr@ i@ get 48 sub dig!
-    dig@ 0 lt 'dskip 'dgt2 if_else
+dgt: i! clstr i get 48 sub dig!
+    dig 0 lt 'dskip 'dgt2 if_else
     0 ret
-dgt2: dig@ 9 gt 'dskip 'dgt3 if_else
+dgt2: dig 9 gt 'dskip 'dgt3 if_else
     0 ret
-dgt3: clen@ 10 mul dig@ add clen! 0 ret
+dgt3: clen 10 mul dig add clen! 0 ret
 dskip: 0 ret
 
 ; done reading — stop the recv loop
@@ -124,17 +124,17 @@ allread:
 
 ; need more data — recv again
 needmore:
-  f@ tb@ 8000 0 _call recv got!
-  got@ 1 lt 'allread 'havemore if_else    ; got<=0 -> closed; got>=1 -> append
+  f tb 8000 0 _call recv got!
+  got 1 lt 'allread 'havemore if_else    ; got<=0 -> closed; got>=1 -> append
   0 ret
 
 havemore:
-  tb@ 0 got@ slice part!
-  req@ part@ concat req!
-  n@ got@ add n!
+  tb 0 got slice part!
+  req part concat req!
+  n got add n!
   1 reread! 0 ret
 
-closefd: f@ 3 _syscall 1 0 ret
+closefd: f 3 _syscall 1 0 ret
 
 ; ---- routing ----
 
@@ -142,31 +142,31 @@ route:
 0 done!
 ; split is destructive (writes NULs in-place), so parse a copy and leave
 ; the global req intact for the body parser in dopar/ssd.
-req@ 0 req@ length slice reqcpy!
-reqcpy@ "\r\n" split 0 get " " split rl!
-rl@ 0 get meth!
-rl@ 1 get_or_zero path!
-meth@ "GET"  eq path@ "/events" eq and 'sev if
-meth@ "GET"  eq path@ "/"      eq and 'spg if
-meth@ "POST" eq path@ "/send"  eq and 'ssd if
-done@ not 'r404 if
+req 0 req length slice reqcpy!
+reqcpy "\r\n" split 0 get " " split rl!
+rl 0 get meth!
+rl 1 get_or_zero path!
+meth "GET"  eq path "/events" eq and 'sev if
+meth "GET"  eq path "/"      eq and 'spg if
+meth "POST" eq path "/send"  eq and 'ssd if
+done not 'r404 if
 0 ret                                 ; `try` body contract: one value
 
-sev: f@ evh@ _call snd
-     ev@ list 0 append f@ append enqueue      ; register fd with broker (fd stays open)
+sev: f evh _call snd
+     ev list 0 append f append enqueue      ; register fd with broker (fd stays open)
      1 done! 0 ret
 
-spg: f@ presp@ _call snd
-     f@ 3 _syscall 1
+spg: f presp _call snd
+     f 3 _syscall 1
      1 done! 0 ret
 
 ssd: 'dopar try
-     f@ okr@ _call snd
-     f@ 3 _syscall 1
+     f okr _call snd
+     f 3 _syscall 1
      1 done! 0 ret
 
-r404: f@ nfr@ _call snd
-      f@ 3 _syscall 1
+r404: f nfr _call snd
+      f 3 _syscall 1
       1 done! 0 ret
 
 ; ---- broker: sole owner of cl (client fds) and hist (frames) ----------
@@ -178,36 +178,36 @@ broker:
 bcond: 1 ret                            ; infinite loop — never exits
 
 bbody:
-ev@ dequeue e!
-e@ 0 get 0 eq 'breg if
-e@ 0 get 1 eq 'bmsg if
+ev dequeue e!
+e 0 get 0 eq 'breg if
+e 0 get 1 eq 'bmsg if
 0 ret                                   ; unknown event type -> loop
 
 breg:                                  ; e = [0 fd]: register + replay
-e@ 1 get f2!
-cl@ f2@ append cl!
-hist@ length 'brep for
+e 1 get f2!
+cl f2 append cl!
+hist length 'brep for
 0 ret
 
-brep: i! hist@ i@ get msg!
-      f2@ msg@ _call snd ret
+brep: i! hist i get msg!
+      f2 msg _call snd ret
 
 bmsg:                                  ; e = [1 msg]: frame, store, fan out
-"data: " e@ 1 get concat "\n\n" concat fr!
-hist@ fr@ append hist!
-hist@ length 100 gt 'hcap if
+"data: " e 1 get concat "\n\n" concat fr!
+hist fr append hist!
+hist length 100 gt 'hcap if
 list cl2!                              ; start fresh live-client list
-cl@ length 'bc for                    ; fan out to all registered clients
-cl2@ cl!                              ; replace cl with the live-client list
+cl length 'bc for                    ; fan out to all registered clients
+cl2 cl!                              ; replace cl with the live-client list
 0 ret
 
-bc: i! cl@ i@ get bf!
-    bf@ fr@ fr@ length 0 _call send 0 lt 'bdead 'balive if_else
+bc: i! cl i get bf!
+    bf fr fr length 0 _call send 0 lt 'bdead 'balive if_else
     ret
 
-balive: cl2@ bf@ append cl2! 0 ret       ; client still alive: keep in new list
-bdead:  bf@ 3 _syscall 1 0 ret              ; send failed: close fd, drop client
-hcap:   hist@ hist@ length 100 sub hist@ length slice hist! 0 ret
+balive: cl2 bf append cl2! 0 ret       ; client still alive: keep in new list
+bdead:  bf 3 _syscall 1 0 ret              ; send failed: close fd, drop client
+hcap:   hist hist length 100 sub hist length slice hist! 0 ret
 
 ; ---- startup ----------------------------------------------------------
 
@@ -226,8 +226,8 @@ argv length 1 gt 'parg if
 "<!doctype html><meta charset=utf-8><title>nmerkar chat</title><style>body{font-family:sans-serif;max-width:42em;margin:2em auto}#log{white-space:pre-wrap;border:1px solid #bbb;padding:1em;min-height:14em}</style><h3>Nmerkar chat</h3><div id=log></div><p><input id=u placeholder=name size=10> <input id=m placeholder=message size=32 onkeydown=\"if(event.key=='Enter')go()\"> <button onclick=go()>send</button><script>var L=document.getElementById('log');new EventSource('/events').onmessage=function(e){L.textContent+=e.data+'\\n'};function go(){var m=document.getElementById('m');fetch('/send',{method:'POST',body:'u='+encodeURIComponent(document.getElementById('u').value)+'&m='+encodeURIComponent(m.value)});m.value=''}</script>" page!
 
 ; precomputed responses (string handles; FFI sees char* via uf_sptr)
-page@ length "%d" format plen!
-"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " plen@ concat "\r\nConnection: close\r\n\r\n" concat page@ concat presp!
+page length "%d" format plen!
+"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " plen concat "\r\nConnection: close\r\n\r\n" concat page concat presp!
 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok" okr!
 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" nfr!
 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n: hi\n\n" evh!
@@ -235,16 +235,16 @@ page@ length "%d" format plen!
 ; listener socket: AF_INET=2 SOCK_STREAM=1, SO_REUSEADDR, INADDR_ANY
 2 1 0 _call socket lfd!
 "\0\0\0\0" opt!
-opt@ 0 1 set
-lfd@ 1 2 opt@ 4 _call setsockopt        ; SOL_SOCKET=1 SO_REUSEADDR=2
+opt 0 1 set
+lfd 1 2 opt 4 _call setsockopt        ; SOL_SOCKET=1 SO_REUSEADDR=2
 "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" sa!
-sa@ 0 2 set
-sa@ 2 port@ 256 div set
-sa@ 3 port@ 256 rem set
-lfd@ sa@ 16 _call bind 0 lt 'bfail if
-lfd@ 64 _call listen
+sa 0 2 set
+sa 2 port 256 div set
+sa 3 port 256 rem set
+lfd sa 16 _call bind 0 lt 'bfail if
+lfd 64 _call listen
 
-port@ "nmerkar chat on :%d — open it in two browser tabs\n" format print
+port "nmerkar chat on :%d — open it in two browser tabs\n" format print
 
 64 channel ev!                           ; broker event queue
 1 channel hs!                            ; accept<->handler handshake
@@ -256,7 +256,7 @@ list cl! list hist!                   ; broker-owned state
 0 ret
 acond: 1 ret
 abody:
-lfd@ 0 0 _call accept pend!
+lfd 0 0 _call accept pend!
 'connh spawn                           ; handle this connection
-hs@ dequeue                            ; wait until handler is done
+hs dequeue                            ; wait until handler is done
 0 ret

@@ -3,9 +3,9 @@ weave                 ; begin task-DAG definition
   task a:             ; task `a` — no inputs
     ret 21            ; task result = 21
   task b: a!          ; task `b` depends on `a`, binding its result to a
-    ret a@ 2 mul      ; task result = a * 2 = 42
+    ret a 2 mul      ; task result = a * 2 = 42
   task c: a! b!       ; task `c` depends on `a` and `b`, binding both results
-    ret a@ b@ add     ; task result = a + b = 63
+    ret a b add     ; task result = a + b = 63
 run c                 ; execute the DAG rooted at `c`; result lands on the stack
 print                 ; prints the weave result (63)
 "63 expected (21 + 42)" print ; sanity-check message

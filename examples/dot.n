@@ -1,0 +1,1 @@
+1024 0 array v0! 1024 0 array v1! 0 v2! _addr v3 _addr v4 while 0 v5! _addr v6 _addr v7 while v5 "dot=%d" format print v3: v2 1024 lt ret v4: v0 v2 v2 set v1 v2 v2 2 mul set v2 1 add v2! 0 ret v6: v2 0 gt ret v7: v2 1 sub v2! v5 v0 v2 get v1 v2 get mul add v5! 0 ret 

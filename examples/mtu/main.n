@@ -1,5 +1,5 @@
 use "m"
 21 _call dbl d!
-d@ "dbl=%d" format print
+d "dbl=%d" format print
 2.0 sqrt s!
-s@ "sqrt=%f" format print
+s "sqrt=%f" format print

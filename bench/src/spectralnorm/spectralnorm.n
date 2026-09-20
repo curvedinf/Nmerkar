@@ -1,30 +1,30 @@
 ; spectralnorm variant: eval_A computed inline, no A matrix (matches C++ memory pattern)
 5500 n!
 has_args 'argn if
-n@ float array v!
-n@ float array u!
-n@ float array tmp!
+n float array v!
+n float array u!
+n float array tmp!
 0 i!
 'ic 'ib while
 10 'power for
 0 uvt! 0 vvt!
-n@ 'dots for
-uvt@ vvt@ div sqrt "%.9f" format print
+n 'dots for
+uvt vvt div sqrt "%.9f" format print
 ret
 argn:
   1 arg_index n!
   ret
 ic:
-  ret i@ n@ lt
+  ret i n lt
 ib:
-  u@ i@ 1.0 array_set
-  v@ i@ 0.0 array_set
+  u i 1.0 array_set
+  v i 0.0 array_set
   i++ ret
 power: k!
-  tmp@ u@ n@ _call mv
-  v@ tmp@ n@ _call tm
-  tmp@ v@ n@ _call mv
-  u@ tmp@ n@ _call tm
+  tmp u n _call mv
+  v tmp n _call tm
+  tmp v n _call mv
+  u tmp n _call tm
   ret
 ; mv(dst,src,n): dst[i] = sum_j src[j] * eval_A(i,j)
 mv: dst! src! nn!
@@ -32,18 +32,18 @@ mv: dst! src! nn!
   'mc 'mb while
   ret 0
 mc:
-  ret mi@ nn@ lt
+  ret mi nn lt
 mb:
   0 ms! 0 mj!
   'jc 'jb while
-  dst@ mi@ ms@ array_set
+  dst mi ms array_set
   mi++ ret
 jc:
-  ret mj@ nn@ lt
+  ret mj nn lt
 jb:
-  mi@ mj@ add mij!
-  mij@ mij@ 1 add mul 2 div mi@ add 1 add mden!
-  src@ mj@ array_get 1.0 mden@ div mul ms+=
+  mi mj add mij!
+  mij mij 1 add mul 2 div mi add 1 add mden!
+  src mj array_get 1.0 mden div mul ms+=
   mj++ ret
 ; tm(dst,src,n): dst[i] = sum_j src[j] * eval_A(j,i)
 tm: dst! src! nn!
@@ -51,20 +51,20 @@ tm: dst! src! nn!
   'tc 'tb while
   ret 0
 tc:
-  ret ti@ nn@ lt
+  ret ti nn lt
 tb:
   0 ts! 0 tj!
   'dc 'db while
-  dst@ ti@ ts@ array_set
+  dst ti ts array_set
   ti++ ret
 dc:
-  ret tj@ nn@ lt
+  ret tj nn lt
 db:
-  tj@ ti@ add ji!
-  ji@ ji@ 1 add mul 2 div tj@ add 1 add tden!
-  src@ tj@ array_get 1.0 tden@ div mul ts+=
+  tj ti add ji!
+  ji ji 1 add mul 2 div tj add 1 add tden!
+  src tj array_get 1.0 tden div mul ts+=
   tj++ ret
 dots: k!
-  u@ k@ array_get v@ k@ array_get mul uvt+=
-  v@ k@ array_get v@ k@ array_get mul vvt+=
+  u k array_get v k array_get mul uvt+=
+  v k array_get v k array_get mul vvt+=
   ret 0

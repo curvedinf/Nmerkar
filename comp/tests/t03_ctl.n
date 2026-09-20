@@ -18,10 +18,10 @@ ret
 yes: "YES" print ret
 then: "THEN" print ret
 els: "ELS" print ret
-i_c: i@ inc i! i@ 10 lt i@ 7 eq not and ret
-i_b: i@ 3 eq not 'pr 'np if_else 0 ret
-pr: i@ print ret
+i_c: i inc i! i 10 lt i 7 eq not and ret
+i_b: i 3 eq not 'pr 'np if_else 0 ret
+pr: i print ret
 np: 0 ret
-fbody: k! k@ 1 eq 'fnp 'fpr if_else ret
-fpr: k@ print 0 ret
+fbody: k! k 1 eq 'fnp 'fpr if_else ret
+fpr: k print 0 ret
 fnp: 0 ret

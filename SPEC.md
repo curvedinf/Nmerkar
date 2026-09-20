@@ -39,6 +39,7 @@ auto-detection).
 | l-space | U+1F130+ (enclosed alphanumerics) | base-64 digit atoms (self-evaluating numbers) |
 | delimiters | U+13100..U+13108 | chat-template delimiters, stripped pre-compilation |
 | type glyphs | U+13110..U+13117 | int, float, ptr, byte, void, handle, str, bool |
+| v15 syntax glyphs | 🏷 U+1F3F7, 📏 U+1F4CF, 📍 U+1F4CD, 📦 U+1F4E6, 🎭 U+1F3AD | label-def marker + the four immediate tag glyphs (below) — each a single token |
 
 Glyph assignments are in `comp/src/lex.rs` (`OP_GLYPHS`, `V_SPACE`, `L_SPACE`).
 
@@ -79,17 +80,22 @@ l-run; elsewhere it begins an ASCII identifier.
 A run of v-space atoms folds into one name. Whitespace must separate two
 adjacent v-runs meant to be distinct.
 
-Variable semantics:
+Variable semantics (v15 — implicit loads):
 - `<name>!` — store into **local** variable (call-scoped, fresh frame per CALL)
   and leave the value on the hidden stack for chaining.
-- `<name>@` — push **local** variable.
+- A bare `<name>` — **implicit load**: pushes the local (or shared) variable.
+  The v14 `<name>@` varget suffix is removed; writing it is a lex error.
 - A name assigned in a TU's straight-line top level (before its first label)
   declares a **shared** variable; inside label bodies the plain name then
   reads/writes that shared var. See "Shared variables" below.
 - A v-run after CALL/ADDR/`'` is a label **reference**.
-- Any other bare v-run is a label **definition** (no colon needed).
-- ASCII `name:` still defines a label; ASCII names work as jump targets.
+- A label **definition** is `name:` (text) or `name` + 🏷 (dense); the v14
+  colon-less dense label definition is removed — a bare v-run now loads a
+  variable. ASCII `name:` works in both encodings.
 - IMPORT/EXPORT/EXTERN/MACRO/STRUCT names remain ASCII.
+- Bare-name resolution order at parse time: internal `@`-sentinel, then macro
+  expansion, then implicit load. Storing into a macro's name is a compile
+  error (macros take precedence over loads; rename one of the two).
 
 Local variables exist from first assignment until the nearest enclosing RET.
 if/while/for body labels are continuations that share the caller's frame.
@@ -110,7 +116,7 @@ operation.
 ```
 3 4 _call add2        ; 7
 add2: a! b!
-  ret a@ b@ add
+  ret a b add
 ```
 
 Parameter bindings are the pass-through assignment tokens, written contiguously
@@ -140,7 +146,7 @@ the first non-binding token ends the parameter list.
 ```
 5 'body for
 body: i!
-  i@ print
+  i print
   ret
 ```
 
@@ -162,11 +168,11 @@ exempt.
 
 ```
 add2: a! b!
-  ret a@ b@ add
+  ret a b add
 
 run_cmd: c!
-  c@ shell out! err! code!
-  ret out@ err@ code@
+  c shell out! err! code!
+  ret out err code
 ```
 
 On return, the callee's **entire data stack is drained** back to the caller's
@@ -201,16 +207,16 @@ main:
 worker: n!
   25000 'loop 'body while
   ret
-loop: n@ count@ lt ret
+loop: n count lt ret
 body:
   count++                    ; atomic add — see below
-  n@ 1 add n!
+  n 1 add n!
   ret
 ```
 
 - **Plain names everywhere.** Inside label bodies, a name declared shared at
   top level resolves to the shared variable; writes and reads are the usual
-  `name!` / `name@` tokens.
+  `name!` / `name` tokens.
 - **Declaration site.** In multi-TU/directory mode, *each* TU's own top-level
   prefix declares shared vars (an `init` TU publishes cross-thread state this
   way). Duplicate declarations across TUs of the same name are fine (one var).
@@ -314,7 +320,7 @@ single-token for the Qwen tokenizer.
 [0 1 2] int array nums!           ; int array
 [1.0 2.0 3.0] float tensor t!     ; float tensor
 [] e!                             ; empty list
-[x@ y@ z@] triplet!               ; elements may be arbitrary expressions
+[x y z] triplet!               ; elements may be arbitrary expressions
 ```
 
 Multi-value returns inside a literal are not automatically destructured; use a
@@ -365,7 +371,7 @@ below. Glyph assignments are 1:1 and final in `comp/src/lex.rs`.
 | 28 | 🚆 | `macro` | (directive) | `macro name { body }` |
 | 29 | 🤔 | `tensor` | len_or_list type → h | as `array`; 64-aligned |
 | 33 | 🌆 | `setv` | value → value | `<v>!` local (pass-through); shared store consumes |
-| 34 | 😆 | `getv` | → value | `<v>@` local / shared read (snapshot for shared) |
+| 34 | 😆 | `getv` | → value | bare `name` — local / shared read (snapshot for shared); v15 removed the `@` suffix spelling |
 | 35 | 🚇 | `_str` | → h | bare `"…"` preferred |
 | 36 | 🤕 | `concat` | a b → h | tag-dispatched: str/arr/list concat |
 | 37 | 🌇 | `format` | args… fmt → h | |
@@ -662,7 +668,7 @@ Two casts, one per casting discipline:
 "42" int cast loose 1 add ; 43       (cast results stay strict)
 2 float cast 0.5 add      ; 2.5
 42 _lit 9 cast            ; "42"      (universal string coercion)
-p@ 1000 cast              ; checked downcast to struct id 0
+p 1000 cast              ; checked downcast to struct id 0
 2 _cast float             ; 2.0       (static, folded at compile time)
 3.9 _cast int             ; 3         (static truncation, no parsing)
 ```
@@ -801,7 +807,7 @@ weave
   task a:
     ret 1
   task b: a!
-    ret a@ 2 add
+    ret a 2 add
 run
 ```
 
@@ -839,9 +845,9 @@ run
     task data:
       ret 3
     task process: data!
-      ret data@ 2 mul
+      ret data 2 mul
     task summary: data! process!
-      ret data@ process@ add
+      ret data process add
     task orphan:
       ret 999        ; not reachable from `summary` — never runs
   run summary        ; 9
@@ -861,10 +867,10 @@ run
       'more 'step while
       ret
     more:
-      ret n@ 100 lt
+      ret n 100 lt
     step:
-      n@ 1 add n!
-      n@ 100 gte 'shut if
+      n 1 add n!
+      n 100 gte 'shut if
       ret
     shut:
       shutdown
@@ -892,7 +898,7 @@ Lowercase ASCII mnemonics, whitespace-delimited. Same Tok AST as dense.
 - Tokens split on whitespace; `;` comments; `"..."` strings may contain spaces.
 - Bare decimal/hex/float literals self-evaluate; `_lit` stays for type ids and
   numbers.
-- Names: label def `name:`, refs `'name`, variables `name!`/`name@` (any
+- Names: label def `name:`, refs `'name`, variables `name!`/`name` (any
   identifier). Opcode mnemonics are reserved words.
 - Mnemonics are full English words or `snake_case` phrases; the complete
   mapping is in the opcode reference tables above.
@@ -979,7 +985,7 @@ label** instead of resuming after the `if`:
 
 ```
 solve: r! cols!
-  r@ cols@ r@ n@ lt 'rec if       ; tail position: only `1 ret` follows
+  r cols r n lt 'rec if       ; tail position: only `1 ret` follows
   1 ret                             ; not taken: return 1
 rec: r! cols! ... ret               ; taken: rec's ret returns from solve
 ```
@@ -1035,7 +1041,7 @@ markers removed compiles to the same machine operations).
 Semantics:
 
 - **Property of a value, not a variable.** The bit follows the value through
-  copies (`x@ y!`), stores (`7 strict x!` makes `x`'s current value strict; a
+  copies (`x y!`), stores (`7 strict x!` makes `x`'s current value strict; a
   later plain `8 x!` makes it loose again), list/dict literals (a container
   built from a strict element is strict), and ops.
 - **Contagion.** Any op that consumes at least one strict *value* operand
@@ -1067,14 +1073,14 @@ Semantics:
 
 ```
 5 strict x!                      ; x holds a strict 5
-x@ 5 structural_equal print      ; ok — 1 (structural_equal never coerces;
+x 5 structural_equal print      ; ok — 1 (structural_equal never coerces;
                                  ;  the result is strict, print accepts it)
-x@ 5 eq                          ; COMPILE ERROR — eq coerces
+x 5 eq                          ; COMPILE ERROR — eq coerces
 "41" strict parse_int            ; ok — explicit conversion; result is strict
 "41" strict parse_int loose 1 add ; 42 — loose before arithmetic
 [1 2] strict nums!
-nums@ 'big? filter ...           ; elements are strict inside big?
-big?: n! n@ loose 2 gt ret       ; loosen the element before comparing
+nums 'big? filter ...           ; elements are strict inside big?
+big?: n! n loose 2 gt ret       ; loosen the element before comparing
 ```
 
 Strictness is the static discipline that pairs with `cast`: implicit
@@ -1097,9 +1103,9 @@ literal      := '[' token* ']' [<type> ('array' | 'tensor')]
 name         := [a-zA-Z][a-zA-Z0-9_]*    ; must NOT start with '_' (reserved for _-prefixed ops)
 varset       := name ('!' | setv-glyph)       ; local: store and pass through;
              ; shared (name declared at top level): store and consume
-varget       := name ('@' | getv-glyph)
-labeldef     := name ':' [param]*       ; params: name! | _!
-             | name                      ; label def without colon
+varget       := name                          ; v15: bare name = implicit load
+labeldef     := name ':' [param]*             ; params: name! | _!
+             | name labeldef-glyph            ; dense: v-run + 🏷 marker
 jump         := (_call | "'") name
 op           := opcode-glyph | text-mnemonic
              ; text mode: immediate-operand ops are _-prefixed — see section below
@@ -1159,6 +1165,25 @@ so no prefix is needed (or possible) there.
 | `_cast` | CAST | type name — `int`/`float`/`ptr`/`byte` or a struct name | v type → v' (static) |
 | `_array` | ARR | type name | len → h |
 | `_tensor` | TENSOR | type name | len → h |
+
+### Dense tag glyphs (v15)
+
+A **struct**-name immediate cannot be slot-encoded (dense names are slot
+glyphs; struct names are global strings that must survive literally), so in
+dense mode each of the four struct-name immediates is spelled with a
+dedicated single-token tag glyph followed by the ASCII name:
+
+| text | dense | folds to |
+|------|-------|----------|
+| `_size_of Point` | `📏Point` | constant `Point` size (op compiled out) |
+| `_offset Point.y` | `📍Point.y` | constant field offset (op compiled out) |
+| `_obj Point` | `📦Point` + OBJ glyph | `size \| sid<<32` push + runtime alloc |
+| `_cast Point` | `🎭Point` + CAST glyph | `1000+sid` push + runtime checked cast |
+
+The v14 `@sizeof:`-style sentinel idents are removed: `@` no longer appears
+in any encoding. (A handful of further `@`-prefixed idents — `@flush`,
+`@liststart`, … — are compiler-internal, injected during parsing, never
+valid in source, and rejected by the text lexer.)
 
 ## Codegen notes
 

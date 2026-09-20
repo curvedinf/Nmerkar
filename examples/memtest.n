@@ -1,0 +1,1 @@
+16 malloc v0! 1234 v0 store v0 load "loadx=%d" format print 16 buffer v1! 5678 v1 store 8 malloc v2! v2 v1 8 copy_memory v2 load "bufcopy=%d" format print v0 free v2 free 

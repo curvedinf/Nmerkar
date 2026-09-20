@@ -6,7 +6,7 @@ weave
   task b:
     ret 10 20 add
   task c: a! b!
-    ret a@ b@ add
+    ret a b add
 run
 print
 
@@ -17,10 +17,10 @@ weave
   task base:
     ret 100
   4 task work: items! base!
-    ret items@ base@ add
+    ret items base add
 run work
 results!
-results@ length print
-results@ sort results!
-results@ 0 get print
-results@ 4 get print
+results length print
+results sort results!
+results 0 get print
+results 4 get print

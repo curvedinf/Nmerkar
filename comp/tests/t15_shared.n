@@ -13,14 +13,14 @@
 'w2 spawn c2!
 'w3 spawn c3!
 'w4 spawn c4!
-c1@ dequeue c2@ dequeue c3@ dequeue c4@ dequeue 'join4 for
-"count: " print cnt@ print
-"count2: " print cnt2@ print
+c1 dequeue c2 dequeue c3 dequeue c4 dequeue 'join4 for
+"count: " print cnt print
+"count2: " print cnt2 print
 ret
 w1: 25000 'bump for ret
 w2: 25000 'bump for ret
 w3: 25000 'bump for ret
 w4: 25000 'both for ret
 bump: k! cnt++ ret
-both: k! cnt++ cnt2@ 1 add cnt2! ret
-join4: q! q@ ret
+both: k! cnt++ cnt2 1 add cnt2! ret
+join4: q! q ret

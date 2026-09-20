@@ -1,36 +1,36 @@
 ; container protocol
 dict d!
-d@ "a" 1 set
-d@ "b" 2 set
-d@ "a" get print
-d@ "zz" get_or_zero print
-d@ "b" contains print
-d@ "zz" contains print
-d@ length print
-d@ keys length print
-d@ "a" remove
-d@ "a" contains print
+d "a" 1 set
+d "b" 2 set
+d "a" get print
+d "zz" get_or_zero print
+d "b" contains print
+d "zz" contains print
+d length print
+d keys length print
+d "a" remove
+d "a" contains print
 list l!
-l@ 10 append 20 append 30 append l!
-l@ 0 get print
-l@ 2 get print
-l@ 9 get_or_zero print
-l@ 1 contains print
-l@ 1 99 set
-l@ 1 get print
+l 10 append 20 append 30 append l!
+l 0 get print
+l 2 get print
+l 9 get_or_zero print
+l 1 contains print
+l 1 99 set
+l 1 get print
 "hello" 1 get print
 "hello" "ell" contains print
 "hello" length print
 "foobar" 1 2 get_or_zero print
 struct P { x:int, y:int }
 _obj P p!
-p@ "x" 42 set
-p@ "x" get print
-p@ "y" get_or_zero print
-p@ "x" contains print
-p@ keys length print
-p@ type_of print
+p "x" 42 set
+p "x" get print
+p "y" get_or_zero print
+p "x" contains print
+p keys length print
+p type_of print
 "str" type_of print
 5 type_of print
-l@ type_of print
-d@ type_of print
+l type_of print
+d type_of print

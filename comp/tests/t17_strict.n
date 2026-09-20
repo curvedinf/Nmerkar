@@ -27,34 +27,34 @@
 ; s2: structural_equal never coerces; the result is strict, print accepts it
 ; (format would not — it coerces its arguments).
 5 strict x!
-"s2: " print x@ 5 structural_equal print
+"s2: " print x 5 structural_equal print
 ; s3: a strict element makes the container strict; get does not coerce.
 "hello" strict v!
-[ v@ ] l!
-"s3: " print l@ 0 get print
+[ v ] l!
+"s3: " print l 0 get print
 ; s4: contagion — the strict value w taints d (an operand of the same `set`),
 ; but non-coercing ops keep working on the tainted dict.
 { } d!
 "k" 7 strict w!
-d@ "k" w@ set
-"s4: " print d@ "k" get print
+d "k" w set
+"s4: " print d "k" get print
 ; s5: `loose` before use — strictness never applies downstream.
 "7" strict loose parse_int 3 add "s5: %d\n" format print
 ; s6: elements of a strict list are strict inside the callback (param taint);
 ; loosen the element before comparing. The filter result is strict again;
 ; length accepts it.
 [1 2 3 4] strict nums!
-"s6: " print nums@ 'big filter length print
+"s6: " print nums 'big filter length print
 ; s7: strict shared counter; the cond label loosens before `lt`, so `while`
 ; never truthiness-coerces a strict value (shared i++ is an atomic RMW — raw,
 ; no coercion).
 0 strict i!
 'cond 'body while
-"s7: " print i@ loose print
+"s7: " print i loose print
 ; s8: strictness crosses call boundaries — the argument taints the callee's
 ; parameter, and the callee's strict return taints the call result.
 "yo" strict m!
-"s8: " print m@ _call echo print
+"s8: " print m _call echo print
 ; s9: `cast` is the dynamic explicit coercer: a strict string parses; the
 ; result stays strict, and print accepts it.
 "42" strict int cast
@@ -65,11 +65,11 @@ d@ "k" w@ set
 2 _cast float 0.5 add print
 ret
 big: n!
-  n@ loose 2 gt ret
+  n loose 2 gt ret
 cond:
-  ret i@ loose 3 lt
+  ret i loose 3 lt
 body:
   i++
   ret
 echo: a!
-  ret a@
+  ret a

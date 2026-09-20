@@ -310,6 +310,9 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 p.ins.push(Ins::GetV(n));
             }
             Tok::LocalSet(n) => {
+                if macros.contains_key(&n) {
+                    panic!("name '{}' collides with a macro — macros take precedence over implicit loads; rename one", n);
+                }
                 if is_multi_return(p.ins.last(), &q) {
                     // v12 destructuring bind: name! after a multi-return op
                     let pattern = collect_destructure(Bind::Local(n), &mut q);
@@ -722,8 +725,11 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                     for t2 in body.into_iter().rev() {
                         q.push_front(t2);
                     }
+                } else if is_reserved(&n) {
+                    panic!("'{}' is a reserved word (opcode mnemonic)", n);
                 } else {
-                    panic!("unknown identifier {} (not a macro)", n);
+                    // v15: a bare name is an implicit variable load
+                    p.ins.push(Ins::LocalGet(n));
                 }
             }
         }

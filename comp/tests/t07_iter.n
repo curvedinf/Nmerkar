@@ -4,50 +4,50 @@
 0 10 range iter 'ev iter_filter collect length print
 ; next
 0 3 range iter it!
-it@ next v! m!
-v@ print
-m@ print
-it@ next v! m!
-v@ print
-m@ print
-it@ next _! _!
-it@ next v! m!
-v@ print
-m@ print
+it next v! m!
+v print
+m print
+it next v! m!
+v print
+m print
+it next _! _!
+it next v! m!
+v print
+m print
 ; dict iter yields keys
-dict d! d@ "k1" 1 set d@ "k2" 2 set
-d@ iter collect length print
+dict d! d "k1" 1 set d "k2" 2 set
+d iter collect length print
 ; str iter yields bytes
 "AB" iter collect 1 get print
 ; json / unjson
 "{\"a\": 1, \"b\": [1, 2, 3], \"s\": \"hi\"}" parse_json j!
-j@ "a" get print
-j@ "b" get 2 get print
-j@ "s" get print
-j@ to_json print
+j "a" get print
+j "b" get 2 get print
+j "s" get print
+j to_json print
 "[1.5, 2]" parse_json 0 get print
 ; try / retry
 'good try r! ok!
-r@ print
-ok@ print
+r print
+ok print
 'bad try r! ok!
-r@ print
-ok@ print
+r print
+ok print
 0 cnt!
 2 'flaky retry r! ok!
-r@ print
-ok@ print
-cnt@ print
+r print
+ok print
+cnt print
 ; spawn
 'work spawn c!
-c@ dequeue print
+c dequeue print
 "done" print
 ret
 ; --- quotation bodies ---
-dbl: n! ret n@ 2 mul
-ev: n! ret n@ 2 rem 0 eq
+dbl: n! ret n 2 mul
+ev: n! ret n 2 rem 0 eq
 good: ret 42
 bad: ret 1 0 div
-flaky: cnt@ inc cnt! cnt@ 2 lt 'do_err if ret 99
+flaky: cnt inc cnt! cnt 2 lt 'do_err if ret 99
 do_err: ret 1 0 div
 work: ret 7 7 mul

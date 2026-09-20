@@ -1,0 +1,1 @@
+dict v0! v0 "a" v0 "a" get_or_zero 1 add set v1! v0 "b" v0 "b" get_or_zero 1 add set v1! v0 "a" v0 "a" get_or_zero 1 add set v1! v0 "c" v0 "c" get_or_zero 1 add set v1! v0 "a" v0 "a" get_or_zero 1 add set v1! v0 "b" v0 "b" get_or_zero 1 add set v1! v0 "a" get_or_zero "a=%d" format print v0 "b" get_or_zero "b=%d" format print v0 "c" get_or_zero "c=%d" format print 

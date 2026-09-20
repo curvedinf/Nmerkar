@@ -36,16 +36,16 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 
 | | Nmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
-| logextract | **303** | 846 | 667 | 329 | 437 |
-| analytics | **251** | 793 | 756 | 366 | 471 |
-| mandelbrot | 186 | 189 | 216 | **163** | 165 |
-| spectralnorm | 370 | 350 | 487 | **258** | 390 |
-| matmul | **143** | 244 | 278 | 172 | 235 |
-| blackscholes | **675** | 764 | 834 | 748 | 749 |
-| nqueens | **254** | 309 | 349 | 267 | 274 |
-| bfs | **386** | 480 | 497 | 397 | 436 |
-| dynamicgraph | 355 | 436 | 423 | **303** | 369 |
-| **total** | **2923** | 4411 | 4507 | 3003 | 3526 |
+| logextract | **301** | 846 | 667 | 329 | 437 |
+| analytics | **241** | 793 | 756 | 366 | 471 |
+| mandelbrot | 179 | 189 | 216 | **163** | 165 |
+| spectralnorm | 376 | 350 | 487 | **258** | 390 |
+| matmul | **138** | 244 | 278 | 172 | 235 |
+| blackscholes | **664** | 764 | 834 | 748 | 749 |
+| nqueens | **257** | 309 | 349 | 267 | 274 |
+| bfs | **381** | 480 | 497 | 397 | 436 |
+| dynamicgraph | 349 | 436 | 423 | **303** | 369 |
+| **total** | **2886** | 4411 | 4507 | 3003 | 3526 |
 
 Token counts use the **Qwen3** tokenizer (151,643 vocab). The first six
 benchmarks are data/tensor-shaped (Nmerkar's home turf); nqueens stresses
@@ -56,23 +56,32 @@ and small-list allocation costs.
 
 | | Nmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
-| logextract 510 MB | 0.48 | **0.41** | 0.69 | 3.77 | 2.94 |
-| analytics 512 MB | **1.03** | **1.03** | 1.72 | 4.48 | 3.51 |
-| mandelbrot | 0.07 | **0.05** | **0.05** | 3.87 | 0.07 |
-| spectralnorm | 1.09 | 1.10 | **1.08** | 134.38 | 1.59 |
-| nqueens N=11 | 0.03 | 0.01 | **0.01** | 1.61 | 0.04 |
-| bfs CSR n=1M | 0.11 | **0.03** | 0.06 | 1.42 | 0.09 |
-| dynamicgraph n=1M | 0.52 | **0.16** | 0.31 | 1.69 | 0.41 |
-| matmul N=512 | 0.04 | 0.03 | **0.03** | 0.16 | 0.13 |
-| blackscholes N=2M | 0.13 | 0.04 | **0.04** | 0.18 | 0.07 |
-| **total** | 3.49 | **2.87** | 3.98 | 151.56 | 8.84 |
+| logextract 510 MB | 0.47 | **0.41** | 0.70 | 3.67 | 2.95 |
+| analytics 512 MB | 1.04 | **1.02** | 1.72 | 4.50 | 3.42 |
+| mandelbrot | 0.07 | **0.05** | 0.05 | 4.24 | 0.07 |
+| spectralnorm | 1.08 | 1.11 | **1.08** | 131.48 | 1.57 |
+| nqueens N=11 | 0.03 | 0.01 | **0.01** | 1.46 | 0.04 |
+| bfs CSR n=1M | 0.09 | **0.03** | 0.05 | 1.31 | 0.07 |
+| dynamicgraph n=1M | 0.46 | **0.16** | 0.30 | 1.51 | 0.39 |
+| matmul N=512 | 0.05 | 0.03 | **0.02** | 0.15 | 0.13 |
+| blackscholes N=2M | 0.14 | 0.04 | **0.04** | 0.17 | 0.07 |
+| **total** | 3.41 | **2.85** | 3.97 | 148.49 | 8.70 |
 
 ### GPU offloading (seconds, lower = faster)
 
 | workload | CPU (`--device cpu`) | GPU (`--device vk0`) |
 |---|---|---|
-| matmul N=2048 | 1.63s | **0.26s** |
-| blackscholes N=32M | 2.14s | **1.64s** |
+| matmul N=2048 | 2.10s | **0.26s** |
+| blackscholes N=32M | **2.01s** | 3.14s |
+
+Measured 2026-09-20 (v15, warm runs, `NK_VK_DEBUG` verified both columns
+dispatch on the 7900 XTX). blackscholes trails the CPU at N=32M: its four
+fused region launches spend ~2.0s dominated by host-visible staging
+(8·n bytes per buffer per region at ~2GB/s), while the CPU path is
+SIMD-fast; matmul's single kernel (24ms) crushes its CPU baseline. Note:
+the previous GPU figure for blackscholes (1.64s) is not reproducible from
+any build of the committed tree on this machine. v15 is faster than HEAD
+on both columns (CPU 2.0s vs 3.1s, GPU 3.1s vs 4.5s).
 
 ## Quick start
 
@@ -103,15 +112,15 @@ no imports, no declarations:
 
 ```
 fi:  row! 128 'fe for ret
-fe:  col! row@ 128 mul col@ add ix!
-     A@ ix@ row@ col@ add set
-     B@ ix@ row@ col@ sub set ret
+fe:  col! row 128 mul col add ix!
+     A ix row col add set
+     B ix row col sub set ret
 cr:  row! 128 'dc for ret
 dc:  col! 0 acc! 128 'ij for
-     C@ row@ 128 mul col@ add acc@ set ret
-ij:  j! A@ row@ 128 mul j@ add get
-     B@ j@ 128 mul col@ add get
-     mul acc@ add acc! ret
+     C row 128 mul col add acc set ret
+ij:  j! A row 128 mul j add get
+     B j 128 mul col add get
+     mul acc add acc! ret
 entry:
   16384 int array A! 16384 int array B! 16384 int array C!
   128 'fi for
@@ -122,7 +131,7 @@ entry:
 Use `nk` inline to efficiently process data with `bash`:
 
 ```
-$ grep ',Retail,' bench/data/sales.csv | nk 'dict p! dict c! "/dev/stdin" "," 0 '\''r file_split_lines z! p@ 5 top_n print c@ 5 top_n print ret r: a! n! p@ 4 10 field_float field_add_to c@ 3 10 field_float field_add_to ret a@'
+$ grep ',Retail,' bench/data/sales.csv | nk 'dict p! dict c! "/dev/stdin" "," 0 '\''r file_split_lines z! p 5 top_n print c 5 top_n print ret r: a! n! p 4 10 field_float field_add_to c 3 10 field_float field_add_to ret a'
 
 > [["Bundle B",23912165787.440258],["Refurb Unit",23788674041.119873],["Gadget X1",23781641142.379787],["Spare Part",23776965024.160465],["Widget Pro",23759658166.90052]]
 [["Mexico",13218417280.809916],["USA",13212495563.130194],["Canada",13160810726.84009],["Colombia",9948195871.5800667],["Egypt",9948038758.9899693]]

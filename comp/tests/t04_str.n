@@ -14,13 +14,13 @@ list "x" append "y" append ", " join print
 "hello" "he" starts_with print
 "hello" "lo" ends_with print
 "abc123" "[0-9]+" regex_match m!
-m@ 0 get print
+m 0 get print
 "a1b2" "[0-9]" "X" regex_replace print
 "a1b2c" "[0-9]" regex_split length print
 "file.txt" "*.txt" glob_match print
 "abc" "abc" eq print
 "abc" "abd" lt print
 "echo hi; echo err >&2" shell out! err! status!
-status@ print
-out@ print
-err@ print
+status print
+out print
+err print

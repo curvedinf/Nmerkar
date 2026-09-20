@@ -6,15 +6,15 @@
 ; samples stay within the documented matmul reassociation tolerance.
 512 n!
 has_args 'setn if
-n@ n@ mul n2!
-0 n2@ range vals!
-[n@ n@] vals@ concat vals!
-vals@ float tensor kmat!
-kmat@ 0.000001 mul 1.0 add a!
-1.0 kmat@ 0.000001 mul sub b!
-a@ b@ mul c!
-"c[0,0]: " print c@ 0 get "%.6f" format print
-"c[N-1,N-1]: " print c@ n2@ 1 sub get "%.6f" format print
-"checksum: " print c@ sum "%.2f" format print
+n n mul n2!
+0 n2 range vals!
+[n n] vals concat vals!
+vals float tensor kmat!
+kmat 0.000001 mul 1.0 add a!
+1.0 kmat 0.000001 mul sub b!
+a b mul c!
+"c[0,0]: " print c 0 get "%.6f" format print
+"c[N-1,N-1]: " print c n2 1 sub get "%.6f" format print
+"checksum: " print c sum "%.2f" format print
 ret
 setn: 1 arg_index n! ret

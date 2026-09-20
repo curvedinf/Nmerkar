@@ -24,11 +24,50 @@ fn glyph_of(idx: usize) -> char {
     crate::lex::glyph_of(idx)
 }
 
+// v15: text-mode bare names arrive as Tok::Ident (macro-or-load is resolved
+// at parse time). Encoding converters work on lexed tokens, so resolve here:
+// '@'-sentinels and macro names stay Ident; every other bare name becomes an
+// implicit LocalGet (dense slot-encodes it; text prints it bare).
+pub fn resolve_implicit_loads(toks: &[Tok]) -> Vec<Tok> {
+    fn collect_macros(toks: &[Tok], out: &mut std::collections::HashSet<String>) {
+        for t in toks {
+            match t {
+                Tok::MacroDef(n, _) => {
+                    out.insert(n.clone());
+                }
+                Tok::List(b) | Tok::Dict(b) => collect_macros(b, out),
+                _ => {}
+            }
+        }
+    }
+    let mut macros = std::collections::HashSet::new();
+    collect_macros(toks, &mut macros);
+    fn walk(toks: &[Tok], macros: &std::collections::HashSet<String>) -> Vec<Tok> {
+        toks.iter()
+            .map(|t| match t {
+                Tok::Ident(n) if !n.starts_with('@') && !macros.contains(n) => Tok::LocalGet(n.clone()),
+                Tok::List(b) => Tok::List(walk(b, macros)),
+                Tok::Dict(b) => Tok::Dict(walk(b, macros)),
+                Tok::Task { name, count, body } => Tok::Task {
+                    name: name.clone(),
+                    count: *count,
+                    body: walk(body, macros),
+                },
+                other => other.clone(),
+            })
+            .collect()
+    }
+    walk(toks, &macros)
+}
+
 // dense -> text: mnemonics; glyph names "v57" are already valid text idents
 pub fn emit_text(toks: &[Tok]) -> String {
     let mut o = String::new();
     let mut in_weave = false;
-    for t in toks {
+    let mut i = 0;
+    while i < toks.len() {
+        let t = &toks[i];
+        i += 1;
         match t {
             Tok::Op(name) => o.push_str(&format!("{} ", text_mnemonic(op_index(name).expect("op")))),
             Tok::PushI(v) => o.push_str(&format!("{} ", v)),
@@ -38,7 +77,8 @@ pub fn emit_text(toks: &[Tok]) -> String {
             Tok::SetV(n) => o.push_str(&format!("^{}! ", n)),
             Tok::GetV(n) => o.push_str(&format!("^{}@ ", n)),
             Tok::LocalSet(n) => o.push_str(&format!("{}! ", n)),
-            Tok::LocalGet(n) => o.push_str(&format!("{}@ ", n)),
+            // v15: bare names load implicitly
+            Tok::LocalGet(n) => o.push_str(&format!("{} ", n)),
             Tok::IncLocal(n) => o.push_str(&format!("{}++ ", n)),
             Tok::AddLocal(n) => o.push_str(&format!("{}+= ", n)),
             Tok::IncGlobal(n) => o.push_str(&format!("^{}++ ", n)),
@@ -57,7 +97,24 @@ pub fn emit_text(toks: &[Tok]) -> String {
                 o.push_str(&format!("struct {} {{ {} }} ", n, fs.join(", ")));
             }
             Tok::Sys(n) => o.push_str(&format!("_sys {} ", n)),
-            Tok::Ident(n) => o.push_str(&format!("{} ", n)),
+            Tok::Ident(n) => {
+                // v15: translate internal sentinels back to source mnemonics
+                // (objsize/cast carry a following runtime op that folds into
+                // the same mnemonic)
+                if let Some(rest) = n.strip_prefix("@sizeof:") {
+                    o.push_str(&format!("_size_of {} ", rest));
+                } else if let Some(rest) = n.strip_prefix("@offset:") {
+                    o.push_str(&format!("_offset {} ", rest));
+                } else if let Some(rest) = n.strip_prefix("@objsize:") {
+                    o.push_str(&format!("_obj {} ", rest));
+                    if matches!(toks.get(i), Some(Tok::Op(op)) if *op == "OBJ") { i += 1; }
+                } else if let Some(rest) = n.strip_prefix("@cast:") {
+                    o.push_str(&format!("_cast {} ", rest));
+                    if matches!(toks.get(i), Some(Tok::Op(op)) if *op == "CAST") { i += 1; }
+                } else {
+                    o.push_str(&format!("{} ", n));
+                }
+            }
             Tok::LabelDef(n) => o.push_str(&format!("{}: ", n)),
             Tok::Entry => o.push_str("entry: "),
             Tok::Task { name, count, body } => {
@@ -190,8 +247,8 @@ pub fn emit_dense(toks: &[Tok]) -> String {
     }
     // Separators: in dense mode, v-glyphs fold into names and l-glyphs fold
     // into numbers. A space is needed ONLY between two adjacent v-runs or two
-    // adjacent l-runs. Everything else (opcodes, ^, !, @, ", ', digits, etc.)
-    // is read independently and needs no separator.
+    // adjacent l-runs. Everything else (opcodes, !, 🏷, tags, ", ', digits,
+    // etc.) is read independently and needs no separator.
     fn sep_v(o: &mut String) {
         if o.chars().last().map_or(false, |c| is_v(c as u32)) { o.push(' '); }
     }
@@ -240,7 +297,7 @@ pub fn emit_dense(toks: &[Tok]) -> String {
                 Tok::SetV(n) => { sep_v(o); o.push_str(&format!("^{}!", nm(n, names, next))); }
                 Tok::GetV(n) => { sep_v(o); o.push_str(&format!("^{}@", nm(n, names, next))); }
                 Tok::LocalSet(n) => { sep_v(o); o.push_str(&format!("{}!", nm(n, names, next))); }
-                Tok::LocalGet(n) => { sep_v(o); o.push_str(&format!("{}@", nm(n, names, next))); }
+                Tok::LocalGet(n) => { sep_v(o); o.push_str(&format!("{}", nm(n, names, next))); }
                 Tok::IncLocal(n) => { sep_v(o); o.push_str(&format!("{}++", nm(n, names, next))); }
                 Tok::AddLocal(n) => { sep_v(o); o.push_str(&format!("{}+=", nm(n, names, next))); }
                 Tok::IncGlobal(n) => { sep_v(o); o.push_str(&format!("^{}++", nm(n, names, next))); }
@@ -263,8 +320,27 @@ pub fn emit_dense(toks: &[Tok]) -> String {
                     o.push_str(&format!("{}{} {{ {} }}", glyph_of(46), n, fs.join(", ")));
                 }
                 Tok::Sys(n) => o.push_str(&format!("{}{}", glyph_of(49), n)),
-                Tok::Ident(n) => o.push_str(&format!("{}", n)),
-                Tok::LabelDef(n) => { sep_v(o); o.push_str(&format!("{}\n", nm(n, names, next))); }
+                Tok::Ident(n) => {
+                    // v15: struct-name immediates get dedicated tag glyphs
+                    if let Some(rest) = n.strip_prefix("@sizeof:") {
+                        o.push(GLYPH_TAG_SIZEOF);
+                        o.push_str(rest);
+                    } else if let Some(rest) = n.strip_prefix("@offset:") {
+                        o.push(GLYPH_TAG_OFFSET);
+                        o.push_str(rest);
+                    } else if let Some(rest) = n.strip_prefix("@objsize:") {
+                        o.push(GLYPH_TAG_OBJSIZE);
+                        o.push_str(rest);
+                    } else if let Some(rest) = n.strip_prefix("@cast:") {
+                        o.push(GLYPH_TAG_CAST);
+                        o.push_str(rest);
+                    } else {
+                        o.push_str(&format!("{}", n));
+                    }
+                }
+                // v15: dense label definitions carry the 🏷 marker (bare
+                // v-runs are implicit loads now)
+                Tok::LabelDef(n) => { sep_v(o); o.push_str(&format!("{}{}\n", nm(n, names, next), GLYPH_LABEL_DEF)); }
                 Tok::Entry => o.push_str(&format!("{}\n", glyph_of(206))),
                 Tok::Task { name, count, body } => {
                     if !*weave {

@@ -6,6 +6,27 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## v15 — 2026-09-20 (implicit loads + dense tag glyphs, this changeset)
+
+- `getv` (34, 😆) — changed: source syntax is now a **bare name** (implicit
+  load) in both encodings; the `<name>@` varget suffix and its glyph-suffix
+  spelling are removed (lex error with migration hint). Slot and semantics
+  unchanged.
+- Dense label definitions — changed: a bare v-run no longer defines a label
+  (bare v-runs load variables); dense label definitions are `name` + 🏷
+  (U+1F3F7, single-token). Text keeps `name:` as-is.
+- `_size_of`/`_offset`/`_obj`/`_cast` struct-name immediates — changed: dense
+  spelling is now a dedicated tag glyph + ASCII name (📏 name, 📍 name.field,
+  📦 name, 🎭 name; all single-token, U+1F4CF/U+1F4CD/U+1F4E6/U+1F3AD),
+  replacing the v14 `@sizeof:`-style sentinel idents. `@` no longer appears
+  in any encoding; `@`-prefixed source tokens are lex errors (also closing
+  the text-mode fallthrough that let hand-written `@flush`/`@liststart`
+  reach the parser).
+- Macros vs variables — changed: bare-name resolution is sentinel → macro →
+  implicit load; storing into a macro's name is a compile error.
+- Dense `name++`/`name+=` — fixed: the dense lexer now accepts the RMW
+  suffixes the emitter writes (previously emitted dense could not re-lex).
+
 ## v14.1 — 2026-09-20 (strictness + casting, this commit)
 
 - `strict` (215, 🔒) — added: postfix compile-time marker that makes the

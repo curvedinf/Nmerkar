@@ -648,7 +648,8 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         mods.push(defmod);
     }
     if emitting {
-        let s = if emit_text_f { emit_text(&emit_toks) } else { emit_dense(&emit_toks) };
+        let toks = resolve_implicit_loads(&emit_toks);
+        let s = if emit_text_f { emit_text(&toks) } else { emit_dense(&toks) };
         let derived = if convert && output.is_none() {
             if inputs.len() != 1 {
                 panic!("--to-text/--to-dense take exactly one input file (or use -o)");

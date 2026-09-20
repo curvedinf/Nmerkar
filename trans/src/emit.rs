@@ -21,8 +21,8 @@
 //     body tail and by `continue`, so `continue` still increments
 //   - early `return` from inside control flow binds `rv`, sets `fr`, and
 //     the remaining statements of the enclosing list are wrapped behind
-//     `fr@ 'c 'b if_else`; loop conditions are `fr@`-guarded so loops
-//     exit; the function epilogue returns `fr@ rv@ mul` (early value when
+//     `fr 'c 'b if_else`; loop conditions are `fr`-guarded so loops
+//     exit; the function epilogue returns `fr rv mul` (early value when
 //     flagged, else 0) and resets the flag
 //   - `return e;` in `main` is `e _call exit` (process exit code)
 
@@ -72,7 +72,7 @@ pub fn emit(prog: &Program) -> Result<String> {
     // v14: declare the cross-body registers once at top level (plain names;
     // a name assigned in several label bodies must be shared). rv/fr carry
     // the early-return value/flag, frv is the epilogue temp, pt holds a call
-    // result for `ret pt@`. C-variable slots stay frame-local: every _call
+    // result for `ret pt`. C-variable slots stay frame-local: every _call
     // entry gets a fresh local frame, so no call-save stack is needed.
     if !prog.functions.is_empty() {
         e.out.push_str("0 rv! 0 fr! 0 frv! 0 pt!\nret\n");
@@ -174,7 +174,7 @@ impl Emitter {
         let epilogue = if is_main {
             "0 _call exit\nret\n"
         } else {
-            "fr@ rv@ mul frv! 0 fr! ret frv@\n"
+            "fr rv mul frv! 0 fr! ret frv\n"
         };
 
         self.out.push_str(&header);
@@ -204,7 +204,7 @@ impl Emitter {
                 // of this list must be skipped via the early-return flag.
                 let c = self.fresh_label();
                 let b = self.fresh_label();
-                buf.code.push_str(&format!("fr@ 'c{c} 'b{b} if_else\n"));
+                buf.code.push_str(&format!("fr 'c{c} 'b{b} if_else\n"));
                 let mut rest = Buf::new();
                 let terminated = self.stmt_list(&mut rest, &stmts[idx + 1..], ctx, ListCtx::LabelBody)?;
                 self.hoisted_guards.push_str(&format!("b{b}:\n{}", rest.code));
@@ -303,7 +303,7 @@ impl Emitter {
                 let mut cond_buf = Buf::new();
                 self.expr(&mut cond_buf, cond, ctx)?;
                 buf.labels.push_str(&cond_buf.labels);
-                buf.labels.push_str(&format!("c{c}:\nfr@ not {}and ret\n", cond_buf.code));
+                buf.labels.push_str(&format!("c{c}:\nfr not {}and ret\n", cond_buf.code));
                 ctx.loops.push(None);
                 let mut body_buf = Buf::new();
                 let terminated = self.stmt_list(&mut body_buf, stmt_of(body), ctx, ListCtx::LabelBody)?;
@@ -335,7 +335,7 @@ impl Emitter {
                 let mut cond_buf = Buf::new();
                 self.expr(&mut cond_buf, cond, ctx)?;
                 buf.labels.push_str(&cond_buf.labels);
-                buf.labels.push_str(&format!("c{c}:\nfr@ not df{df}@ {}or and ret\n", cond_buf.code));
+                buf.labels.push_str(&format!("c{c}:\nfr not df{df} {}or and ret\n", cond_buf.code));
                 buf.code.push_str(&format!("'c{c} 'b{b} while\n"));
             }
             Stmt::For { init, cond, post, body } => {
@@ -363,12 +363,12 @@ impl Emitter {
                     None => cond_buf.code.push_str("1 "),
                 }
                 buf.labels.push_str(&cond_buf.labels);
-                buf.labels.push_str(&format!("c{c}:\nfr@ not {}and ret\n", cond_buf.code));
+                buf.labels.push_str(&format!("c{c}:\nfr not {}and ret\n", cond_buf.code));
                 ctx.loops.push(Some(inc.clone()));
                 let mut body_buf = Buf::new();
                 let terminated = self.stmt_list(&mut body_buf, stmt_of(body), ctx, ListCtx::LabelBody)?;
                 ctx.loops.pop();
-                body_buf.code.push_str(&format!("fr@ not '{inc} if\n"));
+                body_buf.code.push_str(&format!("fr not '{inc} if\n"));
                 buf.labels.push_str(&format!("b{b}:\n{}", body_buf.code));
                 if !terminated {
                     buf.labels.push_str("0 ret\n");
@@ -414,12 +414,12 @@ impl Emitter {
             }
             ExprKind::Var(name) => {
                 let slot = self.slot_of(ctx, name, e.line, e.col)?;
-                buf.code.push_str(&format!("{slot}@ "));
+                buf.code.push_str(&format!("{slot} "));
             }
             ExprKind::Assign { name, op, value } => {
                 let slot = self.slot_of(ctx, name, e.line, e.col)?;
                 if let Some(op) = op {
-                    buf.code.push_str(&format!("{slot}@ "));
+                    buf.code.push_str(&format!("{slot} "));
                     self.expr(buf, value, ctx)?;
                     buf.code.push_str(&format!("{} ", binop_mnemonic(*op)));
                 } else {
@@ -477,7 +477,7 @@ impl Emitter {
             ExprKind::Pre { name, delta } => {
                 let slot = self.slot_of(ctx, name, e.line, e.col)?;
                 let op = if *delta > 0 { "add" } else { "sub" };
-                buf.code.push_str(&format!("{slot}@ 1 {op} {slot}! "));
+                buf.code.push_str(&format!("{slot} 1 {op} {slot}! "));
             }
             ExprKind::Post { name, delta } => {
                 let slot = self.slot_of(ctx, name, e.line, e.col)?;
@@ -485,7 +485,7 @@ impl Emitter {
                 // Net one cell (the old value): local stores pass through, so
                 // the increment's store would leak a second cell under the
                 // result — sink it into frv (free outside the epilogue).
-                buf.code.push_str(&format!("{slot}@ pt! {slot}@ 1 {op} {slot}! frv! pt@ "));
+                buf.code.push_str(&format!("{slot} pt! {slot} 1 {op} {slot}! frv! pt "));
             }
             ExprKind::Call { name, args } => {
                 // malloc/free are Nmerkar opcodes (reserved words), not
@@ -551,7 +551,7 @@ impl Emitter {
                 self.expr(buf, index, ctx)?;
                 // Raw data pointer via strstr(s, ""), pointer+int arithmetic,
                 // byte load, mask.
-                buf.code.push_str(&format!("{slot}@ \"\" _call strstr add load 255 and "));
+                buf.code.push_str(&format!("{slot} \"\" _call strstr add load 255 and "));
             }
             ExprKind::Argv(index) => {
                 self.expr(buf, index, ctx)?;
@@ -632,7 +632,7 @@ mod tests {
     fn while_label_shape() {
         let out = transpile("int main() { int x = 0; while (x < 3) { x = x + 1; } return 0; }");
         assert!(out.contains("'c1 'b2 while"), "missing while instruction:\n{out}");
-        assert!(out.contains("c1:\nfr@ not"), "missing guarded cond label:\n{out}");
+        assert!(out.contains("c1:\nfr not"), "missing guarded cond label:\n{out}");
         assert!(out.contains("b2:\n"), "missing body label:\n{out}");
     }
 
@@ -648,8 +648,8 @@ mod tests {
     #[test]
     fn early_return_guards_remainder() {
         let out = transpile("int f(int n) { if (n) { return 1; } return 0; }");
-        assert!(out.contains("fr@ 'c"), "missing guard:\n{out}");
-        assert!(out.contains("fr@ rv@ mul"), "missing epilogue:\n{out}");
+        assert!(out.contains("fr 'c"), "missing guard:\n{out}");
+        assert!(out.contains("fr rv mul"), "missing epilogue:\n{out}");
     }
 
     #[test]
@@ -667,6 +667,6 @@ mod tests {
         let out = transpile("int main() { int u = 0; do { u = u + 1; } while (u < 1); return u; }");
         assert!(out.contains("1 df1!"), "missing df init:\n{out}");
         assert!(out.contains("0 df1!"), "missing df clear:\n{out}");
-        assert!(out.contains("df1@ "), "missing df cond guard:\n{out}");
+        assert!(out.contains("df1 "), "missing df cond guard:\n{out}");
     }
 }

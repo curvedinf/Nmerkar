@@ -19,7 +19,7 @@ ic:
 ib:
   u@ i@ 1.0 array_set
   v@ i@ 0.0 array_set
-  ret i@ 1 add i!
+  i++ ret
 power: k!
   tmp@ u@ n@ _call mv
   v@ tmp@ n@ _call tm
@@ -37,14 +37,14 @@ mb:
   0 ms! 0 mj!
   'jc 'jb while
   dst@ mi@ ms@ array_set
-  ret mi@ 1 add mi!
+  mi++ ret
 jc:
   ret mj@ nn@ lt
 jb:
   mi@ mj@ add mij!
   mij@ mij@ 1 add mul 2 div mi@ add 1 add mden!
   src@ mj@ array_get 1.0 mden@ div mul ms@ add ms!
-  ret mj@ 1 add mj!
+  mj++ ret
 ; tm(dst,src,n): dst[i] = sum_j src[j] * eval_A(j,i)
 tm: dst! src! nn!
   0 ti!
@@ -56,15 +56,15 @@ tb:
   0 ts! 0 tj!
   'dc 'db while
   dst@ ti@ ts@ array_set
-  ret ti@ 1 add ti!
+  ti++ ret
 dc:
   ret tj@ nn@ lt
 db:
   tj@ ti@ add ji!
   ji@ ji@ 1 add mul 2 div tj@ add 1 add tden!
   src@ tj@ array_get 1.0 tden@ div mul ts@ add ts!
-  ret tj@ 1 add tj!
+  tj++ ret
 dots: k!
-  u@ k@ array_get v@ k@ array_get mul uvt@ add uvt!
-  v@ k@ array_get v@ k@ array_get mul vvt@ add vvt!
+  u@ k@ array_get v@ k@ array_get mul uvt+=
+  v@ k@ array_get v@ k@ array_get mul vvt+=
   ret 0

@@ -13,10 +13,10 @@
 ; necessarily a regression.
 2000000 n!
 0 n@ range lst!
-lst@ ^lst!
+lst@ lst!
 weave
   task kk:
-    ret ^lst@ float tensor
+    ret lst@ float tensor
   task s: kk!
     ret kk@ 0.000001 mul 100.0 add
   task k: kk!

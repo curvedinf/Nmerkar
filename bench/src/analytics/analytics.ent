@@ -1,36 +1,36 @@
 ; analytics.ent — v13: sales CSV analytics (bench/SPEC.md)
 ; Columns: [2] region, [3] country, [4] product, [7] units, [10] total
-0 ^rows! 0.0 ^rev! 0 ^units!
-dict ^region_d! dict ^prod_d! dict ^country_d!
-1 ^first!
+0 rows! 0.0 rev! 0 units!
+dict region_d! dict prod_d! dict country_d!
+1 first!
 argv 1 get f!
 f@ "," 0 'row file_split_lines
 "=== DATA ANALYTICS RESULTS ===" print
-^rows@ "total_rows: %d" format print
-^rev@ "total_revenue: %.2f" format print
-^rev@ ^rows@ div "avg_order: %.2f" format print
-^units@ "total_units: %d" format print
-^region_d@ 6 top_n rl!
+rows@ "total_rows: %d" format print
+rev@ "total_revenue: %.2f" format print
+rev@ rows@ div "avg_order: %.2f" format print
+units@ "total_units: %d" format print
+region_d@ 6 top_n rl!
 rl@ length 'rp for
-^prod_d@ 5 top_n pl!
+prod_d@ 5 top_n pl!
 pl@ length 'pp for
-^country_d@ 3 top_n cl!
+country_d@ 3 top_n cl!
 cl@ length 'cp for
 ret
 row: acc! n!
-  ^first@ 'reset 'accum if_else
+  first@ 'reset 'accum if_else
   ret acc@
 reset:
-  0 ^first!
+  0 first!
   ret
 accum:
-  ^rows@ 1 add ^rows!
+  rows@ 1 add rows!
   10 field_float t!
-  ^rev@ t@ add ^rev!
-  ^region_d@ 2 t@ field_add_to
-  ^prod_d@ 4 t@ field_add_to
-  ^country_d@ 3 t@ field_add_to
-  ^units@ 7 field_int add ^units!
+  rev@ t@ add rev!
+  region_d@ 2 t@ field_add_to
+  prod_d@ 4 t@ field_add_to
+  country_d@ 3 t@ field_add_to
+  units@ 7 field_int add units!
   ret
 rp: k! rl@ k@ get p!
   p@ 0 get nm! p@ 1 get v!

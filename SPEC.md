@@ -1,4 +1,4 @@
-# Enmerkar Specification v13
+# Enmerkar Specification v14
 
 Normative for `comp/` (the `nkr` compiler). The `trans/` transpiler targets the
 text encoding (see final section).
@@ -28,7 +28,8 @@ The following changes are effective as of v13:
 1. **Label parameters.** A label definition declares input bindings:
    `label: a! b!` binds the caller's first pushed cell to `a`, the second to
    `b`. Callers push arguments before `_call`; structured ops pass values
-   implicitly. `^name!` binds a global, `_!` discards. Arity = number of
+   implicitly. `_!` discards a cell (v14: `^name!` global binds are removed).
+   Arity = number of
    declared bindings; labels with no bindings have arity 0 (v12-compatible).
    **Missing args are a compile error** (v13.1; formerly they bound `null`). Excess cells are discarded.
 
@@ -149,13 +150,15 @@ bitwise ops are written as words (`add`, `sub`, `mul`, `and`, `pow`, …).
 A run of v-space atoms folds into one name. Whitespace must separate two
 adjacent v-runs meant to be distinct.
 
-Variable semantics:
+Variable semantics (v14):
 - `<name>!` — store into **local** variable (call-scoped, fresh frame per CALL)
   and leave the value on the hidden stack for chaining.
 - `<name>@` — push **local** variable.
-- `^<name>!` / `^<name>@` — store/fetch **global** variable (static, persists
-  across calls, shared across threads/TUs). `^<name>!` also leaves the value on
-  the hidden stack.
+- A name assigned in a TU's straight-line top level (before its first label)
+  declares a **shared** variable; inside label bodies the plain name then
+  reads/writes that shared var. See "Shared variables" below.
+- `^` is **removed** (v14): a caret anywhere is a compile error. Globals are
+  gone; use shared variables.
 - A v-run after CALL/ADDR/`'` is a label **reference**.
 - Any other bare v-run is a label **definition** (no colon needed).
 - ASCII `name:` still defines a label; ASCII names work as jump targets.
@@ -163,6 +166,12 @@ Variable semantics:
 
 Local variables exist from first assignment until the nearest enclosing RET.
 if/while/for body labels are continuations that share the caller's frame.
+Compile-time scope checks (v14): a plain name assigned (non-param) in more
+than one label body is an error — the bodies are distinct frames, so the
+writes would not alias; declare it shared or rename. Reading a name that is
+never assigned anywhere is an error, and using a body's local from another
+body is an error. Label parameter binds shadow a shared name within their
+own body only.
 
 ## Label parameters
 
@@ -181,7 +190,8 @@ Parameter bindings are the pass-through assignment tokens, written contiguously
 after the label's colon:
 
 - `name!` — bind one cell to local `name`.
-- `^name!` — bind one cell to global `name`.
+- `name@!` — no longer exists; `^name!` global binds were removed in v14.
+  Bind to a local and store to a shared var if needed.
 - `_!` — bind and discard one cell.
 
 The first binding receives the first cell the caller pushed, the second the
@@ -247,6 +257,51 @@ foo:
 
 Recursion uses the same call stack as structured control flow; a label calls
 itself the same way it calls any other label.
+
+## Shared variables (v14)
+
+`^` globals are removed. A **shared** variable is declared by a plain-name
+assignment in a TU's straight-line top level — the code before the TU's first
+label definition:
+
+```
+0 count!                     ; declares shared `count`, initializes to 0
+main:
+  4 spawn-workers
+  ...
+worker: n!
+  25000 'loop 'body while
+  ret
+loop: n@ count@ lt ret
+body:
+  count++                    ; atomic add — see below
+  n@ 1 add n!
+  ret
+```
+
+- **Plain names everywhere.** Inside label bodies, a name declared shared at
+  top level resolves to the shared variable; writes and reads are the usual
+  `name!` / `name@` tokens.
+- **Declaration site.** In multi-TU/directory mode, *each* TU's own top-level
+  prefix declares shared vars (an `init` TU publishes cross-thread state this
+  way). Duplicate declarations across TUs of the same name are fine (one var).
+- **Atomicity.** Each shared variable is a C11 `_Atomic` seqlock cell
+  (`<stdatomic.h>` only — portable to any conforming C11 toolchain). Reads are
+  snapshot reads (retry on writer-in-flight or torn sequence); `x++` and
+  `x += k` compile to a single atomic read-modify-write, so racing increments
+  from multiple threads serialize with **no lost updates** — `n` threads doing
+  `x++` `k` times each yield exactly `n*k`.
+- **Stores consume.** A shared store (`count!`) pops its value off the hidden
+  stack (it does not pass through like a local store).
+- **Spawn transparency.** Spawned bodies get a fresh frame; shared vars are the
+  way to publish results or counters across threads. They are GC roots and are
+  scanned by the collector.
+- **Scope errors.** A plain name assigned in more than one label body is a
+  compile error (the bodies are distinct frames — the writes would not alias);
+  reading a never-assigned name, or using another body's local, is an error.
+  The fix in both cases: declare the name shared at the top level, or rename.
+- **No `^`.** The caret is a hard lex error: "use plain names; declare a
+  shared var with a top-level assignment".
 
 ## Type glyphs
 
@@ -391,8 +446,8 @@ and final in `comp/src/lex.rs`.
 | 27 | 😅 | `_cast` | h type → h | checked downcast (struct id); dies on mismatch |
 | 28 | 🚆 | `macro` | (directive) | `macro name { body }` |
 | 29 | 🤔 | `tensor` | len_or_list type → h | as `array`; 64-aligned |
-| 33 | 🌆 | `setv` | value → value | `<v>!` local, `^<v>!` global (pass-through) |
-| 34 | 😆 | `getv` | → value | `<v>@` local, `^<v>@` global |
+| 33 | 🌆 | `setv` | value → value | `<v>!` local (pass-through); shared store consumes (v14) |
+| 34 | 😆 | `getv` | → value | `<v>@` local / shared read (snapshot for shared) |
 | 35 | 🚇 | `_str` | → h | bare `"…"` preferred |
 | 36 | 🤕 | `concat` | a b → h | tag-dispatched: str/arr/list concat (was `cat`) |
 | 37 | 🌇 | `format` | args… fmt → h | (was `fmt`) |
@@ -722,8 +777,8 @@ USEing TU. Ships: `m.ufm`, `c.ufm`, `pthread.ufm`, `curl.ufm`, `sdl2.ufm`,
 0; a TU's top-level flow never falls into the next TU). Per-TU:
 
 - Optional `MOD"name"` header; default is filename stem. Glyph v-names, ASCII
-  labels, global variables (`^name`), and macros are file-local. Local
-  variables are call-scoped.
+  labels, shared variables (declared in the TU's top-level prefix), and macros
+  are file-local. Local variables are call-scoped.
 - `PUB` before a label exports it to the global namespace; CALL/`'` resolve PUB
   names across TUs. Duplicate PUB = compile error. STRUCTs, IMPORT/EXTERN/USE
   are global (deduped).
@@ -741,8 +796,9 @@ Bare `nkr` (or `nkr somedir/`) discovers source files:
   automatically spawned before main starts. Recurses into nested init subdirs.
 - **Subdirectory without init**: ignored. `mods/` is never scanned.
 
-Init threads are detached pthreads; each gets its own `Ctx`. Global variables
-(`^name`) are shared across all threads. Coordination via chans and PUB/CALL.
+Init threads are detached pthreads; each gets its own `Ctx`. Shared variables
+are visible across all threads (atomic snapshot reads, atomic RMW for
+`x++`/`x+=`). Coordination via chans and PUB/CALL.
 
 Explicit-file mode is unchanged — no discovery, no init threads.
 
@@ -755,7 +811,7 @@ results trivially safe.
 - **Heap objects**: every tagged object allocated with a GC header, linked into
   a global list. Bodies holding cells (list/dict/arr/chan/obj) are scanned for
   children during marking; str/bitmap/bloom are leaf bytes.
-- **Roots**: each `Ctx`'s data and call stacks, all global variables (`^name`),
+- **Roots**: each `Ctx`'s data and call stacks, all shared variables,
   the full locals array of every `Ctx` (v13.2 — the innermost frame is where
   running code keeps its tensors; scanning conservatively past the frame
   pointer only over-retains, never frees live data), weave task results,
@@ -796,8 +852,8 @@ run
   result; with fanout, each worker's `ret` value becomes one element of the
   published result list. `endt` is removed.
 - **Inputs** are parameter bindings after the colon: `task b: a!` makes task
-  `a`'s result available as local parameter `a`; `^name!` binds a global,
-  `_!` discards. Bindings are evaluated left-to-right, matching the label
+  `a`'s result available as local parameter `a`; `_!` discards. Bindings are
+  evaluated left-to-right, matching the label
   parameter convention.
 - **Fanout**: a numeric literal 1..64 before `task` declares the worker count:
   `4 task worker: item!`. Only the **first** input drives fanout and must be
@@ -809,7 +865,7 @@ run
   order**. Empty input → empty list. Count > 1 requires ≥1 input.
 - **Static DAG**: task inputs must name tasks in the same weave block; unknown
   input or cycle = compile error. Task bodies are self-contained (labels
-  task-local; two tasks may reuse v-names). Global variables (`^name`) cross
+  task-local; two tasks may reuse v-names). Shared variables cross
   task boundaries; local variables are per-task.
 - **`run [terminal]`**: `run` with no name executes every task (v12
   compatibility) and leaves the last task's result on the stack. `run <name>`
@@ -842,14 +898,14 @@ run
   ```
   weave
     task serve:
-      0 ^n!
+      0 n!
       'more 'step while
       ret
     more:
-      ret ^n@ 100 lt
+      ret n@ 100 lt
     step:
-      ^n@ 1 add ^n!
-      ^n@ 100 gte 'shut if
+      n@ 1 add n!
+      n@ 100 gte 'shut if
       ret
     shut:
       shutdown
@@ -956,6 +1012,30 @@ yields a raw pointer (`p 8 add load` reads the next 8 bytes). Tracked handles
 truthiness. Falsy values: `0`, `""`, `null`, `NaN`, and empty collections.
 Everything else is truthy (`1`).
 
+### Tail-position if: early returns (v13.2)
+
+When an `if`'s fall-through is only a value push and the enclosing body's
+`ret` (tail position), the branch target's `ret` **returns from the enclosing
+label** instead of resuming after the `if`:
+
+```
+solve: r! cols!
+  r@ cols@ r@ n@ lt 'rec if       ; tail position: only `1 ret` follows
+  1 ret                             ; not taken: return 1
+rec: r! cols! ... ret               ; taken: rec's ret returns from solve
+```
+
+This is the early-return idiom for `_call`ed labels. The rule applies only in
+real bodies (top level and outlined functions); inside inlined loop bodies a
+target's `ret` still means "continue the loop", and `if`/`if_else` elsewhere
+keep resume-after-branch semantics (the target's `ret` value is discarded).
+A limitation to know about: `_call`ed-label recursion that passes frames
+through branch parameters can still mis-bind when a pass-through assignment
+(`x!`) precedes the call (vstack pass-through leak). v14 fixed the other half
+of the old caveat: a callee's local frame is now pushed past the caller's
+live slots, so nested calls can no longer alias the caller's locals
+(the v13 "callee-frame overlap").
+
 ### Equality
 
 - `eq` uses loose equality (`==`): `"3" eq 3` → `1`, `null eq 0` → `1`.
@@ -991,9 +1071,10 @@ string       := '"' ... '"'
 literal      := '[' token* ']' [<type> ('array' | 'tensor')]
              | '{' token* '}'           ; dict literal; element count must be even
 name         := [a-zA-Z][a-zA-Z0-9_]*    ; must NOT start with '_' (reserved for _-prefixed ops)
-varset       := ['^'] name ('!' | setv-glyph)   ; store and pass through
-varget       := ['^'] name ('@' | getv-glyph)
-labeldef     := name ':' [param]*       ; params (v13): name! | ^name! | _!
+varset       := name ('!' | setv-glyph)       ; local: store and pass through;
+             ; shared (name declared at top level): store and consume
+varget       := name ('@' | getv-glyph)
+labeldef     := name ':' [param]*       ; params (v14): name! | _!
              | name                      ; label def without colon
 jump         := (_call | "'") name
 op           := opcode-glyph | text-mnemonic
@@ -1111,12 +1192,39 @@ executors; MSP/mobile targets.
 `trans/` is a C-subset → Enmerkar transpiler written as a standalone Rust
 crate (std-only; modules: lexer, parser, AST, emitter) emitting the text
 encoding. Supported subset, libc IMPORT preamble, emission model
-(quotation-label control flow, `kN` call wrappers for recursion-safe
-parameter save/restore, `^fr`/`^rv` early-return guards), and the gated
+(quotation-label control flow, direct calls with fresh per-call frames,
+`fr`/`rv` shared-register early-return guards), and the gated
 test pathways (system-binary round-trips plus per-operation output gates)
 are documented in `trans/README.md`.
 
 ---
+
+# v14 addenda
+
+## Shared variables replace globals
+
+`^` is removed (hard lex error). Plain names only:
+
+- A plain-name assignment in a TU's straight-line top level (before its first
+  label) declares a **shared variable** — see "Shared variables (v14)" above.
+- Compile-time scope checks: a name assigned (non-param) in more than one
+  label body is an error (distinct frames, non-aliasing writes); a never-
+  assigned name read, or another body's local used cross-body, is an error.
+  Label parameter binds shadow a shared name within their body.
+- Shared vars are C11 `_Atomic` seqlock cells (`<stdatomic.h>` only — no
+  platform-specific intrinsics; compiles anywhere with a C11 toolchain).
+  Reads are snapshots; `x++`/`x += k` become a single atomic RMW
+  (no lost updates across threads); shared stores consume their value.
+- MTU/directory mode: every TU's own top-level prefix may declare shared
+  vars; an init TU publishes cross-thread state this way.
+
+## Callee frames no longer overlap the caller
+
+A `_call` now pushes the callee's local frame past the **caller's** live
+slots (the caller body's slot count), not by the callee's own count. Small
+callees can no longer alias the caller's locals — the v13 "callee-frame
+overlap" limitation is gone. Spawned bodies get a fresh `Ctx` and are
+unaffected.
 
 # v13.1 addenda
 

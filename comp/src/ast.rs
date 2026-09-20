@@ -29,8 +29,8 @@ pub enum Tok {
     LocalGet(String),             // x@  — local fetch (v11)
     IncLocal(String),             // x++ — local increment by 1
     AddLocal(String),             // x+= — local accumulate from stack
-    IncGlobal(String),            // ^x++ — global increment by 1
-    AddGlobal(String),            // ^x+= — global accumulate from stack
+    IncGlobal(String),            // shared x++ — atomic increment by 1
+    AddGlobal(String),            // shared x+= — atomic accumulate from stack
     Discard,                      // _! — discard one slot in destructuring bind
     Import(Import),
     ManifestImport(Import), // import from a loaded .ufm manifest (exempt from ffi.import gating)
@@ -67,6 +67,12 @@ pub enum Ins {
     Ret,
     SetV(String),
     GetV(String),
+    IncLocal(String),             // x++ — placeholder, expanded by the scope pass
+    AddLocal(String),             // x+= — placeholder, expanded by the scope pass
+    IncGlobal(String),            // shared x++ — placeholder, expanded by the scope pass
+    AddGlobal(String),            // shared x+= — placeholder, expanded by the scope pass
+    AtomicAdd(String, bool),      // shared x — atomic add; bool: implicit delta 1 (x++)
+    Nop,                         // internal: erased by the scope pass rewrite
     LocalSet(String),             // v11: unresolved local store (name)
     LocalGet(String),             // v11: unresolved local fetch (name)
     LocalSetI(usize),             // v11: resolved local store (slot)

@@ -1,7 +1,7 @@
 ; ring.ent — v13: spawn + channel, and a weave DAG
 ; (the channel is a global: locals are frame-scoped and the post-weave
 ;  code runs in its own body frame)
-'sender spawn ^ch!
+'sender spawn ch!
 weave
   task one:
     ret 21
@@ -9,6 +9,6 @@ weave
     ret one@ 2 mul
 run two
 print
-^ch@ dequeue print
+ch@ dequeue print
 sender:
   ret 42

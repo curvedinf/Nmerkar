@@ -1,0 +1,67 @@
+; bfs.ent — breadth-first search over a deterministic graph (bench/SPEC.md)
+; n from argv[1] (default 1000000). Edges: u -> (7u+3) mod n and
+; u -> (13u+11) mod n for every u, plus u -> (u+1) mod n when u mod 3 = 0.
+; Adjacency is a dict of per-node lists; dist is an int array (-1 =
+; unreached); the frontier lives in a preallocated int-array queue (each node
+; is enqueued at most once, so tail never passes n).
+1000000 n!
+has_args 'setn if
+n@ dict adj!
+n@ int array dist!
+n@ int array q!
+0 r! 0 s! 0 m!
+0 n@ 'bld for
+0 n@ 'negf for
+dist@ 0 0 set
+q@ 0 0 set
+1 tail!
+0 head!
+'more 'step while
+0 n@ 'tally for
+"reached: " print r@ print
+"unreached: " print n@ r@ sub print
+"sum_dist: " print s@ print
+"max_dist: " print m@ print
+ret
+setn: 1 arg_index n! ret
+bld: u!
+  u@ 7 mul 3 add n@ rem v1!
+  u@ 13 mul 11 add n@ rem v2!
+  list v1@ append v2@ append lst!
+  u@ 3 rem 0 eq 'third 'put if_else
+  ret
+third: lst@ u@ 1 add n@ rem append lst! adj@ u@ lst@ set ret
+put: adj@ u@ lst@ set ret
+negf: i! dist@ i@ -1 set ret
+more: head@ tail@ lt ret
+step:
+  q@ head@ get u!
+  dist@ u@ get du!
+  adj@ u@ get nb!
+  head@ 1 add head!
+  0 j!
+  'vis_c 'vis_b while
+  ret
+vis_c: j@ nb@ length lt ret
+vis_b:
+  nb@ j@ get v!
+  dist@ v@ get 0 lt 'visit 'vskip if_else
+  j@ 1 add j!
+  ret
+visit:
+  dist@ v@ du@ 1 add set
+  q@ tail@ v@ set
+  tail@ 1 add tail!
+  ret
+vskip: ret
+tally: i!
+  dist@ i@ get d!
+  d@ 0 lt 'ts 'tc if_else
+  ret
+ts: ret
+tc:
+  r@ 1 add r!
+  s@ d@ add s!
+  d@ m@ gt 'tmax 'ts if_else
+  ret
+tmax: d@ m! ret

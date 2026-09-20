@@ -826,7 +826,7 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
 // call-entry label, we propagate the body ID to all PushAddr targets within
 // the same body's instruction range. This correctly handles continuation
 // labels that appear after other call entries in the instruction stream.
-pub fn resolve_locals(p: &mut Parsed) {
+pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<String>) {
     if p.ins.is_empty() {
         return;
     }
@@ -964,6 +964,193 @@ pub fn resolve_locals(p: &mut Parsed) {
     }
 
     // Step 4: Collect local names per body, assigning slot IDs.
+    // Step 4.5 (v14): shared-variable scope resolution. A name assigned at
+    // top level (body 0) declares a SHARED var (atomic, cross-thread, visible
+    // in every body). Plain names inside label bodies resolve to the shared
+    // var when one is declared, otherwise to the body's local slot. A name
+    // that is only ever assigned in one non-top body is LOCAL to it; using it
+    // from another body is a compile-time collision error — declare it shared
+    // with a top-level assignment or rename.
+    {
+        // v14 shared-set: assignments in MAIN'S STRAIGHT-LINE CODE (before the
+        // first label body). Label bodies — including quotations that share
+        // main's frame (spawn/for/while/if bodies) — keep their names
+        // frame-local, matching v13 runtime semantics (each spawned Ctx gets
+        // a fresh frame; a quotation's slots are per-invocation).
+        let first_label_pc = p.labels.values().copied().min().unwrap_or(p.ins.len());
+        let mut shared = extra_shared;
+        for (i, ins) in p.ins.iter().enumerate() {
+            if i < first_label_pc && !p.param_pcs.contains_key(&i) {
+                if let Ins::LocalSet(n) = ins {
+                    shared.insert(n.clone());
+                }
+            }
+        }
+        if std::env::var("NKR_DEBUG_SCOPE").is_ok() { eprintln!("[scope] shared={:?}", shared); }
+        // per-body param-bound names: a param bind shadows a shared name
+        // within its own body (reads there hit the frame slot, not the var)
+        let mut body_params: HashMap<usize, std::collections::HashSet<String>> = HashMap::new();
+        for (&pc, _) in p.param_pcs.iter() {
+            if let Some(Ins::LocalSet(n)) = p.ins.get(pc) {
+                body_params.entry(ins_body[pc]).or_default().insert(n.clone());
+            }
+        }
+        // per-body name usage (sets and gets) for collision checks
+        let mut body_names: HashMap<usize, std::collections::HashSet<String>> = HashMap::new();
+        for (i, ins) in p.ins.iter().enumerate() {
+            let n = match ins {
+                Ins::LocalSet(n) | Ins::LocalGet(n) | Ins::IncLocal(n) | Ins::AddLocal(n) => n.clone(),
+                _ => continue,
+            };
+            body_names.entry(ins_body[i]).or_default().insert(n);
+        }
+        let mut assigned_in: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, ins) in p.ins.iter().enumerate() {
+            if let Ins::LocalSet(n) = ins {
+                if p.param_pcs.contains_key(&i) {
+                    continue; // input binds are per-invocation by design
+                }
+                assigned_in.entry(n.as_str()).or_default().push(ins_body[i]);
+            }
+        }
+        // v14: a plain name assigned (non-param) in MORE THAN ONE body is
+        // ambiguous — the bodies are distinct frames at runtime (separate
+        // spawn/call contexts), so the writes do not alias. Declare it shared
+        // (top-level assignment) or rename.
+        for (n, bodies) in &assigned_in {
+            if shared.contains(*n) {
+                continue; // shared vars are frame-independent by design
+            }
+            let mut distinct: Vec<usize> = bodies.clone();
+            distinct.sort();
+            distinct.dedup();
+            if distinct.len() > 1 {
+                panic!(
+                    "name collision: '{}' is assigned in {} distinct bodies — declare it shared with a top-level assignment, or rename per body",
+                    n, distinct.len()
+                );
+            }
+        }
+        let label_of = |body: usize| -> String {
+            p.local_names.get(&body).map(|_| format!("body@{}", body)).unwrap_or_else(|| format!("body@{}", body))
+        };
+        // collision + unresolved checks (label-body names only)
+        for (i, ins) in p.ins.iter().enumerate() {
+            let b = ins_body[i];
+            if i >= first_label_pc {
+                continue; // main straight-line: shared-set already covers it
+            }
+            let n = match ins {
+                Ins::LocalSet(n) | Ins::LocalGet(n) | Ins::IncLocal(n) | Ins::AddLocal(n) => n,
+                _ => continue,
+            };
+            if shared.contains(n) {
+                continue; // resolves to the shared var everywhere
+            }
+            let owners = assigned_in.get(n.as_str()).cloned().unwrap_or_default();
+            if owners.is_empty() {
+                panic!("name '{}' is read but never assigned anywhere — assign it (top level declares a shared var) before use", n);
+            }
+            // local: every referencing body must be an assigning body
+            if !owners.contains(&b) {
+                let decl = if owners.len() == 1 {
+                    format!("local to {}", label_of(owners[0]))
+                } else {
+                    format!("assigned in bodies {:?}", owners.iter().map(|o| label_of(*o)).collect::<Vec<_>>())
+                };
+                panic!(
+                    "name collision: '{}' is {} but used in {} — declare it shared with a top-level assignment, or rename",
+                    n, decl, label_of(b)
+                );
+            }
+        }
+        // rewrite: shared names become SetV/GetV; RMW placeholders expand
+        // (fixups carry the RMW's own body so slot analysis stays correct)
+        for (i, ins) in p.ins.iter_mut().enumerate() {
+            let rmw_body = ins_body[i];
+            match ins {
+                Ins::LocalSet(n) => {
+                    let shadowed = body_params
+                        .get(&ins_body[i])
+                        .map(|ps| ps.contains(n))
+                        .unwrap_or(false);
+                    if shared.contains(n) && !p.param_pcs.contains_key(&i) && !shadowed {
+                        if !p.vars.contains(n) { p.vars.push(n.clone()); }
+                        *ins = Ins::SetV(n.clone());
+                    }
+                }
+                Ins::LocalGet(n) => {
+                    let shadowed = body_params
+                        .get(&ins_body[i])
+                        .map(|ps| ps.contains(n))
+                        .unwrap_or(false);
+                    if shared.contains(n) && !shadowed {
+                        if !p.vars.contains(n) { p.vars.push(n.clone()); }
+                        *ins = Ins::GetV(n.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        // shared RMW pattern rewrite (NO insertions — label/param pcs must
+        // stay stable): GetV(n) ADD SetV(n) -> AtomicAdd(n,false);
+        // PushI(1) GetV(n) ADD SetV(n) -> AtomicAdd(n,true).
+        // The Tok arms already expanded x++/x+= to exactly these triples.
+        for i in 0..p.ins.len() {
+            let is_add = matches!(&p.ins[i], Ins::Simple("op_add"));
+            if !is_add { continue; }
+            let (pre_get, inc_one) = if i >= 1 && matches!(&p.ins[i-1], Ins::GetV(_)) {
+                (i - 1, false)
+            } else if i >= 2 && matches!(&p.ins[i-1], Ins::GetV(_)) && matches!(&p.ins[i-2], Ins::PushI(1)) {
+                (i - 1, true)
+            } else {
+                continue;
+            };
+            let name = match &p.ins[pre_get] { Ins::GetV(n) => n.clone(), _ => continue };
+            let set_at = i + 1;
+            let matches_set = matches!(&p.ins[set_at], Ins::SetV(m) if *m == name);
+            if !matches_set { continue; }
+            let one_at = pre_get as i64 - 1;
+            let is_inc = inc_one && one_at >= 0 && matches!(&p.ins[one_at as usize], Ins::PushI(1));
+            p.ins[i] = Ins::AtomicAdd(name.clone(), is_inc);
+            p.ins[set_at] = Ins::Nop;
+            p.ins[pre_get] = Ins::Nop;
+            if is_inc { p.ins[one_at as usize] = Ins::Nop; }
+        }
+        // drop Nops; every pc-indexed table (labels, label_params,
+        // param_pcs, and the caller's ins_body) is remapped through the
+        // compaction so label entries keep pointing at their first
+        // instruction — label_params was originally missed, leaving stale
+        // pcs that attributed wrong arities to shifted labels
+        let mut newpc: Vec<usize> = vec![0; p.ins.len()];
+        let mut new_body: Vec<usize> = Vec::with_capacity(p.ins.len());
+        let mut w = 0;
+        for r in 0..p.ins.len() {
+            if !matches!(p.ins[r], Ins::Nop) {
+                p.ins[w] = p.ins[r].clone();
+                new_body.push(ins_body[r]);
+                newpc[r] = w;
+                w += 1;
+            }
+        }
+        p.ins.truncate(w);
+        ins_body.clear();
+        ins_body.extend(new_body);
+        let map = |pc: usize| -> usize { if pc < newpc.len() { newpc[pc] } else { w } };
+        let old_labels = std::mem::take(&mut p.labels);
+        for (n, pc) in old_labels { p.labels.insert(n, map(pc)); }
+        let old_lps = std::mem::take(&mut p.label_params);
+        for (pc, ps) in old_lps { p.label_params.insert(map(pc), ps); }
+        let old_params = std::mem::take(&mut p.param_pcs);
+        for (pc, off) in old_params { p.param_pcs.insert(map(pc), off); }
+    }
+
+
+    if std::env::var("NKR_DEBUG_INS").is_ok() {
+        for (i, ins) in p.ins.iter().enumerate() {
+            eprintln!("[ins {}] b{} {:?}", i, ins_body[i], ins);
+        }
+    }
     let mut body_slots: HashMap<usize, HashMap<String, usize>> = HashMap::new();
     for (i, ins) in p.ins.iter().enumerate() {
         let body = ins_body[i];
@@ -1019,6 +1206,7 @@ pub fn prefix_task_labels(body: Vec<Tok>, prefix: &str) -> Vec<Tok> {
 // are rewritten to the mangled name, everything else stays a global (PUB) name.
 // Variables are always file-local: "<mod>__<name>". IMPORT/EXTERN/USE dedupe.
 pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Parsed {
+    let mut tu_shared: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut m = Parsed {
         ins: Vec::new(),
         labels: HashMap::new(),
@@ -1043,6 +1231,19 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
         let off = m.ins.len();
         if init_flags.get(tu_idx).copied().unwrap_or(false) {
             m.init_pcs.push(off);
+        }
+        // v14: each TU's own straight-line prefix (before its first label)
+        // declares shared vars — in directory mode an init TU's top-level
+        // assignment publishes cross-thread state, and it sits after the
+        // merged program's first label so the single-prefix scan in
+        // resolve_locals would miss it
+        let tu_first_label = tu.labels.values().copied().min().unwrap_or(tu.ins.len());
+        for pc in 0..tu_first_label.min(tu.ins.len()) {
+            if let Ins::LocalSet(n) = &tu.ins[pc] {
+                if !tu.param_pcs.contains_key(&pc) {
+                    tu_shared.insert(n.clone());
+                }
+            }
         }
         let str_base = m.strings.len();
         let mut imp_map: Vec<usize> = Vec::new();
@@ -1077,6 +1278,7 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
                 Ins::Ret => Ins::Ret,
                 Ins::SetV(v) => Ins::SetV(format!("{}__{}", modname, v)),
                 Ins::GetV(v) => Ins::GetV(format!("{}__{}", modname, v)),
+                ins @ (Ins::IncLocal(_) | Ins::AddLocal(_) | Ins::IncGlobal(_) | Ins::AddGlobal(_) | Ins::AtomicAdd(_, _) | Ins::Nop) => ins.clone(),
                 Ins::LocalSet(n) => Ins::LocalSet(n.clone()),
                 Ins::LocalGet(n) => Ins::LocalGet(n.clone()),
                 Ins::LocalSetI(id) => Ins::LocalSetI(*id),
@@ -1151,7 +1353,7 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
             m.param_pcs.insert(pc + off, k);
         }
     }
-    resolve_locals(&mut m);
+    resolve_locals(&mut m, tu_shared);
     m
 }
 
@@ -1548,7 +1750,8 @@ pub fn check_label_arity(p: &Parsed) {
             Ins::Break | Ins::Cont | Ins::Goto(_) | Ins::Weave(_) | Ins::Extern(_) | Ins::Flush => {
                 depth = None;
             }
-            Ins::SetV(_) | Ins::GetV(_) | Ins::LocalSet(_) | Ins::LocalGet(_)
+            Ins::SetV(_) | Ins::GetV(_) | Ins::LocalSet(_) | Ins::LocalGet(_) | Ins::AtomicAdd(_, _) | Ins::Nop
+            | Ins::IncLocal(_) | Ins::AddLocal(_) | Ins::IncGlobal(_) | Ins::AddGlobal(_)
             | Ins::LocalSetI(_) | Ins::LocalGetI(_) => {
                 if p.param_pcs.contains_key(&i) {
                     depth = depth.map(|d| d - 1);

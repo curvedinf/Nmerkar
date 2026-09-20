@@ -506,11 +506,17 @@ pub fn task_kernel_at(pc: usize) -> Option<(usize, usize)> {
 // kernel shape as weave-task fusion — this generalizes it to plain code.
 
 #[derive(Clone, Debug)]
+pub enum OutBind {
+    Local(usize),
+    Shared(String),
+}
+
+#[derive(Clone, Debug)]
 pub struct RegionKernel {
     pub pc: usize,          // first instruction of the region
     pub end_pc: usize,      // first instruction AFTER the region (goto target)
     pub inputs: Vec<RegionInput>, // region inputs (locals or globals)
-    pub exprs: Vec<(usize, TExpr)>, // live-out (local slot id, elementwise expr), 1..=4
+    pub exprs: Vec<(OutBind, TExpr)>, // live-outs (binding, elementwise expr), 1..=4
     pub name: String,
     pub glsl: String,
 }
@@ -529,9 +535,9 @@ pub fn register_region_kernels(ks: Vec<RegionKernel>) {
 /// Everything gen.rs needs to emit the fused block for a region at `pc`.
 pub struct RegionGen {
     pub kidx: usize,             // kernel table index (after static + task kernels)
-    pub inputs: Vec<RegionInput>, // locals (cx->locals[base+id]) or globals (var_name)
+    pub inputs: Vec<RegionInput>, // locals (cx->locals[base+id]) or shared (uf_sh_get(&var_name))
     pub end_pc: usize,           // goto target after the fused block
-    pub out_locals: Vec<usize>,  // local slot ids to bind (1..=4 live-outs)
+    pub out_locals: Vec<OutBind>, // live-out bindings (1..=4)
     pub c_exprs: Vec<String>,    // elementwise exprs as C over _v0.._v(n-1)
 }
 /// All registered (pc, end_pc) ranges — gen jumps over them when the fused
@@ -551,7 +557,7 @@ pub fn region_at(pc: usize) -> Option<RegionGen> {
                 kidx: base + i,
                 inputs: ks[i].inputs.clone(),
                 end_pc: ks[i].end_pc,
-                out_locals: ks[i].exprs.iter().map(|(id, _)| *id).collect(),
+                out_locals: ks[i].exprs.iter().map(|(b, _)| b.clone()).collect(),
                 c_exprs: ks[i].exprs.iter().map(|(_, e)| expr_to_c(e)).collect(),
             }
         })
@@ -599,7 +605,7 @@ pub fn expr_to_c(e: &TExpr) -> String {
 
 /// GLSL for a multi-output elementwise kernel: bindings 0..n are inputs,
 /// n..n+k are outputs r_j[i] = expr_j[i]. Same header/layout as task_glsl.
-pub fn region_glsl(ninputs: usize, exprs: &[(usize, TExpr)]) -> String {
+pub fn region_glsl(ninputs: usize, exprs: &[(OutBind, TExpr)]) -> String {
     let mut s = String::new();
     s.push_str("#version 450\n");
     s.push_str("#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require\n");
@@ -634,7 +640,10 @@ pub fn analyze_regions(p: &crate::ast::Parsed) -> Vec<RegionKernel> {
             let name = format!("region_{}", fnv(&format!("pc{}", i)));
             let glsl = region_glsl(inputs.len(), &exprs);
             if dbg {
-                let outs: Vec<String> = exprs.iter().map(|(id, _)| id.to_string()).collect();
+                let outs: Vec<String> = exprs.iter().map(|(b, _)| match b {
+                    OutBind::Local(id) => format!("L{}", id),
+                    OutBind::Shared(n) => format!("S:{}", n),
+                }).collect();
                 eprintln!(
                     "[region] pc {}..{} FUSED ({} inputs, outs [{}])",
                     i, end_pc, inputs.len(), outs.join(",")
@@ -654,7 +663,8 @@ fn slot_read_later(p: &crate::ast::Parsed, id: usize, name: &str, from: usize) -
     for ins in &p.ins[from.min(p.ins.len())..] {
         match ins {
             Ins::LocalGetI(i) if *i == id => return true,
-            Ins::LocalGet(n) if n == name => return true,
+            Ins::LocalGet(n) if !name.is_empty() && n == name => return true,
+            Ins::GetV(n) if !name.is_empty() && n == name => return true,
             _ => {}
         }
     }
@@ -670,19 +680,21 @@ enum InSlot {
     Phantom,
 }
 
-/// Resolve the constant float list bound to local `list_slot` at or before
-/// instruction `before`: the slot's most recent LocalSetI must be fed by a
-/// literal-only ListLit ([ c0 c1 ... ] name!). Returns the constants in
-/// source order.
-fn const_list_of(p: &crate::ast::Parsed, list_slot: usize, before: usize) -> Option<Vec<f64>> {
+/// Resolve the constant float list bound to local `list_slot` (v13: most
+/// recent LocalSetI) or shared var `list_name` (v14: most recent SetV) at or
+/// before instruction `before`. The binding must be fed by a literal-only
+/// ListLit ([ c0 c1 ... ] name!). Returns the constants in source order.
+fn const_list_of(p: &crate::ast::Parsed, list_slot: usize, list_name: &str, before: usize) -> Option<Vec<f64>> {
     use crate::ast::Ins;
     let mut j = before;
     while j > 0 {
         j -= 1;
-        if let Ins::LocalSetI(id) = &p.ins[j] {
-            if *id != list_slot {
-                continue;
-            }
+        let matches_binding = match &p.ins[j] {
+            Ins::LocalSetI(id) => *id == list_slot,
+            Ins::SetV(n) => !list_name.is_empty() && n == list_name,
+            _ => false,
+        };
+        if matches_binding {
             if j == 0 || !matches!(&p.ins[j - 1], Ins::ListLit) {
                 return None;
             }
@@ -793,16 +805,23 @@ fn simulate_fold_body(
                 },
                 _ => return None,
             },
-            _ => return None,
+            other => {
+                if std::env::var("NKR_DEBUG_REGION2").is_ok() { eprintln!("[fold-sim] ineligible: {:?}", other); }
+                return None;
+            }
         }
         i += 1;
     }
     if stack.len() != 1 {
+        if std::env::var("NKR_DEBUG_REGION2").is_ok() { eprintln!("[fold-sim] stack={}", stack.len()); }
         return None;
     }
     match stack.pop() {
         Some(V::E(e)) => Some(e),
-        _ => None,
+        _ => {
+            if std::env::var("NKR_DEBUG_REGION2").is_ok() { eprintln!("[fold-sim] opaque"); }
+            None
+        }
     }
 }
 
@@ -836,7 +855,7 @@ fn walk_one_region(
     p: &crate::ast::Parsed,
     start: usize,
     targets: &std::collections::HashSet<usize>,
-) -> Option<(usize, Vec<RegionInput>, Vec<(usize, TExpr)>)> {
+) -> Option<(usize, Vec<RegionInput>, Vec<(OutBind, TExpr)>)> {
     use crate::ast::Ins;
     use std::collections::HashMap;
     #[derive(Clone, PartialEq, Eq, Hash)]
@@ -871,12 +890,17 @@ fn walk_one_region(
         // list expands to N body simulations (elem = each constant), giving
         // one fused expression — the source keeps its fold shape.
         if let Ins::PushAddr(l) = &p.ins[i] {
-            if matches!(p.ins.get(i + 1), Some(Ins::Simple("op_vfold"))) {
-                let listv = match stack.pop() {
+            let vfold_next = matches!(p.ins.get(i + 1), Some(Ins::Simple("op_vfold")))
+                || (matches!(p.ins.get(i + 1), Some(Ins::Flush))
+                    && matches!(p.ins.get(i + 2), Some(Ins::Simple("op_vfold"))));
+            if vfold_next {
+                // vfold operand order is `arr init fn` (SPEC): at the fold the
+                // stack holds [.., arr, init] — init is on top.
+                let accv = match stack.pop() {
                     Some(V::E(e)) => e,
                     _ => break,
                 };
-                let accv = match stack.pop() {
+                let listv = match stack.pop() {
                     Some(V::E(e)) => e,
                     _ => break,
                 };
@@ -885,11 +909,12 @@ fn walk_one_region(
                     TExpr::Input(idx) => *idx,
                     _ => break,
                 };
-                let list_slot = match inputs.get(list_idx) {
-                    Some(InSlot::Loc(id)) => *id,
+                let (list_slot, list_name) = match inputs.get(list_idx) {
+                    Some(InSlot::Loc(id)) => (*id, String::new()),
+                    Some(InSlot::Glob(name)) => (usize::MAX, name.clone()),
                     _ => break,
                 };
-                let consts = match const_list_of(p, list_slot, i) {
+                let consts = match const_list_of(p, list_slot, &list_name, i) {
                     Some(c) => c,
                     None => break,
                 };
@@ -912,7 +937,8 @@ fn walk_one_region(
                 }
                 inputs[list_idx] = InSlot::Phantom;
                 stack.push(V::E(acc));
-                i += 2; // skip PushAddr + op_vfold
+                // skip PushAddr (+ Flush when present) + op_vfold
+                i += if matches!(p.ins.get(i + 1), Some(Ins::Flush)) { 3 } else { 2 };
                 if stack.is_empty() {
                     clean = Some((i, inputs.clone(), written.clone(), ops, locals.clone(), final_out.clone()));
                 }
@@ -931,15 +957,6 @@ fn walk_one_region(
             }
             Ins::PushI(v) => {
                 stack.push(V::E(TExpr::Const(*v as f64)));
-                stop = false;
-            }
-            Ins::GetV(v) => {
-                let slot = InSlot::Glob(v.clone());
-                let idx = inputs.iter().position(|s| *s == slot).unwrap_or_else(|| {
-                    inputs.push(slot);
-                    inputs.len() - 1
-                });
-                stack.push(V::E(TExpr::Input(idx)));
                 stop = false;
             }
             Ins::LocalGetI(id) => {
@@ -964,6 +981,24 @@ fn walk_one_region(
                 match locals.get(&slot) {
                     Some(v) => stack.push(v.clone()),
                     None => break, // unresolved named read — don't fuse
+                }
+                stop = false;
+            }
+            Ins::GetV(n) => {
+                let slot = Slot::Name(n.clone());
+                match locals.get(&slot) {
+                    Some(v) => stack.push(v.clone()),
+                    None => {
+                        let islot = InSlot::Glob(n.clone());
+                        let idx = match inputs.iter().position(|s| *s == islot) {
+                            Some(idx) => idx,
+                            None => {
+                                inputs.push(islot);
+                                inputs.len() - 1
+                            }
+                        };
+                        stack.push(V::E(TExpr::Input(idx)));
+                    }
                 }
                 stop = false;
             }
@@ -1021,6 +1056,20 @@ fn walk_one_region(
                     _ => stop = true,
                 }
             }
+            Ins::SetV(n) => {
+                match stack.pop() {
+                    Some(V::E(e)) => {
+                        let slot = Slot::Name(n.clone());
+                        locals.insert(slot.clone(), V::E(e));
+                        if !written.contains(&slot) {
+                            written.push(slot.clone());
+                        }
+                        final_out = Some(slot);
+                        stop = false;
+                    }
+                    _ => stop = true,
+                }
+            }
             _ => stop = true,
         }
         if stop {
@@ -1048,14 +1097,15 @@ fn walk_one_region(
         }
     }
     if std::env::var("NKR_DEBUG_REGION2").is_ok() {
-        eprintln!("[region?] start={} end={} stack={} ops={} inputs={}",
-            start, end_pc, stack.len(), ops, inputs.len());
+        let ctx: Vec<String> = (start..((start+6).min(p.ins.len()))).map(|k| format!("{:?}", p.ins[k])).collect();
+        eprintln!("[region?] start={} end={} stack={} ops={} inputs={} ctx={:?}",
+            start, end_pc, stack.len(), ops, inputs.len(), ctx);
     }
     if end_pc == start || !stack.is_empty() || ops == 0 || inputs.is_empty() {
         return None;
     }
     // the region must end on a local bind (statement boundary after a Set)
-    if !matches!(&p.ins[end_pc - 1], Ins::LocalSetI(_) | Ins::LocalSet(_)) {
+    if !matches!(&p.ins[end_pc - 1], Ins::LocalSetI(_) | Ins::LocalSet(_) | Ins::SetV(_)) {
         return None;
     }
     // live-outs: every slot written in the region that is read at or after
@@ -1074,20 +1124,24 @@ fn walk_one_region(
             }
         }
     }
+    if std::env::var("NKR_DEBUG_REGION2").is_ok() {
+        let lv: Vec<String> = live.iter().map(|x| match x { Slot::Id(i)=>format!("L{}",i), Slot::Name(n)=>format!("S:{}",n) }).collect();
+        eprintln!("[region?] start={} live={:?}", start, lv);
+    }
     if live.is_empty() || live.len() > 4 {
         return None;
     }
-    let mut exprs: Vec<(usize, TExpr)> = Vec::new();
+    let mut exprs: Vec<(OutBind, TExpr)> = Vec::new();
     for slot in &live {
-        let id = match slot {
-            Slot::Id(id) => *id,
-            Slot::Name(_) => return None, // unresolved (label-body) bind — decline
+        let bind = match slot {
+            Slot::Id(id) => OutBind::Local(*id),
+            Slot::Name(n) => OutBind::Shared(n.clone()),
         };
         let e = match locals.get(slot) {
             Some(V::E(e)) => e.clone(),
             _ => return None,
         };
-        exprs.push((id, e));
+        exprs.push((bind, e));
     }
     if !exprs.iter().any(|(_, e)| expr_uses_input(e)) {
         return None;

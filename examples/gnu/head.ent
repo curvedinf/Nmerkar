@@ -2,16 +2,13 @@ import c"printf"(ptr,...)->int
 import c"fprintf"(ptr,ptr,...)->int
 import c"fputc"(int,ptr)->int
 import c"ungetc"(int,ptr)->int
-import c"puts"(ptr)->int
 import c"putchar"(int)->int
 import c"getchar"()->int
 import c"fputs"(ptr,ptr)->int
 import c"fwrite"(ptr,int,int,ptr)->int
-import c"strlen"(ptr)->int
 import c"strcmp"(ptr,ptr)->int
 import c"strncmp"(ptr,ptr,int)->int
 import c"strcpy"(ptr,ptr)->ptr
-import c"strcat"(ptr,ptr)->ptr
 import c"exit"(int)->void
 import c"fread"(ptr,int,int,ptr)->int
 import c"fopen"(ptr,ptr)->ptr
@@ -21,283 +18,267 @@ import c"strstr"(ptr,ptr)->ptr
 extern "stdout"
 extern "stdin"
 extern "stderr"
+0 rv! 0 fr! 0 frv! 0 pt!
+ret
 head_read:
-^v0!
-^v0@ 0 eq 'i1 if
-^fr@ 'c3 'b4 if_else
-^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
+v0!
+v0@ 0 eq 'i1 if
+fr@ 'c2 'b3 if_else
+fr@ rv@ mul frv! 0 fr! ret frv@
 i1:
-_call k2 ^rv! 1 ^fr! 0 ret
-b4:
-_call k5 ^rv! 1 ^fr! 0 ret
-c3:
+_call getchar rv! 1 fr! 0 ret
+b3:
+v0@ _call fgetc rv! 1 fr! 0 ret
+c2:
 0 ret
-k2: ^svst@ ^v0@ append ^svst! _call getchar ^pt! ^svst@ pop ^v0! ret ^pt@
-k5: ^svst@ ^v0@ append ^svst! ^v0@ _call fgetc ^pt! ^svst@ pop ^v0! ret ^pt@
 head_stream:
-^v1!
-^v2!
-^v3!
-0 ^v5!
-0 ^v6!
-'c6 'b7 while
-^fr@ 'c24 'b25 if_else
-^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
-c6:
-^fr@ not 1 and ret
-b7:
-^v3@ 0 eq not 'i8 'e9 if_else
-^fr@ 'c16 'b17 if_else
+v1!
+v2!
+v3!
+0 v5!
+0 v6!
+'c4 'b5 while
+fr@ 'c20 'b21 if_else
+fr@ rv@ mul frv! 0 fr! ret frv@
+c4:
+fr@ not 1 and ret
+b5:
+v3@ 0 eq not 'i6 'e7 if_else
+fr@ 'c14 'b15 if_else
+0 ret
+i6:
+v6@ v2@ lt not 'i8 if
+fr@ 'c9 'b10 if_else
 0 ret
 i8:
-^v6@ ^v2@ lt not 'i10 if
-^fr@ 'c11 'b12 if_else
+0 rv! 1 fr! 0 ret
+e7:
+v5@ v2@ lt not 'i11 if
+fr@ 'c12 'b13 if_else
 0 ret
-i10:
-0 ^rv! 1 ^fr! 0 ret
-e9:
-^v5@ ^v2@ lt not 'i13 if
-^fr@ 'c14 'b15 if_else
+i11:
+0 rv! 1 fr! 0 ret
+b10:
 0 ret
-i13:
-0 ^rv! 1 ^fr! 0 ret
-b12:
+c9:
 0 ret
-c11:
+b13:
+0 ret
+c12:
+0 ret
+b18:
+v4@ _call putchar 
+v6@ pt! v6@ 1 add v6! frv! pt@ 
+v4@ 10 eq 'i19 if
+0 ret
+i19:
+v5@ pt! v5@ 1 add v5! frv! pt@ 
+0 ret
+c17:
 0 ret
 b15:
+v1@ _call head_read v4! 
+v4@ -1 eq 'i16 if
+fr@ 'c17 'b18 if_else
 0 ret
+i16:
+0 rv! 1 fr! 0 ret
 c14:
 0 ret
 b21:
-_call k22 
-^v6@ ^pt! ^v6@ 1 add ^v6! ^pt@ 
-^v4@ 10 eq 'i23 if
-0 ret
-i23:
-^v5@ ^pt! ^v5@ 1 add ^v5! ^pt@ 
-0 ret
+0 rv! 1 fr! 0 ret
 c20:
 0 ret
-b17:
-_call k18 ^v4! 
-^v4@ -1 eq 'i19 if
-^fr@ 'c20 'b21 if_else
-0 ret
-i19:
-0 ^rv! 1 ^fr! 0 ret
-c16:
-0 ret
-b25:
-0 ^rv! 1 ^fr! 0 ret
-c24:
-0 ret
-k18: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! ^svst@ ^v3@ append ^svst! ^v1@ _call head_read ^pt! ^svst@ pop ^v3! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
-k22: ^svst@ ^v1@ append ^svst! ^svst@ ^v2@ append ^svst! ^svst@ ^v3@ append ^svst! ^v4@ _call putchar ^pt! ^svst@ pop ^v3! ^svst@ pop ^v2! ^svst@ pop ^v1! ret ^pt@
 entry:
-list ^svst!
-10 ^v7!
-0 ^v8!
-0 ^v9!
-0 ^v10!
-0 ^v11!
-1 ^v12!
-0 ^v13!
-0 ^v14!
-'c26 'b27 while
-^fr@ 'c43 'b44 if_else
+10 v7!
+0 v8!
+0 v9!
+0 v10!
+0 v11!
+1 v12!
+0 v13!
+0 v14!
+'c22 'b23 while
+fr@ 'c35 'b36 if_else
 0 _call exit
 ret
-c26:
-^fr@ not ^v12@ extern "nkr_argc" load lt and ret
-b27:
-^v12@ 8 mul extern "nkr_argv" load add load ^v15! 
-^v11@ 0 eq 0 ^v15@ "" _call strstr add load 255 and 45 eq mul not not 1 ^v15@ "" _call strstr add load 255 and 0 eq not mul not not 'i28 if
-^fr@ 'c41 'b42 if_else
+c22:
+fr@ not v12@ extern "nkr_argc" load lt and ret
+b23:
+v12@ 8 mul extern "nkr_argv" load add load v15! 
+v11@ 0 eq 0 v15@ "" _call strstr add load 255 and 45 eq mul not not 1 v15@ "" _call strstr add load 255 and 0 eq not mul not not 'i24 if
+fr@ 'c33 'b34 if_else
 0 ret
-i28:
-1 ^v15@ "" _call strstr add load 255 and 110 eq 1 ^v15@ "" _call strstr add load 255 and 99 eq or not not 'i29 if
-1 ^v15@ "" _call strstr add load 255 and 113 eq 'i35 if
-1 ^v15@ "" _call strstr add load 255 and 118 eq 'i36 if
-1 ^v15@ "" _call strstr add load 255 and 45 eq 2 ^v15@ "" _call strstr add load 255 and 0 eq mul not not 'i37 if
-1 ^v15@ "" _call strstr add load 255 and 48 lt not 1 ^v15@ "" _call strstr add load 255 and 57 gt not mul not not 'i38 if
-_call k40 
+i24:
+1 v15@ "" _call strstr add load 255 and 110 eq 1 v15@ "" _call strstr add load 255 and 99 eq or not not 'i25 if
+1 v15@ "" _call strstr add load 255 and 113 eq 'i29 if
+1 v15@ "" _call strstr add load 255 and 118 eq 'i30 if
+1 v15@ "" _call strstr add load 255 and 45 eq 2 v15@ "" _call strstr add load 255 and 0 eq mul not not 'i31 if
+1 v15@ "" _call strstr add load 255 and 48 lt not 1 v15@ "" _call strstr add load 255 and 57 gt not mul not not 'i32 if
+extern "stderr" load "head: invalid option -- %s\n" v15@ 1 add 1 _call fprintf 
 1 _call exit
 0 ret
+i25:
+1 v15@ "" _call strstr add load 255 and 99 eq 'i26 if
+2 v15@ "" _call strstr add load 255 and 0 eq not 'i27 'e28 if_else
+v12@ pt! v12@ 1 add v12! frv! pt@ 
+continue
+0 ret
+i26:
+1 v8! 
+0 ret
+i27:
+v15@ 2 add _call head_num v7! 
+0 ret
+e28:
+v12@ pt! v12@ 1 add v12! frv! pt@ 
+v12@ 8 mul extern "nkr_argv" load add load _call head_num v7! 
+0 ret
 i29:
-1 ^v15@ "" _call strstr add load 255 and 99 eq 'i30 if
-2 ^v15@ "" _call strstr add load 255 and 0 eq not 'i31 'e32 if_else
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
+1 v9! 
+v12@ pt! v12@ 1 add v12! frv! pt@ 
 continue
 0 ret
 i30:
-1 ^v8! 
+1 v10! 
+v12@ pt! v12@ 1 add v12! frv! pt@ 
+continue
 0 ret
 i31:
-_call k33 ^v7! 
-0 ret
-e32:
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
-_call k34 ^v7! 
-0 ret
-i35:
-1 ^v9! 
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
+1 v11! 
+v12@ pt! v12@ 1 add v12! frv! pt@ 
 continue
 0 ret
-i36:
-1 ^v10! 
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
+i32:
+v15@ 1 add _call head_num v7! 
+v12@ pt! v12@ 1 add v12! frv! pt@ 
 continue
 0 ret
-i37:
-1 ^v11! 
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
-continue
+b34:
+v13@ pt! v13@ 1 add v13! frv! pt@ 
+v12@ pt! v12@ 1 add v12! frv! pt@ 
 0 ret
-i38:
-_call k39 ^v7! 
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
-continue
+c33:
 0 ret
-b42:
-^v13@ ^pt! ^v13@ 1 add ^v13! ^pt@ 
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
+b49:
+v16@ v7@ v8@ _call head_stream 
+v16@ _call fclose 
 0 ret
-c41:
+c48:
 0 ret
-b62:
-_call k63 
-_call k64 
+b51:
+v12@ pt! v12@ 1 add v12! frv! pt@ 
 0 ret
-c61:
+c50:
 0 ret
-b66:
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
-0 ret
-c65:
-0 ret
-b68:
-^v13@ 0 eq 'i69 if
+b53:
+v13@ 0 eq 'i54 if
 0 _call exit
 0 ret
-i69:
-^v9@ 0 eq ^v10@ 0 eq not mul not not 'i70 if
-_call k72 
-0 ret
-i70:
-_call k71 
-0 ret
-c67:
-0 ret
-b44:
-1 ^v12! 
-0 ^v11! 
-'c45 'b46 while
-^fr@ 'c67 'b68 if_else
-0 ret
-c45:
-^fr@ not ^v12@ extern "nkr_argc" load lt and ret
-b46:
-^v12@ 8 mul extern "nkr_argv" load add load ^v15! 
-^v11@ 0 eq 0 ^v15@ "" _call strstr add load 255 and 45 eq mul not not 1 ^v15@ "" _call strstr add load 255 and 0 eq not mul not not 'i47 if
-^v9@ 0 eq ^v10@ 0 eq not ^v13@ 1 gt or not not mul not not 'i51 if
-1 ^v14! 
-0 ^v15@ "" _call strstr add load 255 and 45 eq 1 ^v15@ "" _call strstr add load 255 and 0 eq mul not not 'i55 'e56 if_else
-^fr@ 'c65 'b66 if_else
-0 ret
-i47:
-1 ^v15@ "" _call strstr add load 255 and 45 eq 2 ^v15@ "" _call strstr add load 255 and 0 eq mul not not 'i48 if
-1 ^v15@ "" _call strstr add load 255 and 110 eq 1 ^v15@ "" _call strstr add load 255 and 99 eq or not not 'i49 if
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
-continue
-0 ret
-i48:
-1 ^v11! 
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
-continue
-0 ret
-i49:
-2 ^v15@ "" _call strstr add load 255 and 0 eq 'i50 if
-0 ret
-i50:
-^v12@ ^pt! ^v12@ 1 add ^v12! ^pt@ 
-0 ret
-i51:
-^v14@ 0 eq not 'i52 if
-_call k54 
-0 ret
-i52:
-_call k53 
+i54:
+v9@ 0 eq v10@ 0 eq not mul not not 'i55 if
+0 v7@ v8@ _call head_stream 
 0 ret
 i55:
-_call k57 
+"==> standard input <==\n" 0 _call printf 
 0 ret
-e56:
-_call k58 ^v16! 
-^v16@ not 'i59 if
-^fr@ 'c61 'b62 if_else
+c52:
 0 ret
-i59:
-_call k60 
+b36:
+1 v12! 
+0 v11! 
+'c37 'b38 while
+fr@ 'c52 'b53 if_else
+0 ret
+c37:
+fr@ not v12@ extern "nkr_argc" load lt and ret
+b38:
+v12@ 8 mul extern "nkr_argv" load add load v15! 
+v11@ 0 eq 0 v15@ "" _call strstr add load 255 and 45 eq mul not not 1 v15@ "" _call strstr add load 255 and 0 eq not mul not not 'i39 if
+v9@ 0 eq v10@ 0 eq not v13@ 1 gt or not not mul not not 'i43 if
+1 v14! 
+0 v15@ "" _call strstr add load 255 and 45 eq 1 v15@ "" _call strstr add load 255 and 0 eq mul not not 'i45 'e46 if_else
+fr@ 'c50 'b51 if_else
+0 ret
+i39:
+1 v15@ "" _call strstr add load 255 and 45 eq 2 v15@ "" _call strstr add load 255 and 0 eq mul not not 'i40 if
+1 v15@ "" _call strstr add load 255 and 110 eq 1 v15@ "" _call strstr add load 255 and 99 eq or not not 'i41 if
+v12@ pt! v12@ 1 add v12! frv! pt@ 
+continue
+0 ret
+i40:
+1 v11! 
+v12@ pt! v12@ 1 add v12! frv! pt@ 
+continue
+0 ret
+i41:
+2 v15@ "" _call strstr add load 255 and 0 eq 'i42 if
+0 ret
+i42:
+v12@ pt! v12@ 1 add v12! frv! pt@ 
+0 ret
+i43:
+v14@ 0 eq not 'i44 if
+"==> %s <==\n" v15@ 1 _call printf 
+0 ret
+i44:
+10 _call putchar 
+0 ret
+i45:
+0 v7@ v8@ _call head_stream 
+0 ret
+e46:
+v15@ "r" _call fopen v16! 
+v16@ not 'i47 if
+fr@ 'c48 'b49 if_else
+0 ret
+i47:
+extern "stderr" load "head: cannot open %s\n" v15@ 1 _call fprintf 
 1 _call exit
 0 ret
-c43:
+c35:
 0 ret
-k33: ^v15@ 2 add _call head_num ^pt! ret ^pt@
-k34: ^v12@ 8 mul extern "nkr_argv" load add load _call head_num ^pt! ret ^pt@
-k39: ^v15@ 1 add _call head_num ^pt! ret ^pt@
-k40: extern "stderr" load "head: invalid option -- %s\n" ^v15@ 1 add 1 _call fprintf ^pt! ret ^pt@
-k53: 10 _call putchar ^pt! ret ^pt@
-k54: "==> %s <==\n" ^v15@ 1 _call printf ^pt! ret ^pt@
-k57: 0 ^v7@ ^v8@ _call head_stream ^pt! ret ^pt@
-k58: ^v15@ "r" _call fopen ^pt! ret ^pt@
-k60: extern "stderr" load "head: cannot open %s\n" ^v15@ 1 _call fprintf ^pt! ret ^pt@
-k63: ^v16@ ^v7@ ^v8@ _call head_stream ^pt! ret ^pt@
-k64: ^v16@ _call fclose ^pt! ret ^pt@
-k71: "==> standard input <==\n" 0 _call printf ^pt! ret ^pt@
-k72: 0 ^v7@ ^v8@ _call head_stream ^pt! ret ^pt@
 head_num:
-^v17!
-1 ^v18!
-0 ^v19!
-0 ^v20!
-1 ^v21!
-0 ^v17@ "" _call strstr add load 255 and 45 eq 'i73 'e74 if_else
-^v19@ ^v17@ "" _call strstr add load 255 and ^v22! 
-'c76 'b77 while
-^v22@ 98 eq 'i78 if
-^v22@ 75 eq ^v22@ 107 eq or not not 'i79 if
-^v22@ 77 eq 'i80 if
-^v22@ 71 eq 'i81 if
-^v18@ ^v20@ mul ^v21@ mul ^rv! 1 ^fr!
-^fr@ ^rv@ mul ^frv! 0 ^fr! ret ^frv@
-i73:
-0 1 sub ^v18! 
-1 ^v19! 
+v17!
+1 v18!
+0 v19!
+0 v20!
+1 v21!
+0 v17@ "" _call strstr add load 255 and 45 eq 'i56 'e57 if_else
+v19@ v17@ "" _call strstr add load 255 and v22! 
+'c59 'b60 while
+v22@ 98 eq 'i61 if
+v22@ 75 eq v22@ 107 eq or not not 'i62 if
+v22@ 77 eq 'i63 if
+v22@ 71 eq 'i64 if
+v18@ v20@ mul v21@ mul rv! 1 fr!
+fr@ rv@ mul frv! 0 fr! ret frv@
+i56:
+0 1 sub v18! 
+1 v19! 
 0 ret
-e74:
-0 ^v17@ "" _call strstr add load 255 and 43 eq 'i75 if
+e57:
+0 v17@ "" _call strstr add load 255 and 43 eq 'i58 if
 0 ret
-i75:
-1 ^v19! 
+i58:
+1 v19! 
 0 ret
-c76:
-^fr@ not ^v22@ 48 lt not ^v22@ 57 gt not mul not not and ret
-b77:
-^v20@ 10 mul ^v22@ 48 sub add ^v20! 
-^v19@ ^pt! ^v19@ 1 add ^v19! ^pt@ 
-^v19@ ^v17@ "" _call strstr add load 255 and ^v22! 
+c59:
+fr@ not v22@ 48 lt not v22@ 57 gt not mul not not and ret
+b60:
+v20@ 10 mul v22@ 48 sub add v20! 
+v19@ pt! v19@ 1 add v19! frv! pt@ 
+v19@ v17@ "" _call strstr add load 255 and v22! 
 0 ret
-i78:
-512 ^v21! 
+i61:
+512 v21! 
 0 ret
-i79:
-1024 ^v21! 
+i62:
+1024 v21! 
 0 ret
-i80:
-1048576 ^v21! 
+i63:
+1048576 v21! 
 0 ret
-i81:
-1073741824 ^v21! 
+i64:
+1073741824 v21! 
 0 ret

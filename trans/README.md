@@ -31,7 +31,7 @@ shape checks). `bash run_tests.sh` runs the behavioral suite.
 
 Three gated pathways:
 
-`bash run_tests.sh` → `pass=22 fail=0` (per-operation + coreutils round-trips):
+`bash run_tests.sh` → `pass=23 fail=0` (per-operation + coreutils round-trips):
 
 - **Round-trips** (`tests/*.c`): C → trans → nkr → run, compared against
   system binaries (`echo`, `false`, `true`, `wc`, `yes`) or expected-output
@@ -85,9 +85,21 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
   `__byte(p)` (first byte of `p`), `NULL` (0), `EOF` (-1).
 - Comments (`/* ... */`, `//`) and blank lines are fine; preprocessor lines
   (`#include` etc.) are skipped. Call libc directly; the emitted preamble
-  always IMPORTs `printf malloc free puts putchar getchar fputs fwrite
-  strlen strcmp strncmp strcpy strcat exit fopen fclose fgetc strstr` and
-  declares `extern "stdout"`.
+  always IMPORTs `printf fprintf fputc ungetc putchar getchar fputs fwrite
+  fread strcmp strncmp strcpy exit fopen fclose fgetc strstr` and declares
+  `extern "stdout" "stdin" "stderr"`.
+- **Native mappings** — these libc calls compile to Enmerkar ops instead of
+  FFI imports (no libc symbol, works under any sandbox policy):
+  `malloc(n)`→`malloc`, `free(p)`→`free`, `strlen(s)`→`length`,
+  `strcat(a,b)`→`concat` (returns a NEW string; the C destination is not
+  mutated — use the return value), `puts(s)`→`print` + newline (a `0`
+  stands in for the C return value). `strstr` stays imported: the generated
+  `p[i]` byte-index idiom uses it to obtain a string's raw data pointer
+  (there is no native pointer-extraction op). Streaming stdio
+  (`fopen/fread/fprintf/...`) has no native equivalent — `read_file`/
+  `write_file` are whole-file and die on error, which would change tool
+  behavior (exact "No such file" diagnostics, streaming of unseekable
+  input), so those remain FFI.
 - `return expr;` in `main` becomes the process exit code (`_call exit`).
 
 ## Deliberate omissions (parse-time or run-time errors)
@@ -105,32 +117,41 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
 - `&&`/`||` do not short-circuit: both sides are evaluated (normalized via
   `not not` then combined). Guard out-of-bounds dereferences with nested
   `if`s.
-- Recursion works: parameter slots are saved and restored around every call
-  via generated `kN` wrapper labels (variables are still globals — a
-  recursive callee's *non-parameter* locals can still collide with the
-  caller's if the caller reads them after the call; parameters are
-  protected).
+- Recursion works: every `_call` entry gets a fresh local frame, so a
+  callee (recursive or not) cannot clobber the caller's slots.
 
 ## Emission model
 
-- Every C variable is a unique global slot `vN` (never reused), tracked
-  per function; `main` becomes the `entry:` label.
+- A top-level register prologue `0 rv! 0 fr! 0 frv! 0 pt! ret` declares the
+  four cross-body registers shared (v14: plain names assigned in several
+  label bodies must be shared). `rv`/`fr` carry the early-return value and
+  flag, `frv` is the epilogue temp, `pt` holds call results and inc/dec
+  temps.
+- Every C variable is a unique local slot `vN` (never reused), local to the
+  function's body (construct labels merge into that body); `main` becomes
+  the `entry:` label.
 - Control flow emits `if`/`if_else`/`while` with quotation labels whose
   bodies are defined after the function body; nested construct labels
   follow their enclosing body's `ret`.
-- Early `return` inside control flow binds `^rv`, sets `^fr`, and the
+- Early `return` inside control flow binds `rv`, sets `fr`, and the
   remaining statements of the enclosing list are wrapped behind
-  `^fr@ 'c 'b if_else` (guard labels hoisted to function end); loop
-  conditions are `^fr@`-guarded so loops exit; each function epilogue
-  returns `^fr@ ^rv@ mul` (the early value when flagged, else 0) and
+  `fr@ 'c 'b if_else` (guard labels hoisted to function end); loop
+  conditions are `fr@`-guarded so loops exit; each function epilogue
+  returns `fr@ rv@ mul` (the early value when flagged, else 0) and
   resets the flag. Dead code after a top-level `return` is dropped.
-- Each call site emits `_call kN`; the `kN` wrapper label saves the
-  caller's parameter slots on `^svst`, evaluates arguments, calls, and
-  restores — recursion-correct and vararg-safe (exactly one value left on
-  the stack). Wrappers are hoisted after all construct labels so
-  Enmerkar's linear break/continue validation keeps `break` inside its
-  loop's textual region.
+- Calls are direct: arguments evaluate inline in the caller's body, then
+  `_call name`. The callee's parameter binds pop the arguments, its `ret`
+  drains the data stack and leaves the single return value — vararg
+  counts (`printf`/`fprintf`) are pushed after the arguments. No
+  save/restore wrapper is needed: callee frames are fresh (v14), and
+  argument residue below the vararg window is impossible because local
+  stores' pass-through cells stay under the argument values.
 - A `for` post-expression becomes an `nN` label invoked by the loop body
-  tail and by `continue` (`_call nN continue`), so `continue` still
-  increments. `do-while` uses a `dfN` first-pass flag because `'c 'b
-  while` tests before the first body run.
+  tail and by `continue` (`1 'nN if continue` — a quotation jump, same
+  frame, so the post's slot writes land in the loop's locals; a `_call`
+  would push a fresh frame and lose them). `do-while` uses a `dfN`
+  first-pass flag because `'c 'b while` tests before the first body run.
+- Post-`++`/`--` emits `x@ pt! x@ 1 add x! frv! pt@` — net exactly one
+  cell (the old value): the increment's pass-through residue is sunk into
+  `frv` (free outside the epilogue) so it cannot leak between a vararg
+  format string and its arguments.

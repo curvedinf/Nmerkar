@@ -1,0 +1,6 @@
+_call strlen
+_call strcat
+_call puts
+import c"strlen"
+import c"strcat"
+import c"puts"

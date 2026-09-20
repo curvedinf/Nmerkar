@@ -364,6 +364,9 @@ pub fn emit_range(
     let mut lit_starts: Vec<usize> = Vec::new();
     for (i, ins) in p.ins.iter().enumerate().take(end).skip(start) {
         let mut e = String::new();
+        if std::env::var("NKR_DEBUG_EMIT").is_ok() && prefix.starts_with("F54") {
+            eprintln!("[emit {}] {:?}", i, ins);
+        }
         if i > start && targets.contains(&i) {
             vdiscard(&mut e, &mut vstack, &mut vcache);
         }
@@ -405,7 +408,7 @@ pub fn emit_range(
                             e.push_str(&format!("cx->locals[cx->local_base+{}]", id));
                         }
                         crate::compute::RegionInput::Global(name) => {
-                            e.push_str(&format!("var_{}", name));
+                            e.push_str(&format!("uf_sh_get(&var_{})", name));
                         }
                     }
                 }
@@ -456,11 +459,21 @@ pub fn emit_range(
                 }
                 e.push_str("_fz=1;}}\n");
                 e.push_str("if(_fz){");
-                for (j, id) in rg.out_locals.iter().enumerate() {
-                    e.push_str(&format!(
-                        "cx->locals[cx->local_base+{}]=_ro[{}];",
-                        id, j
-                    ));
+                for (j, bind) in rg.out_locals.iter().enumerate() {
+                    match bind {
+                        crate::compute::OutBind::Local(id) => {
+                            e.push_str(&format!(
+                                "cx->locals[cx->local_base+{}]=_ro[{}];",
+                                id, j
+                            ));
+                        }
+                        crate::compute::OutBind::Shared(name) => {
+                            e.push_str(&format!(
+                                "uf_sh_set(&var_{},_ro[{}]);",
+                                name, j
+                            ));
+                        }
+                    }
                 }
                 e.push_str(&format!("goto {};}}}}\n", plab(prefix, rg.end_pc)));
                 // leave the block in `e`: the head instruction's normal
@@ -969,12 +982,14 @@ pub fn emit_range(
             Ins::Call(l) => {
                 vflush(&mut e, &mut vstack, &mut vcache);
                 // Outlined bodies run as separate C functions; the body computes
-                // its own drain target (_osp) from its declared arity.
+                // its own drain target (_osp) from its declared arity. The frame
+                // bump is passed in (v14: past the caller's live slots).
                 if let Some(&(bs, _be)) = outlined_bodies.get(&i) {
                     if UF_DEBUG.load(Ordering::Relaxed) {
                         e.push_str(&format!("cx->call_pcs[cx->call_csp++]={};", bs));
                     }
-                    e.push_str(&format!("uf_ob_{}(cx);\n", bs));
+                    let caller_n = p.local_counts.get(&ins_body[i]).copied().unwrap_or(0);
+                    e.push_str(&format!("uf_ob_{}(cx,{});\n", bs, caller_n));
                     o.push_str(&e);
                     continue;
                 }
@@ -982,14 +997,18 @@ pub fn emit_range(
                 // arguments (clamped to 0). The callee's RET restores sp to
                 // this value and pushes the single return value, so the call
                 // boundary is self-contained (stack draining).
+                // v14: the callee frame is pushed past the CALLER's live
+                // slots (its body's local count), not by the callee's own
+                // count — the old bump let small callees alias the caller's
+                // locals (v13's documented "callee-frame overlap").
                 let target_pc = resolve(l);
                 let arity = p.label_params.get(&target_pc).map(|v| v.len()).unwrap_or(0);
-                let lc = p.local_counts.get(&target_pc).copied().unwrap_or(0);
+                let caller_n = p.local_counts.get(&ins_body[i]).copied().unwrap_or(0);
                 let call_pc_push = if UF_DEBUG.load(Ordering::Relaxed) { format!("cx->call_pcs[cx->call_csp++]={};", target_pc) } else { String::new() };
                 let call_pc_pop = if UF_DEBUG.load(Ordering::Relaxed) { "cx->call_csp--;".to_string() } else { String::new() };
                 e.push_str(&format!(
                     "cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+={};{}uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto L_{};K_{}{}:;cx->local_base=cx->local_frames[--cx->local_fsp];{}\n",
-                    lc,
+                    caller_n,
                     call_pc_push,
                     prefix,
                     i,
@@ -1096,10 +1115,39 @@ pub fn emit_range(
                         _ => 0,
                     }
                 } else { 0 };
-                e.push_str(&format!(
-                    "{{const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *b;K_{}{}:;}}}}\n",
-                    prefix, i, if_arity, if_arity, prefix, i
-                ))
+                // v13.2: tail-position if — when everything between this if
+                // and the enclosing body's `ret` is just the ret value, the
+                // branch target's `ret` RETURNS FROM THE LABEL instead of
+                // resuming after the if (early-return idiom):
+                //     cond 'go if / X ret / go: ... ret
+                // Not-taken falls through to `X ret`; taken runs `go`, whose
+                // ret pops the label's call continuation. Without this the
+                // taken path would resume at K and unconditionally run
+                // `X ret`, clobbering the target's value. Only in REAL bodies
+                // (top level or outlined functions): inside inlined loop
+                // bodies a target's `ret` means "continue the loop", and the
+                // resume-after-if semantics must stand.
+                let mut tail_if = false;
+                if prefix.is_empty() || prefix.starts_with("OB") {
+                    let mut j = i + 1;
+                    while j < p.ins.len() {
+                        match &p.ins[j] {
+                            Ins::Flush | Ins::PushI(_) | Ins::PushF(_) | Ins::LocalGetI(_) | Ins::LocalGet(_) | Ins::GetV(_) => { j += 1; }
+                            Ins::Ret => { tail_if = true; break; }
+                            _ => break,
+                        }
+                    }
+                }
+                if tail_if {
+                    e.push_str(&format!(
+                        "{{const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c))goto *b;}}\n"
+                    ));
+                } else {
+                    e.push_str(&format!(
+                        "{{const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *b;K_{}{}:;}}}}\n",
+                        prefix, i, if_arity, if_arity, prefix, i
+                    ))
+                }
             }
             Ins::IfElse => {
                 vflush(&mut e, &mut vstack, &mut vcache);
@@ -1166,13 +1214,17 @@ pub fn emit_range(
                         // and be written back once at loop exit.
                         let mut reg: HashMap<usize, (String, VType)> = HashMap::new();
                         {
+                            let mut esc_why = String::new();
                             let escapable = UF_DEBUG.load(Ordering::Relaxed) || (cbs..cbe_trim).chain(bbs..bbe_trim).any(|k| match &p.ins[k] {
                                 Ins::Break | Ins::Cont | Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
                                 Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While | Ins::For |
-                                Ins::If | Ins::IfElse | Ins::PushAddr(_) => true,
-                                Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
+                                Ins::If | Ins::IfElse | Ins::PushAddr(_) => { esc_why = format!("{:?}", p.ins[k]); true }
+                                Ins::Simple(h) if *h == "op_ffold" || *h == "op_fsplit" => { esc_why = h.to_string(); true }
                                 _ => false,
                             });
+                            if std::env::var("NKR_DEBUG_REG").is_ok() {
+                                eprintln!("[reg] while@{} esc={} why={} range={}..{}+{}..{}", i, escapable, esc_why, cbs, cbe_trim, bbs, bbe_trim);
+                            }
                             if !escapable {
                                 for k in (cbs..cbe_trim).chain(bbs..bbe_trim) {
                                     let id = match &p.ins[k] {
@@ -1182,6 +1234,10 @@ pub fn emit_range(
                                     if reg.contains_key(&id) { continue; }
                                     let key = ins_body[k] * 1000000 + id;
                                     let ty = local_types.get(&key).copied().unwrap_or(VType::Unknown);
+                                    let num = numeric.contains(&key);
+                                    if std::env::var("NKR_DEBUG_REG").is_ok() {
+                                        eprintln!("[reg]   id={} key={} ty={:?} numeric={}", id, key, ty, num);
+                                    }
                                     if ty == VType::Int || ty == VType::Float {
                                         reg.insert(id, (format!("_r{}", id), ty));
                                     } else if numeric.contains(&key) {
@@ -1363,43 +1419,49 @@ pub fn emit_range(
                 } else {
                     vpop(&mut e, &mut vstack, &mut vtmp)
                 };
-                // Wrap typed values into Cell for global storage. A bare
-                // var-read operand must be snapshotted into a C temp before
-                // caching: caching the variable reference would alias it, and
-                // a later rebind of that variable would silently change this
-                // one through the cache.
-                let cell_expr = if t.ty == VType::Unknown && t.expr.starts_with("var_") {
-                    let tmp = format!("t{}", vtmp);
-                    vtmp += 1;
-                    e.push_str(&format!("Cell {}={};", tmp, t.expr));
-                    tmp
-                } else {
-                    match t.ty {
-                        VType::Unknown | VType::FloatArr => t.expr.clone(),
-                        VType::Float => format!("uf_mkf({})", t.expr),
-                        VType::Int => format!("uf_mki({})", t.expr),
-                    }
+                // v14: shared writes are atomic and write-through (never
+                // cached — another thread may write between statements).
+                let cell_expr = match t.ty {
+                    VType::Unknown | VType::FloatArr => t.expr.clone(),
+                    VType::Float => format!("uf_mkf({})", t.expr),
+                    VType::Int => format!("uf_mki({})", t.expr),
                 };
-                if let Some(ent) = vcache.iter_mut().find(|(n, _, _)| n == v) {
-                    ent.1 = cell_expr;
-                    ent.2 = true;
-                } else {
-                    vcache.push((v.clone(), cell_expr, true));
-                }
-                // v12: assignment is pass-through; leave value on stack
-                // (param binds consume their cell and are not pass-through)
-                if !is_param_bind {
-                    vstack.push(t);
-                }
+                let tmp = format!("t{}", vtmp);
+                vtmp += 1;
+                e.push_str(&format!(
+                    "Cell {}={};uf_sh_set(&var_{},{});",
+                    tmp, cell_expr, v, tmp
+                ));
+                // v14: shared stores CONSUME their value (not pass-through).
+                // Atomic-cell writes are not free-floating stack values:
+                // leaving them on the vstack let the next op (notably
+                // AtomicAdd's delta pop) consume a stale cell, corrupting
+                // RMW chains. Param binds also consume.
+                let _ = is_param_bind;
             }
             Ins::GetV(v) => {
-                if let Some((_, t, _)) = vcache.iter().find(|(n, _, _)| n == v) {
-                    let t = t.clone();
-                    vstack.push(VEntry { expr: t, ty: VType::Unknown });
+                // v14: shared vars are seqlocked and NEVER cached — every
+                // read is an atomic snapshot (threads may write between any
+                // two statements).
+                vpush_cell(&mut e, &mut vstack, &mut vtmp, &format!("uf_sh_get(&var_{})", v));
+            }
+            Ins::AtomicAdd(v, inc) => {
+                vflush(&mut e, &mut vstack, &mut vcache);
+                if *inc {
+                    e.push_str(&format!(
+                        "uf_cur_op=\"atomic_add\";{{Cell _n=uf_sh_add1(&var_{});pushc(cx,_n);}}\n",
+                        v
+                    ));
                 } else {
-                    vpush_cell(&mut e, &mut vstack, &mut vtmp, &format!("var_{}", v));
-                    vcache.push((v.clone(), format!("var_{}", v), false));
+                    e.push_str(&format!(
+                        "uf_cur_op=\"atomic_add\";{{Cell _d=pop(cx);Cell _n=uf_sh_add(&var_{},_d);pushc(cx,_n);}}\n",
+                        v
+                    ));
                 }
+            }
+            Ins::Nop => {}
+            Ins::IncLocal(_) | Ins::AddLocal(_) | Ins::IncGlobal(_) | Ins::AddGlobal(_) => {
+                unreachable!("RMW placeholders are expanded by the parse scope pass")
             }
             Ins::LocalSetI(id) => {
                 // v13: param pops (instruction pcs recorded by the parser) pop
@@ -1603,7 +1665,7 @@ pub fn emit_range(
                 }
                 e.push_str(&format!("uf_weave(cx,uf_wt,{},nkr_run);\n", n));
                 for (k, t) in tasks.iter().enumerate() {
-                    e.push_str(&format!("var_{}=uf_wt[{}].result;\n", t.name, k));
+                    e.push_str(&format!("uf_sh_set(&var_{},uf_wt[{}].result);\n", t.name, k));
                 }
                 e.push_str(&format!("pushc(cx,uf_wt[{}].result);\n", n - 1));
                 e.push_str("}\n");
@@ -1799,6 +1861,12 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
             }
         }
     }
+    // v14: shared-variable types. SetV stores record evidence, GetV reads
+    // push the committed type — without this, every shared read is Unknown
+    // and call sites degrade callee parameter inference (v13 typed these as
+    // top-level local reads).
+    let mut shared_types: HashMap<String, VType> = HashMap::new();
+    let mut shared_conflicted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut changed_outer = true;
     let mut outer_iter = 0;
     while changed_outer && outer_iter < 10 {
@@ -1814,6 +1882,10 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                 }
             }
         }
+        // Shared-var evidence accumulates across the inner rounds (GetV
+        // pushes refine as shared types commit); committed in the outer tail.
+        let mut shared_ev: HashMap<String, Vec<VType>> = HashMap::new();
+        let mut shared_poison: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Caller stack snapshots at each CALL (target body pc, stack before
         // the call) and per-body stacks at each RET — recorded during the
         // last inner pass and consumed below.
@@ -1882,6 +1954,18 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                     } else if matches!(*h, "op_atof") {
                         type_stack.pop();
                         type_stack.push((VType::Float, false));
+                    } else if matches!(*h, "op_arr"|"op_tensor") {
+                        // _array/_tensor <ty>: pops [len_or_list, type-id];
+                        // the type-id immediate says the element type (0=int,
+                        // 1=float) — a float array is a FloatArr handle
+                        type_stack.pop(); // type id
+                        type_stack.pop(); // length or list
+                        let ety_float = i >= 1 && matches!(&p.ins[i - 1], Ins::PushI(1));
+                        if ety_float {
+                            type_stack.push((VType::FloatArr, false));
+                        } else {
+                            type_stack.push((VType::Unknown, true));
+                        }
                     } else if matches!(*h, "op_get") {
                         type_stack.pop(); type_stack.pop();
                         type_stack.push((VType::Unknown, true));
@@ -1925,14 +2009,19 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                         Some((t, opq)) => {
                             if t != VType::Unknown {
                                 records.entry(*id).or_default().push(t);
-                            } else {
-                                // v13.1: an Unknown-typed store must block
-                                // committing a concrete type to this slot —
-                                // polymorphic arithmetic may store array or
-                                // matrix handles where a scalar was inferred.
+                            } else if opq {
+                                // Opaque Unknown store (globals/externs/
+                                // unseeded params/underflow): must block
+                                // committing a concrete type — polymorphic
+                                // arithmetic may store array or matrix
+                                // handles where a scalar was inferred.
                                 poisoned.insert(*id);
                             }
-                            let _ = opq;
+                            // Non-opaque Unknown (e.g. a slot's own
+                            // uncommitted read feeding back through `x@ …
+                            // x!`): record nothing and let the fixed point
+                            // retry once the slot commits — otherwise
+                            // self-feeding counters can never converge.
                         }
                     }
                 }
@@ -1945,8 +2034,30 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                         type_stack.push((ty, false));
                     }
                 }
-                Ins::SetV(_) => { type_stack.pop(); }
-                Ins::GetV(_) => { type_stack.push((VType::Unknown, true)); }
+                Ins::SetV(name) => {
+                    match type_stack.pop() {
+                        Some((t, opq)) => {
+                            if t != VType::Unknown {
+                                shared_ev.entry(name.clone()).or_default().push(t);
+                            } else if opq {
+                                shared_poison.insert(name.clone());
+                            }
+                            // non-opaque Unknown: shared read feeding back —
+                            // retry after the shared type commits
+                        }
+                        None => { shared_poison.insert(name.clone()); }
+                    }
+                }
+                Ins::GetV(name) => {
+                    if let Some(&t) = shared_types.get(name) {
+                        type_stack.push((t, false));
+                    } else {
+                        type_stack.push((VType::Unknown, false));
+                    }
+                }
+                Ins::AtomicAdd(_, _) => { type_stack.pop(); type_stack.push((VType::Unknown, true)); }
+                Ins::Nop => {}
+                Ins::IncLocal(_) | Ins::AddLocal(_) | Ins::IncGlobal(_) | Ins::AddGlobal(_) => {}
                 Ins::Ret => {
                     // v13: a body leaves exactly one return value — the top of
                     // the stack (or null), or a fresh list when several values
@@ -2106,6 +2217,53 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                 changed_outer = true;
             }
         }
+        // Commit shared-var types: same rules as slots — all stores must
+        // agree on a provable type; opaque stores block; numeric mixes
+        // promote to Float; conflicts stay Unknown permanently.
+        {
+            let mut names: std::collections::HashSet<String> =
+                shared_ev.keys().cloned().collect();
+            names.extend(shared_conflicted.iter().cloned());
+            for name in names {
+                if shared_conflicted.contains(&name) { continue; }
+                let known = shared_ev.get(&name).cloned().unwrap_or_default();
+                if known.is_empty() { continue; }
+                let all_numeric = known.iter().all(|&t| t == VType::Int || t == VType::Float);
+                if !all_numeric && known.iter().any(|&t| t != known[0]) {
+                    shared_conflicted.insert(name.clone());
+                    if shared_types.get(&name) != Some(&VType::Unknown) {
+                        shared_types.insert(name, VType::Unknown);
+                        changed_outer = true;
+                    }
+                    continue;
+                }
+                if shared_poison.contains(&name) { continue; }
+                let resolved = if all_numeric && known.iter().any(|&t| t == VType::Float) {
+                    VType::Float
+                } else {
+                    known[0]
+                };
+                let cur = shared_types.get(&name).copied();
+                let merged = match (cur, resolved) {
+                    (None, _) | (Some(VType::Unknown), _) => Some(resolved),
+                    (Some(a), b) if a == b => Some(a),
+                    (Some(VType::Int), VType::Float) | (Some(VType::Float), VType::Int) => Some(VType::Float),
+                    _ => None,
+                };
+                match merged {
+                    None => {
+                        shared_conflicted.insert(name.clone());
+                        shared_types.insert(name, VType::Unknown);
+                        changed_outer = true;
+                    }
+                    Some(m) if cur == Some(m) => {}
+                    Some(m) => {
+                        shared_types.insert(name, m);
+                        changed_outer = true;
+                    }
+                }
+            }
+        }
         numeric_slots = round_numeric;
     }
 
@@ -2199,14 +2357,14 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
             im.name
         ));
     }
-    // variables
+    // v14 variables: seqlocked shared vars (atomic cross-thread access)
     for v in &p.vars {
-        o.push_str(&format!("static Cell var_{};\n", v));
+        o.push_str(&format!("static UFShVar var_{};\n", v));
     }
-    // GC roots: all variables are precise roots
+    // GC roots: all shared vars are precise roots (collector snapshots each)
     if !p.vars.is_empty() {
         o.push_str(&format!(
-            "static Cell* uf_vroots[] = {{{}}};\n",
+            "static UFShVar* uf_shvars[] = {{{}}};\n",
             p.vars.iter().map(|v| format!("&var_{}", v)).collect::<Vec<_>>().join(",")
         ));
     }
@@ -2274,6 +2432,35 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         *p.labels.get(name).unwrap_or_else(|| panic!("undefined label {}", name))
     };
     o.push_str("\nstatic void nkr_run(Ctx*cx, long pc){\n  uf_current_ctx=cx;\n  if(pc<0){ goto *(void*)uf_entry_addr; }\n  /* v11: set up the entry label's local frame (v13: capacity-checked) */\n  cx->local_frames[cx->local_fsp++]=cx->local_base; cx->local_base+=uf_lc(pc); if(cx->local_base>cx->local_cap)die(\"local frame overflow\");\n");
+    // v14: spawn frame lookup — body address -> frame size (spawned bodies
+    // bind locals; the runtime bumps the callee frame like _call does).
+    // Address-of-label constants only exist inside nkr_run, so the tables
+    // are static locals published through file-scope pointers on entry.
+    {
+        let mut lts = String::from("\nstatic const void* const _slt[] = {");
+        let mut frs = String::from("\nstatic const long _sfr[] = {");
+        let mut first = true;
+        let mut lnames: Vec<(&String, &usize)> = p.labels.iter().collect();
+        lnames.sort_by_key(|(_, &pc)| pc);
+        let no_labels = lnames.is_empty();
+        for (_name, &pc) in lnames {
+            let f = p.local_counts.get(&pc).copied().unwrap_or(0);
+            if !first { lts.push(','); frs.push(','); }
+            first = false;
+            lts.push_str(&format!("&&{}", plab("", pc)));
+            frs.push_str(&format!("{}", f));
+        }
+        if no_labels {
+            lts = String::from("\nstatic const void* const _slt[] = {(void*)0};");
+            frs = String::from("\nstatic const long _sfr[] = {0};");
+        } else {
+            lts.push_str(",(void*)0};");
+            frs.push_str(",0};");
+        }
+        o.push_str(&format!("{}{}\n", lts, frs));
+        o.push_str("uf_spawn_ltab=_slt;uf_spawn_frames=_sfr;\n");
+    }
+
     let n = p.ins.len();
     // Only labels that can be entered dynamically (initial pc, FOR bodies via
     // PushAddr, weave task entries, SEND methods, exports) go into labtab.
@@ -2479,11 +2666,12 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         if outlined_emitted.contains(&bs) { continue; }
         outlined_emitted.insert(bs);
         let fname = format!("uf_ob_{}", bs);
-        let lc = p.local_counts.get(&bs).copied().unwrap_or(0);
         let oarity = p.label_params.get(&bs).map(|v| v.len()).unwrap_or(0);
+        // v14: fb = the caller's live-slot count, passed by the call site —
+        // the frame is pushed past the caller's slots (no callee overlap)
         outlined_fns.push_str(&format!(
-            "static void {}(Ctx*cx){{cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+={};\n",
-            fname, lc
+            "static void {}(Ctx*cx,long fb){{cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+=fb;\n",
+            fname
         ));
         // v13: the outline's own pre-arg data-stack pointer — its RET drains
         // back to it and pushes the return value
@@ -2520,11 +2708,11 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         ));
     }
     let lits_arg = if p.strings.is_empty() { "0,0".to_string() } else { format!("uf_lits,{}", p.strings.len()) };
-    let roots_arg = if p.vars.is_empty() { "0,0".to_string() } else { format!("uf_vroots,{}", p.vars.len()) };
+    let roots_arg = if p.vars.is_empty() { "0,0".to_string() } else { format!("uf_shvars,{}", p.vars.len()) };
     let dbg_init = if debug {
         "uf_debug_mode=1;uf_vnames=uf_vnames_v;uf_init_labnames();uf_init_local_names();"
     } else { "" };
-    o.push_str(&format!("int main(int argc,char**argv){{nkr_argc=argc;nkr_argv=(void*)argv;uf_init_reflection();uf_init_locals();{}uf_init_lits({});uf_gc_setroots({});uf_gc_init();nkr_run(main_cx,0);return 0;}}\n", dbg_init, lits_arg, roots_arg));
+    o.push_str(&format!("int main(int argc,char**argv){{nkr_argc=argc;nkr_argv=(void*)argv;uf_init_reflection();uf_init_locals();{}uf_init_lits({});uf_gc_setshared({});uf_gc_init();nkr_run(main_cx,0);return 0;}}\n", dbg_init, lits_arg, roots_arg));
     o
 }
 

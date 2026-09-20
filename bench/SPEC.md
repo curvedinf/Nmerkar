@@ -184,6 +184,45 @@ the concatenated `[d1 d2]` vector and splits the result (identical doubles,
 same op order per element — outputs stay bit-identical while the 19
 coefficients appear once in source).
 
+### 7. N-Queens (`nqueens`)
+
+**Input:** N from argv[1] (default 11). Pinned algorithm: iterative
+backtracking with an explicit stack — `cols[r]` is the placed column of row
+r, `nxt[r]` the next column to try after backtracking into row r. Candidate
+(r, c) conflicts with row i < r when `cols[i] == c` or `|cols[i]-c| == |r-i|`
+(expressed as the two signed tests `(ci-c)==(i-r)` / `(ci-c)==(r-i)` so no
+`abs` op is needed). Reaching depth N counts one solution.
+
+**Output format:**
+```
+solutions: <count>
+```
+Known counts for verification: N=8 → 92, N=10 → 724, N=11 → 2680, N=12 → 14200.
+
+Pattern coverage: search/backtracking, nested loops, flag-driven early exit,
+int-array state — no tensors, no GPU offloading (CPU-only group).
+
+### 8. Graph BFS (`bfs`)
+
+**Input:** n from argv[1] (default 1000000). Deterministic graph: node u has
+edges to `(7u+3) mod n` and `(13u+11) mod n`, plus `(u+1) mod n` when
+`u mod 3 == 0`. BFS from node 0 over an adjacency structure of per-node
+neighbor lists; `dist` is an int array initialized to -1; the frontier lives
+in a preallocated int-array queue with head/tail indices.
+
+**Output format (exact integers, identical across languages):**
+```
+reached: <r>
+unreached: <n-r>
+sum_dist: <sum of finite distances>
+max_dist: <max finite distance>
+```
+At n=1M: reached 1000000, sum_dist 15758576, max_dist 21.
+
+Pattern coverage: hash-map construction and lookup, dynamic per-node lists,
+queue mutation, mixed int-array/dict access — a pointer-chasing/dynamic-data
+shape with no elementwise structure to fuse (CPU-only group).
+
 ### CPU-only policy and GPU-on column (v13.1)
 
 The four legacy benchmarks (logextract, analytics, mandelbrot, spectralnorm)
@@ -192,9 +231,10 @@ GPU offloading never contaminates the historical numbers. The **GPU-on column**
 shows the same Enmerkar source under the default `auto` device; other languages
 show `—` (no GPU builds of those programs).
 
-Enmerkar GPU-on entries also pass `--gc-threshold` — multi-MB arrays trip a
-pre-existing GC issue at the default 1MB threshold (present at v13 HEAD,
-unrelated to GPU offloading).
+Enmerkar GPU-on entries also pass `--gc-threshold` — large multi-MB arrays
+collect constantly at the default 1MB threshold, which costs time (the v13.2
+GC fixes made small-threshold runs *correct*; the big thresholds are now
+pure performance).
 
 The non-Enmerkar GPU variants (`*_gpu.{cpp,rs,py,js}`) share `src/_gpu/gpucomp.c`,
 a Vulkan launcher mirroring the nkr runtime (auto device = hardware-first, most

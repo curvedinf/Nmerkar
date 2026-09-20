@@ -81,6 +81,15 @@ def compile_all():
     sn_cpp_bin=BENCH/"src"/"spectralnorm"/"spectralnorm_cpp"
     rc,t,out,err=run_cmd(["g++","-std=c++17","-O2","-o",str(sn_cpp_bin),str(sn_cpp_src)])
     print(f"  C++ spectralnorm: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+    # ---- v13.2 pattern-diverse benchmarks (nqueens, bfs) ----
+    for bn in ("nqueens","bfs"):
+        d=BENCH/"src"/bn
+        rc,t,out,err=run_cmd(["g++","-std=c++17","-O2","-o",str(d/f"{bn}_cpp"),str(d/f"{bn}.cpp")])
+        results[f"cpp_{bn}"]=(rc==0,t)
+        print(f"  C++ {bn}: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+        rc,t,out,err=run_cmd(["rustc","-O","-o",str(d/f"{bn}_rs"),str(d/f"{bn}.rs")])
+        results[f"rs_{bn}"]=(rc==0,t)
+        print(f"  Rust {bn}: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
     # ---- v13.1 GPU-oriented benchmarks (matmul, blackscholes) ----
     for bn in ("matmul","blackscholes"):
         d=BENCH/"src"/bn
@@ -124,7 +133,7 @@ def main():
     print("=== Token Counting (Qwen3-0.6B tokenizer) ===\n")
     # Generate dense .en files from .ent for Enmerkar token counting
     print("=== Generating dense .en files ===\n")
-    bench_names=["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes"]
+    bench_names=["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes","nqueens","bfs"]
     uf_paths={}
     for bn in bench_names:
         uft=BENCH/"src"/bn/f"{bn}.ent"
@@ -143,24 +152,32 @@ def main():
             "analytics":BENCH/"src"/"analytics"/"analytics.py",
             "mandelbrot":BENCH/"src"/"mandelbrot"/"mandelbrot.py",
             "spectralnorm":BENCH/"src"/"spectralnorm"/"spectralnorm.py",
+            "nqueens":BENCH/"src"/"nqueens"/"nqueens.py",
+            "bfs":BENCH/"src"/"bfs"/"bfs.py",
         },
         "Node.js":{
             "logextract":BENCH/"src"/"logextract"/"logextract.js",
             "analytics":BENCH/"src"/"analytics"/"analytics.js",
             "mandelbrot":BENCH/"src"/"mandelbrot"/"mandelbrot.js",
             "spectralnorm":BENCH/"src"/"spectralnorm"/"spectralnorm.js",
+            "nqueens":BENCH/"src"/"nqueens"/"nqueens.js",
+            "bfs":BENCH/"src"/"bfs"/"bfs.js",
         },
         "C++":{
             "logextract":BENCH/"src"/"logextract"/"logextract.cpp",
             "analytics":BENCH/"src"/"analytics"/"analytics.cpp",
             "mandelbrot":BENCH/"src"/"mandelbrot"/"mandelbrot.cpp",
             "spectralnorm":BENCH/"src"/"spectralnorm"/"spectralnorm.cpp",
+            "nqueens":BENCH/"src"/"nqueens"/"nqueens.cpp",
+            "bfs":BENCH/"src"/"bfs"/"bfs.cpp",
         },
         "Rust":{
             "logextract":BENCH/"src"/"logextract"/"logextract.rs",
             "analytics":BENCH/"src"/"analytics"/"analytics.rs",
             "mandelbrot":BENCH/"src"/"mandelbrot"/"mandelbrot.rs",
             "spectralnorm":BENCH/"src"/"spectralnorm"/"spectralnorm.rs",
+            "nqueens":BENCH/"src"/"nqueens"/"nqueens.rs",
+            "bfs":BENCH/"src"/"bfs"/"bfs.rs",
         },
         "Enmerkar":{bn:uf_paths[bn] for bn in bench_names if bn in uf_paths},
     }
@@ -231,6 +248,28 @@ def main():
     sn_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","1000000000",str(sn_nkr_src),"--",str(N_SPECTRAL)],timeout=300))
     sn_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","1000000000",str(sn_nkr_src),"--",str(N_SPECTRAL)],timeout=300))
 
+    # ---- pattern-diverse benchmarks (v13.2) ----
+    N_QUEENS=11
+    print(f"\n=== Performance: N-Queens N={N_QUEENS} (iterative backtracking) ===\n")
+    nq=BENCH/"src"/"nqueens"
+    nq_results=[]
+    nq_results.append(run_benchmark("C++",[str(nq/"nqueens_cpp"),str(N_QUEENS)]))
+    nq_results.append(run_benchmark("Rust",[str(nq/"nqueens_rs"),str(N_QUEENS)]))
+    nq_results.append(run_benchmark("Python",["python3",str(nq/"nqueens.py"),str(N_QUEENS)],timeout=120))
+    nq_results.append(run_benchmark("Node.js",["node",str(nq/"nqueens.js"),str(N_QUEENS)]))
+    nq_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","1000000000",str(nq/"nqueens.ent"),"--",str(N_QUEENS)],timeout=120))
+    nq_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","1000000000",str(nq/"nqueens.ent"),"--",str(N_QUEENS)],timeout=120))
+    N_BFS=1000000
+    print(f"\n=== Performance: BFS n={N_BFS} (graph, dict+queue) ===\n")
+    bf=BENCH/"src"/"bfs"
+    bf_results=[]
+    bf_results.append(run_benchmark("C++",[str(bf/"bfs_cpp"),str(N_BFS)],timeout=120))
+    bf_results.append(run_benchmark("Rust",[str(bf/"bfs_rs"),str(N_BFS)],timeout=120))
+    bf_results.append(run_benchmark("Python",["python3",str(bf/"bfs.py"),str(N_BFS)],timeout=120))
+    bf_results.append(run_benchmark("Node.js",["node",str(bf/"bfs.js"),str(N_BFS)],timeout=120))
+    bf_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","2000000000",str(bf/"bfs.ent"),"--",str(N_BFS)],timeout=240))
+    bf_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","2000000000",str(bf/"bfs.ent"),"--",str(N_BFS)],timeout=240))
+
     # ---- GPU-oriented benchmarks (v13.1): CPU column + GPU-on column ----
     # Enmerkar GPU-on = default auto device (Vulkan). The non-Enmerkar GPU variants
     # use the shared launcher in src/_gpu (see bench/SPEC.md; when its binaries
@@ -271,7 +310,7 @@ def main():
         "tokens":token_data,
         "performance":{"logextract":le_results,"analytics":an_results,
                         "mandelbrot":mb_results,"spectralnorm":sn_results,
-                        "matmul":mm_results,"blackscholes":bs_results},
+                        "matmul":mm_results,"blackscholes":bs_results,"nqueens":nq_results,"bfs":bf_results},
     }
     with open(RESULTS/"benchmark.json","w") as f:
         json.dump(report,f,indent=2)
@@ -282,6 +321,8 @@ def main():
     print(f"{'Language':<10} {'LogExtract':>11} {'Analytics':>11} {'Mandelbrot':>11} {'SpectralNorm':>13} {'Matmul':>11} {'BlackSch':>11}")
     print("-"*82)
     perf_le={r["name"]:r for r in le_results}
+    perf_nq={r["name"]:r for r in nq_results}
+    perf_bf={r["name"]:r for r in bf_results}
     perf_an={r["name"]:r for r in an_results}
     perf_mm={r["name"]:r for r in mm_results}
     perf_bs={r["name"]:r for r in bs_results}
@@ -289,19 +330,19 @@ def main():
         t=d.get(k,{}).get("time_sec","—")
         return f"{t:.3f}s" if isinstance(t,float) else str(t)
     for lang in["Enmerkar","Rust","C++","Python","Node.js"]:
-        print(f"{lang:<10} {fmt(perf_le,lang):>11} {fmt(perf_an,lang):>11} {fmt(perf_mb,lang):>11} {fmt(perf_sn,lang):>13} {fmt(perf_mm,lang):>11} {fmt(perf_bs,lang):>11}")
+        print(f"{lang:<10} {fmt(perf_le,lang):>11} {fmt(perf_an,lang):>11} {fmt(perf_mb,lang):>11} {fmt(perf_sn,lang):>13} {fmt(perf_mm,lang):>11} {fmt(perf_bs,lang):>11} {fmt(perf_nq,lang):>11} {fmt(perf_bf,lang):>11}")
     print()
-    print(f"{'GPU-on':<10} {'LogExtract':>11} {'Analytics':>11} {'Mandelbrot':>11} {'SpectralNorm':>13} {'Matmul':>11} {'BlackSch':>11}")
+    print(f"{'GPU-on':<10} {'LogExtract':>11} {'Analytics':>11} {'Mandelbrot':>11} {'SpectralNorm':>13} {'Matmul':>11} {'BlackSch':>11} {'NQueens':>11} {'BFS':>11}")
     print("-"*82)
-    print(f"{'Enmerkar':<10} {fmt(perf_le,'Enmerkar(GPU-on)'):>11} {fmt(perf_an,'Enmerkar(GPU-on)'):>11} {fmt(perf_mb,'Enmerkar(GPU-on)'):>11} {fmt(perf_sn,'Enmerkar(GPU-on)'):>13} {fmt(perf_mm,'Enmerkar(GPU-on)'):>11} {fmt(perf_bs,'Enmerkar(GPU-on)'):>11}")
+    print(f"{'Enmerkar':<10} {fmt(perf_le,'Enmerkar(GPU-on)'):>11} {fmt(perf_an,'Enmerkar(GPU-on)'):>11} {fmt(perf_mb,'Enmerkar(GPU-on)'):>11} {fmt(perf_sn,'Enmerkar(GPU-on)'):>13} {fmt(perf_mm,'Enmerkar(GPU-on)'):>11} {fmt(perf_bs,'Enmerkar(GPU-on)'):>11} {fmt(perf_nq,'Enmerkar(GPU-on)'):>11} {fmt(perf_bf,'Enmerkar(GPU-on)'):>11}")
     print(f"{'C++':<10} {'—':>11} {'—':>11} {'—':>11} {'—':>13} {fmt(perf_mm,'C++(GPU-on)'):>11} {fmt(perf_bs,'C++(GPU-on)'):>11}")
     print(f"\n{'Token counts':<10} {'LogExtract':>12} {'Analytics':>12} {'Mandelbrot':>12} {'SpectralNorm':>14} {'Matmul':>12} {'BlackSch':>12}")
     print("-"*88)
     for lang in["Enmerkar","Rust","C++","Python","Node.js"]:
         vals=[]
-        for bn in["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes"]:
+        for bn in["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes","nqueens","bfs"]:
             t=token_data.get(lang,{}).get(bn,{}).get("tokens")
             vals.append(f"{t:>12}" if t else f"{'—':>12}")
-        print(f"{lang:<10} {vals[0]} {vals[1]} {vals[2]} {vals[3]:>14} {vals[4]} {vals[5]}")
+        print(f"{lang:<10} {vals[0]} {vals[1]} {vals[2]} {vals[3]:>14} {vals[4]} {vals[5]} {vals[6]} {vals[7]}")
 if __name__=="__main__":
     main()

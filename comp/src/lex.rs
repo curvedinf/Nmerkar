@@ -617,52 +617,12 @@ impl Lexer {
                 out.push(self.lex_lnumber(false));
                 continue;
             }
-            // ---- ^ prefix: global variable (^x! / ^x@) ----
+            // ---- v14: ^ removed — plain names; shared vars are declared by
+            // first top-level assignment and resolved by a compile-time
+            // scope pass (parse). See SPEC.md "Shared variables". ----
             if c == '^' {
                 self.prev_ret = false;
-                self.pos += 1;
-                self.skip_ws();
-                let c2 = match self.peek() {
-                    Some(c) => c,
-                    None => self.err("^ needs a variable name"),
-                };
-                let cp2 = c2 as u32;
-                // v-run name after ^
-                if is_v(cp2) {
-                    let name = self.fold_slots();
-                    self.skip_ws();
-                    let g = self.peek();
-                    if g == Some('!') || g.map_or(false, |c| opcode_index(c) == Some(33)) {
-                        self.pos += 1;
-                        out.push(Tok::SetV(name));
-                    } else if g == Some('@') || g.map_or(false, |c| opcode_index(c) == Some(34)) {
-                        self.pos += 1;
-                        out.push(Tok::GetV(name));
-                    } else {
-                        self.err("^ needs ! or @ after the name");
-                    }
-                    continue;
-                }
-                // ASCII ident after ^ (dense mode with ASCII names)
-                if c2.is_ascii_alphabetic() || c2 == '_' {
-                    let name = self.lex_ident();
-                    if is_bad_ident(&name) {
-                        self.err(&format!("variable '{}' — identifiers may not start with '_'", name));
-                    }
-                    self.skip_ws();
-                    let g = self.peek();
-                    if g == Some('!') || g.map_or(false, |c| opcode_index(c) == Some(33)) {
-                        self.pos += 1;
-                        out.push(Tok::SetV(name));
-                    } else if g == Some('@') || g.map_or(false, |c| opcode_index(c) == Some(34)) {
-                        self.pos += 1;
-                        out.push(Tok::GetV(name));
-                    } else {
-                        self.err("^ needs ! or @ after the name");
-                    }
-                    continue;
-                }
-                self.err("^ needs a variable name");
+                self.err("^ is removed (v14) — use plain names; declare a shared var with a top-level assignment");
             }
             // ---- v-space: variable use or label definition ----
             if is_v(cp) {
@@ -1473,34 +1433,16 @@ impl TextLexer {
                         out.push(Tok::Discard);
                         continue;
                     }
-                    // v11: ^x! = global, x! = local
-                    if let Some(gname) = name.strip_prefix('^') {
-                        if gname.is_empty() {
-                            self.err("variable name is empty");
-                        }
-                        check_ident(gname, "variable");
-                        out.push(Tok::SetV(gname.to_string()));
-                    } else {
-                        check_ident(name, "variable");
-                        out.push(Tok::LocalSet(name.to_string()));
-                    }
+                    check_ident(name, "variable");
+                    out.push(Tok::LocalSet(name.to_string()));
                     continue;
                 }
             }
             if let Some(name) = tok.strip_suffix('@') {
                 if !name.is_empty() && !tok.starts_with('@') {
                     self.pos += 1;
-                    // v11: ^x@ = global, x@ = local
-                    if let Some(gname) = name.strip_prefix('^') {
-                        if gname.is_empty() {
-                            self.err("variable name is empty");
-                        }
-                        check_ident(gname, "variable");
-                        out.push(Tok::GetV(gname.to_string()));
-                    } else {
-                        check_ident(name, "variable");
-                        out.push(Tok::LocalGet(name.to_string()));
-                    }
+                    check_ident(name, "variable");
+                    out.push(Tok::LocalGet(name.to_string()));
                     continue;
                 }
             }
@@ -1508,14 +1450,8 @@ impl TextLexer {
             if let Some(name) = tok.strip_suffix("++") {
                 if !name.is_empty() && !tok.starts_with('+') {
                     self.pos += 1;
-                    if let Some(gname) = name.strip_prefix('^') {
-                        if gname.is_empty() { self.err("variable name is empty"); }
-                        check_ident(gname, "variable");
-                        out.push(Tok::IncGlobal(gname.to_string()));
-                    } else {
-                        check_ident(name, "variable");
-                        out.push(Tok::IncLocal(name.to_string()));
-                    }
+                    check_ident(name, "variable");
+                    out.push(Tok::IncLocal(name.to_string()));
                     continue;
                 }
             }
@@ -1523,14 +1459,8 @@ impl TextLexer {
             if let Some(name) = tok.strip_suffix("+=") {
                 if !name.is_empty() && !tok.starts_with('+') {
                     self.pos += 1;
-                    if let Some(gname) = name.strip_prefix('^') {
-                        if gname.is_empty() { self.err("variable name is empty"); }
-                        check_ident(gname, "variable");
-                        out.push(Tok::AddGlobal(gname.to_string()));
-                    } else {
-                        check_ident(name, "variable");
-                        out.push(Tok::AddLocal(name.to_string()));
-                    }
+                    check_ident(name, "variable");
+                    out.push(Tok::AddLocal(name.to_string()));
                     continue;
                 }
             }

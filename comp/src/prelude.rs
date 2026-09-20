@@ -267,6 +267,61 @@ static void ctx_register(Ctx*c){ pthread_mutex_lock(&uf_gc_mu); int i=uf_nctxs; 
 static void ctx_unregister(Ctx*c){ pthread_mutex_lock(&uf_gc_mu); for(int i=0;i<uf_nctxs;i++) if(uf_ctxs[i]==c){ uf_ctxs[i]=uf_ctxs[uf_nctxs-1]; uf_nctxs--; break; } pthread_mutex_unlock(&uf_gc_mu); }
 /* variable roots, registered by generated code */
 static void uf_gc_setroots(Cell** r, long n){ uf_var_roots=r; uf_nvar_roots=n; }
+
+/* ================= v14 shared variables =================
+   Plain-name vars resolved shared by the compile-time scope pass are stored
+   as SEQLOCKED Cells: every read is a consistent snapshot, every write is
+   atomic, and `x++`/`x+=` compile to a writer-locked read-modify-write.
+   Portable by construction: only C11 <stdatomic.h> atomics — no platform
+   intrinsics, no torn 16-byte Cells, works anywhere the runtime already
+   compiles (same dependency set as the GC's atomics).
+   Memory model: writer lock acquire/release; reader retries on odd/changed
+   sequence. Cross-thread visibility is sequentially consistent enough for
+   the "transparent shared state" contract; racing RMWs serialize on the
+   writer lock, so x+= under concurrency loses no updates. */
+typedef struct UFShVar { _Atomic uint64_t seq; Cell v; } UFShVar;
+static double uf_f(Cell c);
+static Cell uf_mkf(double v);
+static Cell uf_mki(int64_t v);
+static Cell uf_sh_get(UFShVar*s){
+  uint64_t a,b; Cell c;
+  do{
+    a=atomic_load_explicit(&s->seq,memory_order_acquire);
+    if(a&1ULL) continue;                 /* writer in flight */
+    c=s->v;                              /* may tear — validated below */
+    b=atomic_load_explicit(&s->seq,memory_order_acquire);
+  }while(a!=b);
+  return c;
+}
+static void uf_sh_set(UFShVar*s,Cell c){
+  uint64_t exp=atomic_load_explicit(&s->seq,memory_order_relaxed);
+  for(;;){
+    if(exp&1ULL){ exp=atomic_load_explicit(&s->seq,memory_order_relaxed); continue; }
+    if(atomic_compare_exchange_weak_explicit(&s->seq,&exp,exp+1,memory_order_acq_rel,memory_order_acquire)) break;
+  }
+  s->v=c;
+  atomic_store_explicit(&s->seq,exp+2,memory_order_release);
+}
+/* atomic read-modify-write: v = f(v, delta) under the writer lock;
+   numeric add for int/float cells, falls back to overwrite for others */
+static Cell uf_sh_add(UFShVar*s,Cell d){
+  uint64_t exp=atomic_load_explicit(&s->seq,memory_order_relaxed);
+  for(;;){
+    if(exp&1ULL){ exp=atomic_load_explicit(&s->seq,memory_order_relaxed); continue; }
+    if(atomic_compare_exchange_weak_explicit(&s->seq,&exp,exp+1,memory_order_acq_rel,memory_order_acquire)) break;
+  }
+  Cell c=s->v, r;
+  if(c.tag==1||d.tag==1) r=uf_mkf(uf_f(c)+uf_f(d));
+  else r=uf_mki(c.i+d.i);
+  s->v=r;
+  atomic_store_explicit(&s->seq,exp+2,memory_order_release);
+  return r;
+}
+static Cell uf_sh_add1(UFShVar*s){ Cell d; d.tag=0; d.i=1; return uf_sh_add(s,d); }
+/* GC roots for shared vars: snapshot each consistently (collect runs at a
+   safepoint; concurrent writers are mid-seqlock and retry until even) */
+static UFShVar* uf_shvars_tbl[1024]; static long uf_nshvars;
+static void uf_gc_setshared(UFShVar** t, long n){ for(long i=0;i<n&&i<1024;i++) uf_shvars_tbl[i]=t[i]; uf_nshvars=n; }
 /* tmp roots for builder ops (in-progress containers while they grow).
    v13.2: PER-THREAD stacks. The old shared counter broke two ways under
    weave workers: (a) a thread's publish window (counter bumped before the
@@ -326,6 +381,7 @@ static void uf_gc_collect(void){
   uint64_t start_seq = uf_gc_seq;
   /* mark all roots */
   for(long i=0;i<uf_nvar_roots;i++) uf_mark_cell(*uf_var_roots[i]);
+  for(long i=0;i<uf_nshvars;i++) uf_mark_cell(uf_sh_get(uf_shvars_tbl[i]));
   int nc = uf_nctxs;
   for(int i=0;i<nc;i++){ Ctx* c=uf_ctxs[i]; for(long s=0;s<c->sp;s++) uf_mark_cell(c->ds[s]);
     /* v13.2: mark the full locals array, not just [0,local_base). local_base
@@ -2652,7 +2708,10 @@ static void op_vmap(Ctx*cx){
   UF_UNPROTECT(); pushp(cx,r);
 }
 static void op_vfold(Ctx*cx){
-  Cell f=pop(cx),acc=pop(cx),h=pop(cx); Hdr*a=uf_vcheck(h,"VFOLD");
+  Cell f=pop(cx),acc=pop(cx),h=pop(cx);
+  Hdr*a=uf_handle(h,"VFOLD");
+  if(a->tag==HT_DYN){ /* list input: convert to a float tensor once */ Dyn*d=(Dyn*)a; Hdr*t=(Hdr*)uf_gc_alloc(sizeof(Hdr)+d->len*8,0); t->tag=HT_TENSOR; t->len=d->len; t->esz=8; t->ety=1; UF_PROTECT((void**)(void*)&t); for(uint64_t q=0;q<d->len;q++){ ((double*)t->data)[q]=uf_f(d->data[q]); } UF_UNPROTECT(); a=t; }
+  else if(a->tag!=HT_ARR&&a->tag!=HT_TENSOR&&a->tag!=HT_MAT)die("vector op: not an arr");
   for(uint64_t i=0;i<a->len;i++){
     pushc(cx,acc);
     if(a->ety==1)pushf(cx,uf_el(a,i)); else pushi(cx,(int64_t)uf_el(a,i));
@@ -3433,10 +3492,16 @@ static void op_retry(Ctx*cx){
 
 /* ================= detached threads ================= */
 typedef struct { const void* body; Ring* r; } UfSpawn;
+const void* const* uf_spawn_ltab; const long* uf_spawn_frames;
+static long nkr_spawn_frame(const void* body);
 static void* uf_spawn_worker(void* arg){
   UfSpawn* g=(UfSpawn*)arg;
   Ctx* c=ctx_new(1<<16,1<<12);
-  uf_call_addr(c,g->body,0,-1,0);
+  /* v14: spawned bodies may bind locals — the generated code defines
+     uf_spawn_ltab/uf_spawn_frames (address -> frame size); bump the callee
+     frame exactly like _call does. */
+  long f=nkr_spawn_frame(g->body);
+  uf_call_addr(c,g->body,f,-1,0);
   Cell r = c->sp>0 ? c->ds[c->sp-1] : uf_mki(0);
   ring_enq(g->r,r);
   ring_close(g->r);
@@ -3446,6 +3511,11 @@ static void* uf_spawn_worker(void* arg){
 }
 /* SPAWN: body_addr -> chan (cap 1; body's top-of-stack enqueued at end,
    then closed — deq on it is a join) */
+static long nkr_spawn_frame(const void* body){
+  if(!uf_spawn_ltab) return 0;
+  for(long q=0; uf_spawn_ltab[q]; q++){ if(uf_spawn_ltab[q]==body) return uf_spawn_frames[q]; }
+  return 0;
+}
 static void op_spawn(Ctx*cx){
   Cell a=pop(cx);
   Ring* r=uf_ring_new(1);

@@ -33,36 +33,42 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 
 | | Enmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
-| logextract | **321** | 846 | 667 | 329 | 437 |
-| analytics | **362** | 793 | 756 | 366 | 471 |
-| mandelbrot | 205 | **189** | 216 | 163 | 165 |
+| logextract | **310** | 846 | 667 | 329 | 437 |
+| analytics | **336** | 793 | 756 | 366 | 471 |
+| mandelbrot | 205 | 189 | 216 | **163** | 165 |
 | spectralnorm | 406 | 350 | 487 | **258** | 390 |
-| matmul | **157** | 244 | 278 | 172 | 235 |
-| blackscholes | 697 | 764 | 834 | 748 | 749 |
-| **total** | **2148** | 3186 | 3238 | 2036 | 2447 |
+| matmul | **153** | 244 | 278 | 172 | 235 |
+| blackscholes | **695** | 764 | 834 | 748 | 749 |
+| nqueens | 275 | 309 | 349 | **267** | 274 |
+| bfs | 386 | 411 | 416 | **282** | 375 |
+| **total** | 2766 | 3906 | 4003 | **2585** | 3096 |
 
-Token counts use the **Qwen3-0.6B** tokenizer (151,643 vocab).
+Token counts use the **Qwen3-0.6B** tokenizer (151,643 vocab). The first six
+benchmarks are data/tensor-shaped (Enmerkar's home turf); nqueens and bfs are
+imperative control-flow shapes where Python's loops stay terse.
 
 ### Speed (CPU only, seconds, lower = faster)
 
 | | Enmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
-| logextract 510 MB | 0.96 | **0.41** | 0.70 | 3.72 | 2.98 |
-| analytics 512 MB | 1.60 | **1.03** | 1.79 | 4.49 | 3.72 |
-| mandelbrot | 0.38 | **0.05** | 0.05 | 3.86 | 0.07 |
-| spectralnorm | 16.6 | 1.12 | **1.08** | 135.9 | 1.60 |
-| matmul N=512 | 0.04 | 0.05 | **0.02** | 0.16 | 0.15 |
-| blackscholes N=2M | 0.15 | **0.05** | 0.04 | 0.18 | 0.07 |
-| **total (4 CPU benches)** | 19.5 | **2.61** | 3.62 | 148.0 | 8.37 |
+| logextract 510 MB | 0.96 | **0.40** | 0.67 | 3.71 | 2.94 |
+| analytics 512 MB | 1.51 | **0.99** | 1.71 | 4.47 | 3.39 |
+| mandelbrot | 0.07 | **0.05** | 0.05 | 4.13 | 0.06 |
+| spectralnorm | 1.11 | 1.10 | **1.08** | 133.1 | 1.57 |
+| matmul N=512 | 0.03 | 0.04 | **0.02** | 0.15 | 0.14 |
+| blackscholes N=2M | 0.15 | **0.04** | 0.04 | 0.17 | 0.07 |
+| nqueens N=11 | 0.36 | **0.01** | 0.01 | 1.52 | 0.03 |
+| bfs n=1M | 0.97 | 0.11 | **0.09** | 1.68 | 0.25 |
+| **total (6 CPU benches)** | 3.83 | **2.61** | 3.57 | 145.8 | 8.17 |
 
 ### GPU offloading (seconds, lower = faster)
 
 | workload | CPU (--device cpu) | GPU |
 |---|---|---|
-| matmul N=512 | **0.04s** | 0.05s |
+| matmul N=512 | **0.03s** | 0.07s |
 | matmul N=1024 | 0.26s | **0.12s** |
 | matmul N=2048 | 2.74s | **0.42s** |
-| blackscholes N=2M | **0.14s** | 0.57s |
+| blackscholes N=2M | **0.15s** | 0.66s |
 
 ## Quick start
 
@@ -91,16 +97,16 @@ no imports, no declarations:
 ```
 fi:  row! 128 'fe for ret
 fe:  col! row@ 128 mul col@ add ix!
-     ^A@ ix@ row@ col@ add set
-     ^B@ ix@ row@ col@ sub set ret
+     A@ ix@ row@ col@ add set
+     B@ ix@ row@ col@ sub set ret
 cr:  row! 128 'dc for ret
 dc:  col! 0 acc! 128 'ij for
-     ^C@ row@ 128 mul col@ add acc@ set ret
-ij:  j! ^A@ row@ 128 mul j@ add get
-     ^B@ j@ 128 mul col@ add get
+     C@ row@ 128 mul col@ add acc@ set ret
+ij:  j! A@ row@ 128 mul j@ add get
+     B@ j@ 128 mul col@ add get
      mul acc@ add acc! ret
 entry:
-  16384 int array ^A! 16384 int array ^B! 16384 int array ^C!
+  16384 int array A! 16384 int array B! 16384 int array C!
   128 'fi for
   128 'cr for
   ret
@@ -109,7 +115,7 @@ entry:
 Use `nkr` inline to efficiently process data with `bash`:
 
 ```
-$ grep ',Retail,' bench/data/sales.csv | nkr 'dict ^p! dict ^c! "/dev/stdin" "," 0 '\''r file_split_lines z! ^p@ 5 top_n print ^c@ 5 top_n print ret r: a! n! ^p@ 4 10 field_float field_add_to ^c@ 3 10 field_float field_add_to ret a@'
+$ grep ',Retail,' bench/data/sales.csv | nkr 'dict p! dict c! "/dev/stdin" "," 0 '\''r file_split_lines z! p@ 5 top_n print c@ 5 top_n print ret r: a! n! p@ 4 10 field_float field_add_to c@ 3 10 field_float field_add_to ret a@'
 
 > [["Bundle B",23912165787.440258],["Refurb Unit",23788674041.119873],["Gadget X1",23781641142.379787],["Spare Part",23776965024.160465],["Widget Pro",23759658166.90052]]
 [["Mexico",13218417280.809916],["USA",13212495563.130194],["Canada",13160810726.84009],["Colombia",9948195871.5800667],["Egypt",9948038758.9899693]]
@@ -145,6 +151,12 @@ accelerates applicable segments of code.
 
 ```sh
 nkr bigmatmul.ent          # auto: uses the GPU when one exists
-nkr --device cpu prog.ent  # never offload (v13 behavior)
+nkr --device cpu prog.ent  # never offload
 nkr --device vk0 prog.ent  # pin a specific Vulkan device
 ```
+
+## Transpiler
+
+Enmerkar's project includes a transpiler which converts simple C programs and
+libraries to Enmerkar-native versions. This allows automated creation of training
+data for language models.

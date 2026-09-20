@@ -79,6 +79,13 @@ for c in tests/ops/*.c; do
   "$TRANS" "$c" > "$T/op.ent" 2>"$T/op.terr"
   [ $? -ne 0 ] && { gate_fail "$name" "transpile rc!=0: $(head -c 120 "$T/op.terr")"; continue; }
   [ -s "$T/op.terr" ] && { gate_fail "$name" "transpiler stderr not empty"; continue; }
+  # optional .noent: lines that must NOT appear in the transpiled output
+  # (proves native mappings replaced FFI imports)
+  noe="tests/ops/$(basename "$c" .c).noent"
+  if [ -f "$noe" ]; then
+    bad=$(grep -Ff "$noe" "$T/op.ent" | head -3)
+    [ -n "$bad" ] && { gate_fail "$name" "emitted FFI instead of native op: $bad"; continue; }
+  fi
   $UF --device cpu -c "$T/op.ent" -o "$T/op.bin" 2>"$T/op.cerr"
   [ $? -ne 0 ] && { gate_fail "$name" "compile rc!=0: $(head -c 120 "$T/op.cerr")"; continue; }
   [ -s "$T/op.cerr" ] && { gate_fail "$name" "compile stderr not empty"; continue; }

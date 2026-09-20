@@ -99,6 +99,7 @@ pub enum VType {
     Float,
     Int,
     FloatArr, // marks a local holding a float-typed array handle
+    IntArr,   // marks a local holding an int-typed array handle
     Unknown,
 }
 
@@ -134,14 +135,14 @@ fn c_type_of(ty: VType) -> &'static str {
     match ty {
         VType::Float => "double",
         VType::Int => "int64_t",
-        VType::FloatArr | VType::Unknown => "Cell",
+        VType::FloatArr | VType::IntArr | VType::Unknown => "Cell",
     }
 }
 
 // Extract the C expression to read a value from a VEntry for Cell-context ops
 fn cell_of(v: &VEntry) -> String {
     match v.ty {
-        VType::Unknown | VType::FloatArr => v.expr.clone(),
+        VType::Unknown | VType::FloatArr | VType::IntArr => v.expr.clone(),
         VType::Float => format!("uf_mkf({})", v.expr),
         VType::Int => format!("uf_mki({})", v.expr),
     }
@@ -248,7 +249,7 @@ pub fn vflush(e: &mut String, vs: &mut Vec<VEntry>, vc: &mut Vec<(String, String
     }
     for t in vs.drain(..) {
         match t.ty {
-            VType::Unknown | VType::FloatArr => e.push_str(&format!("pushc(cx,{});", t.expr)),
+            VType::Unknown | VType::FloatArr | VType::IntArr => e.push_str(&format!("pushc(cx,{});", t.expr)),
             VType::Float => e.push_str(&format!("pushf(cx,{});", t.expr)),
             VType::Int => e.push_str(&format!("pushi(cx,{});", t.expr)),
         }
@@ -352,6 +353,7 @@ pub fn emit_range(
     reg: &HashMap<usize, (String, VType)>,
     numeric: &std::collections::HashSet<usize>,
     arr_ptr: &HashMap<String, String>,
+    shared_types: &HashMap<String, VType>,
     suppress_flush: bool,
 ) {
     let resolve = |name: &str| -> usize {
@@ -555,6 +557,7 @@ pub fn emit_range(
                         && (a.ty == VType::Float || b.ty == VType::Float)
                         && a.ty != VType::Unknown && b.ty != VType::Unknown
                         && a.ty != VType::FloatArr && b.ty != VType::FloatArr
+                        && a.ty != VType::IntArr && b.ty != VType::IntArr
                     {
                         // Float-dominant: a known float operand forces float
                         // semantics at runtime, so emit raw double arithmetic
@@ -576,6 +579,7 @@ pub fn emit_range(
                         }
                     } else if rt != VType::Unknown && a.ty != VType::Unknown && b.ty != VType::Unknown
                         && a.ty != VType::FloatArr && b.ty != VType::FloatArr
+                        && a.ty != VType::IntArr && b.ty != VType::IntArr
                         && (!matches!(*h, "op_and"|"op_or"|"op_xor") || rt == VType::Int) {
                         // Peephole: Int division/modulo by a constant power-of-2
                         // literal. GCC can't strength-reduce idivq→shift inside
@@ -643,7 +647,7 @@ pub fn emit_range(
                         // can sweep them (v13.2). Scalar-only pending temps
                         // cannot be collected: skip the flush (hot loops run
                         // this path every iteration).
-                        if vstack.iter().any(|t| matches!(t.ty, VType::Unknown | VType::FloatArr)) {
+                        if vstack.iter().any(|t| matches!(t.ty, VType::Unknown | VType::FloatArr | VType::IntArr)) {
                             vflush(&mut e, &mut vstack, &mut vcache);
                         }
                         vpush_cell(&mut e, &mut vstack, &mut vtmp,
@@ -708,7 +712,7 @@ pub fn emit_range(
                             };
                             e.push_str(&format!("uf_cseti({},{},{});", cell_of(&hh), ix_c, cell_of(&v)));
                         }
-                        "op_vget" => {
+                        "op_vget" | "op_get" => {
                             let idx = vpop(&mut e, &mut vstack, &mut vtmp);
                             let hh = vpop(&mut e, &mut vstack, &mut vtmp);
                             let idx_c = match idx.ty {
@@ -725,11 +729,18 @@ pub fn emit_range(
                                     vpush(&mut e, &mut vstack, &mut vtmp,
                                         &format!("((double*)uf_data((Hdr*)({}).i))[{}]", hh.expr, idx_c), VType::Float);
                                 }
-                            } else {
+                            } else if hh.ty == VType::IntArr {
+                                vpush(&mut e, &mut vstack, &mut vtmp,
+                                    &format!("((int64_t*)uf_data((Hdr*)({}).i))[{}]", hh.expr, idx_c), VType::Int);
+                            } else if *h == "op_vget" {
                                 vpush_cell(&mut e, &mut vstack, &mut vtmp, &format!("uf_cvget({},{})", cell_of(&hh), idx_c));
+                            } else {
+                                vflush(&mut e, &mut vstack, &mut vcache);
+                                e.push_str(&format!("pushc(cx,{});pushc(cx,{});uf_cur_op=\"op_get\";op_get(cx);\n", cell_of(&hh), cell_of(&idx)));
+                                vpush_cell(&mut e, &mut vstack, &mut vtmp, "pop(cx)");
                             }
                         }
-                        "op_vset" => {
+                        "op_vset" | "op_set" => {
                             let v = vpop(&mut e, &mut vstack, &mut vtmp);
                             let idx = vpop(&mut e, &mut vstack, &mut vtmp);
                             let hh = vpop(&mut e, &mut vstack, &mut vtmp);
@@ -744,8 +755,14 @@ pub fn emit_range(
                                 } else {
                                     e.push_str(&format!("((double*)uf_data((Hdr*)({}).i))[{}]={};", hh.expr, idx_c, f64_expr(&v)));
                                 }
-                            } else {
+                            } else if hh.ty == VType::IntArr {
+                                e.push_str(&format!("((int64_t*)uf_data((Hdr*)({}).i))[{}]={};", hh.expr, idx_c,
+                                    if v.ty == VType::Int { v.expr.clone() } else { format!("uf_i({})", cell_of(&v)) }));
+                            } else if *h == "op_vset" {
                                 e.push_str(&format!("uf_cvset({},{},{});", cell_of(&hh), idx_c, cell_of(&v)));
+                            } else {
+                                vflush(&mut e, &mut vstack, &mut vcache);
+                                e.push_str(&format!("pushc(cx,{});pushc(cx,{});pushc(cx,{});uf_cur_op=\"op_set\";op_set(cx);\n", cell_of(&hh), cell_of(&idx), cell_of(&v)));
                             }
                         }
                         _ => {
@@ -758,7 +775,7 @@ pub fn emit_range(
                                         e.push_str("{Cell _ff_acc=pop(cx),_ff_p=pop(cx);uf_fs_gate(uf_sptr(_ff_p),0);FILE*_fp=fopen(uf_sptr(_ff_p),\"r\");if(!_fp)die(\"FFOLD: cannot open file\");char*_line=0;size_t _ncap=0;ssize_t m;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FF_C_");
                                         e.push_str(&format!("{}{};cx->loops[fr].end=&&K_FF_E_{}{};long _ff_base=cx->sp;while((m=getline(&_line,&_ncap,_fp))>=0){{while(m>0&&(_line[m-1]=='\\n'||_line[m-1]=='\\r'))_line[--m]=0;Cell _ls=uf_str_new(_line,(size_t)m);pushc(cx,_ff_acc);pushc(cx,_ls);\n", prefix, i, prefix, i));
                                         let inner = format!("{}FF{}_", prefix, i);
-                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), false);
+                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, false);
                                         e.push_str(&format!("K_FF_C_{}{}:;_ff_acc=pop(cx);cx->sp=_ff_base+1;}}K_FF_E_{}{}:;cx->lsp=fr;free(_line);fclose(_fp);pushc(cx,_ff_acc);}}\n", prefix, i, prefix, i));
                                     } else if *h == "op_fsplit" {
                                         /* inlined FSPLIT: getline loop + in-place split + field offsets + callback */
@@ -771,13 +788,13 @@ pub fn emit_range(
                                         e.push_str("while(uf_fsplit_nfields<128){char*_sp=strstr(_cur,_E);if(!_sp){uf_fsplit_offsets[uf_fsplit_nfields*2]=(int64_t)(_cur-_line);uf_fsplit_offsets[uf_fsplit_nfields*2+1]=(int64_t)strlen(_cur);uf_fsplit_nfields++;break;}*_sp=0;uf_fsplit_offsets[uf_fsplit_nfields*2]=(int64_t)(_cur-_line);uf_fsplit_offsets[uf_fsplit_nfields*2+1]=(int64_t)(_sp-_cur);uf_fsplit_nfields++;_cur=_sp+_el;}\n");
                                         e.push_str("pushc(cx,_ff_acc);pushi(cx,uf_fsplit_nfields);\n");
                                         let inner = format!("{}FF{}_", prefix, i);
-                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), false);
+                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, false);
                                         e.push_str(&format!("K_FF_C_{}{}:;_ff_acc=pop(cx);cx->sp=_ff_base+1;}}K_FF_E_{}{}:;cx->lsp=fr;free(_line);fclose(_fp);uf_fsplit_line=0;pushc(cx,_ff_acc);}}\n", prefix, i, prefix, i));
                                     } else if *h == "op_rangefold" {
                                         /* inlined RANGEFOLD: count loop + callback */
                                         e.push_str(&format!("{{Cell _rf_acc=pop(cx);int64_t _rf_cnt=uf_i(pop(cx));long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_RF_C_{}{};cx->loops[fr].end=&&K_RF_E_{}{};long _rf_base=cx->sp;for(int64_t _rf_k=0;_rf_k<_rf_cnt;_rf_k++){{pushc(cx,_rf_acc);pushi(cx,_rf_k);\n", prefix, i, prefix, i));
                                         let inner = format!("{}RF{}_", prefix, i);
-                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), false);
+                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, false);
                                         e.push_str(&format!("K_RF_C_{}{}:;_rf_acc=pop(cx);cx->sp=_rf_base+1;}}K_RF_E_{}{}:;cx->lsp=fr;pushc(cx,_rf_acc);}}\n", prefix, i, prefix, i));
                                     }
                                 }
@@ -959,7 +976,7 @@ pub fn emit_range(
                         }
                         let eff_bs = if reg_store.is_some() { bs + 1 } else { bs };
                         let inner = format!("{}F{}_", prefix, i);
-                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, eff_bs, be, &inner, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, false);
+                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, eff_bs, be, &inner, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, false);
                         e.push_str(&format!("K_FC_{}{}:;cx->sp=_sp0;}}\nK_FE_{}{}:;", prefix, i, prefix, i));
                         for (id, (name, ty)) in &regs {
                             if inherited.contains(id) { continue; }
@@ -1046,7 +1063,7 @@ pub fn emit_range(
                 } else if vals.len() == 1 {
                     let v = &vals[0];
                     match v.ty {
-                        VType::Unknown | VType::FloatArr => pre.push_str(&format!("Cell {}={};", rv, v.expr)),
+                        VType::Unknown | VType::FloatArr | VType::IntArr => pre.push_str(&format!("Cell {}={};", rv, v.expr)),
                         VType::Float => pre.push_str(&format!("Cell {}=uf_mkf({});", rv, v.expr)),
                         VType::Int => pre.push_str(&format!("Cell {}=uf_mki({});", rv, v.expr)),
                     }
@@ -1055,7 +1072,7 @@ pub fn emit_range(
                     // list from them, then drain
                     for v in &vals {
                         match v.ty {
-                            VType::Unknown | VType::FloatArr => pre.push_str(&format!("pushc(cx,{});", v.expr)),
+                            VType::Unknown | VType::FloatArr | VType::IntArr => pre.push_str(&format!("pushc(cx,{});", v.expr)),
                             VType::Float => pre.push_str(&format!("pushf(cx,{});", v.expr)),
                             VType::Int => pre.push_str(&format!("pushi(cx,{});", v.expr)),
                         }
@@ -1300,7 +1317,7 @@ pub fn emit_range(
                         // plain typed value push, peel it into a direct C test
                         // and skip the data-stack round trip entirely.
                         let mut ce = String::new();
-                        emit_range(&mut ce, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, cbs, cbe_trim, &inner_c, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, false);
+                        emit_range(&mut ce, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, cbs, cbe_trim, &inner_c, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, false);
                         let mut direct_cond: Option<String> = None;
                         if ce.ends_with(");") {
                             for tag in ["pushi(cx,", "pushf(cx,"] {
@@ -1357,7 +1374,7 @@ pub fn emit_range(
                         };
                         let body_suppress = !body_esc && operand_push_first
                             && !(bbs..bbe_trim).any(|k| matches!(p.ins[k], Ins::ListLit | Ins::DictLit));
-                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bbs, bbe_trim, &inner_b, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, body_suppress);
+                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bbs, bbe_trim, &inner_b, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, body_suppress);
                         // With dead-flush suppression active the body never
                         // touches the data stack (no pushes, and a `pop(cx)`
                         // would mean a vpop-empty the suppression guards
@@ -1422,7 +1439,7 @@ pub fn emit_range(
                 // v14: shared writes are atomic and write-through (never
                 // cached — another thread may write between statements).
                 let cell_expr = match t.ty {
-                    VType::Unknown | VType::FloatArr => t.expr.clone(),
+                    VType::Unknown | VType::FloatArr | VType::IntArr => t.expr.clone(),
                     VType::Float => format!("uf_mkf({})", t.expr),
                     VType::Int => format!("uf_mki({})", t.expr),
                 };
@@ -1440,10 +1457,19 @@ pub fn emit_range(
                 let _ = is_param_bind;
             }
             Ins::GetV(v) => {
-                // v14: shared vars are seqlocked and NEVER cached — every
-                // read is an atomic snapshot (threads may write between any
-                // two statements).
-                vpush_cell(&mut e, &mut vstack, &mut vtmp, &format!("uf_sh_get(&var_{})", v));
+                // Snapshot read (seqlock). Array handles can be typed so
+                // get/set specialize; scalar Int/Float stay Cells — a slot
+                // initialized with `0 x!` and later holding a float must not
+                // be unwrapped with uf_i.
+                let get = format!("uf_sh_get(&var_{})", v);
+                match shared_types.get(v).copied().unwrap_or(VType::Unknown) {
+                    ty @ (VType::IntArr | VType::FloatArr) => {
+                        vpush(&mut e, &mut vstack, &mut vtmp, &get, ty);
+                    }
+                    _ => {
+                        vpush_cell(&mut e, &mut vstack, &mut vtmp, &get);
+                    }
+                }
             }
             Ins::AtomicAdd(v, inc) => {
                 vflush(&mut e, &mut vstack, &mut vcache);
@@ -1501,7 +1527,7 @@ pub fn emit_range(
                     continue;
                 }
                 match t.ty {
-                    VType::Unknown | VType::FloatArr => {
+                    VType::Unknown | VType::FloatArr | VType::IntArr => {
                         e.push_str(&format!("cx->locals[cx->local_base+{}]={};", id, t.expr));
                     }
                     VType::Float => {
@@ -1538,14 +1564,14 @@ pub fn emit_range(
                         vpush(&mut e, &mut vstack, &mut vtmp,
                             &format!("uf_i(cx->locals[cx->local_base+{}])", id), VType::Int);
                     }
-                    VType::FloatArr => {
+                    VType::FloatArr | VType::IntArr => {
                         let slot_expr = format!("cx->locals[cx->local_base+{}]", id);
                         if arr_ptr.contains_key(&slot_expr) {
                             // Loop-hoisted pointer exists: push raw expression
                             // (not a temp) so vget's arr_ptr lookup matches
-                            vstack.push(VEntry { expr: slot_expr, ty: VType::FloatArr });
+                            vstack.push(VEntry { expr: slot_expr, ty });
                         } else {
-                            vpush(&mut e, &mut vstack, &mut vtmp, &slot_expr, VType::FloatArr);
+                            vpush(&mut e, &mut vstack, &mut vtmp, &slot_expr, ty);
                         }
                     }
                 }
@@ -1598,7 +1624,7 @@ pub fn emit_range(
                 let vals = std::mem::take(&mut vstack);
                 for v in &vals {
                     match v.ty {
-                        VType::Unknown | VType::FloatArr => e.push_str(&format!("pushc(cx,{});", v.expr)),
+                        VType::Unknown | VType::FloatArr | VType::IntArr => e.push_str(&format!("pushc(cx,{});", v.expr)),
                         VType::Float => e.push_str(&format!("pushf(cx,{});", v.expr)),
                         VType::Int => e.push_str(&format!("pushi(cx,{});", v.expr)),
                     }
@@ -1614,7 +1640,7 @@ pub fn emit_range(
                 let vals = std::mem::take(&mut vstack);
                 for v in &vals {
                     match v.ty {
-                        VType::Unknown | VType::FloatArr => e.push_str(&format!("pushc(cx,{});", v.expr)),
+                        VType::Unknown | VType::FloatArr | VType::IntArr => e.push_str(&format!("pushc(cx,{});", v.expr)),
                         VType::Float => e.push_str(&format!("pushf(cx,{});", v.expr)),
                         VType::Int => e.push_str(&format!("pushi(cx,{});", v.expr)),
                     }
@@ -1697,7 +1723,7 @@ pub fn emit_range(
 // Pre-pass: determine local variable types by simulating the virtual stack.
 // For each call body, tracks what type each LocalSetI stores. If all stores
 // to a slot agree, the slot is typed. Conflicts → Unknown.
-fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::collections::HashSet<usize>) {
+fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::collections::HashSet<usize>, HashMap<String, VType>) {
     // Determine call-entry labels (same logic as resolve_locals)
     let mut call_entries: std::collections::HashSet<usize> = std::collections::HashSet::new();
     call_entries.insert(0);
@@ -1939,13 +1965,12 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                         type_stack.push((r, r == VType::Unknown && a.1));
                     } else if matches!(*h, "op_drop") {
                         type_stack.pop();
-                    } else if matches!(*h, "op_vget"|"op_idx") {
+                    } else if matches!(*h, "op_vget"|"op_idx"|"op_get") {
                         type_stack.pop(); // index
-                        // FloatArr handle (float-array local or propagated
-                        // parameter) means vget yields a raw Float.
+                        // Typed array handle means get/vget yields a raw scalar.
                         let hty = type_stack.pop().unwrap_or((VType::Unknown, true));
-                        type_stack.push(if hty.0 == VType::FloatArr { (VType::Float, false) } else { (VType::Unknown, true) });
-                    } else if matches!(*h, "op_vset"|"op_seti") {
+                        type_stack.push(if hty.0 == VType::FloatArr { (VType::Float, false) } else if hty.0 == VType::IntArr { (VType::Int, false) } else { (VType::Unknown, true) });
+                    } else if matches!(*h, "op_vset"|"op_seti"|"op_set") {
                         type_stack.pop(); type_stack.pop(); type_stack.pop();
                     } else if matches!(*h, "op_atoi"|"op_len") {
                         // Result provably Int regardless of input
@@ -1961,8 +1986,11 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                         type_stack.pop(); // type id
                         type_stack.pop(); // length or list
                         let ety_float = i >= 1 && matches!(&p.ins[i - 1], Ins::PushI(1));
+                        let ety_int = i >= 1 && matches!(&p.ins[i - 1], Ins::PushI(0));
                         if ety_float {
                             type_stack.push((VType::FloatArr, false));
+                        } else if ety_int {
+                            type_stack.push((VType::IntArr, false));
                         } else {
                             type_stack.push((VType::Unknown, true));
                         }
@@ -1992,9 +2020,20 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                             if *h == "op_arr" && *ty == 1 { is_farr = true; }
                         }
                     }
+                    let mut is_iarr = false;
+                    if i >= 2 {
+                        if let (Ins::PushI(ty), Ins::Simple(h)) = (&p.ins[i-2], &p.ins[i-1]) {
+                            if *h == "op_arr" && *ty == 0 { is_iarr = true; }
+                        }
+                    }
                     if is_farr {
                         type_stack.pop();
                         records.entry(*id).or_default().push(VType::FloatArr);
+                        continue;
+                    }
+                    if is_iarr {
+                        type_stack.pop();
+                        records.entry(*id).or_default().push(VType::IntArr);
                         continue;
                     }
                     match type_stack.pop() {
@@ -2283,6 +2322,7 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
         result.into_iter().map(|((b, s), t)| (b * 1000000 + s, t)).collect(),
         ins_body,
         numeric_slots,
+        shared_types,
     )
 }
 
@@ -2611,7 +2651,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
     }
     // Compute types and body mapping BEFORE outlined-body detection so we
     // can find the full extent of each call body (including continuation labels).
-    let (mut local_types, ins_body, numeric_slots) = compute_local_types(p);
+    let (mut local_types, ins_body, numeric_slots, shared_types) = compute_local_types(p);
 
     // Outlined call bodies: detect call bodies that use locals and contain
     // while loops but don't call other uf bodies (only externs). These are
@@ -2679,7 +2719,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         let ob_prefix = format!("OB{}_", bs);
         // Emit the body code — use empty reg/arr_ptr maps; the inlined while
         // loops within the body will do their own register caching.
-        emit_range(&mut outlined_fns, p, &targets, &inline_fors, &inline_ffolds, &inline_whiles, &outlined_bodies, &suppress, &ext_idx, bs, be, &ob_prefix, 0, &mut local_types, &ins_body, &HashMap::new(), &numeric_slots, &HashMap::new(), false);
+        emit_range(&mut outlined_fns, p, &targets, &inline_fors, &inline_ffolds, &inline_whiles, &outlined_bodies, &suppress, &ext_idx, bs, be, &ob_prefix, 0, &mut local_types, &ins_body, &HashMap::new(), &numeric_slots, &HashMap::new(), &shared_types, false);
         // If the body has no explicit RET at the end (shouldn't happen, but
         // be safe), restore the frame.
         outlined_fns.push_str(&format!("cx->local_base=cx->local_frames[--cx->local_fsp];{}}}\n", if UF_DEBUG.load(Ordering::Relaxed) { "cx->call_csp--;" } else { "" }));
@@ -2696,7 +2736,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         });
         o.insert_str(insert_pos, &outlined_fns);
     }
-    emit_range(&mut o, p, &targets, &inline_fors, &inline_ffolds, &inline_whiles, &outlined_bodies, &suppress, &ext_idx, 0, n, "", 0, &mut local_types, &ins_body, &HashMap::new(), &numeric_slots, &HashMap::new(), false);
+    emit_range(&mut o, p, &targets, &inline_fors, &inline_ffolds, &inline_whiles, &outlined_bodies, &suppress, &ext_idx, 0, n, "", 0, &mut local_types, &ins_body, &HashMap::new(), &numeric_slots, &HashMap::new(), &shared_types, false);
     o.push_str(&format!("L_{}: return;\n}}\n", n));
 
     // exported wrappers (fixed 4-arg C ABI trampoline, run on the main ctx)

@@ -1,10 +1,9 @@
 # Benchmark Specification
 
-Programs print results to stdout and exit 0. The four file benchmarks
-(1–4 below) read the input file path from argv[1]; the two compute benchmarks
-(5–6) take their problem size N from argv[1] and read no files. Output format
-must match exactly for cross-validation (tolerances for reductions are noted
-per benchmark).
+Programs print results to stdout and exit 0. The first two benchmarks read an
+input file path from argv[1]; the remaining generated-data workloads take their
+problem size N from argv[1] and read no files. Output format must match exactly
+for cross-validation (tolerances for reductions are noted per benchmark).
 
 ## 1. Log Extraction (`logextract`)
 
@@ -179,7 +178,7 @@ Sequential CPU implementations are bit-identical; GPU columns may differ on
 `premium_sum` within ±0.01% (reduction order).
 
 **Structure**: the formula, coefficients and outputs are pinned; the code
-shape is not. The Enmerkar implementation evaluates the polynomial once over
+shape is not. The Nmerkar implementation evaluates the polynomial once over
 the concatenated `[d1 d2]` vector and splits the result (identical doubles,
 same op order per element — outputs stay bit-identical while the 19
 coefficients appear once in source).
@@ -202,13 +201,15 @@ Known counts for verification: N=8 → 92, N=10 → 724, N=11 → 2680, N=12 →
 Pattern coverage: search/backtracking, nested loops, flag-driven early exit,
 int-array state — no tensors, no GPU offloading (CPU-only group).
 
-### 8. Graph BFS (`bfs`)
+### 8. Packed-CSR graph BFS (`bfs`)
 
 **Input:** n from argv[1] (default 1000000). Deterministic graph: node u has
 edges to `(7u+3) mod n` and `(13u+11) mod n`, plus `(u+1) mod n` when
-`u mod 3 == 0`. BFS from node 0 over an adjacency structure of per-node
-neighbor lists; `dist` is an int array initialized to -1; the frontier lives
-in a preallocated int-array queue with head/tail indices.
+`u mod 3 == 0`. All implementations first materialize the graph in compressed
+sparse row form: `offsets` has n+1 integer entries and `edges` has
+`2n + ceil(n/3)` packed integer entries. BFS starts at node 0; `dist` is an
+integer array initialized to -1 and the frontier is a preallocated integer
+queue with head/tail indices.
 
 **Output format (exact integers, identical across languages):**
 ```
@@ -219,26 +220,41 @@ max_dist: <max finite distance>
 ```
 At n=1M: reached 1000000, sum_dist 15758576, max_dist 21.
 
-Pattern coverage: hash-map construction and lookup, dynamic per-node lists,
-queue mutation, mixed int-array/dict access — a pointer-chasing/dynamic-data
-shape with no elementwise structure to fuse (CPU-only group).
+Pattern coverage: packed graph construction, indirect typed-array access,
+nested variable-bound loops, and queue mutation. This is the traversal/codegen
+benchmark; dynamic-container overhead is isolated below.
+
+### 9. Dynamic graph stress (`dynamicgraph`)
+
+**Input and graph:** identical to `bfs`, including default n=1000000 and BFS
+from node 0. Instead of CSR, every implementation stores adjacency in a hash
+map keyed by node id, with a separately allocated dynamic neighbor list as each
+value. The queue remains preallocated so this benchmark isolates hash-map,
+small-list allocation, dynamic lookup, and pointer-chasing costs.
+
+**Output format and reference values:** identical to `bfs`. At n=1M: reached
+1000000, sum_dist 15758576, max_dist 21.
+
+Pattern coverage: one million hash-map entries, one million small dynamic
+lists, irregular lookup, GC/allocation pressure, and mixed dynamic/typed-array
+access. It has no elementwise structure to fuse or offload (CPU-only group).
 
 ### CPU-only policy and GPU-on column (v13.1)
 
 The four legacy benchmarks (logextract, analytics, mandelbrot, spectralnorm)
-run **CPU-only**: Enmerkar entries are compiled with `--device cpu` so automatic
+run **CPU-only**: Nmerkar entries are compiled with `--device cpu` so automatic
 GPU offloading never contaminates the historical numbers. The **GPU-on column**
-shows the same Enmerkar source under the default `auto` device; other languages
+shows the same Nmerkar source under the default `auto` device; other languages
 show `—` (no GPU builds of those programs).
 
-Enmerkar GPU-on entries also pass `--gc-threshold` — large multi-MB arrays
+Nmerkar GPU-on entries also pass `--gc-threshold` — large multi-MB arrays
 collect constantly at the default 1MB threshold, which costs time (the v13.2
 GC fixes made small-threshold runs *correct*; the big thresholds are now
 pure performance).
 
-The non-Enmerkar GPU variants (`*_gpu.{cpp,rs,py,js}`) share `src/_gpu/gpucomp.c`,
-a Vulkan launcher mirroring the nkr runtime (auto device = hardware-first, most
+The non-Nmerkar GPU variants (`*_gpu.{cpp,rs,py,js}`) share `src/_gpu/gpucomp.c`,
+a Vulkan launcher mirroring the nk runtime (auto device = hardware-first, most
 free VRAM). **Status: pending** — the launcher currently hangs on pipeline
 setup outside gdb and its binaries are disabled (`.broken`); sources are kept
-and the Enmerkar GPU-on columns (which exercise the same shaders through the
+and the Nmerkar GPU-on columns (which exercise the same shaders through the
 compiler's own runtime) are fully functional.

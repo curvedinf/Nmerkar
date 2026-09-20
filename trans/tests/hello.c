@@ -6,7 +6,7 @@ int main() {
     i = i + 1;
   }
   if (s == 55) {
-    puts("hello, enmerkar");
+    puts("hello, nmerkar");
   } else {
     puts("wrong");
   }

@@ -4,7 +4,7 @@
 #include "shim.h"
 #undef main
 int main(int __ac, char** __av) {
-  __nkr_argc_g = __ac;
-  __nkr_argv_g = __av;
+  __nk_argc_g = __ac;
+  __nk_argv_g = __av;
   return tool_main();
 }

@@ -1,0 +1,61 @@
+; dynamicgraph.n — BFS over a dict of separately allocated neighbor lists
+; (bench/SPEC.md). This intentionally stresses dynamic containers and GC.
+1000000 n!
+has_args 'setn if
+dict adj!
+n@ int array dist!
+n@ int array q!
+0 r! 0 s! 0 m!
+0 n@ 'bld for
+0 n@ 'negf for
+dist@ 0 0 set
+q@ 0 0 set
+1 tail!
+0 head!
+'more 'step while
+0 n@ 'tally for
+"reached: " print r@ print
+"unreached: " print n@ r@ sub print
+"sum_dist: " print s@ print
+"max_dist: " print m@ print
+ret
+setn: 1 arg_index n! ret
+bld: u!
+  u@ 7 mul 3 add n@ rem v1!
+  u@ 13 mul 11 add n@ rem v2!
+  u@ 3 rem 0 eq 'third 'put if_else
+  ret
+third: adj@ u@ [v1@ v2@ u@ 1 add n@ rem] set ret
+put: adj@ u@ [v1@ v2@] set ret
+negf: i! dist@ i@ -1 set ret
+more: head@ tail@ lt ret
+step:
+  q@ head@ get u!
+  dist@ u@ get du!
+  adj@ u@ get nb!
+  nb@ length end!
+  head++
+  0 j!
+  'vis_c 'vis_b while
+  ret
+vis_c: j@ end@ lt ret
+vis_b:
+  nb@ j@ get v!
+  dist@ v@ get 0 lt 'visit if
+  j++
+  ret
+visit:
+  dist@ v@ du@ 1 add set
+  q@ tail@ v@ set
+  tail++
+  ret
+tally: i!
+  dist@ i@ get d!
+  d@ 0 gte 'tc if
+  ret
+tc:
+  r++
+  d@ s+=
+  d@ m@ gt 'tmax if
+  ret
+tmax: d@ m! ret

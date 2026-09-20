@@ -73,6 +73,8 @@ pub enum Ins {
     AddGlobal(String),            // shared x+= — placeholder, expanded by the scope pass
     AtomicAdd(String, bool),      // shared x — atomic add; bool: implicit delta 1 (x++)
     Nop,                         // internal: erased by the scope pass rewrite
+    Strict,                      // v14.1: compile-time strictness marker (v → v)
+    Loose,                       // v14.1: compile-time strictness eraser (v → v)
     LocalSet(String),             // v11: unresolved local store (name)
     LocalGet(String),             // v11: unresolved local fetch (name)
     LocalSetI(usize),             // v11: resolved local store (slot)

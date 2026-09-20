@@ -1,0 +1,29 @@
+; matmul.n — v12 text encoding: 128x128 C=A*B, checksum=2863136768
+
+fi:
+  row! 128 'fe for ret
+fe:
+  col! row@ 128  mul  col@  add  ix!
+  A@ ix@ row@ col@  add  set
+  B@ ix@ row@ col@  sub  set ret
+
+cr:
+  row! 128 'dc for ret
+dc:
+  col! 0 acc! 128 'ij for
+  C@ row@ 128  mul  col@  add  acc@ set ret
+ij:
+  j! A@ row@ 128  mul  j@  add  get
+  B@ j@ 128  mul  col@  add  get
+   mul  acc@  add  acc! ret
+
+se:
+  ix! C@ ix@ get total@  add  total! ret
+
+entry:
+  16384 int array A! 16384 int array B! 16384 int array C!
+  128 'fi for
+  128 'cr for
+  0 total!
+  16384 'se for
+  total@ "checksum=%d" format print ret

@@ -1,4 +1,4 @@
-// driver.rs — shared CLI/compile/run driver for the `nkr` and `nkrsb` binaries.
+// driver.rs — shared CLI/compile/run driver for the `nk` and `nks` binaries.
 // The only per-binary difference is the baked sandbox config passed to run().
 
 use crate::ast::*;
@@ -18,7 +18,7 @@ include!(concat!(env!("OUT_DIR"), "/baked_sb.rs"));
 
 // ---------------- directory discovery ----------------
 
-/// Collect all .en/.ent files in dir, sorted for deterministic compilation order.
+/// Collect all .n/.nd files in dir, sorted for deterministic compilation order.
 fn collect_uf_files(dir: &std::path::Path) -> Vec<String> {
     let mut files: Vec<String> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("cannot read dir {}: {}", dir.display(), e))
@@ -27,7 +27,7 @@ fn collect_uf_files(dir: &std::path::Path) -> Vec<String> {
             let p = e.path();
             if p.is_file() {
                 if let Some(ext) = p.extension() {
-                    if ext == "en" || ext == "ent" {
+                    if ext == "n" || ext == "nd" {
                         return Some(p.to_string_lossy().to_string());
                     }
                 }
@@ -39,32 +39,32 @@ fn collect_uf_files(dir: &std::path::Path) -> Vec<String> {
     files
 }
 
-/// Check if dir contains init.en or init.ent
+/// Check if dir contains init.n or init.nd
 fn has_init(dir: &std::path::Path) -> bool {
-    dir.join("init.en").exists() || dir.join("init.ent").exists()
+    dir.join("init.n").exists() || dir.join("init.nd").exists()
 }
 
-/// Recursively collect files from an init-directory: init.en first, then other
-/// .en/.ent, then recurse into nested init subdirs.
+/// Recursively collect files from an init-directory: init.n first, then other
+/// .n/.nd, then recurse into nested init subdirs.
 fn collect_init_dir(
     dir: &std::path::Path,
     files: &mut Vec<String>,
     init_flags: &mut Vec<bool>,
 ) {
-    // init.en (or init.ent) first — it's the thread entry point
-    let init_file = if dir.join("init.en").exists() {
-        dir.join("init.en").to_string_lossy().to_string()
+    // init.n (or init.nd) first — it's the thread entry point
+    let init_file = if dir.join("init.n").exists() {
+        dir.join("init.n").to_string_lossy().to_string()
     } else {
-        dir.join("init.ent").to_string_lossy().to_string()
+        dir.join("init.nd").to_string_lossy().to_string()
     };
     files.push(init_file);
     init_flags.push(true);
 
-    // other .en/.ent in this dir (not init)
+    // other .n/.nd in this dir (not init)
     let mut others = collect_uf_files(dir);
     others.retain(|f| {
         let p = std::path::Path::new(f);
-        p.file_name().map(|n| n != "init.en" && n != "init.ent").unwrap_or(true)
+        p.file_name().map(|n| n != "init.n" && n != "init.nd").unwrap_or(true)
     });
     for f in others {
         files.push(f);
@@ -92,29 +92,29 @@ fn discover_directory(root: &str) -> (Vec<String>, Vec<bool>) {
     let mut files: Vec<String> = Vec::new();
     let mut init_flags: Vec<bool> = Vec::new();
 
-    // main.en (or main.ent) is the entry point — must exist
-    let main_file = if rootpath.join("main.en").exists() {
-        rootpath.join("main.en").to_string_lossy().to_string()
-    } else if rootpath.join("main.ent").exists() {
-        rootpath.join("main.ent").to_string_lossy().to_string()
+    // main.n (or main.nd) is the entry point — must exist
+    let main_file = if rootpath.join("main.n").exists() {
+        rootpath.join("main.n").to_string_lossy().to_string()
+    } else if rootpath.join("main.nd").exists() {
+        rootpath.join("main.nd").to_string_lossy().to_string()
     } else {
-        panic!("nkr: no main.en found in {}", root);
+        panic!("nk: no main.n found in {}", root);
     };
     files.push(main_file);
     init_flags.push(false);
 
-    // other .en/.ent in root (not main)
+    // other .n/.nd in root (not main)
     let mut others = collect_uf_files(rootpath);
     others.retain(|f| {
         let p = std::path::Path::new(f);
-        p.file_name().map(|n| n != "main.en" && n != "main.ent").unwrap_or(true)
+        p.file_name().map(|n| n != "main.n" && n != "main.nd").unwrap_or(true)
     });
     for f in others {
         files.push(f);
         init_flags.push(false);
     }
 
-    // subdirs with init.en
+    // subdirs with init.n
     let subdirs: Vec<std::path::PathBuf> = fs::read_dir(rootpath)
         .unwrap_or_else(|e| panic!("cannot read dir {}: {}", rootpath.display(), e))
         .filter_map(|e| e.ok())
@@ -131,7 +131,7 @@ fn discover_directory(root: &str) -> (Vec<String>, Vec<bool>) {
 }
 
 // locate mods/<name>.ufm by walking up from the input's directory, then CWD,
-// ~/.nkr/mods, and finally each $NKRMODPATH dir.
+// ~/.nk/mods, and finally each $NKMODPATH dir.
 fn find_manifest(name: &str, base: Option<&std::path::Path>) -> Option<String> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(b) = base {
@@ -143,9 +143,9 @@ fn find_manifest(name: &str, base: Option<&std::path::Path>) -> Option<String> {
     }
     candidates.push(std::path::PathBuf::from(format!("mods/{}.ufm", name)));
     if let Ok(home) = env::var("HOME") {
-        candidates.push(std::path::PathBuf::from(format!("{}/.nkr/mods/{}.ufm", home, name)));
+        candidates.push(std::path::PathBuf::from(format!("{}/.nk/mods/{}.ufm", home, name)));
     }
-    if let Ok(paths) = env::var("NKRMODPATH") {
+    if let Ok(paths) = env::var("NKMODPATH") {
         for dir in paths.split(':').filter(|d| !d.is_empty()) {
             candidates.push(std::path::PathBuf::from(format!("{}/{}.ufm", dir, name)));
         }
@@ -166,55 +166,62 @@ fn skill_template() -> String {
         .enumerate()
         .filter(|(_, n)| !n.starts_with('~'))
         .map(|(_, n)| {
-            let glyph = char::from_u32(OP_GLYPHS[op_index(n).unwrap()]).unwrap();
-            let usage = op_usage(n);
-            if usage.is_empty() {
-                format!("- {} `{}`", glyph, n.to_lowercase())
-            } else {
-                format!("- {} `{}` — {}", glyph, n.to_lowercase(), usage)
+            let idx = op_index(n).unwrap();
+            let mn = text_mnemonic(idx);
+            if mn == "~retired" {
+                return None;
             }
+            let glyph = char::from_u32(OP_GLYPHS[idx]).unwrap();
+            let usage = op_usage(n);
+            Some(if usage.is_empty() {
+                format!("- {} `{}`", glyph, mn)
+            } else {
+                format!("- {} `{}` — {}", glyph, mn, usage)
+            })
         })
+        .flatten()
         .collect();
     let count = op_entries.len();
     let op_list = op_entries.join("\n");
 
     format!(
 r#"---
-name: enmerkar
+name: nmerkar
 description: |
-  Use Enmerkar (`nkr`) for all inline custom tools — counting lines, transforming data, inspecting files, quick scripts. Enmerkar is based on a managed hidden stack, compiled to C then native via `cc`, designed for LLM-authored scripts (low token count, fast, reliable). Use dense mode (glyph, `.en`) for one-off tools; use text mode (mnemonic, `.ent`) for saved programs. Invoke inline with `nkr "<code here>"` (last positional arg is treated as source if no file matches), or pipe stdin with `nkr -`.
+  Use Nmerkar (`nk`) for all inline custom tools — counting lines, transforming data, inspecting files, quick scripts. Nmerkar is based on a managed hidden stack, compiled to C then native via `cc`, designed for LLM-authored scripts (low token count, fast, reliable). Text mode (mnemonic, `.n`) is the default; dense mode (glyph, `.nd`) is experimental, for token-critical one-off scripts. Invoke inline with `nk "<code here>"` (last positional arg is treated as source if no file matches), or pipe stdin with `nk -`.
 ---
 
-# Enmerkar (nkr) Agent Skill
+# Nmerkar (nk) Agent Skill
 
-Enmerkar is a dynamically typed, weakly typed language based on a **managed hidden stack**, compiled to C then native via `cc`.
+Nmerkar is a dynamically typed, weakly typed language based on a **managed hidden stack**, compiled to C then native via `cc`.
 Programs are terse (low token count), fast, and reliable — designed for LLM-authored scripts.
 Cells are untyped 64-bit values at runtime — ints, floats, and pointers freely interconvert.
 Type inference happens at compile time where possible, but types are not enforced at the language level.
 
-The data stack is an implementation detail. Source code reasons about **named local/global variables**, **literal constants**, and **the return value of the immediately preceding op**. There are no stack-manipulation primitives (`dup`, `drop`, `swp`, `ovr`, `pick`) in v13.
+The data stack is an implementation detail. Source code reasons about **named local/global variables**, **literal constants**, and **the return value of the immediately preceding op**.
 
-> **Maintenance:** When `nkr` is updated, regenerate this file with `nkr --skill` to refresh the opcode list.
+> **Maintenance:** When `nk` is updated, regenerate this file with `nk --skill` to refresh the opcode list.
 
 ## Inline usage
 
 Run code inline without saving a file:
 ```
-nkr '"hello" print'
-nkr '1 2 add print'
+nk '"hello" print'
+nk '1 2 add print'
 ```
-Or pipe via stdin with `echo '...' | nkr -`
+Or pipe via stdin with `echo '...' | nk -`
 
 ## Encoding
 
-Enmerkar has two encodings:
+Text is the default encoding. Nmerkar has two encodings:
 
-- **Dense** (glyph mode, `.en`): single-token emoji glyphs, optimized for LLM token efficiency.
-  Use for **one-off tools** and inline scripts where token count matters.
-- **Text** (mnemonic mode, `.ent`): human-readable ASCII mnemonics like `add`, `if`, `get`.
-  Use for **saved programs** that humans will read, edit, and maintain.
+- **Text** (mnemonic mode, `.n`): human-readable ASCII mnemonics like `add`, `if`, `get`.
+  The default — use it for saved programs, shared code, and inline scripts.
+- **Dense** (glyph mode, `.nd`): **experimental** single-token emoji glyphs, optimized
+  for LLM token efficiency. Opt in only for one-off tools where token count matters.
 
-The compiler auto-detects the encoding per file: any character at or above U+13000 = dense.
+The compiler auto-detects the encoding per file: any character at or above U+13000 = dense;
+otherwise text.
 
 ## Quick reference
 
@@ -222,7 +229,7 @@ The compiler auto-detects the encoding per file: any character at or above U+130
 - Comments: `;` to end of line.
 - Numbers: self-evaluating. Negative numbers allowed in text mode.
 - Strings: `"hello\n"` — escapes: \n \t \r \0 \\ \"
-- Variables: `x!` (store), `x@` (fetch) for locals; `^x!` / `^x@` for globals; `x++` / `x+=` increment/accumulate. `x!` and `^x!` are pass-through (leave the value for the next op).
+- Variables: `x!` (store, pass-through), `x@` (fetch) for locals; a plain name assigned at a TU's top level declares a **shared variable** (atomic, thread-safe); `x++` / `x+=` increment/accumulate.
 - Labels: `name:` defines; `'name` pushes address; `_call name` calls. Labels may declare input parameters: `add2: a! b!` then `3 4 _call add2`.
 - Control flow: `if` (cond `'label`), `if_else` (cond `'then_label 'else_label`), `while` (`'cond_label 'body_label`), `for` (count `'body_label`); `break`/`continue` in loop bodies only.
 - Every label body must end with `ret` (returns null when bare; `ret expr` returns the value; `ret a b c` returns a list).
@@ -238,18 +245,6 @@ The compiler auto-detects the encoding per file: any character at or above U+130
 ## Reserved words
 
 **Every opcode mnemonic is a reserved identifier.** You cannot use any of them as label names or variable names. The full list is in the opcode list below. For example, `iter:` is illegal because `iter` is an opcode — use a different name like `walk:` or `each:`.
-
-## Removed opcodes (do not use)
-
-The following are **deleted from the language** and produce compile errors:
-- Raw jumps: `jmp`, `jz`, `je` (and the `=` token).
-- Stack manipulation: `dup`, `ovr`, `drop`, `swp`, `pick`.
-
-Use structured control flow instead:
-- `jmp label` → use `_call label` or `entry:`
-- `jz` (jump if zero) → use `if` with a `'label`
-- `je` (jump if equal) → use `eq` then `if` with a `'label`
-- Stack juggling → use named variables and op results.
 
 ## Common mistakes
 
@@ -274,7 +269,7 @@ Where `yes:`, `then_label:`, `else_label:` are labels ending with `ret`.
 
 **`shell` idiom to keep only stdout:** `"cmd" shell out! _! _!` (binds stderr and status to discard slots, leaves stdout in `out`).
 
-**Use globals (`^x!`/`^x@`) for state shared across labels** called via `if`/`for`/`filter`/`file_fold_lines` callbacks. Locals (`x!`/`x@`) are scoped to the calling function and may not be visible inside callback labels.
+**Use shared variables (a plain name assigned at the top level) for state shared across labels** called via `if`/`for`/`filter`/`file_fold_lines` callbacks. Locals (`x!`/`x@`) are scoped to the calling function and may not be visible inside callback labels.
 
 ## Container construction
 
@@ -320,73 +315,68 @@ Common ops with non-obvious stack signatures:
 
 ### Count lines in all .rs files (inline)
 ```
-nkr '"find . -name "*.rs" | sort" sh out! _! _! "\n" split len print'
+nk '"find . -name \"*.rs\" | sort" shell out! _! _! out@ "\n" split length print ret'
 ```
 
-### ffold to count lines in a file
+### file_fold_lines to count lines in a file
 ```
-"data.txt" 0 'step ffold "lines: %d" fmt print
-step:
-  _! inc ret
+"data.txt" 0 'step file_fold_lines "lines: %d" format print ret
+step: acc! _!
+  acc@ inc ret
 ```
 
 ### for loop
 ```
 5 'body for "done" print ret
 body:
-  "%d" fmt print ret
+  "%d" format print ret
 ```
 
 ### Sum a list of numbers
 ```
-list 10 push 20 push 30 push
-0 'addup vfold "sum: %d" fmt print
+[10 20 30] int array 0 'addup array_reduce "sum: %d" format print ret
 addup:
   add ret
 ```
 
 ### Double every element in an array
 ```
-5 int arr nums!
-'dbl vmap nums!
-nums@ 0 get "first: %d" fmt print
+5 int array nums!
+nums@ 'dbl array_map nums!
+nums@ 0 get "first: %d" format print ret
 dbl:
   2 mul ret
 ```
 
 ### Keep elements greater than 3
 ```
-0 10 range 'big? filter len "kept: %d" fmt print
+0 10 range 'big? filter length "kept: %d" format print ret
 big?:
   3 gt ret
 ```
 
 ### Count lines matching a pattern in a file
 ```
-"log.txt" 'check feach
-0 count!
-"errors: %d" count@ fmt print ret
-check:
-  "ERROR" match _! _! if count@ inc count! then
-  1 ret
+"log.txt" 0 'count_err file_fold_lines "errors: %d" format print ret
+count_err: acc! line!
+  line@ "ERROR" starts_with acc@ add ret
 ```
 
 ### Transform a list of strings to uppercase
 ```
-list "hello" push "world" push
-'ucase imap collect "\n" join print
+list "hello" append "world" append iter 'ucase iter_map collect "\n" join print ret
 ucase:
-  up ret
+  uppercase ret
 ```
 
 ## Best practices
 
 - Prefer named variables over chaining more than two ops in a row.
-- Use locals (`x!`/`x@`) for function-scoped state, globals (`^x!`/`^x@`) for shared state.
-- Prefer structured ops (`filter`, `sort`, `vmap`, `vfold`) over manual loops.
-- Use `slurp`/`spit` for file I/O, `sh` for shell commands, `json`/`unjson` for structured data.
-- Dense mode for inline/one-shot scripts; text mode for anything you'll save or share.
-- Test with: `nkr program.ent` (compiles, caches, and runs in one step).
+- Use locals (`x!`/`x@`) for function-scoped state, shared variables (top-level plain-name assignment) for shared state.
+- Prefer structured ops (`filter`, `sort`, `array_map`, `array_reduce`) over manual loops.
+- Use `read_file`/`write_file` for file I/O, `shell` for shell commands, `parse_json`/`to_json` for structured data.
+- Text mode is the default for everything; dense mode is experimental — opt in only for token-critical one-off scripts.
+- Test with: `nk program.n` (compiles, caches, and runs in one step).
 
 ## Opcode list ({count} live opcodes)
 
@@ -397,7 +387,7 @@ ucase:
     )
 }
 
-pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
+pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
     let mut emit_c = false;
@@ -474,11 +464,11 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
                 device = Some(d);
             }
             "-h" | "--help" => {
-                eprintln!("usage: nkr [directory]                   compile+run directory (auto-discovers)");
-                eprintln!("       nkr input.en... ['inline source'|-]        compile+run (cached in TMPDIR)");
-                eprintln!("       nkr -c input.en... [-o output] [--emit-c|--emit-text|--emit-dense]");
-                eprintln!("       nkr --to-text prog.en | --to-dense prog.ent   convert encodings (writes prog.ent/.en)");
-                eprintln!("       nkr -s | --skill                    print agent SKILL.md template");
+                eprintln!("usage: nk [directory]                   compile+run directory (auto-discovers)");
+                eprintln!("       nk input.n... ['inline source'|-]        compile+run (cached in TMPDIR)");
+                eprintln!("       nk -c input.n... [-o output] [--emit-c|--emit-text|--emit-dense]");
+                eprintln!("       nk --to-text prog.nd | --to-dense prog.n   convert encodings (writes prog.n/.nd)");
+                eprintln!("       nk -s | --skill                    print agent SKILL.md template");
                 eprintln!("");
                 eprintln!("  runtime flags (baked into compiled binary):");
                 eprintln!("       --gc-threshold N   GC collection threshold in bytes (default: 1MB)");
@@ -488,7 +478,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
                 eprintln!("       --                  pass remaining args to the program");
                 eprintln!("");
                 eprintln!("  sandbox flags (see SPEC.md — Sandboxing and capabilities):");
-                eprintln!("       --policy NAME       select a capability policy baked into this build (nkrsb: pure|data|web|build)");
+                eprintln!("       --policy NAME       select a capability policy baked into this build (nks: pure|data|web|build)");
                 eprintln!("       --sandbox FILE      tighten capabilities with a .ufs config (repeatable, tighten-only)");
                 eprintln!("       --workspace DIR     add/intersect a filesystem workspace root (repeatable)");
                 eprintln!("       --caps              print this build's effective capabilities and exit");
@@ -507,7 +497,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
         }
         i += 1;
     }
-    // Directory mode: bare `nkr` or `nkr somedir/` discovers files automatically.
+    // Directory mode: bare `nk` or `nk somedir/` discovers files automatically.
     // (--caps never requires a program to be present.)
     let init_flags: Vec<bool>;
     if inputs.is_empty() && !show_caps {
@@ -527,10 +517,10 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
     let baked_parsed: Option<(SandboxFile, String)> = if baked_sb.trim().is_empty() {
         None
     } else {
-        let origin = if bin_is_nkrsb {
-            "baked into nkrsb at build (comp/sandbox.ufs or NKR_SANDBOX_CONFIG)".to_string()
+        let origin = if bin_is_nks {
+            "baked into nks at build (comp/sandbox.ufs or NK_SANDBOX_CONFIG)".to_string()
         } else {
-            "baked into nkr at build (NKR_SANDBOX_CONFIG)".to_string()
+            "baked into nk at build (NK_SANDBOX_CONFIG)".to_string()
         };
         Some((parse_ufs(baked_sb, "<build-baked sandbox>"), origin))
     };
@@ -612,7 +602,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
                         .collect();
                     (s, clean)
                 }
-                Err(_) if last && !input.ends_with(".en") && !input.ends_with(".ent") => {
+                Err(_) if last && !input.ends_with(".nd") && !input.ends_with(".n") => {
                     (input.clone(), "main".to_string())
                 }
                 Err(e) => panic!("cannot read {}: {}", input, e),
@@ -634,13 +624,13 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
             })
             .collect();
         let is_path = input != "-"
-            && (input.ends_with(".en") || input.ends_with(".ent") || std::path::Path::new(input).exists());
+            && (input.ends_with(".nd") || input.ends_with(".n") || std::path::Path::new(input).exists());
         let canon_base = is_path.then(|| std::path::Path::new(input).canonicalize().ok()).flatten();
         let base_path = canon_base.as_deref();
         let mut manifest_toks = Vec::new();
         for u in &uses {
             let msrc = find_manifest(u, base_path)
-                .unwrap_or_else(|| panic!("USE\"{}\": no mods/{}.ufm found (searched near input, CWD/mods, ~/.nkr/mods, NKRMODPATH)", u, u));
+                .unwrap_or_else(|| panic!("USE\"{}\": no mods/{}.ufm found (searched near input, CWD/mods, ~/.nk/mods, NKMODPATH)", u, u));
             hash_src.push_str(&msrc);
             let mut mt = lex_source(&msrc);
             // manifest imports are exempt from ffi.import gating: loading the
@@ -667,8 +657,8 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
             if inp == "-" || !std::path::Path::new(inp).exists() {
                 panic!("--to-text/--to-dense need a file input (or use -o with inline source)");
             }
-            let stem = inp.strip_suffix(".en").or_else(|| inp.strip_suffix(".ent")).unwrap_or(inp);
-            Some(format!("{}.{}", stem, if emit_text_f { "ent" } else { "en" }))
+            let stem = inp.strip_suffix(".nd").or_else(|| inp.strip_suffix(".n")).unwrap_or(inp);
+            Some(format!("{}.{}", stem, if emit_text_f { "n" } else { "nd" }))
         } else {
             None
         };
@@ -681,12 +671,15 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
         }
         return;
     }
-    if std::env::var("NKR_DEBUG_PARSE").is_ok() {
+    if std::env::var("NK_DEBUG_PARSE").is_ok() {
         for (i, t) in tus.iter().enumerate() { eprintln!("[tu{}] ins={}", i, t.ins.len()); }
     }
-    let parsed = merge_tus(tus, mods, &init_flags);
-    if std::env::var("NKR_DEBUG_PARSE").is_ok() { eprintln!("[merged] ins={}", parsed.ins.len()); }
+    let mut parsed = merge_tus(tus, mods, &init_flags);
+    if std::env::var("NK_DEBUG_PARSE").is_ok() { eprintln!("[merged] ins={}", parsed.ins.len()); }
     check_label_arity(&parsed);
+    // v14.1 strictness: propagate strict/loose taints, reject implicit
+    // coercion of strict values, and erase the markers (purely static)
+    check_strictness(&mut parsed);
     // ---- automatic GPU offloading (no opt-in): compile the static shader
     // library (plus any fused weave-task kernels) and embed it when a Vulkan
     // toolchain is present, the device mode is not cpu, and the program has
@@ -710,7 +703,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
         }
     }
     // regions fuse on CPU regardless of GPU availability (gen guards the GPU
-    // try in #ifdef NKR_GPU); kidx only matters when the prefix defined it
+    // try in #ifdef NK_GPU); kidx only matters when the prefix defined it
     compute::register_region_kernels(region_kernels);
     let mut csrc = gen(&parsed, &structs, debug);
     if let Some(prefix) = gpu_prefix {
@@ -719,7 +712,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
     // bake runtime config into the generated binary
     let mut config_lines = c_bake(&caps, device.as_deref().unwrap_or("auto"));
     if let Some(t) = gc_threshold {
-        config_lines.push_str(&format!("  setenv(\"NKR_GC_THRESHOLD\",\"{}\",1);\n", t));
+        config_lines.push_str(&format!("  setenv(\"NK_GC_THRESHOLD\",\"{}\",1);\n", t));
     }
     if gc_off {
         config_lines.push_str("  uf_gc_on=0;\n");
@@ -773,7 +766,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nkrsb: bool) {
         h = h.wrapping_mul(0x100000001b3);
     }
     let dir = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let cdir = std::path::Path::new(&dir).join("nkr-cache");
+    let cdir = std::path::Path::new(&dir).join("nk-cache");
     fs::create_dir_all(&cdir).unwrap_or_else(|e| panic!("cannot create {}: {}", cdir.display(), e));
     let bin = cdir.join(format!("{:016x}", h));
     let bins = bin.to_string_lossy().to_string();

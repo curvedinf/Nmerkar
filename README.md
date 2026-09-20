@@ -1,10 +1,10 @@
-# Enmerkar
+# Nmerkar (nk)
 
 A programming language that gives AI agents **Python brevity at native speed**.
-Enmerkar includes a powerful suite of built-ins which simplify and accelerate data
+Nmerkar includes a powerful suite of built-ins which simplify and accelerate data
 processing, while retaining full compatibility with C's ecosystem. When a GPU
-is available, Enmerkar automatically accelerates code by compiling optimized
-fused vulkan kernels. Ask your agent if they'd rather use Enmerkar.
+is available, Nmerkar automatically accelerates code by compiling optimized
+fused vulkan kernels. Ask your agent if they'd rather use Nmerkar.
 
 # Who was Enmerkar?
 
@@ -17,21 +17,24 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 
 ## Language Attributes
 
-| Attribute | Enmerkar |
+| Attribute | Nmerkar |
 |---|---|
-| Execution | Compiled (Enmerkar → C → native binary) |
+| Specialization | Throwaway data processing tools |
+| Execution | Compiled (Nmerkar → C → native binary) |
+| Style | Forth-like postfix |
+| Block control | Implicit (no brackets) |
 | Typing | Dynamic and weak |
 | Memory | Garbage collected |
+| C Imports | Direct ABI, no glue |
 | Primitives | int, float, str, ptr |
 | Data structures | list, dict, arr, tensor, chan, atom, obj, bitmap, bloom, iter |
-| GPU Acceleration | automatic |
-| C Imports | Zero-overhead, no glue |
 | Concurrency | Channels, threads, dataflow DAGs with fanout |
 | Built-ins | Regex, JSON, shell, I/O, streaming, tensor math |
+| GPU Acceleration | Full source automatic fusion |
 
 ### Tokens to write (fewer = cheaper LLM calls)
 
-| | Enmerkar | C++ | Rust | Python | Node.js |
+| | Nmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
 | logextract | **303** | 846 | 667 | 329 | 437 |
 | analytics | **251** | 793 | 756 | 366 | 471 |
@@ -40,58 +43,58 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | matmul | **143** | 244 | 278 | 172 | 235 |
 | blackscholes | **675** | 764 | 834 | 748 | 749 |
 | nqueens | **254** | 309 | 349 | 267 | 274 |
-| bfs | 353 | 411 | 416 | **282** | 375 |
-| **total** | **2535** | 3906 | 4003 | 2585 | 3096 |
+| bfs | **386** | 480 | 497 | 397 | 436 |
+| dynamicgraph | 355 | 436 | 423 | **303** | 369 |
+| **total** | **2923** | 4411 | 4507 | 3003 | 3526 |
 
-Token counts use the **Qwen3-0.6B** tokenizer (151,643 vocab). The first six
-benchmarks are data/tensor-shaped (Enmerkar's home turf); nqueens and bfs are
-imperative control-flow shapes where Python's loops stay terse.
+Token counts use the **Qwen3** tokenizer (151,643 vocab). The first six
+benchmarks are data/tensor-shaped (Nmerkar's home turf); nqueens stresses
+control flow, bfs uses packed CSR arrays, and dynamicgraph isolates hash-map
+and small-list allocation costs.
 
 ### Speed (CPU only, seconds, lower = faster)
 
-| | Enmerkar | C++ | Rust | Python | Node.js |
+| | Nmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
-| logextract 510 MB | 0.46 | **0.40** | 0.67 | 3.71 | 2.94 |
-| analytics 512 MB | 1.01 | **0.99** | 1.71 | 4.47 | 3.39 |
-| mandelbrot | 0.06 | **0.05** | 0.05 | 4.13 | 0.06 |
-| spectralnorm | **1.06** | 1.10 | 1.08 | 133.1 | 1.57 |
-| matmul N=512 | 0.03 | 0.04 | **0.02** | 0.15 | 0.14 |
-| blackscholes N=2M | 0.13 | **0.04** | 0.04 | 0.17 | 0.07 |
-| nqueens N=11 | 0.02 | **0.01** | 0.01 | 1.52 | 0.03 |
-| bfs n=1M | 0.48 | 0.11 | **0.09** | 1.68 | 0.25 |
-| **total (6 CPU benches)** | 2.75 | **2.61** | 3.57 | 145.8 | 8.17 |
+| logextract 510 MB | 0.48 | **0.41** | 0.69 | 3.77 | 2.94 |
+| analytics 512 MB | **1.03** | **1.03** | 1.72 | 4.48 | 3.51 |
+| mandelbrot | 0.07 | **0.05** | **0.05** | 3.87 | 0.07 |
+| spectralnorm | 1.09 | 1.10 | **1.08** | 134.38 | 1.59 |
+| nqueens N=11 | 0.03 | 0.01 | **0.01** | 1.61 | 0.04 |
+| bfs CSR n=1M | 0.11 | **0.03** | 0.06 | 1.42 | 0.09 |
+| dynamicgraph n=1M | 0.52 | **0.16** | 0.31 | 1.69 | 0.41 |
+| matmul N=512 | 0.04 | 0.03 | **0.03** | 0.16 | 0.13 |
+| blackscholes N=2M | 0.13 | 0.04 | **0.04** | 0.18 | 0.07 |
+| **total** | 3.49 | **2.87** | 3.98 | 151.56 | 8.84 |
 
 ### GPU offloading (seconds, lower = faster)
 
-| workload | CPU (--device cpu) | GPU |
+| workload | CPU (`--device cpu`) | GPU (`--device vk0`) |
 |---|---|---|
-| matmul N=512 | **0.03s** | 0.05s |
-| matmul N=1024 | 0.20s | **0.11s** |
-| matmul N=2048 | 1.53s | **0.36s** |
-| blackscholes N=2M | **0.13s** | 0.67s |
-
-Default `auto` uses a static first-run estimate (work vs transfer vs init — no
-autotuning): N=512 matmul and N=2M blackscholes stay on CPU; N=1024/2048
-matmul use the GPU. `--device vk<N>` still forces the GPU column.
+| matmul N=2048 | 1.63s | **0.26s** |
+| blackscholes N=32M | 2.14s | **1.64s** |
 
 ## Quick start
 
 ```sh
 cd comp && cargo build --release
-./comp/target/release/nkr '"Hello!\n" print'
-cargo install --path comp       # optional: install nkr to PATH
+./comp/target/release/nk '"Hello!\n" print'
+cargo install --path comp       # optional: install nk to PATH
 ```
 
 ## Usage
 
 ```sh
-nkr '"Hello Enmerkar!" print'      # run an inline program (cached)
-nkr prog.en                     # compile + run (cached)
-nkr -c prog.en -o hello         # compile to standalone binary
-nkr --emit-c prog.en            # dump the generated C
-nkr --to-text prog.en           # convert dense → text
-nkr somedir/                    # directory mode (auto-discovers main + init threads)
+nk '"Hello Nmerkar!" print'      # run an inline program (cached)
+nk prog.n                      # compile + run (cached)
+nk -c prog.n -o hello          # compile to standalone binary
+nk --emit-c prog.n             # dump the generated C
+nk --to-text prog.nd           # convert dense → text
+nk somedir/                    # directory mode (auto-discovers main + init threads)
 ```
+
+Text (`.n`) is the default encoding; dense (`.nd`) is an experimental
+token-optimized encoding.
 
 ## Example
 
@@ -116,10 +119,10 @@ entry:
   ret
 ```
 
-Use `nkr` inline to efficiently process data with `bash`:
+Use `nk` inline to efficiently process data with `bash`:
 
 ```
-$ grep ',Retail,' bench/data/sales.csv | nkr 'dict p! dict c! "/dev/stdin" "," 0 '\''r file_split_lines z! p@ 5 top_n print c@ 5 top_n print ret r: a! n! p@ 4 10 field_float field_add_to c@ 3 10 field_float field_add_to ret a@'
+$ grep ',Retail,' bench/data/sales.csv | nk 'dict p! dict c! "/dev/stdin" "," 0 '\''r file_split_lines z! p@ 5 top_n print c@ 5 top_n print ret r: a! n! p@ 4 10 field_float field_add_to c@ 3 10 field_float field_add_to ret a@'
 
 > [["Bundle B",23912165787.440258],["Refurb Unit",23788674041.119873],["Gadget X1",23781641142.379787],["Spare Part",23776965024.160465],["Widget Pro",23759658166.90052]]
 [["Mexico",13218417280.809916],["USA",13212495563.130194],["Canada",13160810726.84009],["Colombia",9948195871.5800667],["Egypt",9948038758.9899693]]
@@ -128,7 +131,7 @@ $ grep ',Retail,' bench/data/sales.csv | nkr 'dict p! dict c! "/dev/stdin" "," 0
 ## Documentation
 
 Full language spec (every opcode, semantics, encoding rules) in
-[`SPEC.md`](SPEC.md). Benchmark details in [`bench/SPEC.md`](bench/SPEC.md).
+[`SPEC.md`](SPEC.md).
 
 ## Status
 
@@ -136,33 +139,31 @@ Experimental, under active development.
 
 ## Sandboxing
 
-Building Enmerkar by default produces two compilers: `nkr` and
-`nkrsb`. `nkrsb` is a sandboxed version of `nkr` that prevents agent-authored 
+Building Nmerkar by default produces two compilers: `nk` and
+`nks`. `nks` is a sandboxed version of `nk` that prevents agent-authored
 scripts from performing unsafe operations.
 
 ```sh
-nkrsb --caps                       # show effective capabilities + workspace roots
-nkrsb --policy web fetch.ent       # use a preconfigred policy
+nks --caps                       # show effective capabilities + workspace roots
+nks --policy web fetch.n       # use a preconfigred policy
 ```
 
-`nkrsb` defaults to the `data` policy, or set of disabled features, but ships
+`nks` defaults to the `data` policy, or set of disabled features, but ships
 with other policies. You can customize the policy at runtime.
 
 ## Automatic GPU Acceleration
 
-When a Vulkan toolchain is present, Enmerkar by default automatically hardware
-accelerates applicable segments of code. Default `auto` never times both
-backends: it picks CPU or GPU from a static estimate of work vs transfer vs
-init so the first run of a fresh binary is not slower than the faster pin.
+When a Vulkan toolchain is present, Nmerkar by default, automatically hardware
+accelerates applicable segments of code.
 
 ```sh
-nkr bigmatmul.ent          # auto: GPU when the static estimate says it wins
-nkr --device cpu prog.ent  # never offload
-nkr --device vk0 prog.ent  # pin a specific Vulkan device
+nk bigmatmul.n          # auto: GPU when the static estimate says it wins
+nk --device cpu prog.n  # never offload
+nk --device vk0 prog.n  # pin a specific Vulkan device
 ```
 
 ## Transpiler
 
-Enmerkar's project includes a transpiler which converts simple C programs and
-libraries to Enmerkar-native versions. This allows automated creation of training
+Nmerkar's project includes a transpiler which converts simple C programs and
+libraries to Nmerkar-native versions. This allows automated creation of training
 data for language models.

@@ -3,10 +3,10 @@
 // There is no opt-in flag: when a Vulkan shader toolchain (glslc) is present
 // and the device mode is not `--device cpu`, the compiler compiles the STATIC
 // shader library below to SPIR-V, embeds the blobs into the generated C
-// (`#define NKR_GPU`), and links -lvulkan. The runtime shims in the prelude
+// (`#define NK_GPU`), and links -lvulkan. The runtime shims in the prelude
 // pick the device (auto = most free VRAM via VK_EXT_memory_budget; pinned via
 // the baked --device string) and launch prebuilt kernels for eligible ops
-// when the element count clears NKR_GPU_MIN; otherwise they fall back to the
+// when the element count clears NK_GPU_MIN; otherwise they fall back to the
 // CPU implementation. Kernels are only ever *launched*, never generated from
 // user code.
 //
@@ -179,14 +179,14 @@ pub fn gpu_enablement(device: &str, extra_kernels: &[(String, String)]) -> Optio
 
     // cache dir
     let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let cdir = std::path::Path::new(&dir).join("nkr-spirv");
+    let cdir = std::path::Path::new(&dir).join("nk-spirv");
     let _ = std::fs::create_dir_all(&cdir);
 
     let lib = backend.shader_library();
     let mut all: Vec<(String, String)> = lib.into_iter().map(|(n, s)| (n.to_string(), s)).collect();
     all.extend(extra_kernels.iter().cloned());
     let lib = all;
-    let mut c = String::from("#define NKR_GPU 1\n");
+    let mut c = String::from("#define NK_GPU 1\n");
     for (name, src) in &lib {
         let spv_path = cdir.join(format!("{}_{:016x}.spv", name, fnv(src)));
         let spv = if spv_path.exists() {
@@ -665,7 +665,7 @@ pub fn region_glsl(ninputs: usize, exprs: &[(OutBind, TExpr)]) -> String {
 pub fn analyze_regions(p: &crate::ast::Parsed) -> Vec<RegionKernel> {
     use std::collections::HashSet;
     let targets: HashSet<usize> = p.labels.values().copied().collect();
-    let dbg = std::env::var("UF_DEBUG_REGION").is_ok() || std::env::var("NKR_DEBUG_REGION").is_ok();
+    let dbg = std::env::var("UF_DEBUG_REGION").is_ok() || std::env::var("NK_DEBUG_REGION").is_ok();
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < p.ins.len() {
@@ -839,20 +839,20 @@ fn simulate_fold_body(
                 _ => return None,
             },
             other => {
-                if std::env::var("NKR_DEBUG_REGION2").is_ok() { eprintln!("[fold-sim] ineligible: {:?}", other); }
+                if std::env::var("NK_DEBUG_REGION2").is_ok() { eprintln!("[fold-sim] ineligible: {:?}", other); }
                 return None;
             }
         }
         i += 1;
     }
     if stack.len() != 1 {
-        if std::env::var("NKR_DEBUG_REGION2").is_ok() { eprintln!("[fold-sim] stack={}", stack.len()); }
+        if std::env::var("NK_DEBUG_REGION2").is_ok() { eprintln!("[fold-sim] stack={}", stack.len()); }
         return None;
     }
     match stack.pop() {
         Some(V::E(e)) => Some(e),
         _ => {
-            if std::env::var("NKR_DEBUG_REGION2").is_ok() { eprintln!("[fold-sim] opaque"); }
+            if std::env::var("NK_DEBUG_REGION2").is_ok() { eprintln!("[fold-sim] opaque"); }
             None
         }
     }
@@ -1129,7 +1129,7 @@ fn walk_one_region(
             None => return None,
         }
     }
-    if std::env::var("NKR_DEBUG_REGION2").is_ok() {
+    if std::env::var("NK_DEBUG_REGION2").is_ok() {
         let ctx: Vec<String> = (start..((start+6).min(p.ins.len()))).map(|k| format!("{:?}", p.ins[k])).collect();
         eprintln!("[region?] start={} end={} stack={} ops={} inputs={} ctx={:?}",
             start, end_pc, stack.len(), ops, inputs.len(), ctx);
@@ -1157,7 +1157,7 @@ fn walk_one_region(
             }
         }
     }
-    if std::env::var("NKR_DEBUG_REGION2").is_ok() {
+    if std::env::var("NK_DEBUG_REGION2").is_ok() {
         let lv: Vec<String> = live.iter().map(|x| match x { Slot::Id(i)=>format!("L{}",i), Slot::Name(n)=>format!("S:{}",n) }).collect();
         eprintln!("[region?] start={} live={:?}", start, lv);
     }

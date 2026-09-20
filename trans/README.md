@@ -1,7 +1,7 @@
-# trans — C → Enmerkar transpiler (Rust)
+# trans — C → Nmerkar transpiler (Rust)
 
-`trans` reads a C-subset source file and prints Enmerkar **text-encoding**
-source (`.ent`, per `../SPEC.md`) to stdout. It is a standalone Rust crate
+`trans` reads a C-subset source file and prints Nmerkar **text-encoding**
+source (`.n`, per `../SPEC.md`) to stdout. It is a standalone Rust crate
 (std-only, no external dependencies) split into logical modules:
 
 ```
@@ -12,16 +12,16 @@ src/
   lexer.rs   hand-rolled scanner; skips whitespace/comments/preprocessor
   ast.rs     the C-subset syntax tree (expressions, statements, functions)
   parser.rs  recursive descent with C precedence for the supported subset
-  emit.rs    AST → Enmerkar text (the translation proper)
+  emit.rs    AST → Nmerkar text (the translation proper)
 ```
 
 Build and run:
 
 ```
 cargo build --release            # binary at trans/target/release/trans
-./target/release/trans prog.c > prog.ent
-../comp/target/release/nkr prog.ent                 # compile + run
-# or: ../comp/target/release/nkr -c prog.ent -o prog && ./prog -- args...
+./target/release/trans prog.c > prog.n
+../comp/target/release/nk prog.n                 # compile + run
+# or: ../comp/target/release/nk -c prog.n -o prog && ./prog -- args...
 ```
 
 `cargo test` runs the crate's unit tests (lexer, parser precedence, emitter
@@ -33,7 +33,7 @@ Three gated pathways:
 
 `bash run_tests.sh` → `pass=23 fail=0` (per-operation + coreutils round-trips):
 
-- **Round-trips** (`tests/*.c`): C → trans → nkr → run, compared against
+- **Round-trips** (`tests/*.c`): C → trans → nk → run, compared against
   system binaries (`echo`, `false`, `true`, `wc`, `yes`) or expected-output
   files (`hello`, `mini_gen`). Infinite streams (`yes`) compare the first
   50 lines and the timeout exit code.
@@ -54,7 +54,7 @@ Three gated pathways:
   CRC-32 with little-endian length feeding), `base64` (encode with -w
   wrap, decode with padding). Each tool's `.c` files (concatenated in
   `ls` order) are transpiled in one invocation — multi-file input — and
-  gated against the system binaries. The transpiled `.ent` of every tool
+  gated against the system binaries. The transpiled `.n` of every tool
   is exported to `examples/gnu/` so the generated code is publicly
   browsable.
 
@@ -81,14 +81,14 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
   `< <= > >= == !=`, logical `&& ||` (both operands always evaluated — no
   short-circuit), with C precedence. `p[i]` on a `char*` reads byte `i`
   (via `strstr` raw-pointer idiom + `load`).
-- Builtins: `argc`, `argv[i]` (via `extern "nkr_argc"` / `extern "nkr_argv"`),
+- Builtins: `argc`, `argv[i]` (via `extern "nk_argc"` / `extern "nk_argv"`),
   `__byte(p)` (first byte of `p`), `NULL` (0), `EOF` (-1).
 - Comments (`/* ... */`, `//`) and blank lines are fine; preprocessor lines
   (`#include` etc.) are skipped. Call libc directly; the emitted preamble
   always IMPORTs `printf fprintf fputc ungetc putchar getchar fputs fwrite
   fread strcmp strncmp strcpy exit fopen fclose fgetc strstr` and declares
   `extern "stdout" "stdin" "stderr"`.
-- **Native mappings** — these libc calls compile to Enmerkar ops instead of
+- **Native mappings** — these libc calls compile to Nmerkar ops instead of
   FFI imports (no libc symbol, works under any sandbox policy):
   `malloc(n)`→`malloc`, `free(p)`→`free`, `strlen(s)`→`length`,
   `strcat(a,b)`→`concat` (returns a NEW string; the C destination is not
@@ -110,7 +110,7 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
 - `switch`, arrays (other than byte-indexing a `char*`), structs, enums,
   pointers other than `char*`, `long`/`float`/`double`, `goto`, the
   preprocessor.
-- C `\x..` and `\0..` escapes **inside string/char literals**: Enmerkar
+- C `\x..` and `\0..` escapes **inside string/char literals**: Nmerkar
   string escapes are only `\n \t \r \0 \\ \"`; an unknown char escape is an
   error. Use numeric codes instead (the test programs compare against e.g.
   92 for backslash).

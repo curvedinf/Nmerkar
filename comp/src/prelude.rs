@@ -81,14 +81,14 @@ typedef struct WeaveJobS { WeaveTask* ts; int n; UfRun run; _Atomic int shutdown
 
 static void die(const char*m);
 static _Thread_local const char* uf_cur_op;
-static void nkr_run(Ctx*cx, long pc);
+static void nk_run(Ctx*cx, long pc);
 static _Thread_local const void* uf_entry_addr;
 static void uf_call_addr(Ctx*cx, const void* a, long frame, long entry_pc, long nargs){
   if(cx->csp>=cx->ccap){char _b[128];snprintf(_b,sizeof(_b),"call stack overflow in %s (csp=%ld, cap=%ld)",uf_cur_op,cx->csp,cx->ccap);die(_b);}
   /* save the pre-argument data-stack pointer: the callee's param pops guard
      against it, and its RET drains back to it */
   long _sp0 = cx->sp - nargs; if(_sp0 < 0) _sp0 = 0;
-  cx->rsps[cx->csp]=_sp0; cx->cs[cx->csp++]=0; cx->local_frames[cx->local_fsp++]=cx->local_base; cx->call_pcs[cx->call_csp++]=entry_pc; cx->local_base+=frame; uf_entry_addr=a; nkr_run(cx,-1); cx->local_base=cx->local_frames[--cx->local_fsp]; cx->call_csp--; }
+  cx->rsps[cx->csp]=_sp0; cx->cs[cx->csp++]=0; cx->local_frames[cx->local_fsp++]=cx->local_base; cx->call_pcs[cx->call_csp++]=entry_pc; cx->local_base+=frame; uf_entry_addr=a; nk_run(cx,-1); cx->local_base=cx->local_frames[--cx->local_fsp]; cx->call_csp--; }
 /* push a continuation with its saved caller-sp; checked against cs capacity */
 static inline void uf_cspush(Ctx*cx, const void* k, long sp0){
   if(cx->csp>=cx->ccap){char _b[128];snprintf(_b,sizeof(_b),"call stack overflow in %s (csp=%ld, cap=%ld)",uf_cur_op,cx->csp,cx->ccap);die(_b);}
@@ -121,7 +121,7 @@ static void uf_dump_cell(Cell c){
 }
 
 static void uf_crash_dump(Ctx*cx){
-  fprintf(stderr,"\n--- nkr crash dump ---\n");
+  fprintf(stderr,"\n--- nk crash dump ---\n");
   fprintf(stderr,"  call stack:\n");
   for(long i=cx->call_csp-1;i>=0;i--){
     long pc=cx->call_pcs[i];
@@ -131,7 +131,7 @@ static void uf_crash_dump(Ctx*cx){
   fprintf(stderr,"  locals:\n");
   for(long i=cx->call_csp-1;i>=0;i--){
     long pc=cx->call_pcs[i];
-    /* local_frames has one extra entry (the nkr_run entry frame) that
+    /* local_frames has one extra entry (the nk_run entry frame) that
        has no corresponding call_pcs entry, so call_pcs[i] maps to
        local_frames[i+1] as the saved local_base before this frame's bump.
        The frame's actual locals start at saved_base + frame_size. */
@@ -157,7 +157,7 @@ static void uf_crash_dump(Ctx*cx){
 static void die(const char*m){
   if(uf_try_top){ UfTry*t=uf_try_top; longjmp(t->jb,1); }
   if(uf_debug_mode && uf_current_ctx) uf_crash_dump(uf_current_ctx);
-  fprintf(stderr,"nkr: %s\n",m); exit(1);
+  fprintf(stderr,"nk: %s\n",m); exit(1);
 }
 
 /* ================= sandbox capability state =================
@@ -465,7 +465,7 @@ static void uf_gc_register_static(void* p){
 }
 static void uf_init_lits(void** lits, long n){ for(long i=0;i<n;i++) uf_gc_register_static(lits[i]); }
 static void uf_gc_init(void){
-  const char* e=getenv("NKR_GC_THRESHOLD");
+  const char* e=getenv("NK_GC_THRESHOLD");
   if(e&&*e){ uint64_t v=strtoull(e,0,0); if(v) uf_gc_threshold=v; }
   (void)UF_MAXTMP;
   ctx_register(&main_cx_store);
@@ -480,7 +480,7 @@ static Cell main_locals[65536]; static long main_local_frames[65536];
 static long main_call_pcs[1<<16];
 static Ctx main_cx_store = { main_ds, 0, 1<<20, main_cs, 0, 1<<16, main_rsps, {{0,0,0}}, 0, main_locals, 0, 65536, main_local_frames, 0, 65536, main_call_pcs, 0, 1<<16, 0 };
 static Ctx* main_cx = &main_cx_store;
-int64_t nkr_argc=0; void* nkr_argv=0; /* program args, reachable via EXTERN "nkr_argc"/"nkr_argv" + LOADX, or ARGV */
+int64_t nk_argc=0; void* nk_argv=0; /* program args, reachable via EXTERN "nk_argc"/"nk_argv" + LOADX, or ARGV */
 
 static inline void pushc(Ctx*cx,Cell c){ if(cx->sp>=cx->dcap){char _b[128];snprintf(_b,sizeof(_b),"stack overflow in %s (sp=%ld, cap=%ld)",uf_cur_op,cx->sp,cx->dcap);die(_b);} cx->ds[cx->sp++]=c; }
 static inline Cell uf_mki(int64_t v){ Cell c; c.tag=T_INT; c.i=v; return c; }
@@ -562,7 +562,7 @@ static Hdr* uf_arr_like(Hdr*a,uint64_t n);
 static double uf_el(Hdr*a,uint64_t i);
 static void uf_put_el(Hdr*a,uint64_t i,double d);
 static int uf_is_arrish(Hdr*a){ return a->tag==HT_ARR||a->tag==HT_TENSOR||a->tag==HT_MAT; }
-#ifdef NKR_GPU
+#ifdef NK_GPU
 struct UFPC { int64_t n0,n1,n2,n3; double s; int64_t rev; };
 static long uf_gpu_min(void);
 static int uf_spv_index(const char*name);
@@ -666,7 +666,7 @@ static void op_and(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_cand(a,b)); }
 static void op_pow(Ctx*cx){ Cell b=pop(cx),a=pop(cx); double x=uf_to_number(a),y=uf_to_number(b); pushc(cx,uf_mkf(pow(x,y))); }
 static void op_sqrt(Ctx*cx){ Cell a=pop(cx);
   UF_PROTECT((void**)(void*)&a.i);
-#ifdef NKR_GPU
+#ifdef NK_GPU
   if(a.tag==T_PTR&&a.i){ Hdr*h=uf_gc_find((void*)a.i);
     if(h&&uf_is_arrish(h)&&h->ety==1&&h->len>=(uint64_t)uf_gpu_min()){
       struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)h->len;
@@ -781,7 +781,68 @@ static void op_clone(Ctx*cx){
   memcpy(n,a,sz); n->gc_next=0; n->gc_flags=((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
   UF_UNPROTECT(); pushp(cx,n);
 }
-static void op_cast(Ctx*cx){ Cell id=pop(cx); Cell h=pop(cx); Hdr*a=(Hdr*)((void*)h.i); int64_t tk=(a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag; if(tk!=id.i)die("CAST: type mismatch"); pushc(cx,h); }
+/* CAST (_cast, static): C-style conversion, no value-content interpretation.
+   [v type] -> v'.
+   int (0): float truncates to i64, ptr reinterprets its address, byte widens.
+   float (1): int/byte widen to double; float is identity; else dies.
+   ptr (2): numeric payloads reinterpret as a handle; handles pass through.
+   byte (3): truncate the i64 payload to its low 8 bits (byte cell).
+   >=1000: checked struct downcast (struct id); dies on mismatch. */
+static void op_cast(Ctx*cx){
+  Cell id=pop(cx); Cell h=pop(cx); int64_t ty=id.i;
+  if(ty>=1000){
+    if(!h.i) die("CAST: null handle");
+    Hdr*a=(Hdr*)((void*)h.i); int64_t tk=(a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag;
+    if(tk!=ty)die("CAST: type mismatch"); pushc(cx,h); return;
+  }
+  switch(ty){
+    case 0:
+      if(h.tag==T_FLOAT) pushi(cx,(int64_t)uf_fbits(h.i));
+      else pushi(cx,h.i);
+      return;
+    case 1:
+      if(h.tag==T_FLOAT) pushc(cx,h);
+      else if(h.tag==T_INT||h.tag==T_BYTE) pushf(cx,(double)h.i);
+      else die("CAST float: not a scalar");
+      return;
+    case 2:
+      if(h.tag==T_PTR) pushc(cx,h);
+      else pushp(cx,(void*)h.i);
+      return;
+    case 3: {
+      Cell b; b.tag=T_BYTE; b.i=h.i&0xff; pushc(cx,b); return;
+    }
+    default: { char _b[96]; snprintf(_b,sizeof(_b),"CAST: unsupported type id %lld",(long long)ty); die(_b); }
+  }
+}
+/* DCAST (cast, dynamic): content-aware conversion — the explicit form of
+   universal coercion. [v type] -> v'.
+   int (0): universal numeric coercion (strings parsed, single-element lists
+   unwrapped), then integer truncation; NaN dies.
+   float (1): universal numeric coercion (NaN allowed).
+   ptr (2): static reinterpret (no content inspection).
+   byte (3): truncate the i64 payload to its low 8 bits.
+   str (9, the tag): universal string coercion (rendered representation).
+   >=1000: checked struct downcast, exactly as _cast. */
+static void op_dcast(Ctx*cx){
+  Cell id=pop(cx); Cell v=pop(cx); int64_t ty=id.i;
+  if(ty>=1000){
+    if(!v.i) die("cast: null handle");
+    Hdr*a=(Hdr*)((void*)v.i); int64_t tk=(a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag;
+    if(tk!=ty)die("cast: type mismatch"); pushc(cx,v); return;
+  }
+  switch(ty){
+    case 0: { double d=uf_to_number(v); if(isnan(d))die("cast int: value has no numeric form"); pushi(cx,(int64_t)d); return; }
+    case 1: pushf(cx,uf_to_number(v)); return;
+    case 2:
+      if(v.tag==T_PTR) pushc(cx,v);
+      else pushp(cx,(void*)v.i);
+      return;
+    case 3: { Cell b; b.tag=T_BYTE; b.i=v.i&0xff; pushc(cx,b); return; }
+    case 9: pushc(cx,uf_to_string(v)); return;
+    default: { char _b[96]; snprintf(_b,sizeof(_b),"cast: unsupported type id %lld",(long long)ty); die(_b); }
+  }
+}
 
 /* OBJ: size in low 32 bits of the operand, struct id above; esz = byte size,
    len = struct id. Field access via the container protocol. */
@@ -1408,7 +1469,7 @@ static void uf_weave(Ctx*cx,WeaveTask*ts,int n,UfRun run){
     for(int i=0;i<nw-1;i++) pthread_join(th[i],0);
   }
   uf_active_job=0;
-  if(getenv("NKR_WEAVE_DEBUG")){
+  if(getenv("NK_WEAVE_DEBUG")){
     for(int i=0;i<n;i++){
       WeaveTask*t=&ts[i];
       fprintf(stderr,"weave: task pc=%ld wall=%.3fms workers=%ld items=%ld retries=%ld tolerated=%ld\n",
@@ -1791,6 +1852,7 @@ static void op_split(Ctx*cx){
     S = (char*)uf_sptr(st); /* legacy raw char* */
   }
   const char* E=uf_sptr(sep);
+  if(!S)die("SPLIT: not a string");
   if(!*E)die("SPLIT: empty separator");
   size_t el=strlen(E);
   Dyn*d=uf_dyn_new(8); UF_PROTECT(&d);
@@ -2004,17 +2066,17 @@ static Hdr* uf_arr_like(Hdr*a,uint64_t n){
 }
 
 /* ================= GPU compute offloading (Vulkan, v13.1) =================
-   Enabled when the compiler embedded the SPIR-V blobs and defined NKR_GPU
+   Enabled when the compiler embedded the SPIR-V blobs and defined NK_GPU
    (automatic when glslc is present and device mode != cpu). The shims below
    lazily initialize Vulkan, pick the device (auto = most free VRAM via
    VK_EXT_memory_budget, discrete preferred; or the pinned --device bake),
    and LAUNCH prebuilt kernels for eligible ops when the element count clears
-   NKR_GPU_MIN (env, default 65536). Any failure or too-small workload falls
+   NK_GPU_MIN (env, default 65536). Any failure or too-small workload falls
    back to the CPU implementation — the GPU is a fast path, never a
    correctness dependency. Kernels are float64; other element types stay CPU.
    NOTE: `div` on the GPU yields inf/nan for zero divisors where the CPU dies
    (documented divergence). */
-#ifdef NKR_GPU
+#ifdef NK_GPU
 #include <vulkan/vulkan.h>
 static VkInstance uf_vk_inst;
 static VkPhysicalDevice uf_vk_pd;
@@ -2030,18 +2092,18 @@ static VkBuffer uf_vk_dummy;
 static VkDeviceMemory uf_vk_dummy_mem;
 static VkPipeline uf_vk_pipe[sizeof(uf_spv_all)/sizeof(uf_spv_all[0])];
 static int uf_vk_ready, uf_vk_broken;
-static long uf_gpu_min(void){ const char*e=getenv("NKR_GPU_MIN"); long v=e?atol(e):65536; return v>0?v:65536; }
+static long uf_gpu_min(void){ const char*e=getenv("NK_GPU_MIN"); long v=e?atol(e):65536; return v>0?v:65536; }
 /* v13.2: per-op arith offload floor. A fused region does O(ops) work per
    element for ONE transfer — worth it on the GPU at any size. A single
    per-op add/mul moves ~3×n×8 bytes for one op — on host-visible staging
    (~2GB/s) that loses to the CPU fast path until n is large. Fused-region
    and reduce paths keep the plain uf_gpu_min(). */
-static long uf_gpu_arith_min(void){ const char*e=getenv("NKR_GPU_ARITH_MIN"); long v=e?atol(e):(8L<<20); return v>0?v:(8L<<20); }
+static long uf_gpu_arith_min(void){ const char*e=getenv("NK_GPU_ARITH_MIN"); long v=e?atol(e):(8L<<20); return v>0?v:(8L<<20); }
 /* Static first-run matmul floor (no timing / no calibration): offload only
    when ra*ca*cb FLOPs clear this. 512³=134M loses to the CPU even after
    Vulkan is up (transfer+init); 1024³=1.07B wins. Default 400M sits between
-   512³ and 768³. Env NKR_GPU_MATMUL_MIN overrides. */
-static long uf_gpu_matmul_min(void){ const char*e=getenv("NKR_GPU_MATMUL_MIN"); long v=e?atol(e):(400L<<20); return v>0?v:(400L<<20); }
+   512³ and 768³. Env NK_GPU_MATMUL_MIN overrides. */
+static long uf_gpu_matmul_min(void){ const char*e=getenv("NK_GPU_MATMUL_MIN"); long v=e?atol(e):(400L<<20); return v>0?v:(400L<<20); }
 /* auto = pick CPU when the static estimate says so; vk<N> pins GPU. */
 static int uf_dev_is_auto(void){ return !(uf_device[0]=='v' && uf_device[1]=='k'); }
 static pthread_mutex_t uf_gpu_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -2077,7 +2139,7 @@ static void uf_vk_init(void){
   pthread_once(&once, uf_vk_init_body);
 }
 static void uf_vk_init_body(void){
-  VkApplicationInfo app; memset(&app,0,sizeof app); app.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO; app.pApplicationName="enmerkar"; app.apiVersion=VK_API_VERSION_1_1;
+  VkApplicationInfo app; memset(&app,0,sizeof app); app.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO; app.pApplicationName="nmerkar"; app.apiVersion=VK_API_VERSION_1_1;
   VkInstanceCreateInfo ci; memset(&ci,0,sizeof ci); ci.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ci.pApplicationInfo=&app;
   if(vkCreateInstance(&ci,0,&uf_vk_inst)!=VK_SUCCESS){ uf_vk_broken=1; return; }
   uint32_t nd=0; vkEnumeratePhysicalDevices(uf_vk_inst,&nd,0);
@@ -2211,10 +2273,15 @@ static int uf_vk_pool_reserve(VkDeviceSize total){
   VkMemoryRequirements mr; vkGetBufferMemoryRequirements(uf_vk_dev,uf_vk_bpool.buf,&mr);
   VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(uf_vk_pd,&mp);
   int found=0; VkDeviceSize sz=mr.size>want?mr.size:want;
-  for(int pass=0;pass<2&&!found;pass++)
+  /* Prefer cached coherent host memory: region outputs are read back by the
+     CPU after the fence, and uncached coherent mappings make that memcpy
+     dominate otherwise. Fall back to coherent, then any host-visible type. */
+  for(int pass=0;pass<3&&!found;pass++)
     for(uint32_t i=0;i<mp.memoryTypeCount;i++){
-      int wantcoherent=pass==0;
+      VkMemoryPropertyFlags f=mp.memoryTypes[i].propertyFlags;
+      int wantcached=pass==0, wantcoherent=pass<2;
       if((mp.memoryTypes[i].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+        &&(!wantcached||(f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
         &&(!wantcoherent||(mp.memoryTypes[i].propertyFlags&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
         &&(mr.memoryTypeBits&(1u<<i))){
         VkMemoryAllocateInfo ai; memset(&ai,0,sizeof ai); ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ai.allocationSize=sz; ai.memoryTypeIndex=i;
@@ -2231,8 +2298,9 @@ static int uf_vk_pool_reserve(VkDeviceSize total){
   if(!uf_vk_fence){ VkFenceCreateInfo fci; memset(&fci,0,sizeof fci); fci.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; vkCreateFence(uf_vk_dev,&fci,0,&uf_vk_fence); }
   return 1;
 }
-/* DEVICE_LOCAL twin of the staging pool — matmul reads each A/B element
-   O(n) times, so computing from VRAM beats BAR/host-visible. */
+/* DEVICE_LOCAL twin of the staging pool. Matmul and fused kernels execute
+   here so shaders do not stream their working sets from host memory over
+   PCIe. The mapped pool remains the upload/download staging area. */
 static UFCache uf_vk_dl;
 static int uf_vk_dl_reserve(VkDeviceSize total){
   if(uf_vk_dl.cap>=total&&uf_vk_dl.buf) return 1;
@@ -2279,7 +2347,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   pthread_mutex_lock(&uf_gpu_mu);
   if(!uf_vk_ensure_pipe(k)){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
   double _t0=uf_nowd();
-  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] bufs a=%zu b=%zu r=%zu\n",asz,bsz,rsz);
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] bufs a=%zu b=%zu r=%zu\n",asz,bsz,rsz);
   VkDeviceSize oa=0, ob=uf_vk_al((VkDeviceSize)asz), orr=uf_vk_al(ob+(VkDeviceSize)bsz);
   if(!uf_vk_pool_reserve(orr+uf_vk_al((VkDeviceSize)rsz))){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
   if(A&&asz) memcpy(uf_vk_bpool.mapped+oa,A,asz);
@@ -2290,7 +2358,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
   VkDescriptorSet ds;
   VkResult ar=vkAllocateDescriptorSets(uf_vk_dev,&dsai,&ds);
-  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] dsalloc=%d\n",(int)ar);
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] dsalloc=%d\n",(int)ar);
   if(ar!=VK_SUCCESS){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
   VkWriteDescriptorSet w[3]; VkDescriptorBufferInfo bi[3];
   memset(w,0,sizeof w); memset(bi,0,sizeof bi);
@@ -2299,9 +2367,9 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
   bi[2].buffer=cbuf; bi[2].offset=orr; bi[2].range=rsz?rsz:16;
   for(int i=0;i<3;i++){ w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet=ds; w[i].dstBinding=(uint32_t)i; w[i].descriptorCount=1; w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo=&bi[i]; }
   vkUpdateDescriptorSets(uf_vk_dev,3,w,0,0);
-  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] updated\n");
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] updated\n");
   VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] run k=%d n=%llu begin\n",k,(unsigned long long)n);
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] run k=%d n=%llu begin\n",k,(unsigned long long)n);
   vkBeginCommandBuffer(uf_vk_cb,&cbbi);
   if(is_mm){
     if(A&&asz){ VkBufferCopy c={oa,oa,(VkDeviceSize)asz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_bpool.buf,uf_vk_dl.buf,1,&c); }
@@ -2329,10 +2397,10 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
     VkBufferCopy c={orr,orr,(VkDeviceSize)rsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_dl.buf,uf_vk_bpool.buf,1,&c);
   }
   vkEndCommandBuffer(uf_vk_cb);
-  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] submit\n");
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] submit\n");
   int ok = uf_vk_submit_wait();
   if(ok&&R&&rsz) memcpy(R,uf_vk_bpool.mapped+orr,rsz);
-  if(getenv("NKR_VK_DEBUG"))fprintf(stderr,"[vk] total=%.1fms\n",(uf_nowd()-_t0)*1e3);
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] total=%.1fms\n",(uf_nowd()-_t0)*1e3);
   vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
   pthread_mutex_unlock(&uf_gpu_mu);
   return ok;
@@ -2342,7 +2410,7 @@ static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_
    One kernel launch for a whole compilable task body: inputs are the top n
    cells of the ds (peeked, not popped — the ret epilogue drains), the task
    kernel table follows the static library pipelines. Declines (no device,
-   non-float/mismatched inputs, below NKR_GPU_MIN, any Vulkan failure) return
+   non-float/mismatched inputs, below NK_GPU_MIN, any Vulkan failure) return
    the sentinel and the CPU body runs instead. */
 static Cell uf_gpu_decline(void);
 static Cell uf_gpu_task(Ctx*cx,int k,int n){
@@ -2366,6 +2434,10 @@ static Cell uf_gpu_task(Ctx*cx,int k,int n){
   VkDeviceSize offs[8]; VkDeviceSize cur=0;
   for(int j=0;j<=n;j++){ offs[j]=cur; cur=uf_vk_al(cur+(VkDeviceSize)bufsz); }
   int ok=uf_vk_pool_reserve(cur);
+  int use_dl=ok&&uf_vk_dl_reserve(cur);
+  VkBuffer cbuf=use_dl?uf_vk_dl.buf:uf_vk_bpool.buf;
+  int dbg=getenv("NK_VK_DEBUG")!=0;
+  double _t0=dbg?uf_nowd():0;
   Hdr* r=ok?uf_arr_like(ins[0],len):0; UF_PROTECT(&r);
   if(ok){
     for(int j=0;j<n;j++) memcpy(uf_vk_bpool.mapped+offs[j],uf_data(ins[j]),bufsz);
@@ -2375,18 +2447,30 @@ static Cell uf_gpu_task(Ctx*cx,int k,int n){
     if(ok){
       VkWriteDescriptorSet w[8]; VkDescriptorBufferInfo bi[8];
       memset(w,0,sizeof w); memset(bi,0,sizeof bi);
-      for(int j=0;j<=n;j++){ bi[j].buffer=uf_vk_bpool.buf; bi[j].offset=offs[j]; bi[j].range=bufsz;
+      for(int j=0;j<=n;j++){ bi[j].buffer=cbuf; bi[j].offset=offs[j]; bi[j].range=bufsz;
         w[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[j].dstSet=ds; w[j].dstBinding=(uint32_t)j; w[j].descriptorCount=1; w[j].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[j].pBufferInfo=&bi[j]; }
       vkUpdateDescriptorSets(uf_vk_dev,n+1,w,0,0);
       struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)len;
       VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
       ok=vkBeginCommandBuffer(uf_vk_cb,&cbbi)==VK_SUCCESS;
       if(ok){
+        if(use_dl){
+          for(int j=0;j<n;j++){ VkBufferCopy c={offs[j],offs[j],(VkDeviceSize)bufsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_bpool.buf,uf_vk_dl.buf,1,&c); }
+          VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+          mb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+          vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
+        }
         vkCmdBindPipeline(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_pipe[k]);
         vkCmdPushConstants(uf_vk_cb,uf_vk_playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
         vkCmdBindDescriptorSets(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_playout,0,1,&ds,0,0);
         uint64_t groups=(len+255)/256; if(!groups)groups=1;
         vkCmdDispatch(uf_vk_cb,(uint32_t)(groups>0x7fffffff?0x7fffffff:groups),1,1);
+        if(use_dl){
+          VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+          mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+          vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb,0,0,0,0);
+          VkBufferCopy c={offs[n],offs[n],(VkDeviceSize)bufsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_dl.buf,uf_vk_bpool.buf,1,&c);
+        }
         vkEndCommandBuffer(uf_vk_cb);
         ok=uf_vk_submit_wait();
         if(ok) memcpy(uf_data(r),uf_vk_bpool.mapped+offs[n],bufsz);
@@ -2394,6 +2478,7 @@ static Cell uf_gpu_task(Ctx*cx,int k,int n){
       vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
     }
   }
+  if(dbg)fprintf(stderr,"[vk-task] n=%llu in=%d dl=%d total=%.1fms\n",(unsigned long long)len,n,use_dl,(uf_nowd()-_t0)*1e3);
   UF_UNPROTECT();
   pthread_mutex_unlock(&uf_gpu_mu);
   return ok?uf_mkp(r):uf_gpu_decline();
@@ -2430,6 +2515,10 @@ static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
   VkDeviceSize offs[8]; VkDeviceSize cur=0;
   for(int j=0;j<n+nout;j++){ offs[j]=cur; cur=uf_vk_al(cur+(VkDeviceSize)bufsz); }
   int ok=uf_vk_pool_reserve(cur);
+  int use_dl=ok&&uf_vk_dl_reserve(cur);
+  VkBuffer cbuf=use_dl?uf_vk_dl.buf:uf_vk_bpool.buf;
+  int dbg=getenv("NK_VK_DEBUG")!=0;
+  double _t0=dbg?uf_nowd():0;
   Hdr* rs[4]; for(int j=0;j<nout;j++){ rs[j]=0; UF_PROTECT(&rs[j]); }
   if(ok){
     for(int j=0;j<nout;j++) rs[j]=uf_arr_like(hs[0],len);
@@ -2440,18 +2529,30 @@ static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
     if(ok){
       VkWriteDescriptorSet w[8]; VkDescriptorBufferInfo bi[8];
       memset(w,0,sizeof w); memset(bi,0,sizeof bi);
-      for(int j=0;j<n+nout;j++){ bi[j].buffer=uf_vk_bpool.buf; bi[j].offset=offs[j]; bi[j].range=bufsz;
+      for(int j=0;j<n+nout;j++){ bi[j].buffer=cbuf; bi[j].offset=offs[j]; bi[j].range=bufsz;
         w[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[j].dstSet=ds; w[j].dstBinding=(uint32_t)j; w[j].descriptorCount=1; w[j].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[j].pBufferInfo=&bi[j]; }
       vkUpdateDescriptorSets(uf_vk_dev,n+nout,w,0,0);
       struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)len;
       VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
       ok=vkBeginCommandBuffer(uf_vk_cb,&cbbi)==VK_SUCCESS;
       if(ok){
+        if(use_dl){
+          for(int j=0;j<n;j++){ VkBufferCopy c={offs[j],offs[j],(VkDeviceSize)bufsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_bpool.buf,uf_vk_dl.buf,1,&c); }
+          VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+          mb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+          vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
+        }
         vkCmdBindPipeline(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_pipe[k]);
         vkCmdPushConstants(uf_vk_cb,uf_vk_playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
         vkCmdBindDescriptorSets(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_playout,0,1,&ds,0,0);
         uint64_t groups=(len+255)/256; if(!groups)groups=1;
         vkCmdDispatch(uf_vk_cb,(uint32_t)(groups>0x7fffffff?0x7fffffff:groups),1,1);
+        if(use_dl){
+          VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+          mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+          vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb,0,0,0,0);
+          for(int j=0;j<nout;j++){ int q=n+j; VkBufferCopy c={offs[q],offs[q],(VkDeviceSize)bufsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_dl.buf,uf_vk_bpool.buf,1,&c); }
+        }
         vkEndCommandBuffer(uf_vk_cb);
         ok=uf_vk_submit_wait();
         if(ok) for(int j=0;j<nout;j++) memcpy(uf_data(rs[j]),uf_vk_bpool.mapped+offs[n+j],bufsz);
@@ -2459,6 +2560,7 @@ static int uf_region_try(int k,int n,int nout,Cell*ins,Cell*outs){
       vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
     }
   }
+  if(dbg)fprintf(stderr,"[vk-region] n=%llu in=%d out=%d dl=%d total=%.1fms\n",(unsigned long long)len,n,nout,use_dl,(uf_nowd()-_t0)*1e3);
   for(int j=0;j<nout;j++) UF_UNPROTECT();
   pthread_mutex_unlock(&uf_gpu_mu);
   if(ok){ for(int j=0;j<nout;j++){ outs[j].tag=T_PTR; outs[j].i=(int64_t)(void*)rs[j]; } return 1; }
@@ -2640,7 +2742,7 @@ static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn){
   /* operands are popped from the ds before we allocate the result — keep them
      rooted or a GC triggered by the result allocation would sweep them */
   UF_PROTECT((void**)(void*)&a.i); UF_PROTECT((void**)(void*)&b.i);
-#ifdef NKR_GPU
+#ifdef NK_GPU
   if(ha&&hb&&ha->ety==1&&hb->ety==1){
     uint64_t work = (op==2&&ha->tag==HT_MAT&&hb->tag==HT_MAT) ? (ha->esz*(hb->len/hb->esz))
       : (op==2&&ha->tag==HT_MAT) ? ha->esz
@@ -2738,7 +2840,7 @@ static void op_transpose(Ctx*cx){
   if(a->tag!=HT_MAT)die("transpose: not a matrix (build one with [rows cols] type tensor)");
   uint64_t r=a->esz,c=a->len/r;
   UF_PROTECT((void**)(void*)&h.i);
-#ifdef NKR_GPU
+#ifdef NK_GPU
   if(a->ety==1&&(r*c)>=(uint64_t)uf_gpu_min()){
     Hdr*g=uf_mat_new(c,r,1); UF_PROTECT(&g);
     struct UFPC pc; memset(&pc,0,sizeof pc); pc.n1=(int64_t)r; pc.n2=(int64_t)c;
@@ -2816,7 +2918,7 @@ static void op_vgather(Ctx*cx){
 }
 /* reductions */
 static void op_vsum(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VSUM");
-#ifdef NKR_GPU
+#ifdef NK_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
      &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
     double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rsum",&_r)){ pushf(cx,_r); return; } }
@@ -2824,21 +2926,21 @@ static void op_vsum(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VSUM");
  if(a->ety==1){ const double*A=(const double*)uf_data(a); double s=0; for(uint64_t i=0;i<a->len;i++)s+=A[i]; pushf(cx,s); return; }
  double s=0; for(uint64_t i=0;i<a->len;i++)s+=uf_el(a,i); if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
 static void op_vmean(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMEAN"); if(!a->len)die("VMEAN: empty arr");
-#ifdef NKR_GPU
+#ifdef NK_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
      &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
     double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rsum",&_r)){ pushf(cx,_r/(double)a->len); return; } }
 #endif
  double s=0; for(uint64_t i=0;i<a->len;i++)s+=uf_el(a,i); pushf(cx,s/(double)a->len); }
 static void op_vmin(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMIN"); if(!a->len)die("VMIN: empty arr");
-#ifdef NKR_GPU
+#ifdef NK_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
      &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
     double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rmin",&_r)){ pushf(cx,_r); return; } }
 #endif
  double s=uf_el(a,0); for(uint64_t i=1;i<a->len;i++){double d=uf_el(a,i);if(d<s)s=d;} if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
 static void op_vmax(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMAX"); if(!a->len)die("VMAX: empty arr");
-#ifdef NKR_GPU
+#ifdef NK_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
      &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
     double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rmax",&_r)){ pushf(cx,_r); return; } }
@@ -3060,20 +3162,20 @@ static void op_spit(Ctx*cx){
 }
 /* ARGV: -> list of strings */
 static void op_argv(Ctx*cx){
-  Dyn* d=uf_dyn_new((uint64_t)nkr_argc); UF_PROTECT(&d);
-  char** av=(char**)nkr_argv;
-  for(int64_t i=0;i<nkr_argc;i++){ Cell s=uf_str_new(av[i],strlen(av[i])); uf_dyn_push(&d,s); }
+  Dyn* d=uf_dyn_new((uint64_t)nk_argc); UF_PROTECT(&d);
+  char** av=(char**)nk_argv;
+  for(int64_t i=0;i<nk_argc;i++){ Cell s=uf_str_new(av[i],strlen(av[i])); uf_dyn_push(&d,s); }
   UF_UNPROTECT(); pushp(cx,d);
 }
 /* HASARGS: -> int (1 if argv has >1 element, else 0) */
 static void op_hasargs(Ctx*cx){
-  pushi(cx, nkr_argc>1 ? 1 : 0);
+  pushi(cx, nk_argc>1 ? 1 : 0);
 }
 /* ARGI: index -> int (argv[index] parsed as integer) */
 static void op_argi(Ctx*cx){
   int64_t idx=uf_i(pop(cx));
-  if(idx<0||idx>=nkr_argc) die("ARGI: index out of bounds");
-  pushi(cx,(int64_t)strtoll(((char**)nkr_argv)[idx],0,10));
+  if(idx<0||idx>=nk_argc) die("ARGI: index out of bounds");
+  pushi(cx,(int64_t)strtoll(((char**)nk_argv)[idx],0,10));
 }
 
 /* ================= zero-copy file access + streaming ================= */
@@ -3638,14 +3740,14 @@ static void op_retry(Ctx*cx){
 /* ================= detached threads ================= */
 typedef struct { const void* body; Ring* r; } UfSpawn;
 const void* const* uf_spawn_ltab; const long* uf_spawn_frames;
-static long nkr_spawn_frame(const void* body);
+static long nk_spawn_frame(const void* body);
 static void* uf_spawn_worker(void* arg){
   UfSpawn* g=(UfSpawn*)arg;
   Ctx* c=ctx_new(1<<16,1<<12);
   /* v14: spawned bodies may bind locals — the generated code defines
      uf_spawn_ltab/uf_spawn_frames (address -> frame size); bump the callee
      frame exactly like _call does. */
-  long f=nkr_spawn_frame(g->body);
+  long f=nk_spawn_frame(g->body);
   uf_call_addr(c,g->body,f,-1,0);
   Cell r = c->sp>0 ? c->ds[c->sp-1] : uf_mki(0);
   ring_enq(g->r,r);
@@ -3656,7 +3758,7 @@ static void* uf_spawn_worker(void* arg){
 }
 /* SPAWN: body_addr -> chan (cap 1; body's top-of-stack enqueued at end,
    then closed — deq on it is a join) */
-static long nkr_spawn_frame(const void* body){
+static long nk_spawn_frame(const void* body){
   if(!uf_spawn_ltab) return 0;
   for(long q=0; uf_spawn_ltab[q]; q++){ if(uf_spawn_ltab[q]==body) return uf_spawn_frames[q]; }
   return 0;
@@ -3670,7 +3772,7 @@ static void op_spawn(Ctx*cx){
   pthread_detach(th);
   pushp(cx,r);
 }
-/* init-TU worker: fire-and-forget thread for init.en entry points.
+/* init-TU worker: fire-and-forget thread for init.nd entry points.
    Same as uf_spawn_worker minus the chan — process exit kills these. */
 static void* uf_init_worker(void* arg){
   Ctx* c=ctx_new(1<<16,1<<12);

@@ -1,0 +1,40 @@
+; matmul.n — 128x128 matrix multiply with checksum
+v0:                              ; fill-phase row body (v1 = row index, pushed by for)
+  v1! 128 _addr v2 for           ; store the row index; run v2 once per column
+  ret                            ; return from the body (required at end of every body)
+v2:                              ; fill-phase cell body (v3 = column index)
+  v3!
+  v1@ 128 mul v3@ add v4!        ; v4 = row*128 + col (flat index)
+  v5@ v4@ v1@ v3@ add set        ; A[v4] = row + col
+  v6@ v4@ v1@ v3@ sub set        ; B[v4] = row - col
+  ret
+v7:                              ; multiply-phase row body (v1 = row index)
+  v1! 128 _addr v8 for
+  ret
+v8:                              ; multiply-phase cell body (v3 = column index)
+  v3! 0 v9!                      ; store the column index; v9 = dot-product accumulator = 0
+  128 _addr v10 for              ; run v10 for each of the 128 k-steps
+  v11@ v1@ 128 mul v3@ add v9@ set ; C[row*128+col] = v9
+  ret
+v10:                             ; dot-product step body (v12 = k index)
+  v12!
+  v5@ v1@ 128 mul v12@ add get   ; push A[row*128+k]
+  v6@ v12@ 128 mul v3@ add get   ; push B[k*128+col]
+  mul                            ; push the product
+  v9@ add v9!                    ; v9 = product + v9
+  ret
+v13:                             ; checksum step body (v4 = element index)
+  v4! v11@ v4@ get v14@ add v14! ; v14 = v14 + C[v4]
+  ret
+entry:
+  16384 0 array v5!              ; A = new int[16384], zero-filled (`0` = int type id)
+  16384 0 array v6!
+  16384 0 array v11!
+  128 _addr v0 for               ; fill A and B via row bodies
+  128 _addr v7 for               ; C = A×B via row bodies
+  0 v14!                         ; v14 = checksum accumulator
+  16384 _addr v13 for            ; sum all 16384 C elements into v14
+  v14@                           ; push the checksum
+  "checksum=%d" format           ; render with the printf-style template
+  print
+  ret

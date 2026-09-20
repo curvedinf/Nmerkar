@@ -1,16 +1,16 @@
 [package]
-name = "nkr"
+name = "nk"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
 [[bin]]
-name = "nkr"
+name = "nk"
 path = "src/main.rs"
 
 [[bin]]
-name = "nkrsb"
-path = "src/nkrsb.rs"
+name = "nks"
+path = "src/nks.rs"
 
 [profile.release]
 opt-level = 2

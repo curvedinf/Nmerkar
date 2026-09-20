@@ -1,4 +1,4 @@
-/* gpucomp.c — shared Vulkan compute launcher for the non-Enmerkar benchmark
+/* gpucomp.c — shared Vulkan compute launcher for the non-Nmerkar benchmark
  * languages (bench/SPEC.md). Device selection mirrors the uf compiler
  * runtime: auto = most free VRAM (VK_EXT_memory_budget, discrete preferred),
  * or pinned via "vkN". Kernels are .comp shaders compiled by run.py with

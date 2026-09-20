@@ -1,6 +1,6 @@
-// trans — C-subset → Enmerkar (.ent) transpiler.
+// trans — C-subset → Nmerkar (.n) transpiler.
 //
-// Pipeline: read → lex → parse (AST) → emit (Enmerkar text) → stdout.
+// Pipeline: read → lex → parse (AST) → emit (Nmerkar text) → stdout.
 // Errors are positioned diagnostics on stderr; exit 1.
 
 mod ast;

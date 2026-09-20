@@ -1,3 +1,0 @@
-; util.ent — shared library code, PUB exports visible to all TUs
-pub double:
-  2 mul ret

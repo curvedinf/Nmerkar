@@ -7,9 +7,9 @@ use crate::ast::*;
 pub const DELIM_BASE: u32 = 0x13100;
 pub const TYPE_BASE: u32 = 0x13110;
 
-// Opcode glyphs (192 live ops). Index = OP_NAMES array position.
+// Opcode glyphs (194 live ops). Index = OP_NAMES array position.
 // All colored emoji (U+1F300+), each exactly one Qwen3 token.
-pub const OP_GLYPHS: [u32; 215] = [
+pub const OP_GLYPHS: [u32; 218] = [
     0x1F300, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1F682, 0x1F910,
     0x1F302, 0x1F602, 0x1F683, 0x1F911, 0x1F303, 0x1FA94, 0x1FA91, 0x1FA92,
     0x1F603, 0x1F684, 0x1F912, 0x1F304, 0x1F604, 0x1F685, 0x1FA90, 0x1F913,
@@ -39,6 +39,8 @@ pub const OP_GLYPHS: [u32; 215] = [
     0x1F95B, 0x1F95C, 0x1F95D, 0x1F95E,
     0x1F958, 0x1F959, 0x1F95A,
     0x1F500,
+    0x1F512, 0x1F513,
+    0x1F501,
 ];
 
 // v-space: base-64 digits for variable/label name atoms (colored emoji).
@@ -112,10 +114,10 @@ pub fn glyph_type_id(c: char) -> Option<i64> {
     }
 }
 
-// 196 opcode slots (0..=195). Retired indices use "~NN" placeholders: they
+// 218 opcode slots (0..=217). Retired indices use "~NN" placeholders: they
 // have no glyph, no text mnemonic, and no runtime helper — any use is a
 // compile error (unassigned glyph / unknown identifier).
-pub const OP_NAMES: [&str; 215] = [
+pub const OP_NAMES: [&str; 218] = [
     "LIT", "~1", "~2", "~3", "~4", "~5", "ADD", "SUB", "MUL", "AND", "SHR", "INC", "DEC",
     "POW", "SQRT", "LTE", "FOR", "CALL", "RET", "OBJ", "GET", "SET", "GTE", "ARR", "SHUTDOWN", "~25",
     "CLONE", "CAST", "MACRO", "TENSOR", "~30", "~31", "~32", "SETV", "GETV", "STR", "CAT", "FMT",
@@ -156,6 +158,8 @@ pub const OP_NAMES: [&str; 215] = [
     "RANGEFOLD",
     "SEQ", "SNE",
     "TRANSPOSE",
+    "STRICT", "LOOSE",
+    "DCAST",
 ];
 
 pub fn op_index(name: &str) -> Option<usize> {
@@ -185,13 +189,13 @@ pub fn op_usage(name: &str) -> &'static str {
         "OBJ" => "→ h | type immediate (struct id)",
         "GET" => "h k → v | polymorphic container get",
         "SET" => "h k v → | polymorphic container set",
-        "ARR" => "type len → h | type: int=0 float=1 ptr=2 byte=3",
+        "ARR" => "len type → h | type: int=0 float=1 ptr=2 byte=3",
         "CLONE" => "h → h' | deep copy",
         "CAST" => "h type → h | checked downcast",
         "MACRO" => "(directive) | macro name { body }",
-        "TENSOR" => "type len → h",
-        "SETV" => "value → | x!/^x! store local/global",
-        "GETV" => "→ value | x@/^x@ fetch local/global",
+        "TENSOR" => "len type → h",
+        "SETV" => "value → | x! store local (shared stores consume)",
+        "GETV" => "→ value | x@ fetch local/shared",
         "STR" => "→ h | push string",
         "CAT" => "a b → h | concat (str/arr/list)",
         "FMT" => "args… fmt → h | format string",
@@ -210,7 +214,7 @@ pub fn op_usage(name: &str) -> &'static str {
         "IMPORT" => "(directive) | import c\"fn\"(types)->ret",
         "EXPORT" => "(directive) | export \"name\" before label",
         "EXTERN" => "→ address | extern \"symbol\"",
-        "PRINT" => "args… fmt → n | printf; n = chars written",
+        "PRINT" => "v → | type-aware print",
         "SCAN" => "fmt → values… count | fscanf",
         "DICT" => "→ h | empty hash map",
         "LIST" => "→ h | empty growable list",
@@ -362,6 +366,9 @@ pub fn op_usage(name: &str) -> &'static str {
         "SEQ" => "a b → 0/1 | strict equality (===)",
         "TRANSPOSE" => "mat → mat2 | transpose rows/cols (2-D tensor)",
         "SNE" => "a b → 0/1 | strict inequality (!==)",
+        "STRICT" => "v → v | mark value strict (no implicit coercion; compile-time)",
+        "LOOSE" => "v → v | remove strictness from value (compile-time)",
+        "DCAST" => "v type → v' | dynamic cast: explicit universal coercion (int/float/ptr/byte/str tag 9/struct id)",
         _ => "",
     }
 }
@@ -1191,6 +1198,8 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "TRANSPOSE" => "transpose",
         "TRANSPOSE" => "transpose",
         "SEQ" => "structural_equal", "SNE" => "structural_not_equal",
+        "STRICT" => "strict", "LOOSE" => "loose",
+        "DCAST" => "cast",
         other => other, // "~NN" retired placeholders: never a valid source token
     }
 }
@@ -1671,7 +1680,8 @@ impl TextLexer {
                 }
                 "setv" | "getv" => self.err("use name! / name@ for variables"),
                 // backward-compat: old immediate-op names now _-prefixed
-                "call" | "addr" | "sys" | "lit" | "str" | "sizeof" | "offset" | "obj" | "cast" | "arr" => {
+                // (`cast` is now a real postfix op — the dynamic cast)
+                "call" | "addr" | "sys" | "lit" | "str" | "sizeof" | "offset" | "obj" | "arr" => {
                     let n: &str = if tok == "sys" { "syscall" } else if tok == "sizeof" { "size_of" } else if tok == "arr" { "array" } else { tok.as_str() };
                     self.err(&format!("'{}' is now '_{}' — immediate ops are _-prefixed", tok, n));
                 }

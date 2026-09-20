@@ -1,0 +1,311 @@
+import c"printf"(ptr,...)->int
+import c"fprintf"(ptr,ptr,...)->int
+import c"fputc"(int,ptr)->int
+import c"ungetc"(int,ptr)->int
+import c"putchar"(int)->int
+import c"getchar"()->int
+import c"fputs"(ptr,ptr)->int
+import c"fwrite"(ptr,int,int,ptr)->int
+import c"strcmp"(ptr,ptr)->int
+import c"strncmp"(ptr,ptr,int)->int
+import c"strcpy"(ptr,ptr)->ptr
+import c"exit"(int)->void
+import c"fread"(ptr,int,int,ptr)->int
+import c"fopen"(ptr,ptr)->ptr
+import c"fclose"(ptr)->int
+import c"fgetc"(ptr)->int
+import c"strstr"(ptr,ptr)->ptr
+extern "stdout"
+extern "stdin"
+extern "stderr"
+0 rv! 0 fr! 0 frv! 0 pt!
+ret
+nl_num:
+v0!
+0 v1!
+0 v2!
+0 v0@ "" _call strstr add load 255 and 45 eq 0 v0@ "" _call strstr add load 255 and 43 eq or not not 'i1 if
+v1@ v0@ "" _call strstr add load 255 and v3! 
+'c2 'b3 while
+v2@ rv! 1 fr!
+fr@ rv@ mul frv! 0 fr! ret frv@
+i1:
+1 v1! 
+0 ret
+c2:
+fr@ not v3@ 48 lt not v3@ 57 gt not mul not not and ret
+b3:
+v2@ 10 mul v3@ 48 sub add v2! 
+v1@ pt! v1@ 1 add v1! frv! pt@ 
+v1@ v0@ "" _call strstr add load 255 and v3! 
+0 ret
+nl_print_num:
+v4!
+v5!
+v6!
+v7!
+v6@ 0 eq 'i4 if
+fr@ 'c5 'b6 if_else
+fr@ rv@ mul frv! 0 fr! ret frv@
+i4:
+"%-*d%s" v5@ v4@ v7@ 3 _call printf 
+0 rv! 1 fr! 0 ret
+b9:
+"%*d%s" v5@ v4@ v7@ 3 _call printf 
+0 rv! 1 fr! 0 ret
+c8:
+0 ret
+b6:
+v6@ 2 eq 'i7 if
+fr@ 'c8 'b9 if_else
+0 ret
+i7:
+"%0*d%s" v5@ v4@ v7@ 3 _call printf 
+0 rv! 1 fr! 0 ret
+c5:
+0 ret
+nl_seplen:
+v8!
+0 v9!
+'c10 'b11 while
+v9@ rv! 1 fr!
+fr@ rv@ mul frv! 0 fr! ret frv@
+c10:
+fr@ not v9@ v8@ "" _call strstr add load 255 and 0 eq not and ret
+b11:
+v9@ pt! v9@ 1 add v9! frv! pt@ 
+0 ret
+entry:
+1 v10!
+1 v11!
+6 v12!
+1 v13!
+1 v14!
+1 v15!
+1 v16!
+"\t" v17!
+1 v18!
+0 v21!
+'c12 'b13 while
+fr@ 'c42 'b43 if_else
+0 _call exit
+ret
+c12:
+fr@ not v18@ extern "nk_argc" load lt and ret
+b13:
+v18@ 8 mul extern "nk_argv" load add load v19! 
+0 v19@ "" _call strstr add load 255 and 45 eq 1 v19@ "" _call strstr add load 255 and 118 eq mul not not 'i14 if
+0 v19@ "" _call strstr add load 255 and 45 eq 1 v19@ "" _call strstr add load 255 and 105 eq mul not not 'i16 if
+0 v19@ "" _call strstr add load 255 and 45 eq 1 v19@ "" _call strstr add load 255 and 119 eq mul not not 'i18 if
+0 v19@ "" _call strstr add load 255 and 45 eq 1 v19@ "" _call strstr add load 255 and 115 eq mul not not 'i20 if
+0 v19@ "" _call strstr add load 255 and 45 eq 1 v19@ "" _call strstr add load 255 and 98 eq mul not not 2 v19@ "" _call strstr add load 255 and 0 eq mul not not 'i22 if
+0 v19@ "" _call strstr add load 255 and 45 eq 1 v19@ "" _call strstr add load 255 and 110 eq mul not not 2 v19@ "" _call strstr add load 255 and 0 eq mul not not 'i26 if
+0 v19@ "" _call strstr add load 255 and 45 eq 1 v19@ "" _call strstr add load 255 and 110 eq mul not not 'i30 if
+0 v19@ "" _call strstr add load 255 and 45 eq 1 v19@ "" _call strstr add load 255 and 98 eq mul not not 'i34 if
+0 v19@ "" _call strstr add load 255 and 45 eq 1 v19@ "" _call strstr add load 255 and 0 eq mul not not 'i38 if
+v19@ "r" _call fopen v21! 
+v21@ not 'i39 if
+fr@ 'c40 'b41 if_else
+0 ret
+i14:
+2 v19@ "" _call strstr add load 255 and 0 eq not 'i15 if
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+v18@ 8 mul extern "nk_argv" load add load _call nl_num v10! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i15:
+v19@ 2 add _call nl_num v10! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i16:
+2 v19@ "" _call strstr add load 255 and 0 eq not 'i17 if
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+v18@ 8 mul extern "nk_argv" load add load _call nl_num v11! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i17:
+v19@ 2 add _call nl_num v11! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i18:
+2 v19@ "" _call strstr add load 255 and 0 eq not 'i19 if
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+v18@ 8 mul extern "nk_argv" load add load _call nl_num v12! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i19:
+v19@ 2 add _call nl_num v12! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i20:
+2 v19@ "" _call strstr add load 255 and 0 eq not 'i21 if
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+v18@ 8 mul extern "nk_argv" load add load v17! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i21:
+v19@ 2 add v17! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i22:
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+v18@ 8 mul extern "nk_argv" load add load v19! 
+0 v19@ "" _call strstr add load 255 and 97 eq 'i23 if
+0 v19@ "" _call strstr add load 255 and 116 eq 'i24 if
+0 v19@ "" _call strstr add load 255 and 110 eq 'i25 if
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i23:
+0 v14! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i24:
+1 v14! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i25:
+2 v14! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i26:
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+v18@ 8 mul extern "nk_argv" load add load v19! 
+0 v19@ "" _call strstr add load 255 and 108 eq 1 v19@ "" _call strstr add load 255 and 110 eq mul not not 'i27 if
+0 v19@ "" _call strstr add load 255 and 114 eq 1 v19@ "" _call strstr add load 255 and 110 eq mul not not 'i28 if
+0 v19@ "" _call strstr add load 255 and 114 eq 1 v19@ "" _call strstr add load 255 and 122 eq mul not not 'i29 if
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i27:
+0 v13! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i28:
+1 v13! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i29:
+2 v13! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i30:
+2 v19@ "" _call strstr add load 255 and 108 eq 3 v19@ "" _call strstr add load 255 and 110 eq mul not not 'i31 if
+2 v19@ "" _call strstr add load 255 and 114 eq 3 v19@ "" _call strstr add load 255 and 110 eq mul not not 'i32 if
+2 v19@ "" _call strstr add load 255 and 114 eq 3 v19@ "" _call strstr add load 255 and 122 eq mul not not 'i33 if
+0 ret
+i31:
+0 v13! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i32:
+1 v13! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i33:
+2 v13! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i34:
+2 v19@ "" _call strstr add load 255 and 97 eq 'i35 if
+2 v19@ "" _call strstr add load 255 and 116 eq 'i36 if
+2 v19@ "" _call strstr add load 255 and 110 eq 'i37 if
+0 ret
+i35:
+0 v14! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i36:
+1 v14! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i37:
+2 v14! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i38:
+0 v21! 
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+continue
+0 ret
+i39:
+extern "stderr" load "nl: cannot open %s\n" v19@ 1 _call fprintf 
+1 _call exit
+0 ret
+b41:
+v18@ pt! v18@ 1 add v18! frv! pt@ 
+break
+0 ret
+c40:
+0 ret
+b43:
+v10@ v15! 
+'c44 'b45 while
+v16@ 0 eq 'i56 if
+0 _call exit
+0 ret
+c44:
+fr@ not 1 and ret
+b45:
+v21@ 0 eq 'i46 'e47 if_else
+v20@ -1 eq 'i48 if
+v16@ 0 eq not 'i49 if
+v20@ _call putchar 
+v20@ 10 eq 'i54 'e55 if_else
+0 ret
+i46:
+_call getchar v20! 
+0 ret
+e47:
+v21@ _call fgetc v20! 
+0 ret
+i48:
+break
+0 ret
+i49:
+v14@ 2 eq 'i50 'e51 if_else
+0 ret
+i50:
+"%*s%*s" v12@ "" v17@ _call nl_seplen "" 4 _call printf 
+0 ret
+e51:
+v14@ 0 eq v20@ 10 eq not or not not 'i52 'e53 if_else
+0 ret
+i52:
+v15@ v12@ v13@ v17@ _call nl_print_num 
+v15@ v11@ add v15! 
+0 ret
+e53:
+"%*s%*s" v12@ "" v17@ _call nl_seplen "" 4 _call printf 
+0 ret
+i54:
+1 v16! 
+0 ret
+e55:
+0 v16! 
+0 ret
+i56:
+10 _call putchar 
+0 ret
+c42:
+0 ret

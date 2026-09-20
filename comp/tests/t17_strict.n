@@ -1,0 +1,75 @@
+; t17_strict.n — v14.1 strictness + casting: `strict` marks a value so it can
+; never be coerced implicitly again (a compile error at any implicitly-coercing
+; op), the property follows the value through variables and containers, any op
+; consuming a strict value taints the other operand variables and its own
+; outputs (contagion), and `loose` removes the property explicitly.
+; `cast` (postfix, [v type]) is the dynamic explicit conversion and therefore
+; always accepts strict values; `_cast` (immediate) is the static C-style cast.
+; The strict/loose markers are purely compile-time: with them removed, the
+; program compiles to the same machine operations. Accepting paths only —
+; the rejecting paths (add/eq/format/if/filter-truthiness on strict values)
+; are compile errors, verified separately (see SPEC.md "Strictness").
+; Expected:
+;   s1: 42
+;   s2: 1
+;   s3: hello
+;   s4: 7
+;   s5: 10
+;   s6: 2
+;   s7: 3
+;   s8: yo
+;   s9: 42
+;   s10: 44
+;   2.5
+; s1: explicit conversion (parse_int) accepts a strict value; its result is
+; still strict, so `loose` clears it before arithmetic.
+"41" strict parse_int loose 1 add "s1: %d\n" format print
+; s2: structural_equal never coerces; the result is strict, print accepts it
+; (format would not — it coerces its arguments).
+5 strict x!
+"s2: " print x@ 5 structural_equal print
+; s3: a strict element makes the container strict; get does not coerce.
+"hello" strict v!
+[ v@ ] l!
+"s3: " print l@ 0 get print
+; s4: contagion — the strict value w taints d (an operand of the same `set`),
+; but non-coercing ops keep working on the tainted dict.
+{ } d!
+"k" 7 strict w!
+d@ "k" w@ set
+"s4: " print d@ "k" get print
+; s5: `loose` before use — strictness never applies downstream.
+"7" strict loose parse_int 3 add "s5: %d\n" format print
+; s6: elements of a strict list are strict inside the callback (param taint);
+; loosen the element before comparing. The filter result is strict again;
+; length accepts it.
+[1 2 3 4] strict nums!
+"s6: " print nums@ 'big filter length print
+; s7: strict shared counter; the cond label loosens before `lt`, so `while`
+; never truthiness-coerces a strict value (shared i++ is an atomic RMW — raw,
+; no coercion).
+0 strict i!
+'cond 'body while
+"s7: " print i@ loose print
+; s8: strictness crosses call boundaries — the argument taints the callee's
+; parameter, and the callee's strict return taints the call result.
+"yo" strict m!
+"s8: " print m@ _call echo print
+; s9: `cast` is the dynamic explicit coercer: a strict string parses; the
+; result stays strict, and print accepts it.
+"42" strict int cast
+"s9: " print print
+; s10: ...and because the result is strict, `loose` before arithmetic.
+"42" strict int cast loose 2 add "s10: %d\n" format print
+; static cast: `_cast float` on a literal folds at parse time.
+2 _cast float 0.5 add print
+ret
+big: n!
+  n@ loose 2 gt ret
+cond:
+  ret i@ loose 3 lt
+body:
+  i++
+  ret
+echo: a!
+  ret a@

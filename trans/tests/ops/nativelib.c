@@ -1,9 +1,9 @@
-/* nativelib.c — proves the libc calls with Enmerkar-native equivalents
+/* nativelib.c — proves the libc calls with Nmerkar-native equivalents
    compile to ops, not FFI imports: strlen -> length, strcat -> concat,
    puts -> print (+newline). A grep gate in the runner additionally checks
-   the emitted .en contains no `_call strlen/strcat/puts`. */
+   the emitted .nd contains no `_call strlen/strcat/puts`. */
 int main() {
-  char* a = "enmer";
+  char* a = "nmer";
   char* b = "kar";
   printf("%d\n", strlen("hello"));
   printf("%d\n", strlen(""));

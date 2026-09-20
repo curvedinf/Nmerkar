@@ -2,7 +2,7 @@
 comp/target/
 trans/target/
 
-# nkr compiler cache
+# nk compiler cache
 /tmp/uflux-cache/
 
 # benchmark data and artifacts

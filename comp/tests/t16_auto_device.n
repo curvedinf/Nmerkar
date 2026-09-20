@@ -1,0 +1,20 @@
+; t16_auto_device.n — auto first-run CPU vs GPU policy (no autotuning).
+; N from argv[1] (default 512). Same matmul as bench/SPEC.md:
+;   A[k] = 1.0 + 1e-6*k, B[k] = 1.0 - 1e-6*k, C = A·B
+; At N=512 the static estimate must keep default auto on the CPU, so samples
+; are bit-identical to `--device cpu`. At N=2048 auto may use the GPU;
+; samples stay within the documented matmul reassociation tolerance.
+512 n!
+has_args 'setn if
+n@ n@ mul n2!
+0 n2@ range vals!
+[n@ n@] vals@ concat vals!
+vals@ float tensor kmat!
+kmat@ 0.000001 mul 1.0 add a!
+1.0 kmat@ 0.000001 mul sub b!
+a@ b@ mul c!
+"c[0,0]: " print c@ 0 get "%.6f" format print
+"c[N-1,N-1]: " print c@ n2@ 1 sub get "%.6f" format print
+"checksum: " print c@ sum "%.2f" format print
+ret
+setn: 1 arg_index n! ret

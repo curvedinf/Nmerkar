@@ -1,0 +1,42 @@
+; logextract.n — v13: access-log analytics (bench/SPEC.md)
+; Tokens: [0] IP, [3] timestamp (hour at bytes 13-14), [8] status, [9] bytes
+0 lines! 0 bytes!
+24 int array hour_a!
+4 int array st_a!
+dict ips!
+argv 1 get f!
+f@ " " 0 'row file_split_lines
+"=== LOG EXTRACTION RESULTS ===" print
+lines@ "total_lines: %d" format print
+bytes@ "total_bytes: %d" format print
+st_a@ 0 array_get "status_2xx: %d" format print
+st_a@ 1 array_get "status_3xx: %d" format print
+st_a@ 2 array_get "status_4xx: %d" format print
+st_a@ 3 array_get "status_5xx: %d" format print
+24 'hour for
+ips@ 10 top_n ip_list!
+ip_list@ length 'topip for
+ret
+row: acc! n!
+  n@ 10 lt 'skip 'proc if_else
+  ret acc@
+skip:
+  ret
+proc:
+  3 13 field_byte 48 sub 10 mul 3 14 field_byte 48 sub add hh!
+  hour_a@ hh@ hour_a@ hh@ array_get 1 add array_set
+  ips@ 0 field_inc
+  8 0 field_byte 48 sub 2 sub ss!
+  st_a@ ss@ st_a@ ss@ array_get 1 add array_set
+  9 field_int bytes+=
+  lines++
+  ret
+hour: k!
+  hour_a@ k@ array_get v!
+  k@ v@ "hour_%02d: %d" format print
+  ret 0
+topip: k!
+  ip_list@ k@ get p!
+  p@ 0 get nm! p@ 1 get v!
+  k@ 1 add nm@ v@ "top_ip_%d: %s (%d)" format print
+  ret 0

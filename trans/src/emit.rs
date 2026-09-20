@@ -1,4 +1,4 @@
-// emit.rs — AST → Enmerkar text (.ent).
+// emit.rs — AST → Nmerkar text (.n).
 //
 // Shape of the generated program (behaviorally identical to the previous
 // self-hosted transpiler):
@@ -96,7 +96,7 @@ struct Emitter {
     out: String,
     /// Function-level label buffers flushed after every construct label.
     /// k-call wrappers and for-post labels go to `hoisted`; early-return
-    /// guard labels go to `hoisted_guards`. Enmerkar's break/continue
+    /// guard labels go to `hoisted_guards`. Nmerkar's break/continue
     /// validation is a linear scan that treats a `_call`-target label as a
     /// new non-loop context, so a guard body containing `continue`/`break`
     /// must be defined BEFORE any call-wrapper label: guards flush first.
@@ -488,7 +488,7 @@ impl Emitter {
                 buf.code.push_str(&format!("{slot}@ pt! {slot}@ 1 {op} {slot}! frv! pt@ "));
             }
             ExprKind::Call { name, args } => {
-                // malloc/free are Enmerkar opcodes (reserved words), not
+                // malloc/free are Nmerkar opcodes (reserved words), not
                 // importable call targets: emit the opcodes directly.
                 if name == "malloc" && args.len() == 1 {
                     self.expr(buf, &args[0], ctx)?;
@@ -500,7 +500,7 @@ impl Emitter {
                     buf.code.push_str("free ");
                     return Ok(());
                 }
-                // libc calls with exact Enmerkar-native equivalents are
+                // libc calls with exact Nmerkar-native equivalents are
                 // emitted as ops — no FFI import, so they work under any
                 // sandbox policy:
                 //   strlen(s)    -> length   (op 75, str -> byte count)
@@ -555,9 +555,9 @@ impl Emitter {
             }
             ExprKind::Argv(index) => {
                 self.expr(buf, index, ctx)?;
-                buf.code.push_str("8 mul extern \"nkr_argv\" load add load ");
+                buf.code.push_str("8 mul extern \"nk_argv\" load add load ");
             }
-            ExprKind::Argc => buf.code.push_str("extern \"nkr_argc\" load "),
+            ExprKind::Argc => buf.code.push_str("extern \"nk_argc\" load "),
             ExprKind::Stream(name) => buf.code.push_str(&format!("extern \"{name}\" load ")),
             ExprKind::Byte(inner) => {
                 self.expr(buf, inner, ctx)?;

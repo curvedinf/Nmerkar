@@ -64,7 +64,7 @@ fn gate_op(name: &str, caps: &Caps) {
     };
     if !caps.cap(cap) {
         panic!(
-            "sandbox: `{}` is disabled — capability `{}` is denied by policy '{}' ({}); allow it in a sandbox config, or run under a broader policy (e.g. `nkrsb --policy build`)",
+            "sandbox: `{}` is disabled — capability `{}` is denied by policy '{}' ({}); allow it in a sandbox config, or run under a broader policy (e.g. `nks --policy build`)",
             mnem, need, caps.policy_name, caps.origin
         );
     }
@@ -215,6 +215,46 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
             Tok::Op("WHILE") => p.ins.push(Ins::While),
             Tok::Op("BREAK") => p.ins.push(Ins::Break),
             Tok::Op("CONT") => p.ins.push(Ins::Cont),
+            Tok::Op("STRICT") => p.ins.push(Ins::Strict),
+            Tok::Op("LOOSE") => p.ins.push(Ins::Loose),
+            Tok::Op("CAST") => {
+                // v14.1: _cast between all static-castable types. The
+                // immediate stays prefix preprocessing: a literal operand
+                // [v, type-id, CAST] folds at parse time (int<->float);
+                // every other shape lowers to the runtime static-cast
+                // helper (scalar conversions + checked struct downcast).
+                let ty_lit = match p.ins.last() {
+                    Some(Ins::PushI(t)) => Some(*t),
+                    _ => None,
+                };
+                let val_lit = match p.ins.get(p.ins.len().wrapping_sub(2)) {
+                    Some(Ins::PushI(v)) => Some((*v as f64, true)),
+                    Some(Ins::PushF(v)) => Some((*v, false)),
+                    _ => None,
+                };
+                match (ty_lit, val_lit) {
+                    (Some(0), Some((v, true))) => {
+                        p.ins.pop();
+                        p.ins.pop();
+                        p.ins.push(Ins::PushI(v as i64));
+                    }
+                    (Some(0), Some((v, false))) => {
+                        p.ins.pop();
+                        p.ins.pop();
+                        p.ins.push(Ins::PushI(v as i64));
+                    }
+                    (Some(1), Some((v, true))) => {
+                        p.ins.pop();
+                        p.ins.pop();
+                        p.ins.push(Ins::PushF(v));
+                    }
+                    (Some(1), Some((_, false))) => {
+                        // float -> float: the cast is the identity
+                        p.ins.pop();
+                    }
+                    _ => p.ins.push(simple_ins("CAST")),
+                }
+            }
             Tok::Op(name) if name.starts_with('~') => {
                 let retired_name = match name {
                     "~1" => "dup",
@@ -815,22 +855,12 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
     p
 }
 
-// v11: resolve implicit local variables into per-call-body slot IDs.
-//
-// A "call body" is a group of labels that share a single local-variable frame.
-// Each CALL target (or the entry label / pc 0) starts a new call body. Labels
-// reached via PushAddr (if/while/for bodies) are continuations that share the
-// frame of the call body that references them.
-//
-// To determine ownership, we use a worklist algorithm: starting from each
-// call-entry label, we propagate the body ID to all PushAddr targets within
-// the same body's instruction range. This correctly handles continuation
-// labels that appear after other call entries in the instruction stream.
-pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<String>) {
-    if p.ins.is_empty() {
-        return;
-    }
-    // Determine which labels are "call entries" (get their own frame).
+/// Map each instruction index to its owning call body's entry pc (steps 1-3 of
+/// resolve_locals, shared with the strictness pass). A "call body" is a group
+/// of labels sharing one local-variable frame: each CALL target (or pc 0 / the
+/// entry label / a weave task / an export) starts a body; PushAddr targets
+/// (if/while/for continuations) merge into the referencing body via union-find.
+pub fn compute_ins_body(p: &Parsed) -> Vec<usize> {
     let mut call_entries: std::collections::HashSet<usize> = std::collections::HashSet::new();
     call_entries.insert(0);
     if let Some(el) = &p.entry_label {
@@ -858,24 +888,15 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
         }
     }
 
-    // Build a sorted list of label PCs to delimit label regions.
-    // Always include pc 0 (the implicit entry point) even if there's no label.
     let mut all_label_pcs: Vec<usize> = p.labels.values().copied().collect();
     all_label_pcs.push(0);
     all_label_pcs.sort();
     all_label_pcs.dedup();
 
-    // For each label PC, find the nearest preceding call-entry PC.
-    // That call-entry is the "body owner" for that label's region.
-    // But continuation labels (PushAddr targets) may belong to a body whose
-    // entry is further back, past other call entries. We fix this with a
-    // propagation pass: each PushAddr instruction inside body X that references
-    // label L means L belongs to body X (regardless of position).
-    //
-    // Step 1: Initial assignment by position (nearest preceding call entry).
-    let mut label_body: HashMap<usize, usize> = HashMap::new(); // label_pc -> body_entry_pc
+    // Step 1: initial assignment by position (nearest preceding call entry).
+    let mut label_body: HashMap<usize, usize> = HashMap::new();
     {
-        let mut cur_body = 0usize; // pc 0 is always a call entry
+        let mut cur_body = 0usize;
         for &pc in &all_label_pcs {
             if call_entries.contains(&pc) {
                 cur_body = pc;
@@ -884,16 +905,10 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
         }
     }
 
-    // Step 2: Propagate body ownership through PushAddr references.
-    // A PushAddr target (continuation label) belongs to the same body as the
-    // label whose range contains the reference. Continuation labels can be
-    // mutually referenced (if/else webs), so this is a union-find merge over
-    // labels — a naive "reassign until stable" loop oscillates forever on
-    // such cycles. Each component takes the earliest positional body among
-    // its members (a component spanning call entries shares the outermost
-    // frame; locals resolution then treats those labels as one frame).
+    // Step 2: union-find merge over PushAddr references — continuation labels
+    // can be mutually referenced (if/else webs), so a naive reassign loop
+    // oscillates. Each component takes the earliest positional body.
     {
-        // union-find over label pcs
         let mut parent: HashMap<usize, usize> = HashMap::new();
         for &pc in &all_label_pcs {
             parent.insert(pc, pc);
@@ -905,7 +920,6 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
                 if p == root { break; }
                 root = p;
             }
-            // path compression
             let mut cur = x;
             while cur != root {
                 let next = *parent.get(&cur).unwrap_or(&root);
@@ -932,7 +946,6 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
                 }
             }
         }
-        // component body = min positional body among members
         let mut comp_body: HashMap<usize, usize> = HashMap::new();
         for &pc in &all_label_pcs {
             let root = find(&mut parent, pc);
@@ -948,8 +961,7 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
         }
     }
 
-    // Step 3: For each instruction, determine its body by finding the nearest
-    // preceding label and looking up that label's body.
+    // Step 3: per-instruction body = nearest preceding label's body.
     let mut ins_body: Vec<usize> = vec![0usize; p.ins.len()];
     {
         let mut cur_body = 0usize;
@@ -962,6 +974,25 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
             ins_body[i] = cur_body;
         }
     }
+    ins_body
+}
+
+// v11: resolve implicit local variables into per-call-body slot IDs.
+//
+// A "call body" is a group of labels that share a single local-variable frame.
+// Each CALL target (or the entry label / pc 0) starts a new call body. Labels
+// reached via PushAddr (if/while/for bodies) are continuations that share the
+// frame of the call body that references them.
+//
+// To determine ownership, we use a worklist algorithm: starting from each
+// call-entry label, we propagate the body ID to all PushAddr targets within
+// the same body's instruction range. This correctly handles continuation
+// labels that appear after other call entries in the instruction stream.
+pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<String>) {
+    if p.ins.is_empty() {
+        return;
+    }
+    let mut ins_body = compute_ins_body(p);
 
     // Step 4: Collect local names per body, assigning slot IDs.
     // Step 4.5 (v14): shared-variable scope resolution. A name assigned at
@@ -986,7 +1017,7 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
                 }
             }
         }
-        if std::env::var("NKR_DEBUG_SCOPE").is_ok() { eprintln!("[scope] shared={:?}", shared); }
+        if std::env::var("NK_DEBUG_SCOPE").is_ok() { eprintln!("[scope] shared={:?}", shared); }
         // per-body param-bound names: a param bind shadows a shared name
         // within its own body (reads there hit the frame slot, not the var)
         let mut body_params: HashMap<usize, std::collections::HashSet<String>> = HashMap::new();
@@ -1148,7 +1179,7 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
     }
 
 
-    if std::env::var("NKR_DEBUG_INS").is_ok() {
+    if std::env::var("NK_DEBUG_INS").is_ok() {
         for (i, ins) in p.ins.iter().enumerate() {
             eprintln!("[ins {}] b{} {:?}", i, ins_body[i], ins);
         }
@@ -1280,7 +1311,8 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
                 Ins::Ret => Ins::Ret,
                 Ins::SetV(v) => Ins::SetV(format!("{}__{}", modname, v)),
                 Ins::GetV(v) => Ins::GetV(format!("{}__{}", modname, v)),
-                ins @ (Ins::IncLocal(_) | Ins::AddLocal(_) | Ins::IncGlobal(_) | Ins::AddGlobal(_) | Ins::AtomicAdd(_, _) | Ins::Nop) => ins.clone(),
+                ins @ (Ins::IncLocal(_) | Ins::AddLocal(_) | Ins::IncGlobal(_) | Ins::AddGlobal(_) | Ins::AtomicAdd(_, _) | Ins::Nop
+                    | Ins::Strict | Ins::Loose) => ins.clone(),
                 Ins::LocalSet(n) => Ins::LocalSet(n.clone()),
                 Ins::LocalGet(n) => Ins::LocalGet(n.clone()),
                 Ins::LocalSetI(id) => Ins::LocalSetI(*id),
@@ -1540,6 +1572,7 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "TOPN" => "op_topn",
         "RANGEFOLD" => "op_rangefold",
         "TRANSPOSE" => "op_transpose",
+        "DCAST" => "op_dcast",
 
         other => panic!("no helper for {}", other),
     };
@@ -1566,6 +1599,7 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         "op_dict" | "op_list" | "op_caps" => (0, 1),
         "op_arr" | "op_tensor" => (2, 1),
         "op_cast" => (2, 1),
+        "op_dcast" => (2, 1),
         // vector
         "op_vadd" | "op_vsub" | "op_vmul" | "op_vdiv" => (2, 1),
         "op_veadd" | "op_vesub" | "op_vemul" | "op_vediv" | "op_vemax" | "op_vemin" => (2, 1),
@@ -1745,6 +1779,9 @@ pub fn check_label_arity(p: &Parsed) {
                     (None, d) => d, // malformed; leave as-is
                 };
             }
+            Ins::Strict | Ins::Loose => {
+                // compile-time strictness markers: v → v, no stack effect
+            }
             Ins::Ret => {
                 // body ends; the next label entry resets depth
                 depth = None;
@@ -1765,6 +1802,603 @@ pub fn check_label_arity(p: &Parsed) {
                     depth = depth.map(|d| d + net);
                 }
             }
+        }
+    }
+}
+
+// ---------------- strictness: strict / loose (v14.1) ----------------
+//
+// `strict` (🔒, v → v) marks the value on the hidden stack: from then on the
+// value may not be implicitly coerced — any op that performs implicit
+// universal coercion (numeric/string context, truthiness, element coercion)
+// on it is a compile error. Strictness is a property of the VALUE, tracked
+// entirely at compile time: it follows the value through copies and
+// assignments, and any op that consumes a strict value makes every variable
+// that supplied a value operand to that op strict, and the op's outputs
+// strict (contagion). `loose` (🔓, v → v) removes the property; contagion
+// overrides prior looseness — only an explicit `loose` clears it.
+//
+// The pass is an abstract interpretation over the same static stack model the
+// arity checker uses (helper_effect + poisoning). Opaque regions (syscalls,
+// FFI, weave scheduling, statically unknown stack shapes) poison the taint:
+// no error, no propagation there — the same conservative fallback as arity.
+
+// Ops whose runtime semantics perform implicit universal coercion on a value
+// operand. Keyed by the C helper name (Ins::Simple payload).
+fn is_coercing(h: &str) -> bool {
+    matches!(h,
+        // numeric context (uf_to_number / uf_loose_eq)
+        "op_add" | "op_sub" | "op_mul" | "op_div" | "op_rem" | "op_pow" | "op_sqrt"
+        | "op_inc" | "op_dec" | "op_lt" | "op_gt" | "op_lte" | "op_gte" | "op_eq"
+        // string context
+        | "op_cat" | "op_join" | "op_split" | "op_fmt" | "op_find" | "op_repl"
+        | "op_replace" | "op_rsplit" | "op_trim" | "op_up" | "op_down"
+        | "op_starts" | "op_ends" | "op_slice" | "op_glob" | "op_match"
+        // truthiness (uf_truthy)
+        | "op_not" | "op_orelse"
+        // collection / element coercion: the vector family coerces lists,
+        // strings and scalars to arrays; array/tensor coerce elements to the
+        // element type on copy; add_to goes through numeric add (uf_cadd)
+        | "op_veq" | "op_vlt" | "op_vgt" | "op_vge" | "op_vle"
+        | "op_vand" | "op_vor" | "op_vnot" | "op_vcount" | "op_vgather"
+        | "op_vsum" | "op_vmean" | "op_vmin" | "op_vmax"
+        | "op_vemax" | "op_vemin"
+        | "op_vargsort" | "op_vsearchsorted" | "op_vwhere" | "op_vmap" | "op_vfold"
+        | "op_transpose" | "op_arr" | "op_tensor"
+        | "op_addto" | "op_faddto" | "op_finc"
+    )
+}
+
+// Ops that invoke a quoted label with operand-derived values: a strict value
+// operand taints the quoted label's parameters (elements of a strict
+// collection are strict).
+fn is_callback_op(h: &str) -> bool {
+    matches!(h,
+        "op_filter" | "op_some" | "op_every" | "op_vmap" | "op_vfold"
+        | "op_imap" | "op_ifilter" | "op_group" | "op_agg" | "op_feach"
+        | "op_ffold" | "op_fsplit" | "op_bfs" | "op_dfs" | "op_wfind" | "op_rangefold"
+    )
+}
+
+// mnemonic for an error message
+fn strict_op_mnem(h: &str) -> String {
+    match h {
+        "op_add" => "add".to_string(), "op_sub" => "sub".to_string(), "op_mul" => "mul".to_string(), "op_div" => "div".to_string(),
+        "op_rem" => "rem".to_string(), "op_pow" => "pow".to_string(), "op_sqrt" => "sqrt".to_string(), "op_inc" => "inc".to_string(),
+        "op_dec" => "dec".to_string(), "op_lt" => "lt".to_string(), "op_gt" => "gt".to_string(), "op_lte" => "lte".to_string(),
+        "op_gte" => "gte".to_string(), "op_eq" => "eq".to_string(),
+        "op_cat" => "concat".to_string(), "op_join" => "join".to_string(), "op_split" => "split".to_string(),
+        "op_fmt" => "format".to_string(), "op_find" => "find".to_string(), "op_repl" => "replace_all".to_string(),
+        "op_replace" => "regex_replace".to_string(), "op_rsplit" => "regex_split".to_string(),
+        "op_trim" => "trim".to_string(), "op_up" => "uppercase".to_string(), "op_down" => "lowercase".to_string(),
+        "op_starts" => "starts_with".to_string(), "op_ends" => "ends_with".to_string(), "op_slice" => "slice".to_string(),
+        "op_glob" => "glob_match".to_string(), "op_match" => "regex_match".to_string(),
+        "op_not" => "not".to_string(), "op_orelse" => "orelse".to_string(),
+        "op_veq" => "scalar_eq".to_string(), "op_vlt" => "scalar_lt".to_string(), "op_vgt" => "scalar_gt".to_string(),
+        "op_vge" => "scalar_gte".to_string(), "op_vle" => "scalar_lte".to_string(),
+        "op_vand" => "bitmap_and".to_string(), "op_vor" => "bitmap_or".to_string(), "op_vnot" => "bitmap_not".to_string(),
+        "op_vcount" => "bitmap_count".to_string(), "op_vgather" => "array_gather".to_string(),
+        "op_vsum" => "sum".to_string(), "op_vmean" => "mean".to_string(), "op_vmin" => "min".to_string(), "op_vmax" => "max".to_string(),
+        "op_vemax" => "array_max".to_string(), "op_vemin" => "array_min".to_string(),
+        "op_vargsort" => "array_argsort".to_string(), "op_vsearchsorted" => "array_search_sorted".to_string(),
+        "op_vwhere" => "array_where".to_string(), "op_vmap" => "array_map".to_string(), "op_vfold" => "array_reduce".to_string(),
+        "op_arr" => "array".to_string(), "op_tensor" => "tensor".to_string(),
+        "op_addto" => "add_to".to_string(), "op_faddto" => "field_add_to".to_string(), "op_finc" => "field_inc".to_string(),
+        other => other.strip_prefix("op_").unwrap_or(other).to_string(),
+    }
+}
+
+#[derive(Clone)]
+struct SEntry {
+    strict: bool,
+    addr: bool,        // code address (PushAddr): not a value, never tainted
+    prov: Vec<String>, // taint keys of variables holding this value
+}
+
+fn strict_err(op: &str, what: &str, prov: &[String]) -> ! {
+    let src = if prov.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = prov
+            .iter()
+            .map(|k| format!("'{}'", k.rsplit(':').next().unwrap_or(k)))
+            .collect();
+        format!(" (value of variable {})", names.join(", "))
+    };
+    panic!(
+        "strict: {} cannot be implicitly coerced by `{}` — convert explicitly (parse_int/parse_float/format_int/format_float, structural_equal), or apply `loose` first{}",
+        what, op, src
+    )
+}
+
+/// Post-merge pass: propagate compile-time strictness, reject implicit
+/// coercion of strict values, then erase the STRICT/LOOSE markers (the feature
+/// is purely static — no runtime representation).
+pub fn check_strictness(p: &mut Parsed) {
+    if !p.ins.iter().any(|i| matches!(i, Ins::Strict)) {
+        return; // nothing strict anywhere: no analysis, no behavior change
+    }
+    let dbg = std::env::var("NK_DEBUG_STRICT").is_ok();
+    let ins_body = compute_ins_body(p);
+    let mut label_pcs: Vec<usize> = p.labels.values().copied().collect();
+    label_pcs.push(0);
+    label_pcs.sort_unstable();
+    label_pcs.dedup();
+    let arity_at = |pc: usize| -> usize {
+        let mut best: Option<(usize, usize)> = None;
+        for (&lpc, params) in &p.label_params {
+            if lpc <= pc && best.map_or(true, |(b, _)| lpc > b) {
+                best = Some((lpc, params.len()));
+            }
+        }
+        best.map(|(_, n)| n).unwrap_or(0)
+    };
+    // param variable key for seeding a body's incoming cells
+    let param_key = |pc: usize, k: usize| -> String {
+        match p
+            .label_params
+            .get(&pc)
+            .and_then(|ps| ps.get(k))
+        {
+            Some(Param::Local(n)) => format!("L{}:{}", ins_body[pc], n),
+            Some(Param::Global(n)) => format!("S:{}", n),
+            _ => format!("L{}:arg{}", ins_body[pc], k),
+        }
+    };
+    // the quoted label feeding a callback op (its PushAddr is the last one
+    // pushed before the op, so scan back over push instructions)
+    let feeding_addr = |i: usize| -> Option<String> {
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            if let Ins::PushAddr(l) = &p.ins[j] {
+                return Some(l.clone());
+            }
+            if matches!(
+                p.ins[j],
+                Ins::PushI(_) | Ins::PushF(_) | Ins::PushS(_) | Ins::LocalGetI(_) | Ins::GetV(_) | Ins::LocalGet(_)
+            ) {
+                continue;
+            }
+            break;
+        }
+        None
+    };
+    // demangle "<mod>:<name>" merged-TU label names for display (mods and
+    // label names cannot contain ':')
+    let disp = |l: &str| -> String {
+        match l.split_once(':') {
+            Some((_, rest)) => rest.to_string(),
+            None => l.to_string(),
+        }
+    };
+    let local_key = |i: usize, id: usize| -> String {
+        let body = ins_body[i];
+        let name = p
+            .local_names
+            .get(&body)
+            .and_then(|ns| ns.get(id))
+            .cloned()
+            .unwrap_or_else(|| format!("slot{}", id));
+        format!("L{}:{}", body, name)
+    };
+
+    // fixpoint summaries (monotone: bits only ever turn on)
+    let mut param_taint: HashMap<(usize, usize), bool> = HashMap::new(); // (label pc, param idx)
+    let mut ret_region: HashMap<usize, bool> = HashMap::new(); // label pc -> its own rets
+    let mut ret_body: HashMap<usize, bool> = HashMap::new(); // body owner pc -> any ret in body
+    let mut taint_param = |tp: usize,
+                           k: usize,
+                           param_taint: &mut HashMap<(usize, usize), bool>|
+     -> bool {
+        if param_taint.get(&(tp, k)).copied().unwrap_or(false) {
+            false
+        } else {
+            param_taint.insert((tp, k), true);
+            true
+        }
+    };
+
+    for _round in 0..(2 + p.labels.len()).min(64) {
+        let mut changed = false;
+        let mut vars: HashMap<String, bool> = HashMap::new();
+        let mut stack: Option<Vec<SEntry>> = Some(Vec::new());
+        let mut marks: Vec<usize> = Vec::new();
+        for i in 0..p.ins.len() {
+            if label_pcs.binary_search(&i).is_ok() {
+                let n = arity_at(i);
+                let seeded: Vec<SEntry> = (0..n)
+                    .map(|k| SEntry {
+                        strict: param_taint.get(&(i, k)).copied().unwrap_or(false),
+                        addr: false,
+                        prov: vec![param_key(i, k)],
+                    })
+                    .collect();
+                stack = Some(seeded);
+                marks.clear();
+            }
+            match p.ins[i].clone() {
+                Ins::PushI(_) | Ins::PushF(_) | Ins::PushS(_) => {
+                    if let Some(s) = stack.as_mut() {
+                        s.push(SEntry { strict: false, addr: false, prov: vec![] });
+                    }
+                }
+                Ins::PushAddr(_) => {
+                    if let Some(s) = stack.as_mut() {
+                        s.push(SEntry { strict: false, addr: true, prov: vec![] });
+                    }
+                }
+                Ins::Strict => {
+                    if dbg {
+                        eprintln!("[strict pc{}] mark", i);
+                    }
+                    if let Some(e) = stack.as_mut().and_then(|s| s.last_mut()) {
+                        e.strict = true;
+                    }
+                }
+                Ins::Loose => {
+                    if dbg {
+                        eprintln!("[strict pc{}] clear", i);
+                    }
+                    if let Some(e) = stack.as_mut().and_then(|s| s.last_mut()) {
+                        e.strict = false;
+                    }
+                }
+                Ins::Simple(h) => {
+                    if p.param_pcs.contains_key(&i) {
+                        // guarded param pop (_! discard)
+                        if let Some(s) = stack.as_mut() {
+                            s.pop();
+                        }
+                        continue;
+                    }
+                    if h == "op_drop" {
+                        if let Some(s) = stack.as_mut() {
+                            s.pop();
+                        }
+                        continue;
+                    }
+                    let eff = helper_effect(h);
+                    let cb = if is_callback_op(h) { feeding_addr(i) } else { None };
+                    match (stack.take(), eff) {
+                        (None, _) => stack = None,
+                        (_, None) => stack = None, // unknown effect: poison
+                        (Some(mut s), Some((pops, pushes))) => {
+                            if s.len() < pops as usize {
+                                stack = None;
+                                continue;
+                            }
+                            let ops: Vec<SEntry> = s.split_off(s.len() - pops as usize);
+                            let val_strict = ops.iter().any(|e| e.strict && !e.addr);
+                            let mut provs: Vec<String> = Vec::new();
+                            for e in &ops {
+                                if !e.addr {
+                                    provs.extend(e.prov.iter().cloned());
+                                }
+                            }
+                            if val_strict {
+                                if is_coercing(h) {
+                                    strict_err(&strict_op_mnem(h), "a strict value", &provs);
+                                }
+                                for k in &provs {
+                                    vars.insert(k.clone(), true);
+                                }
+                                if let Some(l) = &cb {
+                                    if let Some(&tp) = p.labels.get(l) {
+                                        let n = p.label_params.get(&tp).map(|v| v.len()).unwrap_or(0);
+                                        for k in 0..n {
+                                            changed |= taint_param(tp, k, &mut param_taint);
+                                        }
+                                    }
+                                }
+                            }
+                            // truthiness over a callback's returned value
+                            if let Some(l) = &cb {
+                                if matches!(h, "op_filter" | "op_some" | "op_every") {
+                                    if let Some(&tp) = p.labels.get(l) {
+                                        if ret_region.get(&tp).copied().unwrap_or(false) {
+                                            panic!(
+                                                "strict: label '{}' returns a strict value and `{}` applies truthiness to it — return an explicit comparison from the label, or apply `loose` before its `ret`",
+                                                disp(l),
+                                                strict_op_mnem(h)
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            for _ in 0..pushes {
+                                s.push(SEntry { strict: val_strict, addr: false, prov: vec![] });
+                            }
+                            stack = Some(s);
+                        }
+                    }
+                }
+                Ins::If => {
+                    // [cond, body_addr] -> : cond is the deeper cell
+                    if let Some(mut s) = stack.take() {
+                        if s.len() < 2 {
+                            stack = None;
+                        } else {
+                            let cond = s[s.len() - 2].clone();
+                            if cond.strict && !cond.addr {
+                                strict_err("if", "a strict condition", &cond.prov);
+                            }
+                            s.truncate(s.len() - 2);
+                            stack = Some(s);
+                        }
+                    }
+                }
+                Ins::IfElse => {
+                    // [cond, then_addr, else_addr] ->
+                    if let Some(mut s) = stack.take() {
+                        if s.len() < 3 {
+                            stack = None;
+                        } else {
+                            let cond = s[s.len() - 3].clone();
+                            if cond.strict && !cond.addr {
+                                strict_err("if_else", "a strict condition", &cond.prov);
+                            }
+                            s.truncate(s.len() - 3);
+                            stack = Some(s);
+                        }
+                    }
+                }
+                Ins::While => {
+                    // [cond_addr, body_addr] -> : both are addresses; the
+                    // cond label's returned value gets truthiness-tested
+                    if let Some(mut s) = stack.take() {
+                        if s.len() < 2 {
+                            stack = None;
+                        } else {
+                            s.truncate(s.len() - 2);
+                            stack = Some(s);
+                        }
+                    }
+                    if i >= 2 {
+                        if let Ins::PushAddr(cl) = &p.ins[i - 2] {
+                            if let Some(&tp) = p.labels.get(cl) {
+                                if ret_region.get(&tp).copied().unwrap_or(false) {
+                                    panic!(
+                                        "strict: label '{}' returns a strict value and `while` applies truthiness to it — return an explicit comparison from the label, or apply `loose` before its `ret`",
+                                        disp(cl)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Ins::For => {
+                    // [count, body_addr] -> : count is used raw (no
+                    // coercion), but a strict count still contaminates
+                    if let Some(mut s) = stack.take() {
+                        if s.len() < 2 {
+                            stack = None;
+                        } else {
+                            let cnt = s[s.len() - 2].clone();
+                            if cnt.strict && !cnt.addr {
+                                for k in &cnt.prov {
+                                    vars.insert(k.clone(), true);
+                                }
+                            }
+                            s.truncate(s.len() - 2);
+                            stack = Some(s);
+                        }
+                    }
+                }
+                Ins::Call(l) => {
+                    let tp = p.labels.get(&l).copied();
+                    let arity = tp
+                        .map(|t| p.label_params.get(&t).map(|v| v.len()).unwrap_or(0))
+                        .unwrap_or(0);
+                    match stack.take() {
+                        None => {}
+                        Some(mut s) => {
+                            if s.len() < arity || tp.is_none() {
+                                stack = None;
+                            } else {
+                                let tp = tp.unwrap();
+                                let args: Vec<SEntry> = s.split_off(s.len() - arity);
+                                let any_strict = args.iter().any(|e| e.strict && !e.addr);
+                                if any_strict {
+                                    for e in &args {
+                                        if e.addr {
+                                            continue;
+                                        }
+                                        for k in &e.prov {
+                                            vars.insert(k.clone(), true);
+                                        }
+                                    }
+                                    for k in 0..arity {
+                                        changed |= taint_param(tp, k, &mut param_taint);
+                                    }
+                                }
+                                let res = ret_body.get(&tp).copied().unwrap_or(false);
+                                s.push(SEntry { strict: res, addr: false, prov: vec![] });
+                                stack = Some(s);
+                            }
+                        }
+                    }
+                }
+                Ins::CallExt(_) | Ins::Sys(_) | Ins::Send | Ins::Weave(_) | Ins::Extern(_) => {
+                    stack = None;
+                }
+                Ins::Ret => {
+                    if let Some(s) = &stack {
+                        if s.last().map(|e| e.strict && !e.addr).unwrap_or(false) {
+                            let lpc = label_pcs.iter().rev().find(|&&c| c <= i).copied().unwrap_or(0);
+                            if !ret_region.get(&lpc).copied().unwrap_or(false) {
+                                ret_region.insert(lpc, true);
+                                changed = true;
+                            }
+                            let b = ins_body[i];
+                            if !ret_body.get(&b).copied().unwrap_or(false) {
+                                ret_body.insert(b, true);
+                                changed = true;
+                            }
+                        }
+                    }
+                    stack = None;
+                    marks.clear();
+                }
+                Ins::Break | Ins::Cont | Ins::Goto(_) => {
+                    stack = None;
+                }
+                Ins::Flush => { /* materialization boundary: shape and taints preserved */ }
+                Ins::ListStart | Ins::DictStart => match stack.as_ref() {
+                    Some(s) => marks.push(s.len()),
+                    None => marks.push(usize::MAX),
+                },
+                Ins::ListLit | Ins::DictLit => {
+                    let m = marks.pop();
+                    match (m, stack.as_mut()) {
+                        (Some(usize::MAX), _) => stack = None,
+                        (Some(m), Some(s)) => {
+                            if s.len() < m {
+                                stack = None;
+                            } else {
+                                let elems: Vec<SEntry> = s.split_off(m);
+                                let any = elems.iter().any(|e| e.strict && !e.addr);
+                                if any {
+                                    for e in &elems {
+                                        if e.addr {
+                                            continue;
+                                        }
+                                        for k in &e.prov {
+                                            vars.insert(k.clone(), true);
+                                        }
+                                    }
+                                }
+                                s.push(SEntry { strict: any, addr: false, prov: vec![] });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ins::SetV(n) => {
+                    let key = format!("S:{}", n);
+                    match stack.as_mut() {
+                        Some(s) => match s.pop() {
+                            Some(e) => {
+                                if e.strict {
+                                    vars.insert(key, true);
+                                } else {
+                                    vars.remove(&key);
+                                }
+                            }
+                            None => stack = None,
+                        },
+                        None => {}
+                    }
+                }
+                Ins::GetV(n) => {
+                    let key = format!("S:{}", n);
+                    if let Some(s) = stack.as_mut() {
+                        let t = vars.get(&key).copied().unwrap_or(false);
+                        s.push(SEntry { strict: t, addr: false, prov: vec![key] });
+                    }
+                }
+                Ins::LocalSetI(id) => {
+                    let key = local_key(i, id);
+                    if p.param_pcs.contains_key(&i) {
+                        // guarded param pop: consumes one incoming cell
+                        match stack.as_mut() {
+                            Some(s) => match s.pop() {
+                                Some(e) => {
+                                    if e.strict {
+                                        vars.insert(key, true);
+                                    } else {
+                                        vars.remove(&key);
+                                    }
+                                }
+                                None => stack = None,
+                            },
+                            None => {}
+                        }
+                    } else if let Some(s) = stack.as_mut() {
+                        if let Some(top) = s.last_mut() {
+                            if top.strict {
+                                vars.insert(key.clone(), true);
+                            } else {
+                                vars.remove(&key);
+                            }
+                            if !top.prov.contains(&key) {
+                                top.prov.push(key);
+                            }
+                        }
+                    }
+                }
+                Ins::LocalGetI(id) => {
+                    let key = local_key(i, id);
+                    if let Some(s) = stack.as_mut() {
+                        let t = vars.get(&key).copied().unwrap_or(false);
+                        s.push(SEntry { strict: t, addr: false, prov: vec![key] });
+                    }
+                }
+                Ins::LocalSet(n) => {
+                    let key = format!("L{}:{}", ins_body[i], n);
+                    if let Some(s) = stack.as_mut() {
+                        if let Some(top) = s.last_mut() {
+                            if top.strict {
+                                vars.insert(key.clone(), true);
+                            } else {
+                                vars.remove(&key);
+                            }
+                            if !top.prov.contains(&key) {
+                                top.prov.push(key);
+                            }
+                        }
+                    }
+                }
+                Ins::LocalGet(n) => {
+                    let key = format!("L{}:{}", ins_body[i], n);
+                    if let Some(s) = stack.as_mut() {
+                        let t = vars.get(&key).copied().unwrap_or(false);
+                        s.push(SEntry { strict: t, addr: false, prov: vec![key] });
+                    }
+                }
+                Ins::AtomicAdd(n, inc) => {
+                    // x++ / x+= : raw i64 RMW (no coercion); a strict delta
+                    // flows into the var, the pushed result is the old value
+                    let key = format!("S:{}", n);
+                    let old = vars.get(&key).copied().unwrap_or(false);
+                    if let Some(s) = stack.as_mut() {
+                        if !inc {
+                            match s.pop() {
+                                Some(d) => {
+                                    if d.strict && !d.addr {
+                                        vars.insert(key.clone(), true);
+                                    }
+                                }
+                                None => {
+                                    stack = None;
+                                    continue;
+                                }
+                            }
+                        }
+                        s.push(SEntry { strict: old, addr: false, prov: vec![key] });
+                    }
+                }
+                Ins::Nop
+                | Ins::IncLocal(_)
+                | Ins::AddLocal(_)
+                | Ins::IncGlobal(_)
+                | Ins::AddGlobal(_) => {}
+            }
+        }
+        if dbg {
+            eprintln!(
+                "[strict] round: params={:?} ret_region={:?} ret_body={:?}",
+                param_taint, ret_region, ret_body
+            );
+        }
+        if !changed {
+            break;
+        }
+    }
+    // erase the markers: strictness is purely compile-time
+    for ins in p.ins.iter_mut() {
+        if matches!(ins, Ins::Strict | Ins::Loose) {
+            *ins = Ins::Nop;
         }
     }
 }

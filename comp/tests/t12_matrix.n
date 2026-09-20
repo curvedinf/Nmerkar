@@ -1,0 +1,71 @@
+; t12_matrix.n — polymorphic matrices (v13.1)
+; matrices: [rows cols] type tensor  (HT_MAT=20, type_of -> 20)
+; mul: matrix x matrix = matmul; matrix x vector = matvec; elementwise/broadcast otherwise
+
+; --- construction + flat indexing (row-major) ---
+[2 3] float tensor m!
+m@ 0 1.0 set
+m@ 1 2.0 set
+m@ 2 3.0 set
+m@ 3 4.0 set
+m@ 4 5.0 set
+m@ 5 6.0 set
+"type: " print m@ type_of print
+"len: " print m@ length print
+"m: " print m@ print
+
+; --- transpose ---
+"transpose: " print m@ transpose print
+
+; --- matmul: (2x3)·(3x2) = 2x2 ---
+[3 2] float tensor b!
+b@ 0 7.0 set
+b@ 1 8.0 set
+b@ 2 9.0 set
+b@ 3 10.0 set
+b@ 4 11.0 set
+b@ 5 12.0 set
+"b: " print b@ print
+"c = m*b: " print m@ b@ mul print
+
+; expected c (floats):
+; row0: 1*7+2*9+3*11=58   1*8+2*10+3*12=64
+; row1: 4*7+5*9+6*11=139  4*8+5*10+6*12=154
+"c00: " print m@ b@ mul 0 get print
+"c01: " print m@ b@ mul 1 get print
+"c10: " print m@ b@ mul 2 get print
+"c11: " print m@ b@ mul 3 get print
+
+; --- matvec: (2x3)·(3) = 2 ---
+3 float tensor x!
+x@ 0 1.0 set
+x@ 1 1.0 set
+x@ 2 1.0 set
+"m*x: " print m@ x@ mul print
+
+; --- elementwise + broadcast (aliases still work) ---
+"m+m: " print m@ m@ add print
+"m*2: " print m@ 2.0 mul print
+"scalar_mul alias: " print m@ 2.0 scalar_mul print
+"array_add alias: " print
+4 float tensor u!
+u@ 0 9.0 set
+u@ 1 9.0 set
+u@ 2 9.0 set
+u@ 3 9.0 set
+4 float tensor v!
+v@ 0 1.0 set
+v@ 1 1.0 set
+v@ 2 1.0 set
+v@ 3 1.0 set
+"u+v: " print u@ v@ array_add print
+"u+v (core add): " print u@ v@ add print
+
+; --- reductions over matrices ---
+"sum(m): " print m@ sum print
+"mean(m): " print m@ mean print
+
+; --- dim mismatch must die (see header comment; uncomment to verify) ---
+; [2 2] float tensor bad!
+; m@ bad@ mul print
+ret

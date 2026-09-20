@@ -1,8 +1,8 @@
 #!/bin/bash
 # GNU tool test suite — transpiles each multi-file tool adaptation,
-# compiles with nkr, and gates behavior against the system binaries.
-# The transpiled .ent of every tool is exported to examples/gnu/ so the
-# generated Enmerkar code is visible to web indexers.
+# compiles with nk, and gates behavior against the system binaries.
+# The transpiled .n of every tool is exported to examples/gnu/ so the
+# generated Nmerkar code is visible to web indexers.
 #
 # Tool sources live in tests/gnu/<tool>/*.c (concatenated in ls order,
 # gnu_main.c excluded — that one is a gcc-reference-only wrapper).
@@ -12,10 +12,10 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 TRANSROOT=$(cd "$HERE/../.." && pwd)
-UF=${UF:-$TRANSROOT/../comp/target/release/nkr}
+UF=${UF:-$TRANSROOT/../comp/target/release/nk}
 TRANS=${TRANS:-$TRANSROOT/target/release/trans}
 [ -x "$TRANS" ] || { echo "trans binary missing; run: (cd trans && cargo build --release)"; exit 1; }
-[ -x "$UF" ] || { echo "nkr binary missing; run: (cd comp && cargo build --release)"; exit 1; }
+[ -x "$UF" ] || { echo "nk binary missing; run: (cd comp && cargo build --release)"; exit 1; }
 TOOLS="cat head nl tee cksum base64"
 EXDIR=$HERE/../../../examples/gnu
 T=$(mktemp -d)
@@ -39,17 +39,17 @@ for tool in $TOOLS; do
 
   # 2. transpile (multi-file, gnu_main.c excluded)
   srcs=$(ls "$dir"/*.c | grep -v gnu_main.c | tr '\n' ' ')
-  "$TRANS" $srcs > "$T/$tool.ent" 2>"$T/$tool.terr"
+  "$TRANS" $srcs > "$T/$tool.n" 2>"$T/$tool.terr"
   [ $? -eq 0 ] || { gate_fail "$tool" "transpile rc!=0: $(head -c 120 "$T/$tool.terr")"; continue; }
   [ -s "$T/$tool.terr" ] && { gate_fail "$tool" "transpiler stderr not empty"; continue; }
 
   # 3. compile
-  "$UF" --device cpu -c "$T/$tool.ent" -o "$T/${tool}_bin" 2>"$T/$tool.cerr"
+  "$UF" --device cpu -c "$T/$tool.n" -o "$T/${tool}_bin" 2>"$T/$tool.cerr"
   [ $? -eq 0 ] || { gate_fail "$tool" "compile rc!=0: $(head -c 120 "$T/$tool.cerr")"; continue; }
   [ -s "$T/$tool.cerr" ] && { gate_fail "$tool" "compile stderr not empty"; continue; }
 
   # 4. export transpiled code for indexers
-  cp "$T/$tool.ent" "$EXDIR/$tool.ent"
+  cp "$T/$tool.n" "$EXDIR/$tool.n"
 
   # 5. behavior gates: (label|args|stdin-fixture...) — compare
   #    transpiled binary vs the SYSTEM binary
@@ -145,7 +145,7 @@ for tool in $TOOLS; do
   esac
 
   if [ $fail_t = 0 ]; then
-    echo "GNU-OK $tool ($pass_t gates, .ent exported)"
+    echo "GNU-OK $tool ($pass_t gates, .n exported)"
     PASS=$((PASS+1))
   else
     gate_fail "$tool" "$fail_t of $((pass_t+fail_t)) behavior gates"

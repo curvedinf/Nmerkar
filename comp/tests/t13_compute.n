@@ -1,0 +1,49 @@
+; t13_compute.n — automatic GPU offloading (Vulkan compute, v13.1)
+; Eligible ops at scale (>= UF_GPU_MIN, default 65536 elements): add/sub/mul/div
+; (elementwise, broadcast, matmul, matvec), sum/mean/min/max, transpose.
+; Run under:  nk t13_compute.n                (auto: GPU when available)
+;             nk --device cpu t13_compute.n   (force CPU)
+;             nk --device vk0 t13_compute.n   (pin device 0)
+; Elementwise results are bit-exact CPU vs GPU; integer-valued double sums are
+; exact in both reduction orders. Compare outputs across modes.
+; NOTE: run with --gc-threshold 200000000 — multi-MB arrays trip a pre-existing
+; GC issue with the default 1MB threshold (present at v13 HEAD; unrelated to
+; GPU offloading).
+
+; ---- 1M double array: fill 0..n-1, double it, reduce ----
+0 70000 range lst!
+lst@ float tensor f!
+f@ 2.0 mul f!
+"first (expect 0): " print f@ 0 get print
+"last  (expect 139998): " print f@ 69999 get print
+"sum (expect 4.89995e+9): " print f@ sum "%.10g" format print
+"mean (expect 69999): " print f@ mean "%.10g" format print
+"1M sum (expect 1.09951e+12): " print 0 1048576 range lst2!
+lst2@ float tensor big!
+big@ sum "%.10g" format print
+"min   (expect 0): " print f@ min print
+"max   (expect 2097150): " print f@ max print
+"broadcast+1 [0] (expect 1): " print f@ 1.0 add 0 get print
+"self-sub [0] (expect 0): " print f@ f@ sub 0 get print
+
+; ---- 512x512 matmul with identity: C = A*I = A, a[k] = row+col ----
+[512 512] float tensor a!
+a@ 1.0 add a!
+a@ a@ mul c!
+"c[5,100]   (expect 512): " print c@ 5 512 mul 100 add get print
+"c[511,511] (expect 512): " print c@ 511 512 mul 511 add get print
+
+; ---- matvec: A·x, x = ones ----
+512 float tensor x!
+x@ 1.0 add x!
+a@ x@ mul y!
+"y[0]   (expect 512): " print y@ 0 get print
+"y[511] (expect 512): " print y@ 511 get print
+
+; ---- transpose: t[c*512+r] = a[r*512+c] ----
+a@ transpose t!
+"t[511] (expect 1): " print t@ 511 get print
+"t[512] (expect 1): " print t@ 512 get print
+ret
+
+ret

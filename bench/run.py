@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import os,sys,json,subprocess,time,platform
 from pathlib import Path
-PROJ=Path("/home/chase/Projects/uflux")  # TODO: update to the enmerkar repo path after the move
+PROJ=Path("/home/chase/Projects/uflux")  # TODO: update to the nmerkar repo path after the move
 BENCH=PROJ/"bench"
 DATA=BENCH/"data"
 RESULTS=BENCH/"results"
-NKR=PROJ/"comp"/"target"/"release"/"nkr"
+NK=PROJ/"comp"/"target"/"release"/"nk"
 RESULTS.mkdir(exist_ok=True)
 from transformers import AutoTokenizer
 tok=AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
@@ -49,19 +49,19 @@ def compile_all():
     rc,t,out,err=run_cmd(["rustc","-O","-o",str(an_rs_bin),str(an_rs_src)])
     results["rs_analytics"]=(rc==0,t)
     print(f"  Rust analytics: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
-    le_nkr_src=BENCH/"src"/"logextract"/"logextract.ent"
-    le_nkr_bin=BENCH/"src"/"logextract"/"logextract_nkr"
-    rc,t,out,err=run_cmd([str(NKR),"-c",str(le_nkr_src),"-o",str(le_nkr_bin)])
+    le_nk_src=BENCH/"src"/"logextract"/"logextract.n"
+    le_nk_bin=BENCH/"src"/"logextract"/"logextract_nk"
+    rc,t,out,err=run_cmd([str(NK),"-c",str(le_nk_src),"-o",str(le_nk_bin)])
     results["uf_logextract"]=(rc==0,t)
     print(f"  uFlux logextract: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
-    an_nkr_src=BENCH/"src"/"analytics"/"analytics.ent"
-    an_nkr_bin=BENCH/"src"/"analytics"/"analytics_nkr"
-    rc,t,out,err=run_cmd([str(NKR),"-c",str(an_nkr_src),"-o",str(an_nkr_bin)])
+    an_nk_src=BENCH/"src"/"analytics"/"analytics.n"
+    an_nk_bin=BENCH/"src"/"analytics"/"analytics_nk"
+    rc,t,out,err=run_cmd([str(NK),"-c",str(an_nk_src),"-o",str(an_nk_bin)])
     results["uf_analytics"]=(rc==0,t)
     print(f"  uFlux analytics: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
-    mb_nkr_src=BENCH/"src"/"mandelbrot"/"mandelbrot.ent"
-    mb_nkr_bin=BENCH/"src"/"mandelbrot"/"mandelbrot_nkr"
-    rc,t,out,err=run_cmd([str(NKR),"-c",str(mb_nkr_src),"-o",str(mb_nkr_bin)])
+    mb_nk_src=BENCH/"src"/"mandelbrot"/"mandelbrot.n"
+    mb_nk_bin=BENCH/"src"/"mandelbrot"/"mandelbrot_nk"
+    rc,t,out,err=run_cmd([str(NK),"-c",str(mb_nk_src),"-o",str(mb_nk_bin)])
     results["uf_mandelbrot"]=(rc==0,t)
     print(f"  uFlux mandelbrot: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
     mb_cpp_src=BENCH/"src"/"mandelbrot"/"mandelbrot.cpp"
@@ -72,17 +72,17 @@ def compile_all():
     mb_rs_bin=BENCH/"src"/"mandelbrot"/"mandelbrot_rs"
     rc,t,out,err=run_cmd(["rustc","-O","-o",str(mb_rs_bin),str(mb_rs_src)])
     print(f"  Rust mandelbrot: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
-    sn_nkr_src=BENCH/"src"/"spectralnorm"/"spectralnorm.ent"
-    sn_nkr_bin=BENCH/"src"/"spectralnorm"/"spectralnorm_nkr"
-    rc,t,out,err=run_cmd([str(NKR),"-c",str(sn_nkr_src),"-o",str(sn_nkr_bin)])
+    sn_nk_src=BENCH/"src"/"spectralnorm"/"spectralnorm.n"
+    sn_nk_bin=BENCH/"src"/"spectralnorm"/"spectralnorm_nk"
+    rc,t,out,err=run_cmd([str(NK),"-c",str(sn_nk_src),"-o",str(sn_nk_bin)])
     results["uf_spectralnorm"]=(rc==0,t)
     print(f"  uFlux spectralnorm: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
     sn_cpp_src=BENCH/"src"/"spectralnorm"/"spectralnorm.cpp"
     sn_cpp_bin=BENCH/"src"/"spectralnorm"/"spectralnorm_cpp"
     rc,t,out,err=run_cmd(["g++","-std=c++17","-O2","-o",str(sn_cpp_bin),str(sn_cpp_src)])
     print(f"  C++ spectralnorm: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
-    # ---- v13.2 pattern-diverse benchmarks (nqueens, bfs) ----
-    for bn in ("nqueens","bfs"):
+    # ---- pattern-diverse benchmarks ----
+    for bn in ("nqueens","bfs","dynamicgraph"):
         d=BENCH/"src"/bn
         rc,t,out,err=run_cmd(["g++","-std=c++17","-O2","-o",str(d/f"{bn}_cpp"),str(d/f"{bn}.cpp")])
         results[f"cpp_{bn}"]=(rc==0,t)
@@ -131,14 +131,14 @@ def run_benchmark(name,cmd,cwd=PROJ,timeout=120,env=False):
            "stdout":out[:500]if out else"","stderr":err[:200]if err else""}
 def main():
     print("=== Token Counting (Qwen3-0.6B tokenizer) ===\n")
-    # Generate dense .en files from .ent for Enmerkar token counting
-    print("=== Generating dense .en files ===\n")
-    bench_names=["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes","nqueens","bfs"]
+    # Generate dense .nd files from .n for Nmerkar token counting
+    print("=== Generating dense .nd files ===\n")
+    bench_names=["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes","nqueens","bfs","dynamicgraph"]
     uf_paths={}
     for bn in bench_names:
-        uft=BENCH/"src"/bn/f"{bn}.ent"
-        uf_out=BENCH/"src"/bn/f"{bn}.en"
-        rc,t,out,err=run_cmd([str(NKR),"--to-dense",str(uft)])
+        uft=BENCH/"src"/bn/f"{bn}.n"
+        uf_out=BENCH/"src"/bn/f"{bn}.nd"
+        rc,t,out,err=run_cmd([str(NK),"--to-dense",str(uft)])
         if rc==0 and uf_out.exists():
             uf_paths[bn]=uf_out
             print(f"  {bn:14s}: generated ({t:.1f}s)")
@@ -154,6 +154,7 @@ def main():
             "spectralnorm":BENCH/"src"/"spectralnorm"/"spectralnorm.py",
             "nqueens":BENCH/"src"/"nqueens"/"nqueens.py",
             "bfs":BENCH/"src"/"bfs"/"bfs.py",
+            "dynamicgraph":BENCH/"src"/"dynamicgraph"/"dynamicgraph.py",
         },
         "Node.js":{
             "logextract":BENCH/"src"/"logextract"/"logextract.js",
@@ -162,6 +163,7 @@ def main():
             "spectralnorm":BENCH/"src"/"spectralnorm"/"spectralnorm.js",
             "nqueens":BENCH/"src"/"nqueens"/"nqueens.js",
             "bfs":BENCH/"src"/"bfs"/"bfs.js",
+            "dynamicgraph":BENCH/"src"/"dynamicgraph"/"dynamicgraph.js",
         },
         "C++":{
             "logextract":BENCH/"src"/"logextract"/"logextract.cpp",
@@ -170,6 +172,7 @@ def main():
             "spectralnorm":BENCH/"src"/"spectralnorm"/"spectralnorm.cpp",
             "nqueens":BENCH/"src"/"nqueens"/"nqueens.cpp",
             "bfs":BENCH/"src"/"bfs"/"bfs.cpp",
+            "dynamicgraph":BENCH/"src"/"dynamicgraph"/"dynamicgraph.cpp",
         },
         "Rust":{
             "logextract":BENCH/"src"/"logextract"/"logextract.rs",
@@ -178,8 +181,9 @@ def main():
             "spectralnorm":BENCH/"src"/"spectralnorm"/"spectralnorm.rs",
             "nqueens":BENCH/"src"/"nqueens"/"nqueens.rs",
             "bfs":BENCH/"src"/"bfs"/"bfs.rs",
+            "dynamicgraph":BENCH/"src"/"dynamicgraph"/"dynamicgraph.rs",
         },
-        "Enmerkar":{bn:uf_paths[bn] for bn in bench_names if bn in uf_paths},
+        "Nmerkar":{bn:uf_paths[bn] for bn in bench_names if bn in uf_paths},
     }
     for lang in ("Python","Node.js","C++","Rust"):
         sources[lang]["matmul"]=BENCH/"src"/"matmul"/("matmul."+{"Python":"py","Node.js":"js","C++":"cpp","Rust":"rs"}[lang])
@@ -204,10 +208,10 @@ def main():
     le_results.append(run_benchmark("Rust",[str(le_bin),log_path]))
     le_results.append(run_benchmark("Python",["python3",str(BENCH/"src"/"logextract"/"logextract.py"),log_path]))
     le_results.append(run_benchmark("Node.js",["node",str(BENCH/"src"/"logextract"/"logextract.js"),log_path]))
-    le_nkr_src=BENCH/"src"/"logextract"/"logextract.ent"
-    rc,t,out,err=run_cmd([str(NKR),"--device","cpu","--gc-threshold","1000000000","-c",str(le_nkr_src),"-o",str(BENCH/"src"/"logextract"/"logextract_nkr")])
-    le_results.append(run_benchmark("Enmerkar",[str(BENCH/"src"/"logextract"/"logextract_nkr"),log_path],timeout=60))
-    le_gpu=run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","1000000000",str(le_nkr_src),"--",log_path],timeout=60)
+    le_nk_src=BENCH/"src"/"logextract"/"logextract.n"
+    rc,t,out,err=run_cmd([str(NK),"--device","cpu","--gc-threshold","1000000000","-c",str(le_nk_src),"-o",str(BENCH/"src"/"logextract"/"logextract_nk")])
+    le_results.append(run_benchmark("Nmerkar",[str(BENCH/"src"/"logextract"/"logextract_nk"),log_path],timeout=60))
+    le_gpu=run_benchmark("Nmerkar(GPU-on)",[str(NK),"--gc-threshold","1000000000",str(le_nk_src),"--",log_path],timeout=60)
     le_results.append(le_gpu)
     print("\n=== Performance: Data Analytics (500MB sales.csv) ===\n")
     an_results=[]
@@ -217,9 +221,9 @@ def main():
     an_results.append(run_benchmark("Rust",[str(an_bin),csv_path]))
     an_results.append(run_benchmark("Python",["python3",str(BENCH/"src"/"analytics"/"analytics.py"),csv_path]))
     an_results.append(run_benchmark("Node.js",["node",str(BENCH/"src"/"analytics"/"analytics.js"),csv_path]))
-    an_nkr_src=BENCH/"src"/"analytics"/"analytics.ent"
-    an_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","1000000000",str(an_nkr_src),"--",csv_path],timeout=60))
-    an_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","1000000000",str(an_nkr_src),"--",csv_path],timeout=60))
+    an_nk_src=BENCH/"src"/"analytics"/"analytics.n"
+    an_results.append(run_benchmark("Nmerkar",[str(NK),"--device","cpu","--gc-threshold","1000000000",str(an_nk_src),"--",csv_path],timeout=60))
+    an_results.append(run_benchmark("Nmerkar(GPU-on)",[str(NK),"--gc-threshold","1000000000",str(an_nk_src),"--",csv_path],timeout=60))
 
     # Compute-only benchmarks (no data files; n passed as argv[1])
     N_MANDEL=1000
@@ -232,9 +236,9 @@ def main():
     mb_results.append(run_benchmark("Rust",[str(mb_rs_bin),str(N_MANDEL)]))
     mb_results.append(run_benchmark("Python",["python3",str(BENCH/"src"/"mandelbrot"/"mandelbrot.py"),str(N_MANDEL)],timeout=120))
     mb_results.append(run_benchmark("Node.js",["node",str(BENCH/"src"/"mandelbrot"/"mandelbrot.js"),str(N_MANDEL)],timeout=120))
-    mb_nkr_src=BENCH/"src"/"mandelbrot"/"mandelbrot.ent"
-    mb_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","1000000000",str(mb_nkr_src),"--",str(N_MANDEL)],timeout=120))
-    mb_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","1000000000",str(mb_nkr_src),"--",str(N_MANDEL)],timeout=120))
+    mb_nk_src=BENCH/"src"/"mandelbrot"/"mandelbrot.n"
+    mb_results.append(run_benchmark("Nmerkar",[str(NK),"--device","cpu","--gc-threshold","1000000000",str(mb_nk_src),"--",str(N_MANDEL)],timeout=120))
+    mb_results.append(run_benchmark("Nmerkar(GPU-on)",[str(NK),"--gc-threshold","1000000000",str(mb_nk_src),"--",str(N_MANDEL)],timeout=120))
 
     print(f"\n=== Performance: Spectral Norm (n={N_SPECTRAL}) ===\n")
     sn_results=[]
@@ -244,9 +248,9 @@ def main():
     sn_results.append(run_benchmark("Rust",[str(sn_rs_bin),str(N_SPECTRAL)]))
     sn_results.append(run_benchmark("Python",["python3",str(BENCH/"src"/"spectralnorm"/"spectralnorm.py"),str(N_SPECTRAL)],timeout=300))
     sn_results.append(run_benchmark("Node.js",["node",str(BENCH/"src"/"spectralnorm"/"spectralnorm.js"),str(N_SPECTRAL)],timeout=300))
-    sn_nkr_src=BENCH/"src"/"spectralnorm"/"spectralnorm.ent"
-    sn_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","1000000000",str(sn_nkr_src),"--",str(N_SPECTRAL)],timeout=300))
-    sn_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","1000000000",str(sn_nkr_src),"--",str(N_SPECTRAL)],timeout=300))
+    sn_nk_src=BENCH/"src"/"spectralnorm"/"spectralnorm.n"
+    sn_results.append(run_benchmark("Nmerkar",[str(NK),"--device","cpu","--gc-threshold","1000000000",str(sn_nk_src),"--",str(N_SPECTRAL)],timeout=300))
+    sn_results.append(run_benchmark("Nmerkar(GPU-on)",[str(NK),"--gc-threshold","1000000000",str(sn_nk_src),"--",str(N_SPECTRAL)],timeout=300))
 
     # ---- pattern-diverse benchmarks (v13.2) ----
     N_QUEENS=11
@@ -257,21 +261,40 @@ def main():
     nq_results.append(run_benchmark("Rust",[str(nq/"nqueens_rs"),str(N_QUEENS)]))
     nq_results.append(run_benchmark("Python",["python3",str(nq/"nqueens.py"),str(N_QUEENS)],timeout=120))
     nq_results.append(run_benchmark("Node.js",["node",str(nq/"nqueens.js"),str(N_QUEENS)]))
-    nq_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","1000000000",str(nq/"nqueens.ent"),"--",str(N_QUEENS)],timeout=120))
-    nq_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","1000000000",str(nq/"nqueens.ent"),"--",str(N_QUEENS)],timeout=120))
+    nq_results.append(run_benchmark("Nmerkar",[str(NK),"--device","cpu","--gc-threshold","1000000000",str(nq/"nqueens.n"),"--",str(N_QUEENS)],timeout=120))
+    nq_results.append(run_benchmark("Nmerkar(GPU-on)",[str(NK),"--gc-threshold","1000000000",str(nq/"nqueens.n"),"--",str(N_QUEENS)],timeout=120))
     N_BFS=1000000
-    print(f"\n=== Performance: BFS n={N_BFS} (graph, dict+queue) ===\n")
+    print(f"\n=== Performance: BFS n={N_BFS} (packed CSR) ===\n")
     bf=BENCH/"src"/"bfs"
+    bf_nk=bf/"bfs_nk"
+    bf_nk_auto=bf/"bfs_nk_auto"
+    run_cmd([str(NK),"--device","cpu","--gc-threshold","2000000000","-c",str(bf/"bfs.n"),"-o",str(bf_nk)])
+    run_cmd([str(NK),"--device","auto","--gc-threshold","2000000000","-c",str(bf/"bfs.n"),"-o",str(bf_nk_auto)])
     bf_results=[]
     bf_results.append(run_benchmark("C++",[str(bf/"bfs_cpp"),str(N_BFS)],timeout=120))
     bf_results.append(run_benchmark("Rust",[str(bf/"bfs_rs"),str(N_BFS)],timeout=120))
     bf_results.append(run_benchmark("Python",["python3",str(bf/"bfs.py"),str(N_BFS)],timeout=120))
     bf_results.append(run_benchmark("Node.js",["node",str(bf/"bfs.js"),str(N_BFS)],timeout=120))
-    bf_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","2000000000",str(bf/"bfs.ent"),"--",str(N_BFS)],timeout=240))
-    bf_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","2000000000",str(bf/"bfs.ent"),"--",str(N_BFS)],timeout=240))
+    bf_results.append(run_benchmark("Nmerkar",[str(bf_nk),str(N_BFS)],timeout=240))
+    bf_results.append(run_benchmark("Nmerkar(GPU-on)",[str(bf_nk_auto),str(N_BFS)],timeout=240))
+
+    N_DYNAMICGRAPH=1000000
+    print(f"\n=== Performance: Dynamic Graph n={N_DYNAMICGRAPH} (hash map + lists) ===\n")
+    dg=BENCH/"src"/"dynamicgraph"
+    dg_nk=dg/"dynamicgraph_nk"
+    dg_nk_auto=dg/"dynamicgraph_nk_auto"
+    run_cmd([str(NK),"--device","cpu","--gc-threshold","2000000000","-c",str(dg/"dynamicgraph.n"),"-o",str(dg_nk)])
+    run_cmd([str(NK),"--device","auto","--gc-threshold","2000000000","-c",str(dg/"dynamicgraph.n"),"-o",str(dg_nk_auto)])
+    dg_results=[]
+    dg_results.append(run_benchmark("C++",[str(dg/"dynamicgraph_cpp"),str(N_DYNAMICGRAPH)],timeout=120))
+    dg_results.append(run_benchmark("Rust",[str(dg/"dynamicgraph_rs"),str(N_DYNAMICGRAPH)],timeout=120))
+    dg_results.append(run_benchmark("Python",["python3",str(dg/"dynamicgraph.py"),str(N_DYNAMICGRAPH)],timeout=120))
+    dg_results.append(run_benchmark("Node.js",["node",str(dg/"dynamicgraph.js"),str(N_DYNAMICGRAPH)],timeout=120))
+    dg_results.append(run_benchmark("Nmerkar",[str(dg_nk),str(N_DYNAMICGRAPH)],timeout=240))
+    dg_results.append(run_benchmark("Nmerkar(GPU-on)",[str(dg_nk_auto),str(N_DYNAMICGRAPH)],timeout=240))
 
     # ---- GPU-oriented benchmarks (v13.1): CPU column + GPU-on column ----
-    # Enmerkar GPU-on = default auto device (Vulkan). The non-Enmerkar GPU variants
+    # Nmerkar GPU-on = default auto device (Vulkan). The non-Nmerkar GPU variants
     # use the shared launcher in src/_gpu (see bench/SPEC.md; when its binaries
     # are absent their GPU-on entries are skipped).
     N_MATMUL=512
@@ -283,8 +306,8 @@ def main():
     mm_results.append(run_benchmark("Rust",[str(mm/"matmul_rs"),str(N_MATMUL)]))
     mm_results.append(run_benchmark("Python",["python3",str(mm/"matmul.py"),str(N_MATMUL)]))
     mm_results.append(run_benchmark("Node.js",["node",str(mm/"matmul.js"),str(N_MATMUL)]))
-    mm_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","500000000",str(mm/"matmul.ent"),"--",str(N_MATMUL)],timeout=120))
-    mm_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","500000000",str(mm/"matmul.ent"),"--",str(N_MATMUL)],timeout=120))
+    mm_results.append(run_benchmark("Nmerkar",[str(NK),"--device","cpu","--gc-threshold","500000000",str(mm/"matmul.n"),"--",str(N_MATMUL)],timeout=120))
+    mm_results.append(run_benchmark("Nmerkar(GPU-on)",[str(NK),"--gc-threshold","500000000",str(mm/"matmul.n"),"--",str(N_MATMUL)],timeout=120))
     if (mm/"matmul_cpp_gpu").exists():
         mm_results.append(run_benchmark("C++(GPU-on)",[f"UF_SPV_DIR={BENCH/'src'/'_gpu'}",str(mm/"matmul_cpp_gpu"),str(N_MATMUL)],timeout=60,env=True))
 
@@ -295,8 +318,8 @@ def main():
     bs_results.append(run_benchmark("Rust",[str(bs/"blackscholes_rs"),str(N_BS)]))
     bs_results.append(run_benchmark("Python",["python3",str(bs/"blackscholes.py"),str(N_BS)],timeout=120))
     bs_results.append(run_benchmark("Node.js",["node",str(bs/"blackscholes.js"),str(N_BS)],timeout=120))
-    bs_results.append(run_benchmark("Enmerkar",[str(NKR),"--device","cpu","--gc-threshold","2000000000",str(bs/"blackscholes.ent"),"--",str(N_BS)],timeout=240))
-    bs_results.append(run_benchmark("Enmerkar(GPU-on)",[str(NKR),"--gc-threshold","2000000000",str(bs/"blackscholes.ent"),"--",str(N_BS)],timeout=240))
+    bs_results.append(run_benchmark("Nmerkar",[str(NK),"--device","cpu","--gc-threshold","2000000000",str(bs/"blackscholes.n"),"--",str(N_BS)],timeout=240))
+    bs_results.append(run_benchmark("Nmerkar(GPU-on)",[str(NK),"--gc-threshold","2000000000",str(bs/"blackscholes.n"),"--",str(N_BS)],timeout=240))
     if (bs/"blackscholes_cpp_gpu").exists():
         bs_results.append(run_benchmark("C++(GPU-on)",[f"UF_SPV_DIR={BENCH/'src'/'_gpu'}",str(bs/"blackscholes_cpp_gpu"),str(N_BS)],timeout=60,env=True))
 
@@ -310,7 +333,8 @@ def main():
         "tokens":token_data,
         "performance":{"logextract":le_results,"analytics":an_results,
                         "mandelbrot":mb_results,"spectralnorm":sn_results,
-                        "matmul":mm_results,"blackscholes":bs_results,"nqueens":nq_results,"bfs":bf_results},
+                        "matmul":mm_results,"blackscholes":bs_results,"nqueens":nq_results,
+                        "bfs":bf_results,"dynamicgraph":dg_results},
     }
     with open(RESULTS/"benchmark.json","w") as f:
         json.dump(report,f,indent=2)
@@ -318,31 +342,32 @@ def main():
     print("\n=== SUMMARY ===\n")
     perf_mb={r["name"]:r for r in mb_results}
     perf_sn={r["name"]:r for r in sn_results}
-    print(f"{'Language':<10} {'LogExtract':>11} {'Analytics':>11} {'Mandelbrot':>11} {'SpectralNorm':>13} {'Matmul':>11} {'BlackSch':>11}")
-    print("-"*82)
+    print(f"{'Language':<10} {'LogExtract':>11} {'Analytics':>11} {'Mandelbrot':>11} {'SpectralNorm':>13} {'Matmul':>11} {'BlackSch':>11} {'NQueens':>11} {'BFS':>11} {'DynGraph':>11}")
+    print("-"*118)
     perf_le={r["name"]:r for r in le_results}
     perf_nq={r["name"]:r for r in nq_results}
     perf_bf={r["name"]:r for r in bf_results}
+    perf_dg={r["name"]:r for r in dg_results}
     perf_an={r["name"]:r for r in an_results}
     perf_mm={r["name"]:r for r in mm_results}
     perf_bs={r["name"]:r for r in bs_results}
     def fmt(d,k):
         t=d.get(k,{}).get("time_sec","—")
         return f"{t:.3f}s" if isinstance(t,float) else str(t)
-    for lang in["Enmerkar","Rust","C++","Python","Node.js"]:
-        print(f"{lang:<10} {fmt(perf_le,lang):>11} {fmt(perf_an,lang):>11} {fmt(perf_mb,lang):>11} {fmt(perf_sn,lang):>13} {fmt(perf_mm,lang):>11} {fmt(perf_bs,lang):>11} {fmt(perf_nq,lang):>11} {fmt(perf_bf,lang):>11}")
+    for lang in["Nmerkar","Rust","C++","Python","Node.js"]:
+        print(f"{lang:<10} {fmt(perf_le,lang):>11} {fmt(perf_an,lang):>11} {fmt(perf_mb,lang):>11} {fmt(perf_sn,lang):>13} {fmt(perf_mm,lang):>11} {fmt(perf_bs,lang):>11} {fmt(perf_nq,lang):>11} {fmt(perf_bf,lang):>11} {fmt(perf_dg,lang):>11}")
     print()
-    print(f"{'GPU-on':<10} {'LogExtract':>11} {'Analytics':>11} {'Mandelbrot':>11} {'SpectralNorm':>13} {'Matmul':>11} {'BlackSch':>11} {'NQueens':>11} {'BFS':>11}")
-    print("-"*82)
-    print(f"{'Enmerkar':<10} {fmt(perf_le,'Enmerkar(GPU-on)'):>11} {fmt(perf_an,'Enmerkar(GPU-on)'):>11} {fmt(perf_mb,'Enmerkar(GPU-on)'):>11} {fmt(perf_sn,'Enmerkar(GPU-on)'):>13} {fmt(perf_mm,'Enmerkar(GPU-on)'):>11} {fmt(perf_bs,'Enmerkar(GPU-on)'):>11} {fmt(perf_nq,'Enmerkar(GPU-on)'):>11} {fmt(perf_bf,'Enmerkar(GPU-on)'):>11}")
+    print(f"{'GPU-on':<10} {'LogExtract':>11} {'Analytics':>11} {'Mandelbrot':>11} {'SpectralNorm':>13} {'Matmul':>11} {'BlackSch':>11} {'NQueens':>11} {'BFS':>11} {'DynGraph':>11}")
+    print("-"*118)
+    print(f"{'Nmerkar':<10} {fmt(perf_le,'Nmerkar(GPU-on)'):>11} {fmt(perf_an,'Nmerkar(GPU-on)'):>11} {fmt(perf_mb,'Nmerkar(GPU-on)'):>11} {fmt(perf_sn,'Nmerkar(GPU-on)'):>13} {fmt(perf_mm,'Nmerkar(GPU-on)'):>11} {fmt(perf_bs,'Nmerkar(GPU-on)'):>11} {fmt(perf_nq,'Nmerkar(GPU-on)'):>11} {fmt(perf_bf,'Nmerkar(GPU-on)'):>11} {fmt(perf_dg,'Nmerkar(GPU-on)'):>11}")
     print(f"{'C++':<10} {'—':>11} {'—':>11} {'—':>11} {'—':>13} {fmt(perf_mm,'C++(GPU-on)'):>11} {fmt(perf_bs,'C++(GPU-on)'):>11}")
-    print(f"\n{'Token counts':<10} {'LogExtract':>12} {'Analytics':>12} {'Mandelbrot':>12} {'SpectralNorm':>14} {'Matmul':>12} {'BlackSch':>12}")
-    print("-"*88)
-    for lang in["Enmerkar","Rust","C++","Python","Node.js"]:
+    print(f"\n{'Token counts':<10} {'LogExtract':>12} {'Analytics':>12} {'Mandelbrot':>12} {'SpectralNorm':>14} {'Matmul':>12} {'BlackSch':>12} {'NQueens':>12} {'BFS':>12} {'DynGraph':>12}")
+    print("-"*128)
+    for lang in["Nmerkar","Rust","C++","Python","Node.js"]:
         vals=[]
-        for bn in["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes","nqueens","bfs"]:
+        for bn in["logextract","analytics","mandelbrot","spectralnorm","matmul","blackscholes","nqueens","bfs","dynamicgraph"]:
             t=token_data.get(lang,{}).get(bn,{}).get("tokens")
             vals.append(f"{t:>12}" if t else f"{'—':>12}")
-        print(f"{lang:<10} {vals[0]} {vals[1]} {vals[2]} {vals[3]:>14} {vals[4]} {vals[5]} {vals[6]} {vals[7]}")
+        print(f"{lang:<10} {vals[0]} {vals[1]} {vals[2]} {vals[3]:>14} {vals[4]} {vals[5]} {vals[6]} {vals[7]} {vals[8]}")
 if __name__=="__main__":
     main()

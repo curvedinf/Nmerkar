@@ -1,7 +1,7 @@
 #!/bin/bash
 # trans test suite — two pathways, all gated.
 #
-#  1. tests/*.c        round-trip: C -> trans (Rust) -> nkr -> run, gated against the
+#  1. tests/*.c        round-trip: C -> trans (Rust) -> nk -> run, gated against the
 #                      system binary's stdout and exit code (echo/true/false/wc/yes)
 #  2. tests/ops/*.c    per-operation: transpile, compile with uf, run, gate on
 #                      exit code 0, empty stderr, and stdout == ops/<name>.out
@@ -10,10 +10,10 @@
 # Every gate must pass: transpile rc 0 + empty stderr, compile rc 0 + empty
 # stderr, run rc (0 or reference), stdout match, stderr empty.
 TROOT=$(cd "$(dirname "$0")" && pwd)
-UF=${UF:-$TROOT/../comp/target/release/nkr}
+UF=${UF:-$TROOT/../comp/target/release/nk}
 TRANS=${TRANS:-$TROOT/target/release/trans}
 [ -x "$TRANS" ] || { echo "trans binary missing; run: (cd trans && cargo build --release)"; exit 1; }
-[ -x "$UF" ] || { echo "nkr binary missing; run: (cd comp && cargo build --release)"; exit 1; }
+[ -x "$UF" ] || { echo "nk binary missing; run: (cd comp && cargo build --release)"; exit 1; }
 T=$(mktemp -d)
 PASS=0; FAIL=0
 
@@ -28,10 +28,10 @@ for c in tests/*.c; do
   [ -x "$SYS" ] || SYS=/bin/$name
   ARGS=""
   [ -f "tests/$name.args" ] && ARGS=$(cat "tests/$name.args")
-  "$TRANS" "$c" > "$T/$name.ent" 2>"$T/$name.terr"
+  "$TRANS" "$c" > "$T/$name.n" 2>"$T/$name.terr"
   [ $? -ne 0 ] && { gate_fail "$name" "transpile rc!=0: $(head -c 120 "$T/$name.terr")"; continue; }
   [ -s "$T/$name.terr" ] && { gate_fail "$name" "transpiler stderr not empty"; continue; }
-  $UF --device cpu -c "$T/$name.ent" -o "$T/$name.bin" 2>"$T/$name.cerr"
+  $UF --device cpu -c "$T/$name.n" -o "$T/$name.bin" 2>"$T/$name.cerr"
   [ $? -ne 0 ] && { gate_fail "$name" "compile rc!=0: $(head -c 120 "$T/$name.cerr")"; continue; }
   [ -s "$T/$name.cerr" ] && { gate_fail "$name" "compile stderr not empty"; continue; }
   if [ -x "$SYS" ]; then
@@ -76,17 +76,17 @@ for c in tests/ops/*.c; do
   [ -f "$exp" ] || { gate_fail "$name" "missing .out file"; continue; }
   ARGS=""
   [ -f "tests/ops/$(basename "$c" .c).args" ] && ARGS=$(cat "tests/ops/$(basename "$c" .c).args")
-  "$TRANS" "$c" > "$T/op.ent" 2>"$T/op.terr"
+  "$TRANS" "$c" > "$T/op.n" 2>"$T/op.terr"
   [ $? -ne 0 ] && { gate_fail "$name" "transpile rc!=0: $(head -c 120 "$T/op.terr")"; continue; }
   [ -s "$T/op.terr" ] && { gate_fail "$name" "transpiler stderr not empty"; continue; }
   # optional .noent: lines that must NOT appear in the transpiled output
   # (proves native mappings replaced FFI imports)
   noe="tests/ops/$(basename "$c" .c).noent"
   if [ -f "$noe" ]; then
-    bad=$(grep -Ff "$noe" "$T/op.ent" | head -3)
+    bad=$(grep -Ff "$noe" "$T/op.n" | head -3)
     [ -n "$bad" ] && { gate_fail "$name" "emitted FFI instead of native op: $bad"; continue; }
   fi
-  $UF --device cpu -c "$T/op.ent" -o "$T/op.bin" 2>"$T/op.cerr"
+  $UF --device cpu -c "$T/op.n" -o "$T/op.bin" 2>"$T/op.cerr"
   [ $? -ne 0 ] && { gate_fail "$name" "compile rc!=0: $(head -c 120 "$T/op.cerr")"; continue; }
   [ -s "$T/op.cerr" ] && { gate_fail "$name" "compile stderr not empty"; continue; }
   timeout 10 "$T/op.bin" $ARGS > "$T/op.out" 2>"$T/op.rerr"

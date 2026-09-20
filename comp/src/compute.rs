@@ -1196,6 +1196,129 @@ fn fuse_binop(h: &str, ae: TExpr, be: TExpr) -> Option<TExpr> {
     })
 }
 
+/// Simulate a straight-line scalar label body for While extraction.
+/// `state`: loop-state slot keys (name or "\u{1}id") mapping to state index;
+/// reads of state slots become State(i). Returns (stack, locals-after).
+#[allow(clippy::type_complexity)]
+fn sim_scalar_label(
+    p: &crate::ast::Parsed,
+    from: usize,
+    state: &std::collections::HashMap<String, usize>,
+    fl0: &std::collections::HashMap<String, TExpr>,
+    outer: &std::collections::HashMap<String, TExpr>,
+) -> Option<(Vec<TExpr>, std::collections::HashMap<String, TExpr>)> {
+    use crate::ast::Ins;
+    use std::collections::HashMap;
+    let mut fl: HashMap<String, TExpr> = fl0.clone();
+    let mut st: Vec<TExpr> = Vec::new();
+    let mut j = from;
+    while j < p.ins.len() {
+        match &p.ins[j] {
+            Ins::Ret | Ins::PushAddr(_) | Ins::While | Ins::For | Ins::If | Ins::IfElse => break,
+            Ins::Flush => {}
+            Ins::PushF(v) => st.push(TExpr::Const(*v)),
+            Ins::PushI(v) => st.push(TExpr::Const(*v as f64)),
+            Ins::LocalGetI(id) => match fl.get(&format!("\u{1}{}", id)) {
+                Some(e) => st.push(e.clone()),
+                None => return None,
+            },
+            Ins::LocalGet(n) | Ins::GetV(n) => {
+                if let Some(i) = state.get(n) {
+                    st.push(TExpr::State(*i));
+                } else if let Some(e) = fl.get(n) {
+                    st.push(e.clone());
+                } else if let Some(e) = outer.get(n) {
+                    st.push(e.clone());
+                } else {
+                    return None;
+                }
+            }
+            Ins::LocalSetI(id) => match st.pop() { Some(e) => { fl.insert(format!("\u{1}{}", id), e); } None => return None },
+            Ins::LocalSet(n) | Ins::SetV(n) => match st.pop() { Some(e) => { fl.insert(n.clone(), e); } None => return None },
+            Ins::Simple(hh) => {
+                let r = if ["op_add","op_sub","op_mul","op_div"].contains(hh) {
+                    match (st.pop(), st.pop()) {
+                        (Some(be), Some(ae)) => fuse_binop(hh, ae, be),
+                        _ => None,
+                    }
+                } else if *hh == "op_sqrt" {
+                    st.pop().map(|e| TExpr::Sqrt(Box::new(e)))
+                } else if ["op_lt","op_gt","op_lte","op_gte","op_eq"].contains(hh) {
+                    match (st.pop(), st.pop()) {
+                        (Some(be), Some(ae)) => {
+                            let op = match *hh { "op_lt" => "lt", "op_gt" => "gt", "op_lte" => "lte", "op_gte" => "gte", _ => "eq" };
+                            Some(TExpr::Cmp(op, Box::new(ae), Box::new(be)))
+                        }
+                        _ => None,
+                    }
+                } else if *hh == "op_and" {
+                    match (st.pop(), st.pop()) {
+                        (Some(be), Some(ae)) => Some(TExpr::And(Box::new(ae), Box::new(be))),
+                        _ => None,
+                    }
+                } else if *hh == "op_not" {
+                    st.pop().map(|e| TExpr::Not(Box::new(e)))
+                } else { None };
+                st.push(r?);
+            }
+            _ => return None,
+        }
+        j += 1;
+    }
+    Some((st, fl))
+}
+
+/// True when the expression references no region array inputs — a while
+/// whose state/cond/updates depend on an array Input is a whole-array loop
+/// in the source (per-op semantics loop the array until GLOBAL truthiness);
+/// extracting it as a per-element kernel loop would diverge. Only
+/// input-free state (consts/Idx/per-element scalars) is sound.
+fn expr_input_free(e: &TExpr) -> bool {
+    match e {
+        TExpr::Input(_) => false,
+        TExpr::Const(_) | TExpr::Idx(_) | TExpr::State(_) => true,
+        TExpr::Add(a, b) | TExpr::Sub(a, b) | TExpr::Mul(a, b) | TExpr::Div(a, b)
+        | TExpr::Cat(a, b) | TExpr::And(a, b) => expr_input_free(a) && expr_input_free(b),
+        TExpr::Sqrt(a) | TExpr::Not(a) | TExpr::At(a, _) => expr_input_free(a),
+        TExpr::Cmp(_, a, b) => expr_input_free(a) && expr_input_free(b),
+        TExpr::While { inits, cond, updates, result } => {
+            expr_input_free(cond)
+                && expr_input_free(result)
+                && inits.iter().all(|(_, e)| expr_input_free(e))
+                && updates.iter().all(expr_input_free)
+        }
+    }
+}
+
+fn same_expr(a: &TExpr, b: &TExpr) -> bool {
+    use TExpr::*;
+    match (a, b) {
+        (Input(x), Input(y)) => x == y,
+        (Const(x), Const(y)) => x.to_bits() == y.to_bits(),
+        (Idx(x), Idx(y)) => x == y,
+        (State(x), State(y)) => x == y,
+        (Add(a1, b1), Add(a2, b2)) | (Sub(a1, b1), Sub(a2, b2))
+        | (Mul(a1, b1), Mul(a2, b2)) | (Div(a1, b1), Div(a2, b2)) => {
+            same_expr(a1, a2) && same_expr(b1, b2)
+        }
+        (Sqrt(x), Sqrt(y)) | (Not(x), Not(y)) => same_expr(x, y),
+        (Cat(a1, b1), Cat(a2, b2)) => same_expr(a1, a2) && same_expr(b1, b2),
+        (At(x, s1), At(y, s2)) => s1 == s2 && same_expr(x, y),
+        (Cmp(o1, a1, b1), Cmp(o2, a2, b2)) => o1 == o2 && same_expr(a1, a2) && same_expr(b1, b2),
+        (And(a1, b1), And(a2, b2)) => same_expr(a1, a2) && same_expr(b1, b2),
+        (While { inits: i1, cond: c1, updates: u1, result: r1 },
+         While { inits: i2, cond: c2, updates: u2, result: r2 }) => {
+            i1.len() == i2.len()
+                && i1.iter().zip(i2.iter()).all(|((t1, e1), (t2, e2))| t1 == t2 && same_expr(e1, e2))
+                && same_expr(c1, c2)
+                && u1.len() == u2.len()
+                && u1.iter().zip(u2.iter()).all(|(e1, e2)| same_expr(e1, e2))
+                && same_expr(r1, r2)
+        }
+        _ => false,
+    }
+}
+
 fn walk_one_region(
     p: &crate::ast::Parsed,
     start: usize,
@@ -1224,6 +1347,10 @@ fn walk_one_region(
     // the NEXT statement before hitting an ineligible op), the region ends
     // here instead — the trailing instructions simply re-run per-op.
     let mut guards: Vec<String> = Vec::new();
+    // slots whose value is changed by an unmodeled RMW (AtomicAdd) at the
+    // stop point — their walked binding is stale, so they must not become
+    // region outputs
+    let mut poisoned: Vec<Slot> = Vec::new();
     let mut clean: Option<(usize, Vec<InSlot>, Vec<Slot>, usize, HashMap<Slot, V>, Option<Slot>, Vec<String>)> =
         None;
     let mut i = start;
@@ -1303,6 +1430,13 @@ fn walk_one_region(
             Ins::Flush => {
                 stop = false;
             }
+            // shared x++/x+= : atomic RMW — unmodeled; stop AND poison the
+            // slot (its walked binding is stale and must not fuse as an
+            // output; scalar reductions need Sum outputs, not yet built)
+            Ins::AtomicAdd(n, _) => {
+                poisoned.push(Slot::Name(n.clone()));
+                stop = true;
+            }
             // v15: inline `_call f` when f is a straight-line scalar
             // function (params from stack exprs, body arithmetic over
             // params/consts/visible region locals, ret expr) — the
@@ -1334,6 +1468,90 @@ fn walk_one_region(
                                 let mut fstack: Vec<TExpr> = Vec::new();
                                 let mut okbody = true;
                                 'body: while j < p.ins.len() {
+                                    // v15: 'cond 'body while over scalar locals inside
+                                    // the inlined function -> TExpr::While (mandelbrot esc)
+                                    if let (Some(Ins::PushAddr(cl)), Some(Ins::PushAddr(bl)), Some(Ins::While)) =
+                                        (p.ins.get(j), p.ins.get(j + 1), p.ins.get(j + 2))
+                                    {
+                                        let cpc = p.labels.get(cl).copied();
+                                        let bpc = p.labels.get(bl).copied();
+                                        if let (Some(cpc), Some(bpc)) = (cpc, bpc) {
+                                            let key = |sl: &Slot| -> String {
+                                                match sl { Slot::Id(id) => format!("\u{1}{}", id), Slot::Name(n) => n.clone() }
+                                            };
+                                            let mut body_assign: Vec<Slot> = Vec::new();
+                                            {
+                                                let mut k = bpc;
+                                                while k < p.ins.len() && !matches!(&p.ins[k], Ins::Ret) {
+                                                    match &p.ins[k] {
+                                                        Ins::LocalSetI(id) => { let s2 = Slot::Id(*id); if !body_assign.contains(&s2) { body_assign.push(s2); } }
+                                                        Ins::LocalSet(n) => { let s2 = Slot::Name(n.clone()); if !body_assign.contains(&s2) { body_assign.push(s2); } }
+                                                        _ => {}
+                                                    }
+                                                    k += 1;
+                                                }
+                                            }
+                                            let mut cond_read: Vec<Slot> = Vec::new();
+                                            {
+                                                let mut k = cpc;
+                                                while k < p.ins.len() && !matches!(&p.ins[k], Ins::Ret) {
+                                                    match &p.ins[k] {
+                                                        Ins::LocalGetI(id) => { let s2 = Slot::Id(*id); if !cond_read.contains(&s2) { cond_read.push(s2); } }
+                                                        Ins::LocalGet(n) | Ins::GetV(n) => { let s2 = Slot::Name(n.clone()); if !cond_read.contains(&s2) { cond_read.push(s2); } }
+                                                        _ => {}
+                                                    }
+                                                    k += 1;
+                                                }
+                                            }
+                                            let state: Vec<Slot> = body_assign.iter().filter(|s2| cond_read.contains(s2)).cloned().collect();
+                                            if !state.is_empty() && state.len() <= 6 {
+                                                let mut outer: std::collections::HashMap<String, TExpr> = std::collections::HashMap::new();
+                                                for (k2, v2) in &locals {
+                                                    if let (Slot::Name(n), V::E(e)) = (k2, v2) { outer.insert(n.clone(), e.clone()); }
+                                                }
+                                                let to_nm: std::collections::HashMap<String, usize> = state.iter().enumerate()
+                                                    .map(|(i2, s2)| (key(s2), i2)).collect();
+                                                let fl0: std::collections::HashMap<String, TExpr> = fl.iter()
+                                                    .filter_map(|(k2, v2)| match v2 { V::E(e) => Some((key(k2), e.clone())), _ => None })
+                                                    .collect();
+                                                let condr = sim_scalar_label(p, cpc, &to_nm, &fl0, &outer);
+                                                let bodyr = sim_scalar_label(p, bpc, &to_nm, &fl0, &outer);
+                                                if let (Some((cst, _)), Some((_, bfl))) = (condr, bodyr) {
+                                                    // soundness gate: per-element extraction only when the
+                                                    // loop is independent of region array inputs
+                                                    let input_free = cst.iter().all(expr_input_free)
+                                                        && state.iter().all(|s2| {
+                                                            fl0.get(&key(s2)).map(expr_input_free).unwrap_or(false)
+                                                                && bfl.get(&key(s2)).map(expr_input_free).unwrap_or(false)
+                                                        });
+                                                    if cst.len() == 1 && input_free {
+                                                        let cond_expr = cst[0].clone();
+                                                        let inits: Vec<(STy, TExpr)> = state.iter().enumerate().map(|(i2, s2)| {
+                                                            let ie = fl0.get(&key(s2)).cloned().unwrap_or(TExpr::Const(0.0));
+                                                            let ty = match ie { TExpr::Const(c) if c == c.trunc() && c.abs() < 9e15 => STy::I, _ => STy::F };
+                                                            (ty, ie)
+                                                        }).collect();
+                                                        let updates: Vec<TExpr> = state.iter().map(|s2| {
+                                                            bfl.get(&key(s2)).cloned().unwrap_or(TExpr::Const(0.0))
+                                                        }).collect();
+                                                        for (i2, s2) in state.iter().enumerate() {
+                                                            let w = TExpr::While {
+                                                                inits: inits.clone(),
+                                                                cond: Box::new(cond_expr.clone()),
+                                                                updates: updates.clone(),
+                                                                result: Box::new(TExpr::State(i2)),
+                                                            };
+                                                            fl.insert(s2.clone(), V::E(w));
+                                                        }
+                                                        ops += 2;
+                                                        j += 3;
+                                                        continue 'body;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        okbody = false; break 'body;
+                                    }
                                     match &p.ins[j] {
                                         Ins::Ret => break,
                                         Ins::Flush => {}
@@ -1731,12 +1949,30 @@ fn walk_one_region(
                 match stack.pop() {
                     Some(V::E(e)) => {
                         let slot = Slot::Name(n.clone());
-                        locals.insert(slot.clone(), V::E(e));
-                        if !written.contains(&slot) {
-                            written.push(slot.clone());
+                        // accumulator rebind (x += e chains): a scalar reduction
+                        // over the domain — needs Sum outputs (not yet
+                        // implemented); decline rather than mis-fuse as a
+                        // per-element value
+                        let is_accum = match locals.get(&slot) {
+                            Some(V::E(old)) => match &e {
+                                TExpr::Add(x, y) => same_expr(x, old) || same_expr(y, old),
+                                _ => false,
+                            },
+                            _ => false,
+                        };
+                        if is_accum {
+                            if std::env::var("NK_DEBUG_REGION2").is_ok() {
+                                eprintln!("[region?] accumulator {} declined", n);
+                            }
+                            stop = true;
+                        } else {
+                            locals.insert(slot.clone(), V::E(e));
+                            if !written.contains(&slot) {
+                                written.push(slot.clone());
+                            }
+                            final_out = Some(slot);
+                            stop = false;
                         }
-                        final_out = Some(slot);
-                        stop = false;
                     }
                     _ => stop = true,
                 }
@@ -1801,6 +2037,9 @@ fn walk_one_region(
     // which is safe — just an extra output.) Cap 4 outputs.
     let mut live: Vec<Slot> = Vec::new();
     for slot in &written {
+        if poisoned.contains(slot) {
+            continue;
+        }
         let (id, name) = match slot {
             Slot::Id(id) => (*id, ""),
             Slot::Name(n) => (usize::MAX, n.as_str()),

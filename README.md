@@ -51,15 +51,15 @@ imperative control-flow shapes where Python's loops stay terse.
 
 | | Enmerkar | C++ | Rust | Python | Node.js |
 |---|---|---|---|---|---|
-| logextract 510 MB | 0.67 | **0.40** | 0.67 | 3.71 | 2.94 |
-| analytics 512 MB | 1.14 | **0.99** | 1.71 | 4.47 | 3.39 |
+| logextract 510 MB | 0.64 | **0.40** | 0.67 | 3.71 | 2.94 |
+| analytics 512 MB | 1.15 | **0.99** | 1.71 | 4.47 | 3.39 |
 | mandelbrot | 0.06 | **0.05** | 0.05 | 4.13 | 0.06 |
 | spectralnorm | **1.06** | 1.10 | 1.08 | 133.1 | 1.57 |
 | matmul N=512 | 0.03 | 0.04 | **0.02** | 0.15 | 0.14 |
 | blackscholes N=2M | 0.13 | **0.04** | 0.04 | 0.17 | 0.07 |
 | nqueens N=11 | 0.02 | **0.01** | 0.01 | 1.52 | 0.03 |
-| bfs n=1M | 0.49 | 0.11 | **0.09** | 1.68 | 0.25 |
-| **total (6 CPU benches)** | 3.09 | **2.61** | 3.57 | 145.8 | 8.17 |
+| bfs n=1M | 0.48 | 0.11 | **0.09** | 1.68 | 0.25 |
+| **total (6 CPU benches)** | 3.07 | **2.61** | 3.57 | 145.8 | 8.17 |
 
 ### GPU offloading (seconds, lower = faster)
 

@@ -1032,6 +1032,35 @@ pub fn emit_range(
                                 e.push_str(&format!("pushc(cx,{});pushc(cx,{});pushc(cx,{});uf_cur_op=\"op_set\";op_set(cx);\n", cell_of(&hh), cell_of(&idx), cell_of(&v)));
                             }
                         }
+                        "op_fbyte" => {
+                            let off = vpop(&mut e, &mut vstack, &mut vtmp);
+                            let idx = vpop(&mut e, &mut vstack, &mut vtmp);
+                            let idx_c = if idx.ty == VType::Int { idx.expr.clone() } else { format!("uf_i({})", cell_of(&idx)) };
+                            let off_c = if off.ty == VType::Int { off.expr.clone() } else { format!("uf_i({})", cell_of(&off)) };
+                            let fb = format!("_fb{}", vtmp);
+                            let fl = format!("_fl{}", vtmp);
+                            vtmp += 1;
+                            e.push_str(&format!(
+                                "if(({})<0||({})>=uf_fsplit_nfields)die(\"FBYTE: index out of bounds\");int64_t {}=uf_fsplit_offsets[({})*2],{}=uf_fsplit_offsets[({})*2+1];if(({})<0||({})>={})die(\"FBYTE: out of bounds\");",
+                                idx_c, idx_c, fb, idx_c, fl, idx_c, off_c, off_c, fl
+                            ));
+                            vpush(&mut e, &mut vstack, &mut vtmp,
+                                &format!("(int64_t)(uint8_t)uf_fsplit_line[{}+({})]", fb, off_c), VType::Int);
+                        }
+                        "op_fatoi" => {
+                            let idx = vpop(&mut e, &mut vstack, &mut vtmp);
+                            let idx_c = if idx.ty == VType::Int { idx.expr.clone() } else { format!("uf_i({})", cell_of(&idx)) };
+                            e.push_str(&format!("if(({})<0||({})>=uf_fsplit_nfields)die(\"FATOI: index out of bounds\");", idx_c, idx_c));
+                            vpush(&mut e, &mut vstack, &mut vtmp,
+                                &format!("(int64_t)strtoll(uf_fsplit_line+uf_fsplit_offsets[({})*2],0,10)", idx_c), VType::Int);
+                        }
+                        "op_fatof" => {
+                            let idx = vpop(&mut e, &mut vstack, &mut vtmp);
+                            let idx_c = if idx.ty == VType::Int { idx.expr.clone() } else { format!("uf_i({})", cell_of(&idx)) };
+                            e.push_str(&format!("if(({})<0||({})>=uf_fsplit_nfields)die(\"FATOF: index out of bounds\");", idx_c, idx_c));
+                            vpush(&mut e, &mut vstack, &mut vtmp,
+                                &format!("strtod(uf_fsplit_line+uf_fsplit_offsets[({})*2],0)", idx_c), VType::Float);
+                        }
                         _ => {
                             let is_inlined_ffold = (*h == "op_ffold" || *h == "op_fsplit" || *h == "op_rangefold") && depth < 8 && inline_ffolds.contains_key(&i);
                             if is_inlined_ffold {
@@ -2302,11 +2331,14 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                         type_stack.push(if hty.0 == VType::FloatArr { (VType::Float, false) } else if hty.0 == VType::IntArr { (VType::Int, false) } else { (VType::Unknown, true) });
                     } else if matches!(*h, "op_vset"|"op_seti"|"op_set") {
                         type_stack.pop(); type_stack.pop(); type_stack.pop();
-                    } else if matches!(*h, "op_atoi"|"op_len") {
+                    } else if matches!(*h, "op_atoi"|"op_len"|"op_fatoi") {
                         // Result provably Int regardless of input
                         type_stack.pop();
                         type_stack.push((VType::Int, false));
-                    } else if matches!(*h, "op_atof") {
+                    } else if matches!(*h, "op_fbyte") {
+                        type_stack.pop(); type_stack.pop();
+                        type_stack.push((VType::Int, false));
+                    } else if matches!(*h, "op_atof"|"op_fatof") {
                         type_stack.pop();
                         type_stack.push((VType::Float, false));
                     } else if matches!(*h, "op_arr"|"op_tensor") {

@@ -1,4 +1,4 @@
-# Nmerkar Specification v14
+# Nmerkar Specification
 
 Nmerkar is a language based on a **managed hidden stack**, compiled to C then native
 via `cc`, designed for LLM-authored one-off scripts (low token count, fast,
@@ -640,12 +640,12 @@ typing — count and containment are the whole policy.
 Two casts, one per casting discipline:
 
 - **`_cast` (27, immediate, prefix)** — **static**: a C-style conversion with
-  no value-content interpretation. The type immediate may now be any
+  no value-content interpretation. The type immediate is any
   static-castable type: `int`/`float`/`ptr`/`byte` (raw payload conversions —
   float truncates toward zero to int, int widens to float, ptr reinterprets
   its address as an integer and back, byte truncates to the low 8 bits) or a
-  struct name (checked downcast: compares the struct id, dies on mismatch —
-  unchanged). As prefix preprocessing, a literal operand folds at compile
+  struct name (checked downcast: compares the struct id, dies on mismatch).
+  As prefix preprocessing, a literal operand folds at compile
   time (`2 _cast float` compiles to the constant `2.0`).
 - **`cast` (217, postfix)** — **dynamic**: `[v type] → v'`, content-aware,
   the *explicit* form of universal coercion (and therefore always legal on
@@ -667,11 +667,10 @@ p@ 1000 cast              ; checked downcast to struct id 0
 3.9 _cast int             ; 3         (static truncation, no parsing)
 ```
 
-`_cast` is not removed even though `cast` covers all of its types
-dynamically: the two have genuinely different semantics (static `_cast int`
-on a string reinterprets the handle; dynamic `int cast` parses the content),
-and only the immediate form resolves a struct *name* to its compiler-assigned
-id at compile time.
+`_cast` and `cast` coexist by design: the two have genuinely different
+semantics (static `_cast int` on a string reinterprets the handle; dynamic
+`int cast` parses the content), and only the immediate form resolves a
+struct *name* to its compiler-assigned id at compile time.
 
 ### Script convenience (207–211), strictness (215–216)
 
@@ -1079,8 +1078,8 @@ big?: n! n@ loose 2 gt ret       ; loosen the element before comparing
 ```
 
 Strictness is the static discipline that pairs with `cast`: implicit
-coercion is the default the language was built on, `strict` withdraws it per
-value, and `loose`/`cast`/`parse_*`/`format_*` restore it explicitly.
+coercion is the default; `strict` withdraws it per value, and
+`loose`/`cast`/`parse_*`/`format_*` restore it explicitly.
 
 ## Concrete grammar
 

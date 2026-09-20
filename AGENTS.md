@@ -1,6 +1,6 @@
 # AGENTS.md — Nmerkar
 
-Nmerkar: a language based on a managed hidden stack, compiled to C then native via `cc`. Designed for LLM-authored scripts (low token count, fast, reliable). Current revision is **v14** — **not backward compatible** with v13 (shared vars are plain names, see SPEC "Shared variables"). Full language spec in `SPEC.md`; v13 design rationale in `SPEC_V13_PROPOSAL.md`.
+Nmerkar: a language based on a managed hidden stack, compiled to C then native via `cc`. Designed for LLM-authored scripts (low token count, fast, reliable). Current revision is **v14.1** — **not backward compatible** with v13 (shared vars are plain names, see SPEC "Shared variables"). Full language spec in `SPEC.md` (current specification only; per-operation history is in `SPEC_HISTORY.md`); v13 design rationale in `SPEC_V13_PROPOSAL.md`.
 
 ## Repository Layout
 

@@ -1480,7 +1480,16 @@ pub fn emit_range(
                 ))
             }
             Ins::While => {
-                vflush(&mut e, &mut vstack, &mut vcache);
+                // Inlined while pops no code addresses; stray pass-through
+                // values (c! / found! before the next while) must not hit the
+                // data stack. The subroutine path still needs a real flush
+                // so it can pop the cond/body addresses.
+                let while_inlined = depth < 8 && inline_whiles.contains_key(&i);
+                if while_inlined {
+                    vdiscard(&mut e, &mut vstack, &mut vcache);
+                } else {
+                    vflush(&mut e, &mut vstack, &mut vcache);
+                }
                 // v13: cond/body declared arities set the per-call drain points
                 let (cond_arity, body_arity) = if i >= 2 {
                     match (&p.ins[i - 2], &p.ins[i - 1]) {
@@ -1625,13 +1634,10 @@ pub fn emit_range(
                         // no list/dict literals (they build from the ds) and the
                         // ret operand starts with a push (a leading bare pop
                         // would read the @flush strays).
-                        let body_esc = UF_DEBUG.load(Ordering::Relaxed) || (bbs..bbe_trim).any(|k| match &p.ins[k] {
-                            Ins::Break | Ins::Cont | Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
-                            Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While | Ins::For |
-                            Ins::If | Ins::IfElse | Ins::PushAddr(_) => true,
-                            Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
-                            _ => false,
-                        });
+                        let body_esc = UF_DEBUG.load(Ordering::Relaxed)
+                            || range_has_escaping_ctl(
+                                p, bbs..bbe_trim, inline_whiles, inline_fors, inline_ifs,
+                            );
                         let last_flush = (bbs..bbe_trim).rev().find(|&k| matches!(p.ins[k], Ins::Flush));
                         let operand_push_first = match last_flush {
                             Some(f) => f + 1 >= bbe_trim || matches!(p.ins[f + 1],

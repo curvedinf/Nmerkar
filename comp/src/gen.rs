@@ -341,6 +341,41 @@ fn tu_has_threads(p: &Parsed) -> bool {
     })
 }
 
+/// Instruction indices reachable from `seeds` by following PushAddr/Call/Goto
+/// into the target label's body (up to its `ret`). Used so a loop with
+/// if_else/while still hoists shared vars that no reachable path writes.
+fn reachable_from(p: &Parsed, seeds: impl IntoIterator<Item = usize>) -> std::collections::HashSet<usize> {
+    let mut ins_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut work: Vec<usize> = Vec::new();
+    for i in seeds {
+        if ins_set.insert(i) { work.push(i); }
+    }
+    let mut qi = 0;
+    while qi < work.len() {
+        let i = work[qi];
+        qi += 1;
+        let target = match &p.ins[i] {
+            Ins::PushAddr(l) | Ins::Call(l) | Ins::Goto(l) => p.labels.get(l).copied(),
+            _ => None,
+        };
+        if let Some(bs) = target {
+            if let Some(be) = for_body_range(&p.ins, bs) {
+                for j in bs..be {
+                    if ins_set.insert(j) { work.push(j); }
+                }
+            }
+        }
+    }
+    ins_set
+}
+
+fn reachable_has_opaque_write(p: &Parsed, ins_set: &std::collections::HashSet<usize>) -> bool {
+    ins_set.iter().any(|&i| matches!(
+        p.ins[i],
+        Ins::CallExt(_) | Ins::Sys(_) | Ins::Weave(_) | Ins::Send
+    ))
+}
+
 /// Shared vars GetV'd in `ks` and never SetV/AtomicAdd'd there. Snapshotting
 /// them once at loop entry is unobservable in the body (this thread does not
 /// write the cell; element stores go through the hoisted handle). Only used
@@ -1062,8 +1097,13 @@ pub fn emit_range(
                         if !escapable2 {
                             hoist_local_arr_ptrs(p, bs..be, ins_body, local_types, &mut arr_ptr);
                         }
-                        let sh_names = if !escapable2 && !tu_has_threads(p) {
-                            shared_readonly_in(p, bs..be)
+                        let sh_names = if !tu_has_threads(p) {
+                            let reach = reachable_from(p, bs..be);
+                            if reachable_has_opaque_write(p, &reach) {
+                                Vec::new()
+                            } else {
+                                shared_readonly_in(p, reach.into_iter())
+                            }
                         } else { Vec::new() };
                         e.push_str(&format!("{{long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};long _sp0=cx->sp;\n", prefix, i, prefix, i));
                         // Only declare registers new to this loop scope;
@@ -1408,8 +1448,13 @@ pub fn emit_range(
                         if !escapable2 {
                             hoist_local_arr_ptrs(p, (cbs..cbe_trim).chain(bbs..bbe_trim), ins_body, local_types, &mut arr_ptr);
                         }
-                        let sh_names = if !escapable2 && !tu_has_threads(p) {
-                            shared_readonly_in(p, (cbs..cbe_trim).chain(bbs..bbe_trim))
+                        let sh_names = if !tu_has_threads(p) {
+                            let reach = reachable_from(p, (cbs..cbe_trim).chain(bbs..bbe_trim));
+                            if reachable_has_opaque_write(p, &reach) {
+                                Vec::new()
+                            } else {
+                                shared_readonly_in(p, reach.into_iter())
+                            }
                         } else { Vec::new() };
                         e.push_str(&format!("{{long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_{}{};cx->loops[fr].end=&&K_WE_{}{};long _sp0=cx->sp;\n", prefix, i, prefix, i));
                         for (id, (name, ty)) in &regs {

@@ -28,8 +28,8 @@ proc:
   ips@ 0 field_inc
   8 0 field_byte 48 sub 2 sub ss!
   st_a@ ss@ st_a@ ss@ array_get 1 add array_set
-  bytes@ 9 field_int add bytes!
-  lines@ 1 add lines!
+  9 field_int bytes+=
+  lines++
   ret
 hour: k!
   hour_a@ k@ array_get v!

@@ -1399,9 +1399,14 @@ pub fn emit_range(
                         VType::Float => pre.push_str(&format!("Cell {}=uf_mkf({});", rv, v.expr)),
                         VType::Int => pre.push_str(&format!("Cell {}=uf_mki({});", rv, v.expr)),
                     }
-                } else {
-                    // multi-value ret: root the values on the ds, build a fresh
-                    // list from them, then drain
+                } else if let Some(dset) = DISCARD_RET_LABELS.get() {
+                    // continuation body (while/for/if): the return is
+                    // discarded — drop the pass-through leftovers instead of
+                    // allocating a list per iteration
+                    let cur = targets.iter().filter(|&&t| t <= i).max().copied();
+                    if cur.map_or(false, |t| dset.contains(&t)) {
+                        pre.push_str(&format!("Cell {}=uf_mki(0);", rv));
+                    } else {
                     for v in &vals {
                         match v.ty {
                             VType::Unknown | VType::FloatArr | VType::IntArr => pre.push_str(&format!("pushc(cx,{});", v.expr)),
@@ -1410,6 +1415,7 @@ pub fn emit_range(
                         }
                     }
                     pre.push_str(&format!("Cell {}=uf_list_build(cx,{});", rv, vals.len()));
+                    }
                 }
                 if outlined {
                     let pop = if UF_DEBUG.load(Ordering::Relaxed) { "cx->call_csp--;" } else { "" };
@@ -2787,8 +2793,39 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
     )
 }
 
+static DISCARD_RET_LABELS: std::sync::OnceLock<std::collections::HashSet<usize>> = std::sync::OnceLock::new();
 pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
     UF_DEBUG.store(debug, Ordering::Relaxed);
+    // continuation-body labels: while/for/if CALL these and discard the
+    // return, so a multi-value ret inside one must not build a return list
+    // (it cost an allocation per iteration in loop-heavy programs)
+    {
+        use std::collections::{HashMap, HashSet};
+        let mut body_uses: HashMap<String, usize> = HashMap::new();
+        let mut all_uses: HashSet<String> = HashSet::new();
+        for (i, ins) in p.ins.iter().enumerate() {
+            if let Ins::PushAddr(l) = ins {
+                all_uses.insert(l.clone());
+                let is_body = matches!(
+                    p.ins.get(i + 1),
+                    Some(Ins::While) | Some(Ins::For) | Some(Ins::If) | Some(Ins::IfElse)
+                ) || (matches!(p.ins.get(i + 2), Some(Ins::While))
+                    && matches!(p.ins.get(i - 1), Some(Ins::PushAddr(_))));
+                if is_body {
+                    *body_uses.entry(l.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut discard: HashSet<usize> = HashSet::new();
+        for (l, uses) in body_uses.iter() {
+            if p.ins.iter().filter(|x| matches!(x, Ins::PushAddr(g) if g == l)).count() == *uses {
+                if let Some(&pc) = p.labels.get(l.as_str()) {
+                    discard.insert(pc);
+                }
+            }
+        }
+        DISCARD_RET_LABELS.set(discard).ok();
+    }
     let mut o = String::new();
     o.push_str(PRELUDE);
     // reflection: struct layouts sorted by sid, consumed by op_fields

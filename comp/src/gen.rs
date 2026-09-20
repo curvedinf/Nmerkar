@@ -330,6 +330,116 @@ pub fn trivial_loop_exit(p: &Parsed, l: &str) -> bool {
     }
 }
 
+/// True when the TU can run another thread that writes shared vars (spawn /
+/// weave / shell_stream). Shared-var loop hoisting is then off: a spin-wait
+/// on a flag must seqlock-read every iteration.
+fn tu_has_threads(p: &Parsed) -> bool {
+    p.ins.iter().any(|ins| match ins {
+        Ins::Weave(_) => true,
+        Ins::Simple(h) if *h == "op_spawn" || *h == "op_shp" => true,
+        _ => false,
+    })
+}
+
+/// Shared vars GetV'd in `ks` and never SetV/AtomicAdd'd there. Snapshotting
+/// them once at loop entry is unobservable in the body (this thread does not
+/// write the cell; element stores go through the hoisted handle). Only used
+/// in sequential TUs — see tu_has_threads.
+fn shared_readonly_in(p: &Parsed, ks: impl IntoIterator<Item = usize>) -> Vec<String> {
+    let mut reads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut writes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for k in ks {
+        match &p.ins[k] {
+            Ins::GetV(n) => { reads.insert(n.clone()); }
+            Ins::SetV(n) | Ins::AtomicAdd(n, _) => { writes.insert(n.clone()); }
+            _ => {}
+        }
+    }
+    let mut v: Vec<String> = reads.into_iter().filter(|n| !writes.contains(n)).collect();
+    v.sort();
+    v
+}
+
+/// Hoist raw element pointers for IntArr/FloatArr locals that are not
+/// reassigned in `ks` (non-moving GC: the Cell slot keeps the object rooted).
+fn hoist_local_arr_ptrs(
+    p: &Parsed,
+    ks: impl IntoIterator<Item = usize>,
+    ins_body: &[usize],
+    local_types: &HashMap<usize, VType>,
+    arr_ptr: &mut HashMap<String, String>,
+) {
+    let ks: Vec<usize> = ks.into_iter().collect();
+    let mut reassigned: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for &k in &ks {
+        if let Ins::LocalSetI(id) = &p.ins[k] { reassigned.insert(*id); }
+    }
+    for &k in &ks {
+        if let Ins::LocalGetI(id) = &p.ins[k] {
+            if reassigned.contains(id) { continue; }
+            let slot = format!("cx->locals[cx->local_base+{}]", id);
+            if arr_ptr.contains_key(&slot) { continue; }
+            let key = ins_body[k] * 1000000 + id;
+            match local_types.get(&key).copied() {
+                Some(VType::FloatArr) => { arr_ptr.insert(slot, format!("_af{}", id)); }
+                Some(VType::IntArr) => { arr_ptr.insert(slot, format!("_ai{}", id)); }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn emit_shared_hoists(
+    e: &mut String,
+    names: &[String],
+    shared_types: &HashMap<String, VType>,
+    shared_hoist: &mut HashMap<String, (String, VType)>,
+    arr_ptr: &mut HashMap<String, String>,
+    tag: &str,
+) {
+    for name in names {
+        if shared_hoist.contains_key(name) { continue; }
+        let ty = shared_types.get(name).copied().unwrap_or(VType::Unknown);
+        let cell = format!("_sh{}_{}", tag, name);
+        match ty {
+            VType::Int => {
+                e.push_str(&format!("int64_t {}=uf_i(uf_sh_get(&var_{}));\n", cell, name));
+                shared_hoist.insert(name.clone(), (cell, VType::Int));
+            }
+            VType::Float => {
+                e.push_str(&format!("double {}=uf_f(uf_sh_get(&var_{}));\n", cell, name));
+                shared_hoist.insert(name.clone(), (cell, VType::Float));
+            }
+            VType::IntArr => {
+                e.push_str(&format!("Cell {}=uf_sh_get(&var_{});\n", cell, name));
+                let ptr = format!("_shpi{}_{}", tag, name);
+                e.push_str(&format!("int64_t* {}=(int64_t*)uf_data((Hdr*)({}).i);\n", ptr, cell));
+                shared_hoist.insert(name.clone(), (cell.clone(), VType::IntArr));
+                arr_ptr.insert(cell, ptr);
+            }
+            VType::FloatArr => {
+                e.push_str(&format!("Cell {}=uf_sh_get(&var_{});\n", cell, name));
+                let ptr = format!("_shpf{}_{}", tag, name);
+                e.push_str(&format!("double* {}=(double*)uf_data((Hdr*)({}).i);\n", ptr, cell));
+                shared_hoist.insert(name.clone(), (cell.clone(), VType::FloatArr));
+                arr_ptr.insert(cell, ptr);
+            }
+            _ => {
+                e.push_str(&format!("Cell {}=uf_sh_get(&var_{});\n", cell, name));
+                shared_hoist.insert(name.clone(), (cell, VType::Unknown));
+            }
+        }
+    }
+}
+
+fn arr_ptr_cdecl(name: &str, expr: &str) -> String {
+    if name.starts_with("_ai") || name.starts_with("_shpi") {
+        format!("int64_t* {}=(int64_t*)uf_data((Hdr*)({}).i);\n", name, expr)
+    } else {
+        format!("double* {}=(double*)uf_data((Hdr*)({}).i);\n", name, expr)
+    }
+}
+
 // Emit instructions [start, end) as C, prefixing every label (including K_
 // continuations) with `prefix` — used to inline FOR bodies as renamed copies
 // so their internal jumps stay local to the copy.
@@ -354,6 +464,7 @@ pub fn emit_range(
     numeric: &std::collections::HashSet<usize>,
     arr_ptr: &HashMap<String, String>,
     shared_types: &HashMap<String, VType>,
+    shared_hoist: &HashMap<String, (String, VType)>,
     suppress_flush: bool,
 ) {
     let resolve = |name: &str| -> usize {
@@ -395,8 +506,20 @@ pub fn emit_range(
         // at the region head: GPU kernel try, then a raw f64 C loop, else the
         // per-op code below runs. Success binds the live-out locals and jumps
         // past the region instructions (which stay emitted as the decline path).
+        // Skip scalar Int/Float inputs: the fused path is for float arrays,
+        // and probing it on `i++` / `d-1` is pure overhead (always declines).
         if prefix.is_empty() && depth == 0 && i + 1 < end {
             if let Some(rg) = crate::compute::region_at(i) {
+                let scalar_inputs = !rg.inputs.is_empty() && rg.inputs.iter().all(|inp| match inp {
+                    crate::compute::RegionInput::Local(id) => {
+                        let key = ins_body[i] * 1000000 + *id;
+                        matches!(local_types.get(&key), Some(VType::Int) | Some(VType::Float))
+                    }
+                    crate::compute::RegionInput::Global(name) => {
+                        matches!(shared_types.get(name), Some(VType::Int) | Some(VType::Float))
+                    }
+                });
+                if !scalar_inputs {
                 let n = rg.inputs.len();
                 let nk = rg.out_locals.len();
                 vflush(&mut e, &mut vstack, &mut vcache);
@@ -482,6 +605,7 @@ pub fn emit_range(
                 // emission path below appends to `e` and flushes it to `o`
                 // once — the block is the guarded fast path, the head (and
                 // region body) is the decline path
+                }
             }
         }
         match ins {
@@ -730,8 +854,13 @@ pub fn emit_range(
                                         &format!("((double*)uf_data((Hdr*)({}).i))[{}]", hh.expr, idx_c), VType::Float);
                                 }
                             } else if hh.ty == VType::IntArr {
-                                vpush(&mut e, &mut vstack, &mut vtmp,
-                                    &format!("((int64_t*)uf_data((Hdr*)({}).i))[{}]", hh.expr, idx_c), VType::Int);
+                                if let Some(p) = arr_ptr.get(&hh.expr) {
+                                    vpush(&mut e, &mut vstack, &mut vtmp,
+                                        &format!("({})[{}]", p, idx_c), VType::Int);
+                                } else {
+                                    vpush(&mut e, &mut vstack, &mut vtmp,
+                                        &format!("((int64_t*)uf_data((Hdr*)({}).i))[{}]", hh.expr, idx_c), VType::Int);
+                                }
                             } else if *h == "op_vget" {
                                 vpush_cell(&mut e, &mut vstack, &mut vtmp, &format!("uf_cvget({},{})", cell_of(&hh), idx_c));
                             } else {
@@ -756,8 +885,12 @@ pub fn emit_range(
                                     e.push_str(&format!("((double*)uf_data((Hdr*)({}).i))[{}]={};", hh.expr, idx_c, f64_expr(&v)));
                                 }
                             } else if hh.ty == VType::IntArr {
-                                e.push_str(&format!("((int64_t*)uf_data((Hdr*)({}).i))[{}]={};", hh.expr, idx_c,
-                                    if v.ty == VType::Int { v.expr.clone() } else { format!("uf_i({})", cell_of(&v)) }));
+                                let rhs = if v.ty == VType::Int { v.expr.clone() } else { format!("uf_i({})", cell_of(&v)) };
+                                if let Some(p) = arr_ptr.get(&hh.expr) {
+                                    e.push_str(&format!("({})[{}]={};", p, idx_c, rhs));
+                                } else {
+                                    e.push_str(&format!("((int64_t*)uf_data((Hdr*)({}).i))[{}]={};", hh.expr, idx_c, rhs));
+                                }
                             } else if *h == "op_vset" {
                                 e.push_str(&format!("uf_cvset({},{},{});", cell_of(&hh), idx_c, cell_of(&v)));
                             } else {
@@ -775,7 +908,7 @@ pub fn emit_range(
                                         e.push_str("{Cell _ff_acc=pop(cx),_ff_p=pop(cx);uf_fs_gate(uf_sptr(_ff_p),0);FILE*_fp=fopen(uf_sptr(_ff_p),\"r\");if(!_fp)die(\"FFOLD: cannot open file\");char*_line=0;size_t _ncap=0;ssize_t m;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FF_C_");
                                         e.push_str(&format!("{}{};cx->loops[fr].end=&&K_FF_E_{}{};long _ff_base=cx->sp;while((m=getline(&_line,&_ncap,_fp))>=0){{while(m>0&&(_line[m-1]=='\\n'||_line[m-1]=='\\r'))_line[--m]=0;Cell _ls=uf_str_new(_line,(size_t)m);pushc(cx,_ff_acc);pushc(cx,_ls);\n", prefix, i, prefix, i));
                                         let inner = format!("{}FF{}_", prefix, i);
-                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, false);
+                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, &HashMap::new(), false);
                                         e.push_str(&format!("K_FF_C_{}{}:;_ff_acc=pop(cx);cx->sp=_ff_base+1;}}K_FF_E_{}{}:;cx->lsp=fr;free(_line);fclose(_fp);pushc(cx,_ff_acc);}}\n", prefix, i, prefix, i));
                                     } else if *h == "op_fsplit" {
                                         /* inlined FSPLIT: getline loop + in-place split + field offsets + callback */
@@ -788,13 +921,13 @@ pub fn emit_range(
                                         e.push_str("while(uf_fsplit_nfields<128){char*_sp=strstr(_cur,_E);if(!_sp){uf_fsplit_offsets[uf_fsplit_nfields*2]=(int64_t)(_cur-_line);uf_fsplit_offsets[uf_fsplit_nfields*2+1]=(int64_t)strlen(_cur);uf_fsplit_nfields++;break;}*_sp=0;uf_fsplit_offsets[uf_fsplit_nfields*2]=(int64_t)(_cur-_line);uf_fsplit_offsets[uf_fsplit_nfields*2+1]=(int64_t)(_sp-_cur);uf_fsplit_nfields++;_cur=_sp+_el;}\n");
                                         e.push_str("pushc(cx,_ff_acc);pushi(cx,uf_fsplit_nfields);\n");
                                         let inner = format!("{}FF{}_", prefix, i);
-                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, false);
+                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, &HashMap::new(), false);
                                         e.push_str(&format!("K_FF_C_{}{}:;_ff_acc=pop(cx);cx->sp=_ff_base+1;}}K_FF_E_{}{}:;cx->lsp=fr;free(_line);fclose(_fp);uf_fsplit_line=0;pushc(cx,_ff_acc);}}\n", prefix, i, prefix, i));
                                     } else if *h == "op_rangefold" {
                                         /* inlined RANGEFOLD: count loop + callback */
                                         e.push_str(&format!("{{Cell _rf_acc=pop(cx);int64_t _rf_cnt=uf_i(pop(cx));long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_RF_C_{}{};cx->loops[fr].end=&&K_RF_E_{}{};long _rf_base=cx->sp;for(int64_t _rf_k=0;_rf_k<_rf_cnt;_rf_k++){{pushc(cx,_rf_acc);pushi(cx,_rf_k);\n", prefix, i, prefix, i));
                                         let inner = format!("{}RF{}_", prefix, i);
-                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, false);
+                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, &HashMap::new(), false);
                                         e.push_str(&format!("K_RF_C_{}{}:;_rf_acc=pop(cx);cx->sp=_rf_base+1;}}K_RF_E_{}{}:;cx->lsp=fr;pushc(cx,_rf_acc);}}\n", prefix, i, prefix, i));
                                     }
                                 }
@@ -844,6 +977,7 @@ pub fn emit_range(
                         // share the same C locals without cx->locals[] round-trips.
                         let inherited: std::collections::HashSet<usize> = reg.keys().copied().collect();
                         let inherited_arr: HashMap<String, String> = arr_ptr.clone();
+                        let inherited_sh: HashMap<String, (String, VType)> = shared_hoist.clone();
                         let mut reg: HashMap<usize, (String, VType)> = reg.clone();
                         {
                             let trivial_exit = |tb: usize| -> bool {
@@ -905,46 +1039,32 @@ pub fn emit_range(
                         }
                         let mut regs: Vec<_> = reg.iter().collect();
                         regs.sort_by_key(|(id, _)| *id);
-                        // Hoist float-array element pointers: same logic as the
-                        // while-inlining path. FloatArr slots never reassigned
-                        // inside the loop get a raw double* C local.
-                        let mut arr_ptr: HashMap<String, String> = HashMap::new();
-                        {
-                            let escapable2 = UF_DEBUG.load(Ordering::Relaxed) || (bs..be).any(|k| match &p.ins[k] {
-                                Ins::Break | Ins::Cont | Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
-                                Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While |
-                                Ins::If | Ins::IfElse => true,
-                                Ins::For => !inline_fors.contains_key(&k),
-                                Ins::PushAddr(_) => {
-                                    match p.ins.get(k + 1) {
-                                        Some(Ins::If) => false,
-                                        Some(Ins::For) => inline_fors.contains_key(&(k + 1)),
-                                        _ => true,
-                                    }
-                                }
-                                Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
-                                _ => false,
-                            });
-                            if !escapable2 {
-                                let mut reassigned: std::collections::HashSet<usize> = std::collections::HashSet::new();
-                                for k in bs..be {
-                                    if let Ins::LocalSetI(id) = &p.ins[k] { reassigned.insert(*id); }
-                                }
-                                for k in bs..be {
-                                    if let Ins::LocalGetI(id) = &p.ins[k] {
-                                        if reassigned.contains(id) { continue; }
-                                        let key = ins_body[k] * 1000000 + id;
-                                        if local_types.get(&key).copied() == Some(VType::FloatArr) {
-                                            arr_ptr.insert(
-                                                format!("cx->locals[cx->local_base+{}]", id),
-                                                format!("_a{}", id));
-                                        }
-                                    }
+                        // Hoist array element pointers (FloatArr and IntArr)
+                        // and read-only shared-var snapshots. Inherit parent
+                        // hoists so nested loops reuse the same C locals.
+                        let mut arr_ptr: HashMap<String, String> = inherited_arr.clone();
+                        let mut shared_hoist: HashMap<String, (String, VType)> = inherited_sh.clone();
+                        let escapable2 = UF_DEBUG.load(Ordering::Relaxed) || (bs..be).any(|k| match &p.ins[k] {
+                            Ins::Break | Ins::Cont | Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
+                            Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While |
+                            Ins::If | Ins::IfElse => true,
+                            Ins::For => !inline_fors.contains_key(&k),
+                            Ins::PushAddr(_) => {
+                                match p.ins.get(k + 1) {
+                                    Some(Ins::If) => false,
+                                    Some(Ins::For) => inline_fors.contains_key(&(k + 1)),
+                                    _ => true,
                                 }
                             }
+                            Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
+                            _ => false,
+                        });
+                        if !escapable2 {
+                            hoist_local_arr_ptrs(p, bs..be, ins_body, local_types, &mut arr_ptr);
                         }
-                        let mut arrps: Vec<_> = arr_ptr.iter().collect();
-                        arrps.sort();
+                        let sh_names = if !escapable2 && !tu_has_threads(p) {
+                            shared_readonly_in(p, bs..be)
+                        } else { Vec::new() };
                         e.push_str(&format!("{{long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};long _sp0=cx->sp;\n", prefix, i, prefix, i));
                         // Only declare registers new to this loop scope;
                         // inherited ones are already in C locals from the parent.
@@ -956,10 +1076,15 @@ pub fn emit_range(
                                 _ => e.push_str(&format!("Cell {}=cx->locals[cx->local_base+{}];\n", name, id)),
                             }
                         }
-                        for (expr, name) in &arrps {
-                            if inherited_arr.contains_key(expr.as_str()) { continue; }
-                            e.push_str(&format!("double* {}=(double*)uf_data((Hdr*)({}).i);\n", name, expr));
+                        {
+                            let mut arrps: Vec<_> = arr_ptr.iter().collect();
+                            arrps.sort();
+                            for (expr, name) in &arrps {
+                                if inherited_arr.contains_key(*expr) { continue; }
+                                e.push_str(&arr_ptr_cdecl(name, expr));
+                            }
                         }
+                        emit_shared_hoists(&mut e, &sh_names, shared_types, &mut shared_hoist, &mut arr_ptr, &format!("{}{}", prefix, i));
                         e.push_str("{int64_t cnt=pop(cx).i;");
                         // If the body immediately stores the index into a
                         // register-cached Int local, assign uf_k directly
@@ -976,7 +1101,7 @@ pub fn emit_range(
                         }
                         let eff_bs = if reg_store.is_some() { bs + 1 } else { bs };
                         let inner = format!("{}F{}_", prefix, i);
-                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, eff_bs, be, &inner, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, false);
+                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, eff_bs, be, &inner, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, &shared_hoist, false);
                         e.push_str(&format!("K_FC_{}{}:;cx->sp=_sp0;}}\nK_FE_{}{}:;", prefix, i, prefix, i));
                         for (id, (name, ty)) in &regs {
                             if inherited.contains(id) { continue; }
@@ -1268,39 +1393,24 @@ pub fn emit_range(
                         }
                         let mut regs: Vec<_> = reg.iter().collect();
                         regs.sort_by_key(|(id, _)| *id);
-                        // Hoist float-array element pointers: FloatArr slots
-                        // never reassigned inside the loop can keep a raw
-                        // double* in a C local (non-moving GC; the memory cell
-                        // keeps the object rooted).
-                        let mut arr_ptr: HashMap<String, String> = HashMap::new();
-                        {
-                            let escapable2 = (cbs..cbe_trim).chain(bbs..bbe_trim).any(|k| match &p.ins[k] {
-                                Ins::Break | Ins::Cont | Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
-                                Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While | Ins::For |
-                                Ins::If | Ins::IfElse | Ins::PushAddr(_) => true,
-                                Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
-                                _ => false,
-                            });
-                            if !escapable2 {
-                                let mut reassigned: std::collections::HashSet<usize> = std::collections::HashSet::new();
-                                for k in (cbs..cbe_trim).chain(bbs..bbe_trim) {
-                                    if let Ins::LocalSetI(id) = &p.ins[k] { reassigned.insert(*id); }
-                                }
-                                for k in (cbs..cbe_trim).chain(bbs..bbe_trim) {
-                                    if let Ins::LocalGetI(id) = &p.ins[k] {
-                                        if reassigned.contains(id) { continue; }
-                                        let key = ins_body[k] * 1000000 + id;
-                                        if local_types.get(&key).copied() == Some(VType::FloatArr) {
-                                            arr_ptr.insert(
-                                                format!("cx->locals[cx->local_base+{}]", id),
-                                                format!("_a{}", id));
-                                        }
-                                    }
-                                }
-                            }
+                        // Hoist IntArr/FloatArr element pointers and read-only
+                        // shared-var snapshots (seqlock once at loop entry).
+                        let inherited_arr: HashMap<String, String> = arr_ptr.clone();
+                        let mut arr_ptr: HashMap<String, String> = inherited_arr.clone();
+                        let mut shared_hoist: HashMap<String, (String, VType)> = shared_hoist.clone();
+                        let escapable2 = (cbs..cbe_trim).chain(bbs..bbe_trim).any(|k| match &p.ins[k] {
+                            Ins::Break | Ins::Cont | Ins::Call(_) | Ins::CallExt(_) | Ins::Sys(_) |
+                            Ins::Weave(_) | Ins::Send | Ins::Goto(_) | Ins::While | Ins::For |
+                            Ins::If | Ins::IfElse | Ins::PushAddr(_) => true,
+                            Ins::Simple(h) => *h == "op_ffold" || *h == "op_fsplit",
+                            _ => false,
+                        });
+                        if !escapable2 {
+                            hoist_local_arr_ptrs(p, (cbs..cbe_trim).chain(bbs..bbe_trim), ins_body, local_types, &mut arr_ptr);
                         }
-                        let mut arrps: Vec<_> = arr_ptr.iter().collect();
-                        arrps.sort();
+                        let sh_names = if !escapable2 && !tu_has_threads(p) {
+                            shared_readonly_in(p, (cbs..cbe_trim).chain(bbs..bbe_trim))
+                        } else { Vec::new() };
                         e.push_str(&format!("{{long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_WC_{}{};cx->loops[fr].end=&&K_WE_{}{};long _sp0=cx->sp;\n", prefix, i, prefix, i));
                         for (id, (name, ty)) in &regs {
                             match ty {
@@ -1309,15 +1419,21 @@ pub fn emit_range(
                                 _ => e.push_str(&format!("Cell {}=cx->locals[cx->local_base+{}];\n", name, id)),
                             }
                         }
-                        for (expr, name) in &arrps {
-                            e.push_str(&format!("double* {}=(double*)uf_data((Hdr*)({}).i);\n", name, expr));
+                        {
+                            let mut arrps: Vec<_> = arr_ptr.iter().collect();
+                            arrps.sort();
+                            for (expr, name) in &arrps {
+                                if inherited_arr.contains_key(*expr) { continue; }
+                                e.push_str(&arr_ptr_cdecl(name, expr));
+                            }
                         }
+                        emit_shared_hoists(&mut e, &sh_names, shared_types, &mut shared_hoist, &mut arr_ptr, &format!("{}{}", prefix, i));
                         e.push_str(&format!("K_WC_{}{}:;{{Cell _wc;{{\n", prefix, i));
                         // Emit the cond into a side buffer; if it ends with a
                         // plain typed value push, peel it into a direct C test
                         // and skip the data-stack round trip entirely.
                         let mut ce = String::new();
-                        emit_range(&mut ce, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, cbs, cbe_trim, &inner_c, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, false);
+                        emit_range(&mut ce, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, cbs, cbe_trim, &inner_c, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, &shared_hoist, false);
                         let mut direct_cond: Option<String> = None;
                         if ce.ends_with(");") {
                             for tag in ["pushi(cx,", "pushf(cx,"] {
@@ -1374,7 +1490,7 @@ pub fn emit_range(
                         };
                         let body_suppress = !body_esc && operand_push_first
                             && !(bbs..bbe_trim).any(|k| matches!(p.ins[k], Ins::ListLit | Ins::DictLit));
-                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bbs, bbe_trim, &inner_b, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, body_suppress);
+                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, outlined_bodies, suppress, ext_idx, bbs, bbe_trim, &inner_b, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, &shared_hoist, body_suppress);
                         // With dead-flush suppression active the body never
                         // touches the data stack (no pushes, and a `pop(cx)`
                         // would mean a vpop-empty the suppression guards
@@ -1457,6 +1573,15 @@ pub fn emit_range(
                 let _ = is_param_bind;
             }
             Ins::GetV(v) => {
+                // Loop-hoisted snapshot: the enclosing non-escapable while/for
+                // proved this shared var is not written in the body, so one
+                // seqlock read at entry is enough. Typed Int/Float unwraps
+                // are safe here because shared_types committed a scalar.
+                if let Some((expr, ty)) = shared_hoist.get(v) {
+                    vstack.push(VEntry { expr: expr.clone(), ty: *ty });
+                    o.push_str(&e);
+                    continue;
+                }
                 // Snapshot read (seqlock). Array handles can be typed so
                 // get/set specialize; scalar Int/Float stay Cells — a slot
                 // initialized with `0 x!` and later holding a float must not
@@ -2719,7 +2844,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         let ob_prefix = format!("OB{}_", bs);
         // Emit the body code — use empty reg/arr_ptr maps; the inlined while
         // loops within the body will do their own register caching.
-        emit_range(&mut outlined_fns, p, &targets, &inline_fors, &inline_ffolds, &inline_whiles, &outlined_bodies, &suppress, &ext_idx, bs, be, &ob_prefix, 0, &mut local_types, &ins_body, &HashMap::new(), &numeric_slots, &HashMap::new(), &shared_types, false);
+        emit_range(&mut outlined_fns, p, &targets, &inline_fors, &inline_ffolds, &inline_whiles, &outlined_bodies, &suppress, &ext_idx, bs, be, &ob_prefix, 0, &mut local_types, &ins_body, &HashMap::new(), &numeric_slots, &HashMap::new(), &shared_types, &HashMap::new(), false);
         // If the body has no explicit RET at the end (shouldn't happen, but
         // be safe), restore the frame.
         outlined_fns.push_str(&format!("cx->local_base=cx->local_frames[--cx->local_fsp];{}}}\n", if UF_DEBUG.load(Ordering::Relaxed) { "cx->call_csp--;" } else { "" }));
@@ -2736,7 +2861,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         });
         o.insert_str(insert_pos, &outlined_fns);
     }
-    emit_range(&mut o, p, &targets, &inline_fors, &inline_ffolds, &inline_whiles, &outlined_bodies, &suppress, &ext_idx, 0, n, "", 0, &mut local_types, &ins_body, &HashMap::new(), &numeric_slots, &HashMap::new(), &shared_types, false);
+    emit_range(&mut o, p, &targets, &inline_fors, &inline_ffolds, &inline_whiles, &outlined_bodies, &suppress, &ext_idx, 0, n, "", 0, &mut local_types, &ins_body, &HashMap::new(), &numeric_slots, &HashMap::new(), &shared_types, &HashMap::new(), false);
     o.push_str(&format!("L_{}: return;\n}}\n", n));
 
     // exported wrappers (fixed 4-arg C ABI trampoline, run on the main ctx)

@@ -948,7 +948,17 @@ pub fn emit_range(
                                         e.push_str(&format!("K_FF_C_{}{}:;_ff_acc=pop(cx);cx->sp=_ff_base+1;}}K_FF_E_{}{}:;cx->lsp=fr;free(_line);fclose(_fp);pushc(cx,_ff_acc);}}\n", prefix, i, prefix, i));
                                     } else if *h == "op_fsplit" {
                                         /* inlined FSPLIT: getline loop + in-place split + field offsets + callback */
-                                        e.push_str("{Cell _ff_acc=pop(cx),_ff_sep=pop(cx),_ff_p=pop(cx);const char*_E=uf_sptr(_ff_sep);if(!*_E)die(\"FSPLIT: empty separator\");size_t _el=strlen(_E);uf_fs_gate(uf_sptr(_ff_p),0);int _fd=open(uf_sptr(_ff_p),O_RDONLY);if(_fd<0)die(\"FSPLIT: cannot open file\");struct stat _st;if(fstat(_fd,&_st))die(\"FSPLIT: fstat\");char*_map=_st.st_size?(char*)mmap(0,(size_t)_st.st_size,PROT_READ,MAP_PRIVATE,_fd,0):(char*)MAP_FAILED;if(_st.st_size&&_map==(char*)MAP_FAILED)die(\"FSPLIT: mmap\");char*_mp=_map;char*_mend=_map==((char*)MAP_FAILED)?_mp:_mp+(size_t)_st.st_size;char*_line=0;size_t _ncap=0;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FF_C_");
+                                        e.push_str("{Cell _ff_acc=pop(cx),_ff_sep=pop(cx),_ff_p=pop(cx);const char*_E=uf_sptr(_ff_sep);if(!*_E)die(\"FSPLIT: empty separator\");size_t _el=strlen(_E);uf_fs_gate(uf_sptr(_ff_p),0);int _fd=open(uf_sptr(_ff_p),O_RDONLY);if(_fd<0)die(\"FSPLIT: cannot open file\");struct stat _st;if(fstat(_fd,&_st))die(\"FSPLIT: fstat\");char*_map=_st.st_size?(char*)mmap(0,(size_t)_st.st_size,PROT_READ,MAP_PRIVATE,_fd,0):(char*)MAP_FAILED;if(_st.st_size&&_map==(char*)MAP_FAILED)die(\"FSPLIT: mmap\");char*_mp=_map;char*_mend=_map==((char*)MAP_FAILED)?_mp:_mp+(size_t)_st.st_size;char*_line=0;size_t _ncap=0;\n");
+                                        let mut ff_arr: HashMap<String, String> = HashMap::new();
+                                        let mut ff_sh: HashMap<String, (String, VType)> = HashMap::new();
+                                        if !tu_has_threads(p) {
+                                            let reach = reachable_from(p, bs..be);
+                                            if !reachable_has_opaque_write(p, &reach) {
+                                                let names = shared_readonly_in(p, reach.into_iter());
+                                                emit_shared_hoists(&mut e, &names, shared_types, &mut ff_sh, &mut ff_arr, &format!("{}FF{}", prefix, i));
+                                            }
+                                        }
+                                        e.push_str("long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FF_C_");
                                         e.push_str(&format!("{}{};cx->loops[fr].end=&&K_FF_E_{}{};long _ff_base=cx->sp;while(_mp<_mend){{char*_nl=(char*)memchr(_mp,'\\n',(size_t)(_mend-_mp));size_t m=(size_t)((_nl?_nl:_mend)-_mp);if(m+1>_ncap){{_ncap=m+1;_line=(char*)realloc(_line,_ncap);if(!_line)die(\"out of memory\");}}memcpy(_line,_mp,m);_line[m]=0;if(_nl)_mp=_nl+1;else _mp=_mend;\n", prefix, i, prefix, i));
                                         /* set up fsplit thread-locals for fget/fatoi/fsget/fbyte */
                                         e.push_str("while(m>0&&(_line[m-1]=='\\n'||_line[m-1]=='\\r'))_line[--m]=0;\n");
@@ -957,7 +967,7 @@ pub fn emit_range(
                                         e.push_str("while(uf_fsplit_nfields<128){size_t _rem=m-(size_t)(_cur-_line);char*_sp=_el==1?(char*)memchr(_cur,_E[0],_rem):strstr(_cur,_E);if(!_sp){uf_fsplit_offsets[uf_fsplit_nfields*2]=(int64_t)(_cur-_line);uf_fsplit_offsets[uf_fsplit_nfields*2+1]=(int64_t)_rem;uf_fsplit_nfields++;break;}*_sp=0;uf_fsplit_offsets[uf_fsplit_nfields*2]=(int64_t)(_cur-_line);uf_fsplit_offsets[uf_fsplit_nfields*2+1]=(int64_t)(_sp-_cur);uf_fsplit_nfields++;_cur=_sp+_el;}\n");
                                         e.push_str("pushc(cx,_ff_acc);pushi(cx,uf_fsplit_nfields);\n");
                                         let inner = format!("{}FF{}_", prefix, i);
-                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, inline_ifs, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &HashMap::new(), shared_types, &HashMap::new(), false);
+                                        emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, inline_ifs, outlined_bodies, suppress, ext_idx, bs, be, &inner, depth + 1, local_types, ins_body, &HashMap::new(), &std::collections::HashSet::new(), &ff_arr, shared_types, &ff_sh, false);
                                         e.push_str(&format!("K_FF_C_{}{}:;_ff_acc=pop(cx);cx->sp=_ff_base+1;}}K_FF_E_{}{}:;cx->lsp=fr;free(_line);if(_map!=(char*)MAP_FAILED)munmap(_map,(size_t)_st.st_size);close(_fd);uf_fsplit_line=0;pushc(cx,_ff_acc);}}\n", prefix, i, prefix, i));
                                     } else if *h == "op_rangefold" {
                                         /* inlined RANGEFOLD: count loop + callback */

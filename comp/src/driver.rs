@@ -832,6 +832,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     }
     let status = program.status()
         .unwrap_or_else(|e| panic!("failed to run {}: {}", bins, e));
+    #[cfg(unix)]
     if status.code().is_none() {
         use std::os::unix::process::ExitStatusExt;
         eprintln!(

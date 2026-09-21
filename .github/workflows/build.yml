@@ -22,10 +22,7 @@ jobs:
           - os: ubuntu-latest
             artifact: nk-linux-x86_64
             bin: nk
-          - os: macos-13
-            artifact: nk-macos-x86_64
-            bin: nk
-          - os: macos-14
+          - os: macos-latest
             artifact: nk-macos-arm64
             bin: nk
           - os: windows-latest
@@ -63,6 +60,45 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: staging/*
+          if-no-files-found: error
+
+  # Intel macOS: GitHub retired the last Intel (macos-13) runners, so
+  # cross-compile x86_64-apple-darwin on an arm64 runner. The Apple toolchain
+  # links cross-arch natively; the smoke test runs under Rosetta 2 (preinstalled
+  # on the arm64 runner images).
+  cross-macos:
+    name: Cross nk-macos-x86_64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: comp
+
+      - name: Build (release)
+        working-directory: comp
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Smoke test (--help, via Rosetta 2)
+        run: comp/target/x86_64-apple-darwin/release/nk --help
+
+      - name: Stage binary
+        run: |
+          mkdir -p staging
+          cp comp/target/x86_64-apple-darwin/release/nk staging/nk
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nk-macos-x86_64
+          path: staging/nk
           if-no-files-found: error
 
   # Cross-compiled Linux builds using `cross` (Docker-based, handles the

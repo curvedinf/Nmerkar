@@ -351,12 +351,28 @@ static void uf_gc_setshared(UFShVar** t, long n){ for(long i=0;i<n&&i<1024;i++) 
    array published with release stores; collectors acquire-load the count.
    Slots are zeroed on pop so a concurrent marker never marks stale values. */
 #define UF_MAXTMP 1024
-typedef struct UF_TR { struct UF_TR* next; pthread_t tid; void*** slots; _Atomic int n; } UF_TR;
+typedef struct UF_TR { struct UF_TR* next; void*** slots; _Atomic int n; } UF_TR;
 static UF_TR* uf_trs; static pthread_mutex_t uf_tr_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local UF_TR* uf_tr_mine;
+static pthread_key_t uf_tr_key; static pthread_once_t uf_tr_key_once=PTHREAD_ONCE_INIT;
+static void uf_tr_destroy(void* arg){
+  UF_TR* t=(UF_TR*)arg;
+  pthread_mutex_lock(&uf_tr_mu);
+  UF_TR** pp=&uf_trs;
+  while(*pp && *pp!=t) pp=&(*pp)->next;
+  if(*pp) *pp=t->next;
+  pthread_mutex_unlock(&uf_tr_mu);
+  free(t->slots); free(t);
+}
+static void uf_tr_make_key(void){
+  if(pthread_key_create(&uf_tr_key,uf_tr_destroy)) die("GC: thread key");
+}
 static void uf_tr_init(void){
   if(uf_tr_mine) return;
-  UF_TR* t=(UF_TR*)calloc(1,sizeof(UF_TR)); t->slots=(void***)calloc(UF_MAXTMP,sizeof(void**)); t->tid=pthread_self();
+  pthread_once(&uf_tr_key_once,uf_tr_make_key);
+  UF_TR* t=(UF_TR*)calloc(1,sizeof(UF_TR)); if(!t) die("out of memory");
+  t->slots=(void***)calloc(UF_MAXTMP,sizeof(void**)); if(!t->slots) die("out of memory");
+  if(pthread_setspecific(uf_tr_key,t)) die("GC: thread key value");
   pthread_mutex_lock(&uf_tr_mu); t->next=uf_trs; uf_trs=t; pthread_mutex_unlock(&uf_tr_mu);
   uf_tr_mine=t;
 }
@@ -421,7 +437,6 @@ static void uf_gc_collect(void){
   }
   pthread_mutex_lock(&uf_tr_mu);
   for(UF_TR* t=uf_trs;t;t=t->next){
-    if(!pthread_equal(t->tid,pthread_self()) && pthread_kill(t->tid,0)==ESRCH) continue; /* dead thread: its slots are moot */
     int nt=atomic_load_explicit(&t->n,memory_order_acquire); if(nt>UF_MAXTMP)nt=UF_MAXTMP;
     for(int i=0;i<nt;i++){ void** pp=t->slots[i]; if(pp&&*pp) uf_mark_ptr(*pp); }
   }

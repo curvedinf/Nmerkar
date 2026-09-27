@@ -783,8 +783,8 @@ results trivially safe.
   chan queue contents, and per-thread temporary-root stacks (operands
   and in-progress results held in C locals across an allocation are pushed
   there by runtime ops via `UF_PROTECT`/`UF_UNPROTECT`, published with
-  release/acquire so a concurrent collection on another weave worker can never
-  miss or pop another thread's entry; dead threads' stacks are skipped).
+  release/acquire; thread-local destructor cleanup removes a worker's root
+  registry entry when it exits, before a later collection scans the registry).
   Generated code materializes pending compiler temporaries onto the data stack
   before polymorphic helper calls that may allocate.
 - **Untagged pointers** (`malloc`, `buffer`): never traced, never freed by GC.

@@ -19,7 +19,7 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | Execution | Compiled (Nmerkar → C → native binary) |
 | Style | Forth-like postfix but no stack manipulation |
 | Block control | Implicit (no brackets) |
-| Typing | Dynamic and weak |
+| Typing | Dynamic and weak default, optional per value strictness |
 | Memory | Garbage collected |
 | C Imports | Direct ABI, no glue |
 | Primitives | int, float, str, ptr |

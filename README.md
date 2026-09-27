@@ -82,7 +82,7 @@ GPU is an AMD Radeon 7900 XTX.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/curvedinf/Nmerkar/main/install.sh | sh
-nk '"Hello!\n" print'
+nk '"Hello!" print'
 ```
 
 Supports Linux (x86_64, ARM64, ARMv7) and macOS (ARM64, Intel). Installs `nk`,

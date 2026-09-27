@@ -1,5 +1,6 @@
 // ---------------- C prelude (v10) ----------------
 pub const PRELUDE: &str = r#"
+#define _GNU_SOURCE 1
 #include <stdint.h>
 #include <errno.h>
 #include <stdio.h>
@@ -81,7 +82,7 @@ typedef struct WeaveTaskS WeaveTask;
 typedef struct WeaveJobS { WeaveTask* ts; int n; UfRun run; _Atomic int shutdown; } WeaveJob;
 
 static void die(const char*m);
-static _Thread_local const char* uf_cur_op;
+static _Thread_local const char* uf_cur_op = "<startup>";
 static void nk_run(Ctx*cx, long pc);
 static _Thread_local const void* uf_entry_addr;
 static void uf_call_addr(Ctx*cx, const void* a, long frame, long entry_pc, long nargs){
@@ -102,7 +103,6 @@ typedef struct UfTry { jmp_buf jb; struct UfTry* prev; long sp; long csp; long l
 static _Thread_local UfTry* uf_try_top = 0;
 static _Thread_local void* uf_cur_task; /* WeaveTask* for debug counters */
 static _Thread_local Ctx* uf_current_ctx = 0;
-static _Thread_local const char* uf_cur_op = "<startup>";
 static int uf_debug_mode = 0;
 static const char** uf_labnames; static long uf_labnames_n;
 static const char*** uf_ln_tab; static long* uf_ln_cnt;

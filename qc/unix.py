@@ -60,7 +60,7 @@ def main():
             args += ["--gc-threshold", "200000000"]
         result = run(*args, path, timeout=300)
         if number == 15:
-            assert "count: 100000" in result.stdout and "count2: 25000" in result.stdout, result.stdout
+            assert result.stdout.split() == ["count:", "100000", "count2:", "25000"], result.stdout
         if number == 13:
             assert "139998" in result.stdout and "69999" in result.stdout
     print(f"PASS: {'quick' if QUICK else 'full'} Unix QC on {os.uname().sysname} {os.uname().machine}")

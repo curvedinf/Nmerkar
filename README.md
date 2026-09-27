@@ -43,10 +43,7 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | dynamicgraph | 349 | 436 | 423 | **303** | 369 |
 | **total** | **2886** | 4411 | 4507 | 3078 | 3526 |
 
-Token counts use the **Qwen3** tokenizer (151,643 vocab). The first six
-benchmarks are data/tensor-shaped (Nmerkar's home turf); nqueens stresses
-control flow, bfs uses packed CSR arrays, and dynamicgraph isolates hash-map
-and small-list allocation costs.
+Token counts use the **Qwen3** tokenizer (151,643 vocab).
 
 ### Speed (CPU only, seconds, lower = faster)
 

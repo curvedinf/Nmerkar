@@ -110,26 +110,53 @@ nk somedir/                    # directory mode (auto-discovers main + init thre
 Text (`.n`) is the default encoding; dense (`.nd`) is an experimental
 token-optimized encoding.
 
+## Key Concepts
+
+**Read left to right.** Nmerkar uses postfix operations: `3 4 add print`
+adds two values, then prints `7`. Each operation consumes its inputs and passes
+its result to the next one. The compiler manages the underlying stack; `total!`
+stores a value and `total` reads it. A `;` starts a comment.
+
+**Work with data.** Integers, floats, and strings can live in lists, dictionaries,
+objects, or typed arrays and tensors. The same `get`, `set`, and `length`
+operations work across several containers. Managed values are garbage collected,
+and built-ins handle JSON, text, files, and regular expressions.
+
+**Compose behavior.** `if`, `while`, and `for` call labeled blocks such as
+`'step`; the block is defined with `step:` and can bind inputs to named variables.
+Blocks also serve as callbacks for operations such as `filter`, and `ret` returns
+a value. Channels and threads support concurrent programs.
+
+**Compile and run.** `nk` translates a program to C, compiles it with the system
+C compiler, and runs the native result; it can also emit C or a standalone
+binary. Eligible compute work can use a Vulkan GPU automatically when the
+toolchain and device are available, while `--device cpu` keeps it on the CPU.
+Use `nks` to run programs under a capability policy.
+
 ## Examples
 
 A shopping list stores items in order:
 
 ```nmerkar
-list groceries!                           ; Create an empty list called groceries.
-groceries "apples" append groceries!      ; Add apples to the list.
-groceries "bread" append groceries!       ; Add bread to the list.
-groceries "milk" append groceries!        ; Add milk to the list.
+["apples" "bread" "milk"] groceries!      ; Create a shopping list with a list literal.
+groceries "eggs" append groceries!        ; Add eggs to the existing list.
 groceries length print                    ; Print how many items to buy.
 groceries 0 get print                     ; Print the first item.
 groceries print                           ; Print the complete shopping list.
 ```
 
-An order arrives as JSON and its fields determine the total price:
+A loop calls a helper to price three orders of increasing size:
 
 ```nmerkar
-"{\"item\":\"notebook\",\"quantity\":3,\"price\":5}" parse_json order! ; Parse JSON into a dictionary called order.
-order "item" get print                                          ; Print the purchased item.
-order "quantity" get order "price" get mul print                ; Multiply quantity by price and print the total.
+0 total!                                   ; Start the running total at zero.
+3 'add_order for                            ; Run add_order with indexes 0, 1, and 2.
+total print                                ; Print the total cost of all three orders.
+ret                                        ; Finish the main program before the helper blocks.
+add_order: index!                          ; Give each loop index a name.
+  index 1 add _call price total add total! ; Price one more item than the index, then add it to the total.
+  ret                                      ; Return to the loop.
+price: quantity!                           ; Define a reusable helper that receives a quantity.
+  ret quantity 5 mul                       ; Return the quantity times the $5 unit price.
 ```
 
 Use `nk` inline to efficiently process data with `bash`:

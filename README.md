@@ -32,7 +32,7 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | Typing | Dynamic and weak default, optional per value strictness |
 | Memory | Garbage collected |
 | Library Ecosystem | C / C++ / Rust full compatibility |
-| Primitives | int, float, str, ptr |
+| Primitives | int, float, bool, byte, str, ptr |
 | Data structures | list, dict, arr, tensor, chan, atom, obj, bitmap, bloom, iter |
 | Concurrency | Channels, threads, dataflow DAGs with fanout |
 | Built-ins | Regex, JSON, shell, I/O, streaming, tensor math |
@@ -94,6 +94,11 @@ nk somedir/                    # directory mode (auto-discovers main + init thre
 
 Text (`.n`) is the default encoding; dense (`.nd`) is an experimental
 token-optimized encoding.
+
+`true` and `false` are boolean values, distinct from `1` and `0` (use
+`structural_equal` to compare types as well as values). `parse_json` preserves
+JSON booleans through lists and dicts, and `to_json` writes them back as
+`true`/`false`. Use `bool cast` to convert a value explicitly.
 
 ## Key Concepts
 

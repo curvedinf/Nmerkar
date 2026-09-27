@@ -239,7 +239,7 @@ body:
 ## Type glyphs
 
 U+13110..U+13117 = int(0) float(1) ptr(2) byte(3) void(4) handle(5→2)
-str(6→2) bool(7→3) — handle/str are ptr aliases, bool a byte alias; void is 4
+str(6→2) bool(7→21) — handle/str are ptr aliases; bool is a distinct scalar type; void is 4
 (SIZEOF void = 8, not useful).
 
 - After `LIT`: pushes the type id.
@@ -248,10 +248,10 @@ str(6→2) bool(7→3) — handle/str are ptr aliases, bool a byte alias; void i
   pushes the id with no LIT. The id lands on top of any preceding length, so
   ARR/TENSOR consume `[len, type]` with type on top.
 - Elsewhere a bare type glyph pushes its id (expression position).
-- ASCII type keywords (`int float ptr handle byte`) work in all the same
+- ASCII type keywords (`int float ptr handle byte bool`) work in all the same
   positions; a bare type keyword pushes its type id in text mode
   (mirroring the bare type glyph in dense). `str` is not a bare keyword —
-  `_str` is the immediate string op — and `void`/`bool` have no text keyword
+  `_str` is the immediate string op — and `void` has no text keyword
   form.
 - `array`/`tensor` are also plain ops taking `[len_or_list, type]` from the
   stack (see the opcode reference).
@@ -260,10 +260,11 @@ str(6→2) bool(7→3) — handle/str are ptr aliases, bool a byte alias; void i
 
 0 int, 1 float, 2 ptr, 3 byte, 4 void, 5 arr, 6 tensor, 7 list, 8 dict,
 9 str, 10 chan, 11 atom, 12 buf, 13 obj, 14 bitmap, 15 time, 16 dur,
-17 bloom, 18 iter, 19 set, 20 matrix, 21 JSON boolean. JSON null is
-a null pointer (tag 2, payload 0). The existing `bool` type glyph remains a
-byte alias (tag 3); a parsed JSON boolean has its own tag to keep it distinct
-from numeric bytes and integers.
+17 bloom, 18 iter, 19 set, 20 matrix, 21 bool. JSON null is
+a null pointer (tag 2, payload 0). Booleans are distinct from integers and
+bytes. `true` and `false` are literals in text mode; the bool type glyph
+and `bool` keyword push type id 21. Dense emission encodes a boolean literal
+as an integer followed by `_cast bool`.
 
 ## Runtime cell
 
@@ -370,7 +371,7 @@ below. Glyph assignments are 1:1 and final in `comp/src/lex.rs`.
 | 23 | 🤓 | `array` | len_or_list type → h | polymorphic: top is a length or a list to copy; `_array <type>` immediate form; 64-aligned typed array |
 | 24 | 🪫 | `shutdown` | → | graceful weave shutdown: sets the drain flag (see Concurrency) |
 | 26 | 🌅 | `copy` | h → h' | deep copy |
-| 27 | 😅 | `_cast` | v type → v' | static cast (immediate type): int/float/ptr/byte convert raw, struct id = checked downcast; dies on mismatch |
+| 27 | 😅 | `_cast` | v type → v' | static cast (immediate type): int/float/ptr/byte/bool, struct id = checked downcast; dies on mismatch |
 | 28 | 🚆 | `macro` | (directive) | `macro name { body }` |
 | 29 | 🤔 | `tensor` | len_or_list type → h | as `array`; 64-aligned |
 | 33 | 🌆 | `setv` | value → value | `<v>!` local (pass-through); shared store consumes |
@@ -609,9 +610,14 @@ No file-handle object type; every op is self-contained.
 | 190 | 🛁 | `parse_json` | str → v | object → dict, array → list, number → int/float, true/false → tagged booleans (21), null → null pointer (2) |
 | 191 | 🤹 | `to_json` | v → str | tagged booleans → `true`/`false`, null pointer → `null`; dict keys must be strings; atom/chan/iter/bitmap/bloom: dies |
 
-JSON booleans participate in loose numeric coercion (`true` → 1, `false` → 0)
-but retain their own tag for `type_of`, strict equality, and JSON round trips.
-Bytes remain numeric when encoded as JSON.
+JSON booleans are the same type as `true` and `false` literals. They participate
+in loose numeric coercion (`true` → 1, `false` → 0), but retain tag 21 for
+`type_of`, `structural_equal`, dict keys, and JSON round trips. `eq` is loose:
+`true 1 eq` returns 1, while `true 1 structural_equal` returns 0. Bytes print
+and serialize as numbers. A `bool array` or `bool tensor` stores one byte per
+element and returns tagged booleans; numeric array arithmetic requires numeric
+element types. C imports may declare `bool` arguments and results, mapped to
+C `_Bool` and tagged Nmerkar booleans.
 
 ### Iterators (tag 18)
 
@@ -654,9 +660,10 @@ Two casts, one per casting discipline:
 
 - **`_cast` (27, immediate, prefix)** — **static**: a C-style conversion with
   no value-content interpretation. The type immediate is any
-  static-castable type: `int`/`float`/`ptr`/`byte` (raw payload conversions —
+  static-castable type: `int`/`float`/`ptr`/`byte`/`bool` (raw scalar conversions —
   float truncates toward zero to int, int widens to float, ptr reinterprets
-  its address as an integer and back, byte truncates to the low 8 bits) or a
+  its address as an integer and back, byte truncates to the low 8 bits,
+  bool follows numeric truthiness and pointer non-nullness) or a
   struct name (checked downcast: compares the struct id, dies on mismatch).
   As prefix preprocessing, a literal operand folds at compile
   time (`2 _cast float` compiles to the constant `2.0`).
@@ -665,7 +672,8 @@ Two casts, one per casting discipline:
   `strict` values). Targets: `int` (universal numeric coercion — strings
   parsed, single-element lists unwrapped — then truncated; dies if the value
   has no numeric form), `float` (universal numeric coercion), `ptr` (raw
-  reinterpret, as `_cast`), `byte` (truncate), the str **tag** `9`
+  reinterpret, as `_cast`), `byte` (truncate), `bool` (parse strings `"true"`
+  and `"false"`; other values use truthiness), the str **tag** `9`
   (`_lit 9 cast` — universal string coercion, the rendered representation),
   and struct ids `≥1000` (checked downcast, identical semantics to
   `_cast Name`). Other type ids die.
@@ -678,6 +686,8 @@ Two casts, one per casting discipline:
 p 1000 cast              ; checked downcast to struct id 0
 2 _cast float             ; 2.0       (static, folded at compile time)
 3.9 _cast int             ; 3         (static truncation, no parsing)
+true 1 structural_equal  ; 0         (bool and int are different tags)
+"false" bool cast         ; false     (content-aware string conversion)
 ```
 
 `_cast` and `cast` coexist by design: the two have genuinely different

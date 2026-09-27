@@ -50,11 +50,30 @@ values unique to_json print
 "{\\"flag\\":true,\\"empty\\":null}" parse_json record!
 record "flag" get to_json print
 record "empty" get to_json print
+true type_of print
+true 1 structural_equal print
+false 0 structural_equal print
+true 1 eq print
+"false" bool cast to_json print
+2 _cast bool to_json print
+0 bool cast to_json print
+[true false 1 0] to_json print
+[true false] bool array flags!
+flags to_json print
+flags 0 get type_of print
+flags 1 true set to_json print
+flags to_json print
+{true "bool" 1 "number"} mapping!
+mapping true get print
+mapping 1 get print
+2 _cast byte print
 '''
     json_result = run(NK, "--device", "cpu", json_cases)
     assert json_result.stdout.splitlines() == [
         '[true,false,null,1,0]', '21', '21', '2', '0',
         '0', '1', '3', '2', '[true,false,null,1,0]', 'true', 'null',
+        '21', '0', '0', '1', 'false', 'true', 'false', '[true,false,1,0]',
+        '[true,false]', '21', 'true', '[true,true]', 'bool', 'number', '2',
     ], json_result.stdout
 
     with tempfile.TemporaryDirectory(prefix="nk-qc-") as tmp:
@@ -66,6 +85,14 @@ record "empty" get to_json print
         file = Path(tmp) / "main.n"
         file.write_text('"source file" print\n')
         assert "source file" in run(NK, "--device", "cpu", file).stdout
+        boolean = Path(tmp) / "boolean.n"
+        boolean.write_text("true to_json print\nfalse type_of print\n")
+        run(NK, "--to-dense", boolean)
+        dense = boolean.with_suffix(".nd")
+        assert run(NK, "--device", "cpu", dense).stdout.splitlines() == ["true", "21"]
+        text = Path(tmp) / "boolean-roundtrip.n"
+        run(NK, "--to-text", dense, "-o", text)
+        assert run(NK, "--device", "cpu", text).stdout.splitlines() == ["true", "21"]
 
     run(NKS, "--caps")
     run(NKS, "--policy", "pure", '"/etc/passwd" read_file print', ok=False)

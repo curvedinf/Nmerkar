@@ -20,6 +20,7 @@ pub enum Param {
 pub enum Tok {
     Op(&'static str),          // simple opcode with no immediate
     PushI(i64),
+    PushBool(bool),              // true/false literal (distinct from int and byte)
     PushF(f64),
     PushS(String),             // STR literal
     Jump(&'static str, String), // CALL/ADDR + label (JMP/JZ/JE removed in v10.1)

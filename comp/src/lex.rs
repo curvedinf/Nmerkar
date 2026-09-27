@@ -101,8 +101,8 @@ pub fn op_glyph_of(name: &str) -> char {
 pub const CUSTOM_OPS: [(u32, usize); 0] = [];
 
 // U+13110..U+13117 = int float ptr byte void handle str bool.
-// Ids match type_id(): int 0, float 1, ptr 2, byte 3; handle/str are ptr
-// aliases, bool a byte alias, void is 4 (SIZEOF void = 8, not useful).
+// Ids match type_id(): int 0, float 1, ptr 2, byte 3, bool 21;
+// handle/str are ptr aliases, void is 4 (SIZEOF void = 8, not useful).
 pub fn glyph_type_id(c: char) -> Option<i64> {
     let cp = c as u32;
     if cp >= TYPE_BASE && cp <= TYPE_BASE + 7 {
@@ -114,7 +114,7 @@ pub fn glyph_type_id(c: char) -> Option<i64> {
             4 => 4,
             5 => 2,
             6 => 2,
-            _ => 3,
+            _ => 21,
         })
     } else {
         None
@@ -386,6 +386,7 @@ pub fn type_id(kw: &str) -> Option<i64> {
         "float" => Some(1),
         "ptr" | "handle" => Some(2),
         "byte" => Some(3),
+        "bool" => Some(21),
         _ => None,
     }
 }
@@ -780,6 +781,10 @@ impl Lexer {
                 if name == "_" && (self.peek() == Some('!') || self.peek().map_or(false, |c| opcode_index(c) == Some(33))) {
                     self.pos += 1;
                     out.push(Tok::Discard);
+                    continue;
+                }
+                if name == "true" || name == "false" {
+                    out.push(Tok::PushBool(name == "true"));
                     continue;
                 }
                 if self.peek() == Some(':') {
@@ -1235,7 +1240,7 @@ pub fn mnemonic_index(tok: &str) -> Option<usize> {
 }
 
 pub fn is_reserved(tok: &str) -> bool {
-    mnemonic_index(tok).is_some()
+    matches!(tok, "true" | "false" | "bool") || mnemonic_index(tok).is_some()
 }
 
 /// Reject _-prefixed names — reserved for immediate-opcode mnemonics
@@ -1709,7 +1714,9 @@ impl TextLexer {
                     self.err(&format!("'{}' is now '_{}' — immediate ops are _-prefixed", tok, n));
                 }
                 _ => {
-                    if let Some(idx) = mnemonic_index(&tok) {
+                    if tok == "true" || tok == "false" {
+                        out.push(Tok::PushBool(tok == "true"));
+                    } else if let Some(idx) = mnemonic_index(&tok) {
                         // plain opcode with no operand handling
                         out.push(Tok::Op(OP_NAMES[idx]));
                     } else if let Some(id) = type_id(&tok) {

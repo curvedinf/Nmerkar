@@ -695,8 +695,8 @@ static inline Cell uf_ceq(Cell a,Cell b){ return uf_mki(uf_loose_eq(a,b)?1:0); }
 static inline Cell uf_cnot(Cell a){ return uf_mki(uf_truthy(a)?0:1); }
 static inline Cell uf_cor(Cell a,Cell b){ return uf_mki(a.i|b.i); }
 static inline Cell uf_cxor(Cell a,Cell b){ return uf_mki(a.i^b.i); }
-static inline Cell uf_cvget(Cell h,int64_t idx){ Hdr*a=(Hdr*)h.i; char*dt=uf_data(a); if(a->ety==1)return uf_mkf(((double*)dt)[idx]); if(a->ety==3)return uf_mki((int64_t)((uint8_t*)dt)[idx]); return uf_mki(((int64_t*)dt)[idx]); }
-static inline void uf_cvset(Cell h,int64_t idx,Cell v){ Hdr*a=(Hdr*)h.i; char*dt=uf_data(a); if(a->ety==1)((double*)dt)[idx]=uf_f(v); else if(a->ety==3)((uint8_t*)dt)[idx]=(uint8_t)v.i; else ((int64_t*)dt)[idx]=v.i; }
+static inline Cell uf_cvget(Cell h,int64_t idx){ Hdr*a=(Hdr*)h.i; char*dt=uf_data(a); if(a->ety==1)return uf_mkf(((double*)dt)[idx]); if(a->ety==T_BOOL)return uf_mkb(((uint8_t*)dt)[idx]); if(a->ety==3)return uf_mki((int64_t)((uint8_t*)dt)[idx]); return uf_mki(((int64_t*)dt)[idx]); }
+static inline void uf_cvset(Cell h,int64_t idx,Cell v){ Hdr*a=(Hdr*)h.i; char*dt=uf_data(a); if(a->ety==1)((double*)dt)[idx]=uf_f(v); else if(a->ety==T_BOOL)((uint8_t*)dt)[idx]=(uint8_t)uf_truthy(v); else if(a->ety==3)((uint8_t*)dt)[idx]=(uint8_t)v.i; else ((int64_t*)dt)[idx]=v.i; }
 
 /* ---- string access: every core string is a tag-9 Str object; raw char*
    from IMPORTed C functions is still accepted (legacy ptr) ---- */
@@ -716,7 +716,7 @@ static void* uf_alloc(size_t sz,int align); /* forward decl for string coercion 
 static Cell uf_to_string(Cell c){
   char tmp[64];
   if(c.tag==T_FLOAT){ double d=uf_fbits(c.i); if(isnan(d)) return uf_str_new("NaN",3); snprintf(tmp,sizeof(tmp),"%.17g",d); return uf_str_new(tmp,strlen(tmp)); }
-  if(c.tag==T_BYTE || c.tag==T_BOOL){ return c.i?uf_str_new("true",4):uf_str_new("false",5); }
+  if(c.tag==T_BOOL){ return c.i?uf_str_new("true",4):uf_str_new("false",5); }
   if(c.tag==T_INT){ snprintf(tmp,sizeof(tmp),"%lld",(long long)c.i); return uf_str_new(tmp,strlen(tmp)); }
   if(c.tag==T_PTR && !c.i) return uf_str_new("null",4);
   if(c.tag==T_PTR && c.i){
@@ -739,9 +739,9 @@ static Cell uf_to_string(Cell c){
   snprintf(tmp,sizeof(tmp),"%lld",(long long)c.i); return uf_str_new(tmp,strlen(tmp));
 }
 
-/* arr element access honors the element type (ety): 0 int (8B), 1 float (8B), 3 byte (1B) */
-static inline Cell uf_cidx(Cell h,int64_t ix){ Hdr*a=(Hdr*)h.i; if(ix<0||(uint64_t)ix>=a->len)die("index out of bounds"); char*dt=uf_data(a); if(a->tag==HT_DYN)return ((Cell*)dt)[ix]; if(a->ety==3)return uf_mki((int64_t)((uint8_t*)dt)[ix]); if(a->ety==1)return uf_mkf(((double*)dt)[ix]); return uf_mki(((int64_t*)dt)[ix]); }
-static inline void uf_cseti(Cell h,int64_t ix,Cell v){ Hdr*a=(Hdr*)h.i; if(ix<0||(uint64_t)ix>=a->len)die("index out of bounds"); char*dt=uf_data(a); if(a->tag==HT_DYN){((Cell*)dt)[ix]=v;return;} if(a->ety==3){((uint8_t*)dt)[ix]=(uint8_t)v.i;return;} if(a->ety==1){((double*)dt)[ix]=uf_f(v);return;} ((int64_t*)dt)[ix]=v.i; }
+/* arr element access honors ety: 0 int (8B), 1 float (8B), 3 byte (1B), 21 bool (1B) */
+static inline Cell uf_cidx(Cell h,int64_t ix){ Hdr*a=(Hdr*)h.i; if(ix<0||(uint64_t)ix>=a->len)die("index out of bounds"); char*dt=uf_data(a); if(a->tag==HT_DYN)return ((Cell*)dt)[ix]; if(a->ety==T_BOOL)return uf_mkb(((uint8_t*)dt)[ix]); if(a->ety==3)return uf_mki((int64_t)((uint8_t*)dt)[ix]); if(a->ety==1)return uf_mkf(((double*)dt)[ix]); return uf_mki(((int64_t*)dt)[ix]); }
+static inline void uf_cseti(Cell h,int64_t ix,Cell v){ Hdr*a=(Hdr*)h.i; if(ix<0||(uint64_t)ix>=a->len)die("index out of bounds"); char*dt=uf_data(a); if(a->tag==HT_DYN){((Cell*)dt)[ix]=v;return;} if(a->ety==T_BOOL){((uint8_t*)dt)[ix]=(uint8_t)uf_truthy(v);return;} if(a->ety==3){((uint8_t*)dt)[ix]=(uint8_t)v.i;return;} if(a->ety==1){((double*)dt)[ix]=uf_f(v);return;} ((int64_t*)dt)[ix]=v.i; }
 static inline void pushi(Ctx*cx,int64_t v){ pushc(cx,uf_mki(v)); }
 static inline void pushf(Ctx*cx,double v){ pushc(cx,uf_mkf(v)); }
 static inline void pushp(Ctx*cx,void* v){ pushc(cx,uf_mkp(v)); }
@@ -805,14 +805,15 @@ static void op_bnot(Ctx*cx){ Cell a=pop(cx); if(a.tag==T_FLOAT||a.tag==T_PTR)die
 static void op_orelse(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_truthy(a)?a:b); }
 
 static void* uf_alloc(size_t sz,int align){ void*p=NULL; if(align>0){ if(posix_memalign(&p,(size_t)align,sz?sz:1))die("alloc failed"); } else { p=malloc(sz?sz:1); } if(!p)die("out of memory"); return p; }
-static void op_arrn(Ctx*cx,uint64_t tag,int align){ int64_t ty=pop(cx).i; Cell top=pop(cx); int64_t esz=(ty==3)?1:8; if(top.tag==T_PTR && top.i && uf_gc_find((void*)top.i) && ((Hdr*)(void*)top.i)->tag==HT_DYN){
+static void op_arrn(Ctx*cx,uint64_t tag,int align){ int64_t ty=pop(cx).i; Cell top=pop(cx); int64_t esz=(ty==3||ty==T_BOOL)?1:8; if(top.tag==T_PTR && top.i && uf_gc_find((void*)top.i) && ((Hdr*)(void*)top.i)->tag==HT_DYN){
     /* v13: `list type array` — copy the list's elements into a typed array */
     Dyn* d=(Dyn*)(void*)top.i; uint64_t len=d->len;
     UF_PROTECT((void**)(void*)&top.i);
     Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)len*(size_t)esz,align); h->tag=tag; h->len=len; h->esz=(uint64_t)esz; h->ety=(uint64_t)ty;
     for(uint64_t i=0;i<len;i++){
       Cell c=d->data[i];
-      if(ty==3) ((uint8_t*)h->data)[i]=(uint8_t)uf_i(c);
+      if(ty==T_BOOL) ((uint8_t*)h->data)[i]=(uint8_t)uf_truthy(c);
+      else if(ty==3) ((uint8_t*)h->data)[i]=(uint8_t)uf_i(c);
       else if(ty==1) ((double*)h->data)[i]=uf_f(c);
       else ((int64_t*)h->data)[i]=uf_i(c);
     }
@@ -843,13 +844,14 @@ static void op_tensor(Ctx*cx){
         if(sh->len==(uint64_t)(rows*cols)+2){
           /* [rows cols v0 v1 ...] type tensor — matrix from flat row-major data */
           Cell tyc=pop(cx); (void)pop(cx);
-          uint64_t ety=(uint64_t)tyc.i, eszb=(ety==3)?1:8;
+          uint64_t ety=(uint64_t)tyc.i, eszb=(ety==3||ety==T_BOOL)?1:8;
           UF_PROTECT((void**)(void*)&shp.i);
           Hdr*h=uf_mat_new((uint64_t)rows,(uint64_t)cols,ety); UF_PROTECT(&h);
           for(uint64_t i=0;i<(uint64_t)(rows*cols);i++){
             Cell c=d->data[i+2];
             char*dt=uf_data(h);
-            if(ety==3)((uint8_t*)dt)[i]=(uint8_t)uf_i(c);
+            if(ety==T_BOOL)((uint8_t*)dt)[i]=(uint8_t)uf_truthy(c);
+            else if(ety==3)((uint8_t*)dt)[i]=(uint8_t)uf_i(c);
             else if(ety==1)((double*)dt)[i]=uf_f(c);
             else ((int64_t*)dt)[i]=uf_i(c);
           }
@@ -866,7 +868,7 @@ static void op_clone(Ctx*cx){
   if(!a)die("CLONE: not a managed object");
   if(a->tag==HT_ITER)die("CLONE: iterators are single-use");
   if(a->tag!=HT_ARR&&a->tag!=HT_TENSOR&&a->tag!=HT_MAT)die("CLONE: only arr/tensor/matrix");
-  size_t nb=(a->tag==HT_MAT)?((size_t)a->len*((a->ety==3)?1:8)):(size_t)a->len*a->esz;
+  size_t nb=(a->tag==HT_MAT)?((size_t)a->len*((a->ety==3||a->ety==T_BOOL)?1:8)):(size_t)a->len*a->esz;
   size_t sz=sizeof(Hdr)+nb; UF_PROTECT((void**)(void*)&h.i);
   Hdr*n=(Hdr*)uf_gc_alloc(sz,a->tag==HT_TENSOR?64:0);
   memcpy(n,a,sz); n->gc_next=0; n->gc_flags=((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
@@ -878,6 +880,7 @@ static void op_clone(Ctx*cx){
    float (1): int/byte widen to double; float is identity; else dies.
    ptr (2): numeric payloads reinterpret as a handle; handles pass through.
    byte (3): truncate the i64 payload to its low 8 bits (byte cell).
+   bool (21): convert scalar truthiness into a boolean cell.
    >=1000: checked struct downcast (struct id); dies on mismatch. */
 static void op_cast(Ctx*cx){
   Cell id=pop(cx); Cell h=pop(cx); int64_t ty=id.i;
@@ -903,6 +906,7 @@ static void op_cast(Ctx*cx){
     case 3: {
       Cell b; b.tag=T_BYTE; b.i=h.i&0xff; pushc(cx,b); return;
     }
+    case 21: pushc(cx,uf_mkb(h.tag==T_PTR?h.i!=0:uf_truthy(h))); return;
     default: { char _b[96]; snprintf(_b,sizeof(_b),"CAST: unsupported type id %lld",(long long)ty); die(_b); }
   }
 }
@@ -913,6 +917,7 @@ static void op_cast(Ctx*cx){
    float (1): universal numeric coercion (NaN allowed).
    ptr (2): static reinterpret (no content inspection).
    byte (3): truncate the i64 payload to its low 8 bits.
+   bool (21): parse "true"/"false" strings or use value truthiness.
    str (9, the tag): universal string coercion (rendered representation).
    >=1000: checked struct downcast, exactly as _cast. */
 static void op_dcast(Ctx*cx){
@@ -930,6 +935,14 @@ static void op_dcast(Ctx*cx){
       else pushp(cx,(void*)v.i);
       return;
     case 3: { Cell b; b.tag=T_BYTE; b.i=v.i&0xff; pushc(cx,b); return; }
+    case 21:
+      if(uf_is_str(v)){
+        const char*s=uf_sptr(v);
+        if(!strcmp(s,"true")){ pushc(cx,uf_mkb(1)); return; }
+        if(!strcmp(s,"false")){ pushc(cx,uf_mkb(0)); return; }
+        die("cast bool: expected true or false string");
+      }
+      pushc(cx,uf_mkb(uf_truthy(v))); return;
     case 9: pushc(cx,uf_to_string(v)); return;
     default: { char _b[96]; snprintf(_b,sizeof(_b),"cast: unsupported type id %lld",(long long)ty); die(_b); }
   }
@@ -1083,6 +1096,7 @@ static void op_vget(Ctx*cx){
   if(idx<0||(uint64_t)idx>=a->len)die("VGET: index out of bounds");
   char*dt=uf_data(a);
   if(a->ety==1)pushf(cx,((double*)dt)[idx]);
+  else if(a->ety==T_BOOL)pushc(cx,uf_mkb(((uint8_t*)dt)[idx]));
   else if(a->ety==3)pushi(cx,(int64_t)((uint8_t*)dt)[idx]);
   else pushi(cx,((int64_t*)dt)[idx]);
 }
@@ -1093,6 +1107,7 @@ static void op_vset(Ctx*cx){
   if(idx<0||(uint64_t)idx>=a->len)die("VSET: index out of bounds");
   char*dt=uf_data(a);
   if(a->ety==1)((double*)dt)[idx]=uf_f(v);
+  else if(a->ety==T_BOOL)((uint8_t*)dt)[idx]=(uint8_t)uf_truthy(v);
   else if(a->ety==3)((uint8_t*)dt)[idx]=(uint8_t)v.i;
   else ((int64_t*)dt)[idx]=v.i;
 }
@@ -1213,7 +1228,7 @@ static void op_loadx(Ctx*cx){ Cell a=pop(cx); if(a.tag==T_PTR&&a.i){ Hdr*h=uf_gc
 static void op_storex(Ctx*cx){ Cell a=pop(cx); Cell v=pop(cx); *(int64_t*)((void*)a.i)=v.i; }
 static void op_malloc(Ctx*cx){ int64_t sz=pop(cx).i; if(sz<0)die("negative MALLOC size"); void*p=malloc((size_t)sz?sz:1); if(!p)die("out of memory"); pushp(cx,p); }
 static void op_free(Ctx*cx){ Cell p=pop(cx); free(((void*)p.i)); }
-static void op_sizeof(Ctx*cx){ int64_t ty=pop(cx).i; pushi(cx,ty==3?1:8); }
+static void op_sizeof(Ctx*cx){ int64_t ty=pop(cx).i; pushi(cx,(ty==3||ty==T_BOOL)?1:8); }
 
 /* ================= fmt / print / scan ================= */
 static int uf_count(const char*f){ int c=0; for(;f&&*f;f++){ if(*f=='%'){ if(f[1]=='%'){ f++; } else { const char*q=f+1; while(*q&&strchr("-+ #0",*q))q++; c++; if(*q=='*')c++; } } } return c; }
@@ -1261,7 +1276,7 @@ static void op_fmt(Ctx*cx){ Cell f=pop(cx); int n=uf_count(uf_sptr(f)); Cell arg
 /* PRINT: v -> (smart recursive printer; top-level strings raw) */
 static void uf_print_cell(Cell c,int nested){
   if(c.tag==T_FLOAT){ double d=uf_fbits(c.i); if(isnan(d))printf("NaN"); else printf("%.17g",d); return; }
-  if(c.tag==T_BYTE || c.tag==T_BOOL){ printf(c.i?"true":"false"); return; }
+  if(c.tag==T_BOOL){ printf(c.i?"true":"false"); return; }
   if(c.tag==T_INT){ printf("%lld",(long long)c.i); return; }
   if(c.tag==T_PTR && !c.i){ printf("null"); return; }
   if(c.tag==T_PTR && c.i){
@@ -2152,12 +2167,12 @@ static void op_every(Ctx*cx){
 }
 
 /* ================= vector ops + bitmap masks ================= */
-static double uf_el(Hdr*a,uint64_t i){ char*dt=uf_data(a); if(a->ety==1)return ((double*)dt)[i]; if(a->ety==3)return (double)((uint8_t*)dt)[i]; return (double)((int64_t*)dt)[i]; }
-static void uf_put_el(Hdr*a,uint64_t i,double d){ char*dt=uf_data(a); if(a->ety==1)((double*)dt)[i]=d; else if(a->ety==3)((uint8_t*)dt)[i]=(uint8_t)d; else ((int64_t*)dt)[i]=(int64_t)d; }
+static double uf_el(Hdr*a,uint64_t i){ char*dt=uf_data(a); if(a->ety==1)return ((double*)dt)[i]; if(a->ety==3||a->ety==T_BOOL)return (double)((uint8_t*)dt)[i]; return (double)((int64_t*)dt)[i]; }
+static void uf_put_el(Hdr*a,uint64_t i,double d){ char*dt=uf_data(a); if(a->ety==1)((double*)dt)[i]=d; else if(a->ety==T_BOOL)((uint8_t*)dt)[i]=(uint8_t)(d!=0.0&&!isnan(d)); else if(a->ety==3)((uint8_t*)dt)[i]=(uint8_t)d; else ((int64_t*)dt)[i]=(int64_t)d; }
 static Hdr* uf_gc_tensor_new(uint64_t n){ Hdr*r=(Hdr*)uf_gc_arr_block_t((size_t)n*8,HT_TENSOR); r->tag=HT_TENSOR; r->len=n; r->esz=8; r->ety=1; return r; }
 static Hdr* uf_arr_like(Hdr*a,uint64_t n){
   /* HT_MAT: esz is rows, not element bytes — derive byte size from ety */
-  uint64_t nb=(a->tag==HT_MAT)?(n*((a->ety==3)?1:8)):(n*a->esz);
+  uint64_t nb=(a->tag==HT_MAT)?(n*((a->ety==3||a->ety==T_BOOL)?1:8)):(n*a->esz);
   /* data is fully overwritten by every caller (elementwise ops, memcpy) — no zero-fill */
   Hdr*r=(Hdr*)uf_gc_arr_block_t(nb,a->tag); r->tag=a->tag; r->len=n; r->esz=a->esz; r->ety=a->ety; return r;
 }
@@ -2842,7 +2857,7 @@ static int uf_gpu_reduce(const double*d,uint64_t n,const char*kname,double*out){
 static int uf_numarr(Cell c){ if(c.tag!=T_PTR||!c.i)return 0; Hdr*h=uf_gc_find((void*)c.i); return h&&(h->tag==HT_ARR||h->tag==HT_TENSOR||h->tag==HT_MAT); }
 static Hdr* uf_mat_new(uint64_t rows,uint64_t cols,uint64_t ety){
   if(!rows||!cols)die("matrix: zero dimension");
-  uint64_t esz=(ety==3)?1:8;
+  uint64_t esz=(ety==3||ety==T_BOOL)?1:8;
   Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)rows*cols*esz,0);
   h->tag=HT_MAT; h->len=rows*cols; h->esz=rows; h->ety=ety;
   memset(h->data,0,(size_t)rows*cols*esz);
@@ -2911,6 +2926,7 @@ static Hdr* uf_vecmat(Hdr*v,Hdr*m){
 static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn){
   Hdr*ha=uf_numarr(a)?(Hdr*)(void*)a.i:0;
   Hdr*hb=uf_numarr(b)?(Hdr*)(void*)b.i:0;
+  if((ha&&ha->ety==T_BOOL)||(hb&&hb->ety==T_BOOL))die("arithmetic on bool arrays requires numeric elements");
   /* operands are popped from the ds before we allocate the result — keep them
      rooted or a GC triggered by the result allocation would sweep them */
   UF_PROTECT((void**)(void*)&a.i); UF_PROTECT((void**)(void*)&b.i);

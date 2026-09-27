@@ -7,11 +7,9 @@
 ; NOTE: task bodies bind every intermediate explicitly (`x!`) — unbound
 ; cross-line stack values do not survive task frames (v13).
 ; Run: nk --device cpu ... / uf ... (auto GPU); outputs must match.
-; KNOWN FLAKY: depends on binary layout — a compiler rebuild can flip it
-; between passing and a SIGSEGV inside uf_gc_alloc from a weave worker
-; (pre-existing at v13 HEAD, reproduced with unmodified sources; same
-; layout-sensitivity class as the t13 GC note). A crash here is not
-; necessarily a regression.
+; GC regression: run at the default 1 MB threshold while weave workers
+; allocate large tensors. Concurrent mark/sweep used to crash in uf_gc_alloc.
+; An explicit collection after the join checks that p remains rooted.
 2000000 n!
 has_args 'setn if
 0 n range lst!
@@ -80,6 +78,8 @@ weave
     ret pr
 run
 p!
+; Collect after the weave joins: its result is now rooted in p.
+gc
 "premium_sum: " print p sum "%.2f" format print
 "sample[0]: " print p 0 get "%.6f" format print
 "sample[N-1]: " print p n 1 sub get "%.6f" format print

@@ -386,7 +386,7 @@ below. Glyph assignments are 1:1 and final in `comp/src/lex.rs`.
 | 47 | 😉 | `malloc` | size → ptr | raw (untracked) |
 | 48 | 🚌 | `free` | ptr → | raw only — never on GC handles |
 | 49 | 🤘 | `_syscall` | args… num → ret | syscall by number |
-| 50 | 🌊 | `gc` | → | forces a full mark-sweep collection |
+| 50 | 🌊 | `gc` | → | requests a full mark-sweep collection (deferred while workers run) |
 | 51 | 😊 | `import` | (directive) | `import c"fn"(types)->ret` |
 | 52 | 🚍 | `export` | (directive) | `export "name"` before a label |
 | 53 | 🤙 | `extern` | → address | `extern "symbol"` — global C symbol via `__asm__` |
@@ -769,7 +769,7 @@ Explicit-file mode does no discovery and spawns no init threads.
 
 ## Garbage collection
 
-Precise, non-moving, stop-the-world mark-sweep. Handle stability (a handle is
+Precise, non-moving mark-sweep. Handle stability (a handle is
 never invalidated by a collection) keeps FFI, chan buffers, and weave task
 results trivially safe.
 
@@ -791,8 +791,13 @@ results trivially safe.
 - **Trigger**: bytes allocated since last collection exceeds threshold (default:
   max(1 MiB, 2× live bytes)), and explicit `gc` op (50). Adjustable via
   `NK_GC_THRESHOLD` env var or `--gc-threshold` runtime flag.
-- **Concurrency**: stop-the-world via global GC mutex; weave workers park at
-  allocation safepoints. Collections never start mid-weave join.
+- **Concurrency**: collection is deferred while a weave or detached runtime
+  worker is active. The collector cannot safely scan a worker's changing
+  stack and locals during execution. Allocations made during this interval
+  remain live, and the next allocation or explicit `gc` after workers finish
+  triggers collection if the threshold has been exceeded. Large or long-lived
+  concurrent workloads can temporarily retain substantially more memory.
+  Hash-set misses are synchronized against concurrent allocation/rehashing.
 - **Non-goals**: compaction, generations, incremental/concurrent marking.
 
 ## Concurrency — weave

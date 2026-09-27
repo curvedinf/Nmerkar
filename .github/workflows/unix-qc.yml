@@ -160,6 +160,7 @@ jobs:
             ln -s "/usr/bin/$C_COMPILER" /tmp/compat-bin/cc
             export PATH="/tmp/compat-bin:$PATH"
             NK_INSTALL_SOURCE_DIR=/work sh install.sh
+            export PATH="$HOME/.cargo/bin:$PATH"
             rustc --version | grep "rustc 1.70.0 "
             cc --version
             cargo test --manifest-path trans/Cargo.toml

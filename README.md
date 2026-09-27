@@ -118,18 +118,18 @@ A shopping list stores items in order:
 list groceries!                           ; Create an empty list called groceries.
 groceries "apples" append groceries!      ; Add apples to the list.
 groceries "bread" append groceries!       ; Add bread to the list.
+groceries "milk" append groceries!        ; Add milk to the list.
 groceries length print                    ; Print how many items to buy.
 groceries 0 get print                     ; Print the first item.
+groceries print                           ; Print the complete shopping list.
 ```
 
-A dictionary looks up a value by name:
+An order arrives as JSON and its fields determine the total price:
 
 ```nmerkar
-dict inventory!                           ; Create an empty dictionary called inventory.
-inventory "apples" 12 set                 ; Record 12 apples in stock.
-inventory "bread" 4 set                   ; Record 4 loaves of bread in stock.
-inventory "apples" get print              ; Print the number of apples in stock.
-inventory "bread" contains print          ; Print whether bread is in stock.
+"{\"item\":\"notebook\",\"quantity\":3,\"price\":5}" parse_json order! ; Parse JSON into a dictionary called order.
+order "item" get print                                          ; Print the purchased item.
+order "quantity" get order "price" get mul print                ; Multiply quantity by price and print the total.
 ```
 
 Use `nk` inline to efficiently process data with `bash`:

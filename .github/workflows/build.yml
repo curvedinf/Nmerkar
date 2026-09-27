@@ -170,10 +170,12 @@ jobs:
           - artifact: nmerkar-linux-arm64-musl
             runner: ubuntu-24.04-arm
             image: arm64v8/debian:bookworm
+            platform: linux/arm64
             qemu: false
           - artifact: nmerkar-linux-armv7
             runner: ubuntu-24.04
             image: arm32v7/debian:bookworm
+            platform: linux/arm/v7
             qemu: true
     steps:
       - uses: actions/checkout@v7
@@ -188,9 +190,10 @@ jobs:
       - name: Install in fresh container and run generated C
         env:
           IMAGE: ${{ matrix.image }}
+          PLATFORM: ${{ matrix.platform }}
           ARCHIVE: ${{ matrix.artifact }}.tar.gz
         run: |
-          docker run --rm -e ARCHIVE -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" sh -ec '
+          docker run --rm --platform "$PLATFORM" -e ARCHIVE -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" sh -ec '
             NK_INSTALL_ARCHIVE="/work/staging/$ARCHIVE" NK_INSTALL_DIR=/tmp/nmerkar/bin sh install.sh
             /tmp/nmerkar/bin/nk --device cpu '\''"cross architecture works" print'\''
           '

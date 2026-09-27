@@ -162,5 +162,6 @@ jobs:
             NK_INSTALL_SOURCE_DIR=/work sh install.sh
             rustc --version | grep "rustc 1.70.0 "
             cc --version
+            cargo test --manifest-path trans/Cargo.toml
             python3 qc/unix.py "$(command -v nk)" "$(command -v nks)" --quick
           '

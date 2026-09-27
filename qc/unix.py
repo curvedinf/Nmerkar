@@ -47,9 +47,9 @@ values 0 get 1 eq print
 values 0 get 2 add print
 2 _cast byte to_json print
 values unique to_json print
-"{\\"flag\\":true,\\"empty\\":null}" parse_json obj!
-obj "flag" get to_json print
-obj "empty" get to_json print
+"{\\"flag\\":true,\\"empty\\":null}" parse_json record!
+record "flag" get to_json print
+record "empty" get to_json print
 '''
     json_result = run(NK, "--device", "cpu", json_cases)
     assert json_result.stdout.splitlines() == [

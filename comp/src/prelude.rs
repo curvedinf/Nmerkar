@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 50170)
-Total output lines: 3908
-
 // ---------------- C prelude (v10) ----------------
 pub const PRELUDE: &str = r#"
 #include <stdint.h>
@@ -714,7 +711,2283 @@ static void op_nop(Ctx*cx){ (void)cx; }
 static int uf_numarr(Cell c);
 static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn);
 static void op_add(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_numarr(a)||uf_numarr(b))pushc(cx,uf_poly_arith(a,b,0,"add")); else pushc(cx,uf_cadd(a,b)); }
-static void op_sub(Ctx*cx){ Cell b=pop(cx),a=p…30170 tokens truncated…PR)); } \
+static void op_sub(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_numarr(a)||uf_numarr(b))pushc(cx,uf_poly_arith(a,b,1,"sub")); else pushc(cx,uf_csub(a,b)); }
+static void op_mul(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_numarr(a)||uf_numarr(b))pushc(cx,uf_poly_arith(a,b,2,"mul")); else pushc(cx,uf_cmul(a,b)); }
+static void op_and(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_cand(a,b)); }
+static void op_pow(Ctx*cx){ Cell b=pop(cx),a=pop(cx); double x=uf_to_number(a),y=uf_to_number(b); pushc(cx,uf_mkf(pow(x,y))); }
+static void op_sqrt(Ctx*cx){ Cell a=pop(cx);
+  UF_PROTECT((void**)(void*)&a.i);
+#ifdef NK_GPU
+  if(a.tag==T_PTR&&a.i){ Hdr*h=uf_gc_find((void*)a.i);
+    if(h&&uf_is_arrish(h)&&h->ety==1&&h->len>=(uint64_t)uf_gpu_min()){
+      struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)h->len;
+      Hdr*r=uf_arr_like(h,h->len); UF_PROTECT(&r);
+      int k=uf_spv_index("esqrt");
+      int ok=k>=0&&uf_vk_run(k,h->len,uf_data(h),(size_t)h->len*8,NULL,0,uf_data(r),(size_t)h->len*8,pc);
+      UF_UNPROTECT();
+      if(ok){ UF_UNPROTECT(); pushp(cx,r); return; }
+    } }
+#endif
+  if(uf_numarr(a)){ Hdr*h=(Hdr*)(void*)a.i; uint64_t n=h->len; Hdr*r=uf_arr_like(h,n); UF_PROTECT(&r);
+    if(h->ety==1){ const double*A=(const double*)uf_data(h); double*R=(double*)uf_data(r); for(uint64_t i=0;i<n;i++)R[i]=sqrt(A[i]); }
+    else for(uint64_t i=0;i<n;i++) uf_put_el(r,i,sqrt(uf_el(h,i)));
+    UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); return; }
+  UF_UNPROTECT(); pushc(cx,uf_mkf(sqrt(uf_to_number(a)))); }
+static void op_lte(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_clte(a,b)); }
+static void op_gte(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_cgte(a,b)); }
+static void op_drop(Ctx*cx){ (void)pop(cx); }
+static void op_shutdown(Ctx*cx){ (void)cx; if(uf_active_job) atomic_store(&((WeaveJob*)uf_active_job)->shutdown,1); }
+static void op_shr(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_cshr(a,b)); }
+static void op_inc(Ctx*cx){ pushc(cx,uf_cinc(pop(cx))); }
+static void op_dec(Ctx*cx){ pushc(cx,uf_cdec(pop(cx))); }
+
+/* v10 arithmetic & logic */
+static void op_div(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_numarr(a)||uf_numarr(b))pushc(cx,uf_poly_arith(a,b,3,"div")); else pushc(cx,uf_cdiv(a,b)); }
+static void op_rem(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_crem(a,b)); }
+static void op_eq(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushi(cx,uf_loose_eq(a,b)?1:0); }
+static void op_seq(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushi(cx,uf_strict_eq(a,b)?1:0); }
+static void op_sne(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushi(cx,uf_strict_eq(a,b)?0:1); }
+static int uf_cmp(Cell a,Cell b,int* ok){ /* -1/0/1; *ok=0 if incomparable (legacy sort order) */
+  *ok=1;
+  if((a.tag==T_INT||a.tag==T_FLOAT||a.tag==T_TIME||a.tag==T_DUR)&&(b.tag==T_INT||b.tag==T_FLOAT||b.tag==T_TIME||b.tag==T_DUR)){
+    double x=uf_f(a),y=uf_f(b); return x<y?-1:x>y?1:0;
+  }
+  if(uf_is_str(a)&&uf_is_str(b)) return strcmp(uf_sptr(a),uf_sptr(b));
+  *ok=0; return 0;
+}
+static void op_lt(Ctx*cx){ Cell b=pop(cx),a=pop(cx); double x=uf_to_number(a),y=uf_to_number(b); pushi(cx,(isnan(x)||isnan(y))?0:(x<y?1:0)); }
+static void op_gt(Ctx*cx){ Cell b=pop(cx),a=pop(cx); double x=uf_to_number(a),y=uf_to_number(b); pushi(cx,(isnan(x)||isnan(y))?0:(x>y?1:0)); }
+static void op_not(Ctx*cx){ Cell a=pop(cx); pushi(cx,uf_truthy(a)?0:1); }
+static void op_or(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(a.tag==T_FLOAT||b.tag==T_FLOAT||a.tag==T_PTR||b.tag==T_PTR)die("OR: ints only"); pushi(cx,a.i|b.i); }
+static void op_xor(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(a.tag==T_FLOAT||b.tag==T_FLOAT||a.tag==T_PTR||b.tag==T_PTR)die("XOR: ints only"); pushi(cx,a.i^b.i); }
+static void op_shl(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(a.tag==T_FLOAT||b.tag==T_FLOAT||a.tag==T_PTR||b.tag==T_PTR)die("SHL: ints only"); if(b.i<0||b.i>=64)die("SHL: shift out of range"); pushi(cx,a.i<<b.i); }
+static void op_bnot(Ctx*cx){ Cell a=pop(cx); if(a.tag==T_FLOAT||a.tag==T_PTR)die("BNOT: ints only"); pushi(cx,~a.i); }
+static void op_orelse(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_truthy(a)?a:b); }
+
+static void* uf_alloc(size_t sz,int align){ void*p=NULL; if(align>0){ if(posix_memalign(&p,(size_t)align,sz?sz:1))die("alloc failed"); } else { p=malloc(sz?sz:1); } if(!p)die("out of memory"); return p; }
+static void op_arrn(Ctx*cx,uint64_t tag,int align){ int64_t ty=pop(cx).i; Cell top=pop(cx); int64_t esz=(ty==3)?1:8; if(top.tag==T_PTR && top.i && uf_gc_find((void*)top.i) && ((Hdr*)(void*)top.i)->tag==HT_DYN){
+    /* v13: `list type array` — copy the list's elements into a typed array */
+    Dyn* d=(Dyn*)(void*)top.i; uint64_t len=d->len;
+    UF_PROTECT((void**)(void*)&top.i);
+    Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)len*(size_t)esz,align); h->tag=tag; h->len=len; h->esz=(uint64_t)esz; h->ety=(uint64_t)ty;
+    for(uint64_t i=0;i<len;i++){
+      Cell c=d->data[i];
+      if(ty==3) ((uint8_t*)h->data)[i]=(uint8_t)uf_i(c);
+      else if(ty==1) ((double*)h->data)[i]=uf_f(c);
+      else ((int64_t*)h->data)[i]=uf_i(c);
+    }
+    UF_UNPROTECT(); pushp(cx,h); return;
+  }
+  int64_t len=top.i; if(len<0)die("negative length"); Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)len*(size_t)esz,align); h->tag=tag; h->len=(uint64_t)len; h->esz=(uint64_t)esz; h->ety=(uint64_t)ty; memset(h->data,0,(size_t)len*(size_t)esz); pushp(cx,h); }
+static void op_arr(Ctx*cx){ op_arrn(cx,HT_ARR,0); }
+static Hdr* uf_mat_new(uint64_t rows,uint64_t cols,uint64_t ety);
+static void op_tensor(Ctx*cx){
+  /* v13.1 2-D form: [rows cols] type tensor -> matrix (HT_MAT; len=rows*cols,
+     esz=rows, cols=len/rows). 1-D form is unchanged. */
+  if(cx->sp>=2){
+    Cell shp=cx->ds[cx->sp-2];
+    if(shp.tag==T_PTR&&shp.i){
+      Hdr*sh=uf_gc_find((void*)shp.i);
+      if(sh&&sh->tag==HT_DYN&&sh->len==2){
+        Cell tyc=pop(cx); (void)pop(cx);
+        Dyn*d=(Dyn*)(void*)shp.i;
+        int64_t rows=uf_i(d->data[0]),cols=uf_i(d->data[1]);
+        if(rows<0||cols<0)die("tensor: negative shape");
+        pushp(cx,uf_mat_new((uint64_t)rows,(uint64_t)cols,(uint64_t)tyc.i));
+        return;
+      }
+      if(sh&&sh->tag==HT_DYN&&sh->len>=3){
+        Dyn*d=(Dyn*)(void*)shp.i;
+        int64_t rows=uf_i(d->data[0]),cols=uf_i(d->data[1]);
+        if(rows<0||cols<0)die("tensor: negative shape");
+        if(sh->len==(uint64_t)(rows*cols)+2){
+          /* [rows cols v0 v1 ...] type tensor — matrix from flat row-major data */
+          Cell tyc=pop(cx); (void)pop(cx);
+          uint64_t ety=(uint64_t)tyc.i, eszb=(ety==3)?1:8;
+          UF_PROTECT((void**)(void*)&shp.i);
+          Hdr*h=uf_mat_new((uint64_t)rows,(uint64_t)cols,ety); UF_PROTECT(&h);
+          for(uint64_t i=0;i<(uint64_t)(rows*cols);i++){
+            Cell c=d->data[i+2];
+            char*dt=uf_data(h);
+            if(ety==3)((uint8_t*)dt)[i]=(uint8_t)uf_i(c);
+            else if(ety==1)((double*)dt)[i]=uf_f(c);
+            else ((int64_t*)dt)[i]=uf_i(c);
+          }
+          (void)eszb;
+          UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,h); return;
+        }
+      }
+    }
+  }
+  op_arrn(cx,HT_TENSOR,64);
+}
+static void op_clone(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=(Hdr*)uf_gc_find((void*)h.i);
+  if(!a)die("CLONE: not a managed object");
+  if(a->tag==HT_ITER)die("CLONE: iterators are single-use");
+  if(a->tag!=HT_ARR&&a->tag!=HT_TENSOR&&a->tag!=HT_MAT)die("CLONE: only arr/tensor/matrix");
+  size_t nb=(a->tag==HT_MAT)?((size_t)a->len*((a->ety==3)?1:8)):(size_t)a->len*a->esz;
+  size_t sz=sizeof(Hdr)+nb; UF_PROTECT((void**)(void*)&h.i);
+  Hdr*n=(Hdr*)uf_gc_alloc(sz,a->tag==HT_TENSOR?64:0);
+  memcpy(n,a,sz); n->gc_next=0; n->gc_flags=((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
+  UF_UNPROTECT(); pushp(cx,n);
+}
+/* CAST (_cast, static): C-style conversion, no value-content interpretation.
+   [v type] -> v'.
+   int (0): float truncates to i64, ptr reinterprets its address, byte widens.
+   float (1): int/byte widen to double; float is identity; else dies.
+   ptr (2): numeric payloads reinterpret as a handle; handles pass through.
+   byte (3): truncate the i64 payload to its low 8 bits (byte cell).
+   >=1000: checked struct downcast (struct id); dies on mismatch. */
+static void op_cast(Ctx*cx){
+  Cell id=pop(cx); Cell h=pop(cx); int64_t ty=id.i;
+  if(ty>=1000){
+    if(!h.i) die("CAST: null handle");
+    Hdr*a=(Hdr*)((void*)h.i); int64_t tk=(a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag;
+    if(tk!=ty)die("CAST: type mismatch"); pushc(cx,h); return;
+  }
+  switch(ty){
+    case 0:
+      if(h.tag==T_FLOAT) pushi(cx,(int64_t)uf_fbits(h.i));
+      else pushi(cx,h.i);
+      return;
+    case 1:
+      if(h.tag==T_FLOAT) pushc(cx,h);
+      else if(h.tag==T_INT||h.tag==T_BYTE) pushf(cx,(double)h.i);
+      else die("CAST float: not a scalar");
+      return;
+    case 2:
+      if(h.tag==T_PTR) pushc(cx,h);
+      else pushp(cx,(void*)h.i);
+      return;
+    case 3: {
+      Cell b; b.tag=T_BYTE; b.i=h.i&0xff; pushc(cx,b); return;
+    }
+    default: { char _b[96]; snprintf(_b,sizeof(_b),"CAST: unsupported type id %lld",(long long)ty); die(_b); }
+  }
+}
+/* DCAST (cast, dynamic): content-aware conversion — the explicit form of
+   universal coercion. [v type] -> v'.
+   int (0): universal numeric coercion (strings parsed, single-element lists
+   unwrapped), then integer truncation; NaN dies.
+   float (1): universal numeric coercion (NaN allowed).
+   ptr (2): static reinterpret (no content inspection).
+   byte (3): truncate the i64 payload to its low 8 bits.
+   str (9, the tag): universal string coercion (rendered representation).
+   >=1000: checked struct downcast, exactly as _cast. */
+static void op_dcast(Ctx*cx){
+  Cell id=pop(cx); Cell v=pop(cx); int64_t ty=id.i;
+  if(ty>=1000){
+    if(!v.i) die("cast: null handle");
+    Hdr*a=(Hdr*)((void*)v.i); int64_t tk=(a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag;
+    if(tk!=ty)die("cast: type mismatch"); pushc(cx,v); return;
+  }
+  switch(ty){
+    case 0: { double d=uf_to_number(v); if(isnan(d))die("cast int: value has no numeric form"); pushi(cx,(int64_t)d); return; }
+    case 1: pushf(cx,uf_to_number(v)); return;
+    case 2:
+      if(v.tag==T_PTR) pushc(cx,v);
+      else pushp(cx,(void*)v.i);
+      return;
+    case 3: { Cell b; b.tag=T_BYTE; b.i=v.i&0xff; pushc(cx,b); return; }
+    case 9: pushc(cx,uf_to_string(v)); return;
+    default: { char _b[96]; snprintf(_b,sizeof(_b),"cast: unsupported type id %lld",(long long)ty); die(_b); }
+  }
+}
+
+/* OBJ: size in low 32 bits of the operand, struct id above; esz = byte size,
+   len = struct id. Field access via the container protocol. */
+static void op_obj(Ctx*cx){ int64_t v=pop(cx).i; int64_t sz=v&0xffffffffLL; int64_t sid=v>>32; if(sz<=0)sz=8; Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)sz,0); h->tag=HT_OBJ; h->len=(uint64_t)sid; h->esz=(uint64_t)sz; memset(h->data,0,(size_t)sz); pushp(cx,h); }
+
+/* reflection tables, populated by generated uf_init_reflection() */
+static long uf_st_n=0; static const int64_t* uf_st_sids=0; static const int64_t* uf_st_nf=0; static const char*** uf_st_fields=0; static const int64_t** uf_st_offs=0;
+/* obj field offset by key: int -> raw offset; str -> field name. -1 = missing */
+static int64_t uf_obj_off(Hdr* a, Cell k){
+  if(k.tag==T_INT) return k.i;
+  if(uf_is_str(k)){
+    int64_t sid=(int64_t)a->len;
+    for(long q=0;q<uf_st_n;q++) if(uf_st_sids[q]==sid){
+      for(int64_t f=0;f<uf_st_nf[q];f++) if(strcmp(uf_sptr(k),uf_st_fields[q][f])==0) return uf_st_offs[q][f];
+      return -1;
+    }
+  }
+  return -1;
+}
+
+/* ================= uniform container protocol ================= */
+static uint64_t uf_fnv(const void*p,size_t n){ const unsigned char*s=(const unsigned char*)p; uint64_t h=1469598103934665603ULL; for(size_t i=0;i<n;i++){ h^=s[i]; h*=1099511628211ULL; } return h; }
+static uint64_t map_hash(Cell k){
+  if(k.tag==T_INT) return (uint64_t)k.i; /* identity — dense 0..n-1 keys (bfs) */
+  if(k.tag==T_PTR&&k.i){ Hdr*h=uf_gc_find((void*)k.i); if(h){ if(h->tag==HT_STR)return uf_fnv(uf_sbytes((Str*)h),h->len); return uf_fnv(&k.i,8); } return uf_fnv((void*)k.i,strlen((char*)k.i)); }
+  return uf_fnv(&k.i,8);
+}
+static int map_keyeq(Cell a,Cell b){
+  if(a.tag==T_INT&&b.tag==T_INT) return a.i==b.i;
+  if(a.tag==T_PTR&&b.tag==T_PTR&&a.i&&b.i){
+    Hdr*ha=uf_gc_find((void*)a.i); Hdr*hb=uf_gc_find((void*)b.i);
+    if(ha&&hb){ if(ha->tag==HT_STR&&hb->tag==HT_STR){ if(ha->len!=hb->len)return 0; return memcmp(uf_sbytes((Str*)ha),uf_sbytes((Str*)hb),ha->len)==0; } return a.i==b.i; }
+    if((ha&&ha->tag==HT_STR)||(hb&&hb->tag==HT_STR)) return strcmp(uf_sptr(a),uf_sptr(b))==0;
+    return strcmp((char*)a.i,(char*)b.i)==0;
+  }
+  return a.i==b.i;
+}
+static void map_put_raw(Map*m,Cell k,Cell v){
+  uint64_t i=map_hash(k)%m->cap;
+  for(;;){ if(m->st[i]!=1){ m->st[i]=1; m->keys[i]=k; m->vals[i]=v; m->len++; return; } if(map_keyeq(m->keys[i],k)){ m->vals[i]=v; return; } i=(i+1)%m->cap; }
+}
+static void map_grow(Map*m){
+  uint64_t ncap=m->cap*4; Cell*ok=m->keys,*ov=m->vals; unsigned char*os=m->st; uint64_t ocap=m->cap;
+  m->cap=ncap; m->keys=(Cell*)uf_alloc(ncap*sizeof(Cell),0); m->vals=(Cell*)uf_alloc(ncap*sizeof(Cell),0); m->st=(unsigned char*)calloc(ncap,1); m->len=0;
+  for(uint64_t i=0;i<ocap;i++) if(os[i]==1) map_put_raw(m,ok[i],ov[i]);
+  free(ok); free(ov); free(os);
+}
+static Map* uf_map_new(void){ Map*m=(Map*)uf_gc_alloc(sizeof(Map),0); m->tag=HT_MAP; m->len=0; m->cap=64; m->keys=(Cell*)uf_alloc(64*sizeof(Cell),0); m->vals=(Cell*)uf_alloc(64*sizeof(Cell),0); m->st=(unsigned char*)calloc(64,1); return m; }
+static void map_put(Map*m,Cell k,Cell v){ if((m->len+1)*10>=m->cap*7) map_grow(m); map_put_raw(m,k,v); }
+static inline int map_get(Map*m,Cell k,Cell*out){
+  if(m->cap==0)return 0;
+  uint64_t i=map_hash(k)%m->cap;
+  for(;;){ if(m->st[i]==0)return 0; if(m->st[i]==1&&map_keyeq(m->keys[i],k)){ *out=m->vals[i]; return 1; } i=(i+1)%m->cap; }
+}
+static void map_del(Map*m,Cell k){
+  if(m->cap==0)return;
+  uint64_t i=map_hash(k)%m->cap;
+  for(;;){ if(m->st[i]==0)return; if(m->st[i]==1&&map_keyeq(m->keys[i],k)){ m->st[i]=2; m->len--; return; } i=(i+1)%m->cap; }
+}
+static Dyn* uf_dyn_new(uint64_t cap){ if(!cap)cap=1; Dyn*d=(Dyn*)uf_gc_alloc(sizeof(Dyn)+cap*sizeof(Cell),0); d->tag=HT_DYN; d->len=0; d->esz=sizeof(Cell); d->cap=cap; return d; }
+/* grow-with-move: returns the (possibly new) list; old handle is reclaimed by GC */
+static Dyn* uf_dyn_push2(Dyn*d,Cell c){ if(d->len>=d->cap){ Dyn*n=uf_dyn_new(d->cap*2); memcpy(n->data,d->data,d->len*sizeof(Cell)); n->len=d->len; d=n; } d->data[d->len++]=c; return d; }
+static void uf_dyn_push(Dyn**pd,Cell c){ *pd=uf_dyn_push2(*pd,c); }
+static void uf_dyn_push_str(Dyn**pd,const char*s,size_t n){ Cell c=uf_str_new(s,n); uf_dyn_push(pd,c); }
+
+static Hdr* uf_handle(Cell h,const char* op){
+  if(h.tag!=T_PTR||!h.i)die("handle is null");
+  /* Non-moving GC: the object's tag is the type. uf_gc_find was a
+     use-after-free check that dominated dict/list GET in bfs (~1M map
+     probes + ~2.5M list indexes). A stale pointer now dies on a bad
+     tag instead of a set lookup. */
+  Hdr*a=(Hdr*)(void*)h.i;
+  switch(a->tag){
+    case HT_ARR: case HT_TENSOR: case HT_DYN: case HT_MAP: case HT_STR:
+    case HT_RING: case HT_ATOM: case HT_BUF: case HT_OBJ: case HT_BITMAP:
+    case HT_BLOOM: case HT_ITER: case HT_SET: case HT_MAT:
+      (void)op; return a;
+    default: die("not a managed handle");
+  }
+}
+/* GET: h k -> v */
+static inline void op_get(Ctx*cx){
+  Cell k=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"GET");
+  switch(a->tag){
+    case HT_MAP: { Map*m=(Map*)a; Cell v; if(!map_get(m,k,&v))die("GET: missing key"); pushc(cx,v); return; }
+    case HT_DYN: {
+      Dyn*d=(Dyn*)a;
+      if(k.i<0||(uint64_t)k.i>=d->len)die("GET: index out of bounds");
+      pushc(cx,d->data[k.i]); return;
+    }
+    case HT_ARR: case HT_TENSOR: case HT_MAT: pushc(cx,uf_cidx(h,k.i)); return;
+    case HT_STR: { Str*s=(Str*)a; if(k.i<0||k.i>=(int64_t)s->len)die("GET: index out of bounds"); pushi(cx,(uint8_t)uf_sbytes(s)[k.i]); return; }
+    case HT_OBJ: { int64_t o=uf_obj_off(a,k); if(o<0||(uint64_t)o>=a->esz)die("GET: no such field"); pushc(cx,*(Cell*)(a->data+o)); return; }
+    default: die("GET: unsupported handle");
+  }
+}
+/* v13 container literals: consume n cells from the ds and build a list/dict.
+   The cells are popped after the Dyn/Map allocation, so they stay rooted on
+   the ds for the whole build (no GC hazard). */
+static Cell uf_list_build(Ctx*cx, int64_t n){
+  if(n<0)die("negative list literal length");
+  Dyn* d=uf_dyn_new(n?(uint64_t)n:1); UF_PROTECT(&d);
+  for(int64_t i=n-1;i>=0;i--) d->data[i]=pop(cx);
+  d->len=(uint64_t)n; UF_UNPROTECT(); return uf_mkp(d);
+}
+static Cell uf_dict_build(Ctx*cx, int64_t n){
+  if(n<0||(n&1))die("dict literal: element count must be even");
+  Dyn* pairs=uf_dyn_new(n?n:2); UF_PROTECT(&pairs);
+  for(int64_t i=n-1;i>=0;i--) pairs->data[i]=pop(cx);
+  pairs->len=(uint64_t)n;
+  Map* m=uf_map_new(); UF_PROTECT(&m);
+  for(int64_t i=0;i<n;i+=2) map_put(m,pairs->data[i],pairs->data[i+1]);
+  UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(m);
+}
+/* GETQ: h k -> v_or_0 (never dies on absence; null handle -> 0) */
+static inline void op_getq(Ctx*cx){
+  Cell k=pop(cx),h=pop(cx);
+  if(h.tag!=T_PTR||!h.i){ pushi(cx,0); return; }
+  Hdr*a=uf_gc_find((void*)h.i); if(!a)die("GETQ: not a managed handle");
+  switch(a->tag){
+    case HT_MAP: { Map*m=(Map*)a; Cell v; if(map_get(m,k,&v))pushc(cx,v); else pushi(cx,0); return; }
+    case HT_DYN: case HT_ARR: case HT_TENSOR: case HT_MAT: if(k.i<0||(uint64_t)k.i>=a->len)pushi(cx,0); else pushc(cx,uf_cidx(h,k.i)); return;
+    case HT_STR: { Str*s=(Str*)a; if(k.i<0||k.i>=(int64_t)s->len)pushi(cx,0); else pushi(cx,(uint8_t)uf_sbytes(s)[k.i]); return; }
+    case HT_OBJ: { int64_t o=uf_obj_off(a,k); if(o<0||(uint64_t)o>=a->esz)pushi(cx,0); else pushc(cx,*(Cell*)(a->data+o)); return; }
+    default: die("GETQ: unsupported handle");
+  }
+}
+/* SET: h k v -> v (v12 pass-through) */
+static inline void op_set(Ctx*cx){
+  Cell v=pop(cx),k=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"SET");
+  switch(a->tag){
+    case HT_MAP: map_put((Map*)a,k,v); break;
+    case HT_DYN: case HT_ARR: case HT_TENSOR: case HT_MAT: uf_cseti(h,k.i,v); break;
+    case HT_STR: { Str*s=(Str*)a; if(s->mlen)die("SET: mmap string is read-only"); if(k.i<0||k.i>=(int64_t)s->len)die("SET: index out of bounds"); s->data[k.i]=(char)v.i; break; }
+    case HT_OBJ: { int64_t o=uf_obj_off(a,k); if(o<0||(uint64_t)o>=a->esz)die("SET: no such field"); *(Cell*)(a->data+o)=v; break; }
+    default: die("SET: unsupported handle");
+  }
+  pushc(cx,v);
+}
+/* VGET: handle idx -> value (direct typed array read, no handle validation)
+   Bypasses uf_handle/uf_gc_find/tag-switch. Assumes caller knows the handle
+   is a valid arr/tensor. Uses the element type (ety) to do the right read. */
+static void op_vget(Ctx*cx){
+  int64_t idx=pop(cx).i; Cell h=pop(cx);
+  Hdr*a=(Hdr*)h.i;
+  if(idx<0||(uint64_t)idx>=a->len)die("VGET: index out of bounds");
+  char*dt=uf_data(a);
+  if(a->ety==1)pushf(cx,((double*)dt)[idx]);
+  else if(a->ety==3)pushi(cx,(int64_t)((uint8_t*)dt)[idx]);
+  else pushi(cx,((int64_t*)dt)[idx]);
+}
+/* VSET: handle idx value -> (direct typed array write, no handle validation) */
+static void op_vset(Ctx*cx){
+  Cell v=pop(cx); int64_t idx=pop(cx).i; Cell h=pop(cx);
+  Hdr*a=(Hdr*)h.i;
+  if(idx<0||(uint64_t)idx>=a->len)die("VSET: index out of bounds");
+  char*dt=uf_data(a);
+  if(a->ety==1)((double*)dt)[idx]=uf_f(v);
+  else if(a->ety==3)((uint8_t*)dt)[idx]=(uint8_t)v.i;
+  else ((int64_t*)dt)[idx]=v.i;
+}
+/* DEL: h k -> (dict only) */
+static void op_del(Ctx*cx){
+  Cell k=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"DEL");
+  if(a->tag!=HT_MAP)die("DEL: only dict supports del");
+  map_del((Map*)a,k);
+}
+/* HAS: h k -> 0/1 (null handle -> 0) */
+static void op_has(Ctx*cx){
+  Cell k=pop(cx),h=pop(cx);
+  if(h.tag!=T_PTR||!h.i){ pushi(cx,0); return; }
+  Hdr*a=uf_gc_find((void*)h.i); if(!a)die("HAS: not a managed handle");
+  switch(a->tag){
+    case HT_MAP: { Cell v; pushi(cx,map_get((Map*)a,k,&v)?1:0); return; }
+    case HT_DYN: case HT_ARR: case HT_TENSOR: case HT_MAT: pushi(cx,(k.i>=0&&(uint64_t)k.i<a->len)?1:0); return;
+    case HT_STR: { const char* s=uf_sptr(h); const char* n=uf_sptr(k); pushi(cx,(*n==0||strstr(s,n))?1:0); return; }
+    case HT_OBJ: { int64_t o=uf_obj_off(a,k); pushi(cx,(o>=0&&(uint64_t)o<a->esz)?1:0); return; }
+    default: die("HAS: unsupported handle");
+  }
+}
+/* KEYS: h -> list (dict keys / obj field names) */
+static void op_keys(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"KEYS");
+  if(a->tag==HT_MAP){
+    Map*m=(Map*)a; Dyn*d=uf_dyn_new(m->len?m->len:1); UF_PROTECT(&d);
+    for(uint64_t i=0;i<m->cap;i++) if(m->st[i]==1) uf_dyn_push(&d,m->keys[i]);
+    UF_UNPROTECT(); pushp(cx,d); return;
+  }
+  if(a->tag==HT_OBJ){
+    int64_t sid=(int64_t)a->len; Dyn*d=0;
+    for(long q=0;q<uf_st_n;q++) if(uf_st_sids[q]==sid){
+      d=uf_dyn_new((uint64_t)uf_st_nf[q]); UF_PROTECT(&d);
+      for(int64_t f=0;f<uf_st_nf[q];f++){ Cell c=uf_str_new(uf_st_fields[q][f],strlen(uf_st_fields[q][f])); uf_dyn_push(&d,c); }
+      UF_UNPROTECT(); pushp(cx,d); return;
+    }
+    die("KEYS: unknown struct id");
+  }
+  die("KEYS: unsupported handle");
+}
+/* TYPEOF: h -> tag (v10 numbering) */
+static void op_typeof(Ctx*cx){
+  Cell h=pop(cx);
+  if(h.tag==T_PTR){ if(!h.i){pushi(cx,2);return;} Hdr*a=uf_gc_find((void*)h.i); pushi(cx,a?(int64_t)a->tag:2); return; }
+  pushi(cx,(int64_t)h.tag);
+}
+/* LEN: h -> n */
+static void op_len(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"LEN");
+  switch(a->tag){
+    case HT_ARR: case HT_TENSOR: case HT_MAT: case HT_DYN: case HT_MAP: case HT_RING: pushi(cx,(int64_t)a->len); return;
+    case HT_STR: pushi(cx,(int64_t)a->len); return;
+    case HT_BITMAP: pushi(cx,(int64_t)a->len); return;
+    case HT_ATOM: pushi(cx,1); return;
+    case HT_BLOOM: pushi(cx,(int64_t)a->len); return;
+    default: die("LEN: handle has no length");
+  }
+}
+/* CAT: a b -> h' (str concat / arr concat / list concat) */
+static void op_cat(Ctx*cx){
+  Cell b=pop(cx),a=pop(cx);
+  Hdr*ha=a.tag==T_PTR&&a.i?uf_gc_find((void*)a.i):0;
+  Hdr*hb=b.tag==T_PTR&&b.i?uf_gc_find((void*)b.i):0;
+  uint64_t ta=ha?ha->tag:0, tb=hb?hb->tag:0;
+  UF_PROTECT((void**)(void*)&a.i); UF_PROTECT((void**)(void*)&b.i);
+  if(ta==HT_DYN||tb==HT_DYN){
+    if(ta!=HT_DYN||tb!=HT_DYN)die("CAT: list/str mismatch");
+    Dyn*x=(Dyn*)ha,*y=(Dyn*)hb; Dyn*r=uf_dyn_new(x->len+y->len); UF_PROTECT(&r);
+    for(uint64_t i=0;i<x->len;i++)uf_dyn_push(&r,x->data[i]);
+    for(uint64_t i=0;i<y->len;i++)uf_dyn_push(&r,y->data[i]);
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); return;
+  }
+  if((ta==HT_ARR||ta==HT_TENSOR)||(tb==HT_ARR||tb==HT_TENSOR)){
+    if((ta!=HT_ARR&&ta!=HT_TENSOR)||(tb!=HT_ARR&&tb!=HT_TENSOR))die("CAT: arr/str mismatch");
+    if(ha->ety!=hb->ety)die("CAT: arr element-type mismatch");
+    uint64_t n=ha->len+hb->len; Hdr*r=(Hdr*)uf_gc_alloc(sizeof(Hdr)+n*ha->esz,0);
+    UF_PROTECT(&r);
+    r->tag=HT_ARR; r->len=n; r->esz=ha->esz; r->ety=ha->ety;
+    memcpy(r->data,ha->data,ha->len*ha->esz); memcpy(r->data+ha->len*ha->esz,hb->data,hb->len*hb->esz);
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); return;
+  }
+  { const char* x=uf_sptr(a),*y=uf_sptr(b); size_t la=strlen(x),lb=strlen(y);
+    Str* r=(Str*)uf_gc_alloc(sizeof(Str)+la+lb+1,0); r->tag=HT_STR; r->esz=1; r->len=la+lb; r->mlen=0;
+    memcpy(r->data,x,la); memcpy(r->data+la,y,lb+1); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); }
+}
+/* SLICE: seq a b -> seq' (tag-dispatched; Python slice semantics) */
+static void op_slice(Ctx*cx){
+  Cell b=pop(cx),a=pop(cx),st=pop(cx);
+  Hdr*h=st.tag==T_PTR&&st.i?uf_gc_find((void*)st.i):0;
+  UF_PROTECT((void**)(void*)&st.i);
+  if(!h){ /* legacy raw char* */
+    const char* S=(const char*)st.i; int64_t n=(int64_t)strlen(S);
+    int64_t i=a.i,j=b.i; if(i<0)i+=n; if(j<0)j+=n; if(i<0)i=0; if(j<0)j=0; if(i>n)i=n; if(j>n)j=n; if(j<i)j=i;
+    UF_UNPROTECT(); pushc(cx,uf_str_new(S+i,(size_t)(j-i))); return;
+  }
+  int64_t n=(int64_t)h->len;
+  int64_t i=a.i,j=b.i; if(i<0)i+=n; if(j<0)j+=n; if(i<0)i=0; if(j<0)j=0; if(i>n)i=n; if(j>n)j=n; if(j<i)j=i;
+  if(h->tag==HT_STR){ Str*s=(Str*)h; UF_UNPROTECT(); pushc(cx,uf_str_new(uf_sbytes(s)+i,(size_t)(j-i))); return; }
+  if(h->tag==HT_BUF){ UF_UNPROTECT(); pushc(cx,uf_str_new(h->data+i,(size_t)(j-i))); return; }
+  if(h->tag==HT_DYN){
+    Dyn*d=(Dyn*)h; Dyn*r=uf_dyn_new((uint64_t)(j-i)); UF_PROTECT(&r);
+    for(int64_t q=i;q<j;q++)uf_dyn_push(&r,d->data[q]);
+    UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); return;
+  }
+  if(h->tag==HT_ARR||h->tag==HT_TENSOR){
+    Hdr*r=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)(j-i)*h->esz,0);
+    r->tag=h->tag; r->len=(uint64_t)(j-i); r->esz=h->esz; r->ety=h->ety;
+    memcpy(r->data,uf_data(h)+i*h->esz,(size_t)(j-i)*h->esz);
+    UF_UNPROTECT(); pushp(cx,r); return;
+  }
+  die("SLICE: unsupported handle");
+}
+
+static void op_buf(Ctx*cx){ int64_t sz=pop(cx).i; if(sz<0)die("negative BUF size"); Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)sz,0); h->tag=HT_BUF; h->len=(uint64_t)sz; h->esz=1; h->gc_flags|=GCF_PINNED; memset(h->data,0,(size_t)sz); pushp(cx,h); }
+static void op_bufcopy(Ctx*cx){ int64_t n=pop(cx).i; Cell s=pop(cx),d=pop(cx); if(n>0)memmove(((void*)d.i),((void*)s.i),(size_t)n); }
+static void op_loadx(Ctx*cx){ Cell a=pop(cx); if(a.tag==T_PTR&&a.i){ Hdr*h=uf_gc_find((void*)a.i); if(h&&h->tag==HT_STR){ pushi(cx,(int64_t)(unsigned char)uf_sptr(a)[0]); return; } } pushi(cx,*(int64_t*)((void*)a.i)); }
+static void op_storex(Ctx*cx){ Cell a=pop(cx); Cell v=pop(cx); *(int64_t*)((void*)a.i)=v.i; }
+static void op_malloc(Ctx*cx){ int64_t sz=pop(cx).i; if(sz<0)die("negative MALLOC size"); void*p=malloc((size_t)sz?sz:1); if(!p)die("out of memory"); pushp(cx,p); }
+static void op_free(Ctx*cx){ Cell p=pop(cx); free(((void*)p.i)); }
+static void op_sizeof(Ctx*cx){ int64_t ty=pop(cx).i; pushi(cx,ty==3?1:8); }
+
+/* ================= fmt / print / scan ================= */
+static int uf_count(const char*f){ int c=0; for(;f&&*f;f++){ if(*f=='%'){ if(f[1]=='%'){ f++; } else { const char*q=f+1; while(*q&&strchr("-+ #0",*q))q++; c++; if(*q=='*')c++; } } } return c; }
+static char* uf_fmt(const char*f,Cell*a,int n){
+  size_t cap=256,bi=0; char*buf=(char*)uf_alloc(cap,0); int ai=0;
+  for(const char*p=f;*p;){
+    if(*p!='%'){ if(bi+2>cap){cap*=2;buf=(char*)realloc(buf,cap);} buf[bi++]=*p++; continue; }
+    if(p[1]=='%'){ if(bi+2>cap){cap*=2;buf=(char*)realloc(buf,cap);} buf[bi++]='%'; p+=2; continue; }
+    char d[48]; int di=0; d[di++]='%'; p++;
+    while(*p&&strchr("-+ #0",*p)) d[di++]=*p++;
+    if(*p=='*'){ p++; if(ai>=n) die("FMT: not enough args"); long w=(long)uf_i(a[ai++]); if(w<0){ d[di++]='-'; w=-w; } di+=snprintf(d+di,sizeof(d)-di-8,"%ld",w); }
+
+    while(*p&&(isdigit((unsigned char)*p)||*p=='.')) d[di++]=*p++;
+    while(*p&&strchr("hlLjzt",*p)) p++;
+    char conv=*p?*p++:'d';
+    if(ai>=n) die("FMT: not enough args");
+    Cell ar=a[ai++];
+    char tmp[128]; int tl=0;
+    d[di]=0;
+    switch(conv){
+      case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': {
+        { size_t l=strlen(d); d[l]='l'; d[l+1]='l'; d[l+2]=conv; d[l+3]=0; }
+        tl=snprintf(tmp,sizeof(tmp),d,(unsigned long long)ar.i); break; }
+      case 'c': { size_t l=strlen(d); d[l]=conv; d[l+1]=0; tl=snprintf(tmp,sizeof(tmp),d,(int)ar.i); break; }
+      case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+        size_t l=strlen(d); d[l]=conv; d[l+1]=0;
+        tl=snprintf(tmp,sizeof(tmp),d,uf_f(ar)); break; }
+      case 's': { size_t l=strlen(d); d[l]=conv; d[l+1]=0;
+        Cell str=uf_to_string(ar); const char* sv=uf_sptr(str);
+        int need=snprintf(0,0,d,sv);
+        while(bi+(size_t)need+1>cap){ cap*=2; buf=(char*)realloc(buf,cap); }
+        snprintf(buf+bi,(size_t)need+1,d,sv);
+        bi+=(size_t)need; continue; }
+      case 'p': { size_t l=strlen(d); d[l]=conv; d[l+1]=0; tl=snprintf(tmp,sizeof(tmp),d,((void*)ar.i)); break; }
+      default: die("FMT: unsupported directive");
+    }
+    if(tl<0) die("FMT failed");
+    if((size_t)tl>sizeof(tmp)) tl=sizeof(tmp); /* clamp to actual bytes written */
+    while(bi+(size_t)tl+1>cap){ cap*=2; buf=(char*)realloc(buf,cap); }
+    memcpy(buf+bi,tmp,(size_t)tl); bi+=(size_t)tl;
+  }
+  buf[bi]=0; return buf;
+}
+static void op_fmt(Ctx*cx){ Cell f=pop(cx); int n=uf_count(uf_sptr(f)); Cell args[16]; if(n>16)die("FMT: too many args"); for(int k=n-1;k>=0;k--) args[k]=pop(cx); char*s=uf_fmt(uf_sptr(f),args,n); Cell r=uf_str_new(s,strlen(s)); free(s); pushc(cx,r); }
+/* PRINT: v -> (smart recursive printer; top-level strings raw) */
+static void uf_print_cell(Cell c,int nested){
+  if(c.tag==T_FLOAT){ double d=uf_fbits(c.i); if(isnan(d))printf("NaN"); else printf("%.17g",d); return; }
+  if(c.tag==T_BYTE){ printf(c.i?"true":"false"); return; }
+  if(c.tag==T_INT){ printf("%lld",(long long)c.i); return; }
+  if(c.tag==T_PTR && !c.i){ printf("null"); return; }
+  if(c.tag==T_PTR && c.i){
+    Hdr*h=uf_gc_find((void*)c.i);
+    if(!h){ printf("<ptr %p>",(void*)c.i); return; }
+    if(h->tag==HT_STR){
+      const char*s=uf_sbytes((Str*)h);
+      if(nested){
+        printf("\"");
+        for(const char*p=s;*p;p++){
+          if(*p=='"')printf("\\\"");
+          else if(*p=='\\')printf("\\\\");
+          else if(*p=='\n')printf("\\n");
+          else if(*p=='\t')printf("\\t");
+          else if(*p=='\r')printf("\\r");
+          else printf("%c",*p);
+        }
+        printf("\"");
+      } else { printf("%s",s); }
+      return;
+    }
+    if(h->tag==HT_DYN){ Dyn*d=(Dyn*)h; printf("["); for(uint64_t i=0;i<d->len;i++){ if(i)printf(","); uf_print_cell(d->data[i],1); } printf("]"); return; }
+    if(h->tag==HT_ARR||h->tag==HT_TENSOR||h->tag==HT_MAT){ printf("["); for(uint64_t i=0;i<h->len;i++){ if(i)printf(","); uf_print_cell(uf_cidx(c,(int64_t)i),1); } printf("]"); return; }
+    if(h->tag==HT_MAP){ Map*m=(Map*)h; printf("{"); int first=1; for(uint64_t i=0;i<m->cap;i++) if(m->st[i]==1){ if(!first)printf(","); first=0; uf_print_cell(m->keys[i],1); printf(":"); uf_print_cell(m->vals[i],1); } printf("}"); return; }
+    if(h->tag==HT_OBJ){ printf("[object Object]"); return; }
+    printf("<%s>",h->tag==HT_BUF?"buf":h->tag==HT_RING?"chan":h->tag==HT_ATOM?"atom":h->tag==HT_ITER?"iter":h->tag==HT_BITMAP?"bitmap":h->tag==HT_BLOOM?"bloom":"object");
+    return;
+  }
+  printf("%lld",(long long)c.i);
+}
+static void op_print(Ctx*cx){ Cell v=pop(cx); uf_print_cell(v,0); printf("\n"); }
+/* SCAN: fmt -> list */
+static void op_scan(Ctx*cx){
+  Cell f=pop(cx); const char*p=uf_sptr(f); Dyn* dl=uf_dyn_new(8); UF_PROTECT(&dl); int n=0;
+  for(;*p;p++){
+    if(*p=='%'){
+      if(p[1]=='%'){ p++; continue; }
+      p++;
+      while(*p&&strchr("-+ #0",*p)) p++;
+      while(*p&&(isdigit((unsigned char)*p)||*p=='.')) p++;
+      while(*p&&strchr("hlLjzt",*p)) p++;
+      char conv=*p?*p:'\0';
+      switch(conv){
+        case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': {
+          long long v; char dbuf[8]; dbuf[0]='%'; dbuf[1]='l'; dbuf[2]='l'; dbuf[3]=conv; dbuf[4]=0;
+          if(fscanf(stdin,dbuf,&v)!=1) die("SCAN: input error"); uf_dyn_push(&dl,uf_mki((int64_t)v)); n++; break; }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+          double v; char dbuf[8]; dbuf[0]='%'; dbuf[1]='l'; dbuf[2]='f'; dbuf[3]=0;
+          if(fscanf(stdin,dbuf,&v)!=1) die("SCAN: input error"); uf_dyn_push(&dl,uf_mkf(v)); n++; break; }
+        case 's': {
+          char*b=(char*)uf_alloc(1<<16,0);
+          if(fscanf(stdin,"%65535s",b)!=1) die("SCAN: input error"); Cell r=uf_str_new(b,strlen(b)); free(b); uf_dyn_push(&dl,r); n++; break; }
+        default: die("SCAN: unsupported directive");
+      }
+    } else if(isspace((unsigned char)*p)) {
+      continue;
+    } else {
+      die("SCAN: literal text in format unsupported");
+    }
+  }
+  uf_dyn_push(&dl,uf_mki((int64_t)n)); UF_UNPROTECT(); pushp(cx,dl);
+}
+
+/* ================= list / dict / chan / atom ops ================= */
+static void op_list(Ctx*cx){ pushp(cx,uf_dyn_new(8)); }
+/* PUSH (was APPEND): h v -> h' (list grows by move; the returned handle is
+   the live one — the old handle is reclaimed by the GC) */
+static void op_push(Ctx*cx){ Cell v=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"PUSH"); if(a->tag!=HT_DYN)die("PUSH: not a list"); pushp(cx,uf_dyn_push2((Dyn*)a,v)); }
+static void op_lpop(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_handle(h,"POP"); if(a->tag!=HT_DYN)die("POP: not a list"); Dyn*d=(Dyn*)a; if(d->len==0)die("POP: empty list"); pushc(cx,d->data[--d->len]); }
+static void op_dict(Ctx*cx){ pushp(cx,uf_map_new()); }
+
+/* CHAN: bounded MPSC ring buffer with blocking ENQ/DEQ */
+static void ring_enq(Ring*r,Cell v){ pthread_mutex_lock(&r->mu); while(r->len>=r->cap&&!r->closed) pthread_cond_wait(&r->notfull,&r->mu); if(r->closed){ pthread_mutex_unlock(&r->mu); die("ENQ: chan closed"); } r->buf[r->tail]=v; r->tail=(r->tail+1)%r->cap; r->len++; pthread_cond_signal(&r->notempty); pthread_mutex_unlock(&r->mu); }
+static void ring_close(Ring*r){ pthread_mutex_lock(&r->mu); r->closed=1; pthread_cond_broadcast(&r->notempty); pthread_cond_broadcast(&r->notfull); pthread_mutex_unlock(&r->mu); }
+/* blocking deq with close detection: 0 = got a value, 1 = closed+drained */
+static int ring_deq1(Ring*r,Cell*out){ pthread_mutex_lock(&r->mu); while(r->len==0&&!r->closed) pthread_cond_wait(&r->notempty,&r->mu); if(r->len==0){ pthread_mutex_unlock(&r->mu); return 1; } *out=r->buf[r->head]; r->head=(r->head+1)%r->cap; r->len--; pthread_cond_signal(&r->notfull); pthread_mutex_unlock(&r->mu); return 0; }
+static Ring* uf_ring_new(uint64_t cap){ if(!cap)cap=16; Ring*r=(Ring*)uf_gc_alloc(sizeof(Ring),0); r->tag=HT_RING; r->len=0; r->cap=cap; r->buf=(Cell*)uf_alloc((size_t)cap*sizeof(Cell),0); r->head=0; r->tail=0; r->closed=0; pthread_mutex_init(&r->mu,0); pthread_cond_init(&r->notfull,0); pthread_cond_init(&r->notempty,0); return r; }
+static void op_chan(Ctx*cx){ int64_t cap=pop(cx).i; if(cap<=0)cap=16; pushp(cx,uf_ring_new((uint64_t)cap)); }
+static void op_enq(Ctx*cx){ Cell v=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"ENQ"); if(a->tag!=HT_RING)die("ENQ: not a chan"); ring_enq((Ring*)a,v); }
+/* DEQ: h -> v  (blocks while empty; closed+empty yields sentinel 0) */
+static void op_deq(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_handle(h,"DEQ"); if(a->tag!=HT_RING)die("DEQ: not a chan"); Cell v; if(ring_deq1((Ring*)a,&v))v=uf_mki(0); pushc(cx,v); }
+static void op_close(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_handle(h,"CLOSE"); if(a->tag!=HT_RING)die("CLOSE: not a chan"); ring_close((Ring*)a); }
+
+/* ATOM: atomic i64 cell */
+static void op_atom(Ctx*cx){ Cell v=pop(cx); Atom*a=(Atom*)uf_gc_alloc(sizeof(Atom),0); a->tag=HT_ATOM; a->len=1; atomic_store(&a->v,v.i); pushp(cx,a); }
+static void op_aget(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_handle(h,"AGET"); if(a->tag!=HT_ATOM)die("AGET: not an atom"); pushi(cx,atomic_load(&((Atom*)a)->v)); }
+static void op_aset(Ctx*cx){ Cell v=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"ASET"); if(a->tag!=HT_ATOM)die("ASET: not an atom"); atomic_store(&((Atom*)a)->v,v.i); }
+static void op_aadd(Ctx*cx){ Cell n=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"AADD"); if(a->tag!=HT_ATOM)die("AADD: not an atom"); pushi(cx,atomic_fetch_add(&((Atom*)a)->v,n.i)); }
+static void op_cas(Ctx*cx){ Cell nw=pop(cx),old=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"CAS"); if(a->tag!=HT_ATOM)die("CAS: not an atom"); int64_t e=old.i; pushi(cx,atomic_compare_exchange_strong(&((Atom*)a)->v,&e,nw.i)?1:0); }
+
+/* RANGE: start stop -> list of ints [start, stop) */
+static void op_range(Ctx*cx){
+  int64_t stop=pop(cx).i, start=pop(cx).i;
+  int64_t n = stop>start ? stop-start : 0;
+  Dyn* d=uf_dyn_new((uint64_t)n); UF_PROTECT(&d);
+  for(int64_t k=start;k<stop;k++) uf_dyn_push(&d,uf_mki(k));
+  UF_UNPROTECT(); pushp(cx,d);
+}
+
+/* ================= iterators ================= */
+static Iter* uf_iter_new(Cell src);
+static int uf_iter_next(Ctx*cx, Iter* it, Cell* out){
+  switch(it->kind){
+    case IT_LIST: { Dyn*d=(Dyn*)uf_gc_find((void*)it->src.i); if(!d)return 0; if((uint64_t)it->idx>=d->len)return 0; *out=d->data[it->idx++]; return 1; }
+    case IT_ARR: { Hdr*a=(Hdr*)uf_gc_find((void*)it->src.i); if(!a)return 0; if((uint64_t)it->idx>=a->len)return 0; *out=uf_cidx(it->src,it->idx++); return 1; }
+    case IT_DICT: { Map*m=(Map*)uf_gc_find((void*)it->src.i); if(!m)return 0; while((uint64_t)it->idx<m->cap&&m->st[it->idx]!=1)it->idx++; if((uint64_t)it->idx>=m->cap)return 0; *out=m->keys[it->idx++]; return 1; }
+    case IT_STR: { Str*s=(Str*)uf_gc_find((void*)it->src.i); if(!s)return 0; if((uint64_t)it->idx>=s->len)return 0; *out=uf_mki((uint8_t)uf_sbytes(s)[it->idx++]); return 1; }
+    case IT_CHAN: { Ring*r=(Ring*)uf_gc_find((void*)it->src.i); if(!r)return 0; return ring_deq1(r,out)?0:1; }
+    case IT_BITMAP: { Bitmap*b=(Bitmap*)uf_gc_find((void*)it->src.i); if(!b)return 0; uint64_t n=b->len; while((uint64_t)it->idx<n){ uint64_t w=(uint64_t)it->idx>>6, o=(uint64_t)it->idx&63; if((w<(n+63)/64)&&((b->words[w]>>o)&1)){ *out=uf_mki(it->idx++); return 1; } it->idx++; } return 0; }
+    case IT_MAP: { Iter* in=(Iter*)uf_gc_find((void*)it->g.i); if(!in)return 0; Cell v; if(!uf_iter_next(cx,in,&v))return 0; pushc(cx,v); uf_call_addr(cx,(const void*)it->f.i,0,-1,1); *out=pop(cx); return 1; }
+    case IT_FILTER: { Iter* in=(Iter*)uf_gc_find((void*)it->g.i); if(!in)return 0; Cell v; while(uf_iter_next(cx,in,&v)){ pushc(cx,v); uf_call_addr(cx,(const void*)it->f.i,0,-1,1); Cell r=pop(cx); if(uf_truthy(r)){ *out=v; return 1; } } return 0; }
+  }
+  return 0;
+}
+static Iter* uf_iter_new(Cell src){
+  if(src.tag!=T_PTR||!src.i)die("ITER: not iterable");
+  Hdr* h=uf_gc_find((void*)src.i); if(!h)die("ITER: not iterable");
+  int kind;
+  switch(h->tag){
+    case HT_DYN: kind=IT_LIST; break;
+    case HT_ARR: case HT_TENSOR: case HT_MAT: kind=IT_ARR; break;
+    case HT_MAP: kind=IT_DICT; break;
+    case HT_STR: kind=IT_STR; break;
+    case HT_RING: kind=IT_CHAN; break;
+    case HT_BITMAP: kind=IT_BITMAP; break;
+    default: die("ITER: not iterable");
+  }
+  Iter* it=(Iter*)uf_gc_alloc(sizeof(Iter),0);
+  it->tag=HT_ITER; it->len=1; it->src=src; it->kind=kind; it->idx=0; it->f=uf_mki(0); it->g=uf_mki(0);
+  return it;
+}
+static void op_iter(Ctx*cx){ Cell h=pop(cx); Iter*it=uf_iter_new(h); pushp(cx,it); }
+static void op_next(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"NEXT"); if(a->tag!=HT_ITER)die("NEXT: not an iter");
+  Cell v; Dyn*d=uf_dyn_new(2); UF_PROTECT(&d);
+  if(uf_iter_next(cx,(Iter*)a,&v)){ uf_dyn_push(&d,v); uf_dyn_push(&d,uf_mki(1)); }
+  else { uf_dyn_push(&d,uf_mki(0)); uf_dyn_push(&d,uf_mki(0)); }
+  UF_UNPROTECT(); pushp(cx,d);
+}
+static Dyn* uf_collect_it(Ctx*cx, Iter* it){
+  Dyn* d=uf_dyn_new(8); UF_PROTECT(&d); UF_PROTECT(&it);
+  Cell v; while(uf_iter_next(cx,it,&v)) uf_dyn_push(&d,v);
+  UF_UNPROTECT(); UF_UNPROTECT(); return d;
+}
+static void op_collect(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_handle(h,"COLLECT"); if(a->tag!=HT_ITER)die("COLLECT: not an iter"); pushp(cx,uf_collect_it(cx,(Iter*)a)); }
+static void op_imap(Ctx*cx){
+  Cell f=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"IMAP"); if(a->tag!=HT_ITER)die("IMAP: not an iter");
+  Iter* it=(Iter*)uf_gc_alloc(sizeof(Iter),0);
+  it->tag=HT_ITER; it->len=1; it->kind=IT_MAP; it->idx=0; it->src=uf_mki(0); it->f=f; it->g=h;
+  pushp(cx,it);
+}
+static void op_ifilter(Ctx*cx){
+  Cell f=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"IFILTER"); if(a->tag!=HT_ITER)die("IFILTER: not an iter");
+  Iter* it=(Iter*)uf_gc_alloc(sizeof(Iter),0);
+  it->tag=HT_ITER; it->len=1; it->kind=IT_FILTER; it->idx=0; it->src=uf_mki(0); it->f=f; it->g=h;
+  pushp(cx,it);
+}
+/* materialize any iterable (or iter, drained) into a list; lists pass through */
+static Dyn* uf_materialize(Ctx*cx, Cell h){
+  if(h.tag==T_PTR&&h.i){
+    Hdr* a=uf_gc_find((void*)h.i);
+    if(a){
+      if(a->tag==HT_DYN) return (Dyn*)a;
+      if(a->tag==HT_ITER) return uf_collect_it(cx,(Iter*)a);
+      if(a->tag==HT_ARR||a->tag==HT_TENSOR||a->tag==HT_MAT){
+        Dyn* d=uf_dyn_new(a->len); UF_PROTECT(&d);
+        for(uint64_t i=0;i<a->len;i++) uf_dyn_push(&d,uf_cidx(h,(int64_t)i));
+        UF_UNPROTECT(); return d;
+      }
+      if(a->tag==HT_MAP||a->tag==HT_STR||a->tag==HT_RING||a->tag==HT_BITMAP){
+        Iter* it=uf_iter_new(h); UF_PROTECT(&it); Dyn* d=uf_collect_it(cx,it); UF_UNPROTECT(); return d;
+      }
+    }
+  }
+  die("not a sequence");
+  return 0;
+}
+
+/* ================= weave: static task DAG + dynamic fanout ================= */
+typedef void(*UfRun)(Ctx*,long);
+typedef struct WeaveTaskS { long pc; int ninputs; int* inputs; long count; Cell result; _Atomic int state; double t0,t1; long items; long retries; long tolerated; } WeaveTask;
+static void uf_weave_mark(struct WeaveJobS* j){ if(!j)return; for(int i=0;i<j->n;i++) uf_mark_cell(j->ts[i].result); }
+static double uf_nowd(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec/1e9; }
+
+/* fanout coordination: feeder drains the (iterable) first input into an
+   internal bounded chan; `count` workers pull items dynamically. Broadcast
+   inputs (declared after the first) sit beneath the item on each worker's
+   initial stack. Results collect in completion order. */
+typedef struct { WeaveJob* j; WeaveTask* t; Ring* q; Dyn* results; pthread_mutex_t* rmu; Iter* it; Ctx* fcx; } UfFan;
+static void* uf_fan_feeder(void* arg){
+  UfFan* f=(UfFan*)arg;
+  Cell v;
+  while(uf_iter_next(f->fcx,f->it,&v)) ring_enq(f->q,v);
+  ring_close(f->q);
+  return 0;
+}
+static void* uf_fan_worker(void* arg){
+  UfFan* f=(UfFan*)arg;
+  WeaveTask* t=f->t; WeaveJob* j=f->j;
+  Ctx* c=ctx_new(1<<16,1<<12);
+  uf_cur_task=t;
+  Cell item;
+  while(ring_deq1(f->q,&item)==0){
+    /* initial stack: the fanout item deepest, broadcast inputs (declared
+       after the first) above it — the reversed param pops bind the first
+       declared input to the item and later inputs to the broadcasts */
+    pushc(c,item);
+    for(int k=1;k<t->ninputs;k++) pushc(c,j->ts[t->inputs[k]].result);
+    j->run(c,t->pc);
+    Cell r = c->sp>0 ? c->ds[c->sp-1] : uf_mki(0);
+    c->sp=0; c->csp=0; c->lsp=0; c->local_base=0; c->local_fsp=0;
+    pthread_mutex_lock(f->rmu);
+    f->results=uf_dyn_push2(f->results,r);
+    t->items++;
+    pthread_mutex_unlock(f->rmu);
+  }
+  uf_cur_task=0;
+  ctx_free(c);
+  return 0;
+}
+static void uf_run_fanout(WeaveJob* j, WeaveTask* t){
+  Cell input = j->ts[t->inputs[0]].result;
+  Iter* it = uf_iter_new(input); /* dies if not iterable */
+  Ring* q = uf_ring_new(64);
+  Dyn* results = uf_dyn_new(8);
+  pthread_mutex_t rmu; pthread_mutex_init(&rmu,0);
+  UF_PROTECT(&it); UF_PROTECT(&q); UF_PROTECT(&results);
+  UfFan f; f.j=j; f.t=t; f.q=q; f.results=results; f.rmu=&rmu; f.it=it;
+  f.fcx=ctx_new(1<<12,1<<8);
+  pthread_t ft; if(pthread_create(&ft,0,uf_fan_feeder,&f))die("WEAVE: feeder thread");
+  long nw=t->count; if(nw<1)nw=1; if(nw>64)nw=64;
+  pthread_t th[64];
+  for(long i=0;i<nw;i++) if(pthread_create(&th[i],0,uf_fan_worker,&f))die("WEAVE: worker thread");
+  for(long i=0;i<nw;i++) pthread_join(th[i],0);
+  pthread_join(ft,0);
+  ctx_free(f.fcx);
+  UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT();
+  t->result=uf_mkp(f.results);
+  pthread_mutex_destroy(&rmu);
+}
+static void* uf_worker(void*arg){
+  WeaveJob*j=(WeaveJob*)arg;
+  for(;;){
+    int pick=-1;
+    /* graceful shutdown: stop scheduling new tasks. Running tasks finish,
+       then the weave drains and run returns; tasks that never started stay
+       pending (their results remain uninitialized). */
+    if(atomic_load(&j->shutdown)){
+      int running = 0;
+      for(int i=0;i<j->n;i++) if(atomic_load(&j->ts[i].state)==1){running=1;break;}
+      if(!running) return 0;
+      sched_yield(); continue;
+    }
+    for(int i=0;i<j->n;i++){
+      if(atomic_load(&j->ts[i].state)!=0) continue;
+      int ready=1;
+      for(int k=0;k<j->ts[i].ninputs;k++) if(atomic_load(&j->ts[j->ts[i].inputs[k]].state)!=2){ready=0;break;}
+      if(!ready) continue;
+      int exp=0;
+      if(atomic_compare_exchange_strong(&j->ts[i].state,&exp,1)){ pick=i; break; }
+    }
+    if(pick<0){
+      int alldone=1; for(int i=0;i<j->n;i++) if(atomic_load(&j->ts[i].state)!=2){alldone=0;break;}
+      if(alldone) return 0;
+      sched_yield(); continue;
+    }
+    WeaveTask*t=&j->ts[pick];
+    t->t0=uf_nowd();
+    uf_cur_task=t;
+    if(t->count>1){
+      uf_run_fanout(j,t);
+    } else {
+      Ctx*c=ctx_new(1<<16,1<<12);
+      for(int k=0;k<t->ninputs;k++) pushc(c,j->ts[t->inputs[k]].result);
+      j->run(c,t->pc);
+      t->result = c->sp>0 ? c->ds[c->sp-1] : uf_mki(0);
+      t->items = 1;
+      ctx_free(c);
+    }
+    uf_cur_task=0;
+    t->t1=uf_nowd();
+    atomic_store(&t->state,2);
+  }
+}
+static void uf_weave(Ctx*cx,WeaveTask*ts,int n,UfRun run){
+  (void)cx;
+  long ncpu=sysconf(_SC_NPROCESSORS_ONLN);
+  long total=0; for(int i=0;i<n;i++) total += ts[i].count>1?ts[i].count:1;
+  int nw=(int)total; if(ncpu>0&&(long)nw>ncpu)nw=(int)ncpu; if(nw<1)nw=1; if(nw>64)nw=64;
+  WeaveJob j={ts,n,run};
+  uf_active_job=&j;
+  if(nw<=1){ uf_worker(&j); }
+  else {
+    pthread_t th[64];
+    for(int i=0;i<nw-1;i++) pthread_create(&th[i],0,uf_worker,&j);
+    uf_worker(&j);
+    for(int i=0;i<nw-1;i++) pthread_join(th[i],0);
+  }
+  uf_active_job=0;
+  if(getenv("NK_WEAVE_DEBUG")){
+    for(int i=0;i<n;i++){
+      WeaveTask*t=&ts[i];
+      fprintf(stderr,"weave: task pc=%ld wall=%.3fms workers=%ld items=%ld retries=%ld tolerated=%ld\n",
+        t->pc,(t->t1-t->t0)*1e3,t->count,t->items,t->retries,t->tolerated);
+    }
+  }
+}
+
+/* ================= shared string helpers ================= */
+static char* uf_read_all(FILE*f){
+  size_t cap=4096,n=0; char*b=(char*)uf_alloc(cap,0); size_t m;
+  while((m=fread(b+n,1,cap-1-n,f))>0){ n+=m; if(cap-1-n==0){ cap*=2; b=(char*)realloc(b,cap); if(!b)die("out of memory"); } }
+  b[n]=0; return b;
+}
+static int uf_wait_status(int r){
+#ifdef _WIN32
+  return r;
+#else
+  if(r==-1)return -1;
+  if(WIFEXITED(r))return WEXITSTATUS(r);
+  if(WIFSIGNALED(r))return 128+WTERMSIG(r);
+  return r;
+#endif
+}
+
+/* ================= shell ops ================= */
+/* SH (merged SH+SHX): cmd -> out err status (always captures both streams
+   as fresh strings; status on top: -1 spawn failure, 128+signal) */
+static void op_sh(Ctx*cx){
+  Cell c=pop(cx); const char*cmd=uf_sptr(c);
+#ifdef _WIN32
+  char tmp[256]; tmpnam(tmp);
+  char*full=(char*)uf_alloc(strlen(cmd)+strlen(tmp)+8,0);
+  sprintf(full,"%s 2>%s",cmd,tmp);
+  FILE* f=_popen(full,"r"); if(!f){ pushc(cx,uf_str_new("",0)); pushc(cx,uf_str_new("",0)); pushi(cx,-1); return; }
+  char*out=uf_read_all(f); int st=uf_wait_status(_pclose(f));
+  FILE* ef=fopen(tmp,"r"); char*err;
+  if(ef){ err=uf_read_all(ef); fclose(ef); remove(tmp); } else err=uf_alloc(1,0),err[0]=0;
+  Cell so=uf_str_new(out,strlen(out)); Cell se=uf_str_new(err,strlen(err));
+  free(out); free(err); free(full);
+  Dyn* shd=uf_dyn_new(3); UF_PROTECT(&shd); uf_dyn_push(&shd,so); uf_dyn_push(&shd,se); uf_dyn_push(&shd,uf_mki((int64_t)st)); UF_UNPROTECT(); pushp(cx,shd);
+#else
+  int pfd[2]; if(pipe(pfd))die("SH: pipe");
+  FILE* ef=tmpfile(); if(!ef)die("SH: tmpfile");
+  pid_t pid=fork();
+  if(pid<0)die("SH: fork");
+  if(pid==0){
+    close(pfd[0]);
+    if(dup2(pfd[1],1)<0)_exit(127);
+    if(dup2(fileno(ef),2)<0)_exit(127);
+    execl("/bin/sh","sh","-c",cmd,(char*)0);
+    _exit(127);
+  }
+  close(pfd[1]);
+  FILE* f=fdopen(pfd[0],"r"); if(!f)die("SH: fdopen");
+  char*out=uf_read_all(f); fclose(f);
+  int rs=0; waitpid(pid,&rs,0);
+  int st=uf_wait_status(rs);
+  rewind(ef); char*err=uf_read_all(ef); fclose(ef);
+  Cell so=uf_str_new(out,strlen(out)); Cell se=uf_str_new(err,strlen(err));
+  free(out); free(err);
+  Dyn* shd=uf_dyn_new(3); UF_PROTECT(&shd); uf_dyn_push(&shd,so); uf_dyn_push(&shd,se); uf_dyn_push(&shd,uf_mki((int64_t)st)); UF_UNPROTECT(); pushp(cx,shd);
+#endif
+}
+/* SHP: cmd -> chan (worker thread streams stdout lines, closes chan at exit) */
+typedef struct { Ring* r; char* cmd; } UfShp;
+static void* uf_shp_worker(void*arg){
+  UfShp* g=(UfShp*)arg;
+#ifdef _WIN32
+  FILE* f=_popen(g->cmd,"r");
+#else
+  FILE* f=popen(g->cmd,"r");
+#endif
+  if(f){
+#ifdef _WIN32
+    char line[16384];
+    while(fgets(line,sizeof(line),f)){ size_t m=strlen(line); while(m>0&&(line[m-1]=='\n'||line[m-1]=='\r'))line[--m]=0; Cell v=uf_str_new(line,m); ring_enq(g->r,v); }
+    _pclose(f);
+#else
+    char*line=0; size_t ncap=0; ssize_t m;
+    while((m=getline(&line,&ncap,f))>=0){ while(m>0&&(line[m-1]=='\n'||line[m-1]=='\r'))line[--m]=0; Cell v=uf_str_new(line,(size_t)m); ring_enq(g->r,v); }
+    free(line); pclose(f);
+#endif
+  }
+  ring_close(g->r);
+  free(g);
+  return 0;
+}
+static void op_shp(Ctx*cx){
+  Cell c=pop(cx);
+  Ring*r=uf_ring_new(64);
+  UfShp* g=(UfShp*)malloc(sizeof(UfShp)); if(!g)die("out of memory"); g->r=r; g->cmd=strdup(uf_sptr(c));
+  pthread_t th; if(pthread_create(&th,0,uf_shp_worker,g)){ ring_close(r); die("SHP: thread"); }
+  pthread_detach(th);
+  pushp(cx,r);
+}
+/* EXEC: list -> status (argv list, no shell) */
+static void op_exec(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"EXEC"); if(a->tag!=HT_DYN)die("EXEC: not a list");
+  Dyn*d=(Dyn*)a;
+  if(d->len==0)die("EXEC: empty argv");
+  char**argv=(char**)malloc((d->len+1)*sizeof(char*)); if(!argv)die("out of memory");
+  for(uint64_t i=0;i<d->len;i++)argv[i]=(char*)uf_sptr(d->data[i]);
+  argv[d->len]=0;
+#ifdef _WIN32
+  intptr_t r=_spawnvp(_P_WAIT,argv[0],(const char* const*)argv);
+  int st=(r==-1)?-1:(int)r;
+#else
+  pid_t pid=fork();
+  if(pid<0)die("EXEC: fork");
+  if(pid==0){ execvp(argv[0],argv); _exit(127); }
+  int rs=0; waitpid(pid,&rs,0); int st=uf_wait_status(rs);
+#endif
+  free(argv); pushi(cx,st);
+}
+
+/* ================= embedded regex (unchanged from v9) =================
+   Syntax: literals, '.', '*', '+', '?', '[...]' (ranges, '^' negation),
+   '^' at alternative start, '$' at end, '|' alternation, '(' ')' groups
+   (<=9, \\1..\\9 backrefs in REPLACE). Greedy with backtracking. */
+typedef struct { const char* s; const char* e; } RxCap;
+enum { RXA_LIT=0, RXA_DOT=1, RXA_CLS=2, RXA_GRP=3 };
+typedef struct { int type; char ch; const char* cs; const char* ce; const char* gs; const char* ge; int cap; } RxAtom;
+static int rx_cls_find(const char* p, const char** close){
+  if(*p=='^')p++;
+  if(*p==']')p++;
+  while(*p){
+    if(*p=='\\'&&p[1]){ p+=2; continue; }
+    if(*p==']'){ *close=p; return 1; }
+    p++;
+  }
+  return 0;
+}
+static int rx_cls_in(const char* cs, const char* ce, char c){
+  int neg=0; const char* p=cs;
+  if(p<ce&&*p=='^'){ neg=1; p++; }
+  int ok=0; int first=1;
+  while(p<ce){
+    char lo;
+    if(*p=='\\'&&p+1<ce){ lo=p[1]; p+=2; } else lo=*p++;
+    if(first&&lo==']'){ if(c==']')ok=1; first=0; continue; }
+    first=0;
+    if(p<ce&&*p=='-'&&p+1<ce){
+      p++; char hi;
+      if(*p=='\\'&&p+1<ce){ hi=p[1]; p+=2; } else hi=*p++;
+      if((unsigned char)c>=(unsigned char)lo&&(unsigned char)c<=(unsigned char)hi)ok=1;
+    } else if(c==lo)ok=1;
+  }
+  return neg?!ok:ok;
+}
+static int rx_group_index(const char* pat0, const char* p){
+  int n=0; const char* q=pat0;
+  while(q<p){
+    if(*q=='\\'&&q[1]){ q+=2; continue; }
+    if(*q=='['){ const char* cl; if(rx_cls_find(q+1,&cl)){ q=cl+1; continue; } }
+    if(*q=='(')n++;
+    q++;
+  }
+  return n;
+}
+static const char* rx_parse_atom(const char* p, RxAtom* a, const char* pat0){
+  memset(a,0,sizeof(*a));
+  char c=*p;
+  if(c=='\\'){ if(!p[1])die("MATCH: trailing backslash"); a->type=RXA_LIT; a->ch=p[1]; return p+2; }
+  if(c=='.'){ a->type=RXA_DOT; return p+1; }
+  if(c=='['){ const char* cl; if(!rx_cls_find(p+1,&cl))die("MATCH: unbalanced ["); a->type=RXA_CLS; a->cs=p+1; a->ce=cl; return cl+1; }
+  if(c=='('){
+    int depth=1; const char* q=p+1;
+    while(*q&&depth){
+      if(*q=='\\'&&q[1]){ q+=2; continue; }
+      if(*q=='['){ const char* cl; if(rx_cls_find(q+1,&cl)){ q=cl+1; continue; } q++; continue; }
+      if(*q=='(')depth++;
+      else if(*q==')')depth--;
+      q++;
+    }
+    if(depth)die("MATCH: unbalanced (");
+    a->type=RXA_GRP; a->gs=p+1; a->ge=q-1; a->cap=rx_group_index(pat0,p)+1;
+    if(a->cap>9)die("MATCH: more than 9 groups");
+    return q;
+  }
+  a->type=RXA_LIT; a->ch=c; return p+1;
+}
+static const char* rx_seq(const char* p, const char* pend, const char* s, RxCap* caps, const char* pat0);
+static const char* rx_atom1(RxAtom* a, const char* s, RxCap* caps, const char* pat0){
+  switch(a->type){
+  case RXA_LIT: return (*s&&*s==a->ch)?s+1:0;
+  case RXA_DOT: return *s?s+1:0;
+  case RXA_CLS: return (*s&&rx_cls_in(a->cs,a->ce,*s))?s+1:0;
+  case RXA_GRP: {
+    const char* alt=a->gs;
+    for(;;){
+      const char* ae=alt; int depth=0;
+      while(ae<a->ge){
+        if(*ae=='\\'&&ae+1<a->ge){ ae+=2; continue; }
+        if(*ae=='['){ const char* cl; if(rx_cls_find(ae+1,&cl)&&cl<a->ge){ ae=cl+1; continue; } }
+        if(*ae=='(')depth++;
+        else if(*ae==')')depth--;
+        else if(*ae=='|'&&depth==0)break;
+        ae++;
+      }
+      const char* r=rx_seq(alt,ae,s,caps,pat0);
+      if(r){ caps[a->cap].s=s; caps[a->cap].e=r; return r; }
+      if(ae>=a->ge)return 0;
+      alt=ae+1;
+    }
+  }
+  }
+  return 0;
+}
+static const char* rx_seq(const char* p, const char* pend, const char* s, RxCap* caps, const char* pat0){
+  if(p>=pend)return s;
+  if(*p=='$'&&p+1==pend)return *s==0?s:0;
+  RxAtom a; const char* q=rx_parse_atom(p,&a,pat0);
+  long min=1,max=1;
+  if(q<pend&&(*q=='*'||*q=='+'||*q=='?')){
+    char t=*q; q++;
+    if(t=='*'){min=0;max=1<<30;} else if(t=='+'){min=1;max=1<<30;} else {min=0;max=1;}
+  }
+  if(max==1){
+    const char* r=rx_atom1(&a,s,caps,pat0);
+    if(r){ const char* e=rx_seq(q,pend,r,caps,pat0); if(e)return e; }
+    if(min==0)return rx_seq(q,pend,s,caps,pat0);
+    return 0;
+  }
+  size_t capn=16,n=0; const char**v=(const char**)malloc(capn*sizeof(char*));
+  if(!v)die("out of memory");
+  v[n++]=s;
+  while((long)n-1<max){
+    const char* r=rx_atom1(&a,v[n-1],caps,pat0);
+    if(!r||r==v[n-1])break;
+    if(n==capn){ capn*=2; v=(const char**)realloc(v,capn*sizeof(char*)); if(!v)die("out of memory"); }
+    v[n++]=r;
+  }
+  const char* ok=0;
+  for(long k=(long)n-1;k>=min;k--){
+    const char* e=rx_seq(q,pend,v[k],caps,pat0);
+    if(e){ ok=e; break; }
+  }
+  free(v);
+  return ok;
+}
+static int rx_exec(const char* pat, const char* str, RxCap* caps){
+  const char* alt=pat;
+  for(;;){
+    const char* ae=alt; int depth=0;
+    while(*ae){
+      if(*ae=='\\'&&ae[1]){ ae+=2; continue; }
+      if(*ae=='['){ const char* cl; if(rx_cls_find(ae+1,&cl)){ ae=cl+1; continue; } }
+      if(*ae=='(')depth++;
+      else if(*ae==')')depth--;
+      else if(*ae=='|'&&depth==0)break;
+      ae++;
+    }
+    const char* p0=alt; int anch=0;
+    if(p0<ae&&*p0=='^'){ anch=1; p0++; }
+    const char* pos=str;
+    for(;;){
+      for(int i=0;i<10;i++){ caps[i].s=0; caps[i].e=0; }
+      const char* r=rx_seq(p0,ae,pos,caps,pat);
+      if(r){ caps[0].s=pos; caps[0].e=r; return 1; }
+      if(anch||!*pos)break;
+      pos++;
+    }
+    if(!*ae)return 0;
+    alt=ae+1;
+  }
+}
+
+/* MATCH (was RX): str pat -> [groups found] */
+static void op_match(Ctx*cx){
+  Cell pat=pop(cx),st=pop(cx);
+  const char* P=uf_sptr(pat); const char* S=uf_sptr(st);
+  RxCap caps[10];
+  int ntotal=rx_group_index(P,P+strlen(P));
+  if(rx_exec(P,S,caps)){
+    Dyn*d=uf_dyn_new((uint64_t)ntotal+1); UF_PROTECT(&d);
+    for(int i=0;i<=ntotal;i++){
+      if(caps[i].s) uf_dyn_push_str(&d,caps[i].s,(size_t)(caps[i].e-caps[i].s));
+      else uf_dyn_push_str(&d,"",0);
+    }
+    Dyn*r=uf_dyn_new(2); UF_PROTECT(&r); uf_dyn_push(&r,uf_mkp(d)); uf_dyn_push(&r,uf_mki(1)); UF_UNPROTECT(); UF_UNPROTECT();
+    pushp(cx,r);
+  } else {
+    Dyn*d=uf_dyn_new(1); UF_PROTECT(&d); Dyn*r=uf_dyn_new(2); UF_PROTECT(&r); uf_dyn_push(&r,uf_mkp(d)); uf_dyn_push(&r,uf_mki(0)); UF_UNPROTECT(); UF_UNPROTECT();
+    pushp(cx,r);
+  }
+}
+/* REPLACE (was RXSUB): str pat repl -> str' (all matches; \\1..\\9, \\\\) */
+static void op_replace(Ctx*cx){
+  Cell repl=pop(cx),pat=pop(cx),st=pop(cx);
+  const char* R=uf_sptr(repl); const char* P=uf_sptr(pat); const char* S=uf_sptr(st);
+  size_t cap=256,n=0; char*out=(char*)uf_alloc(cap,0);
+  RxCap caps[10];
+  const char* cur=S;
+#define UF_APP(src,L) do{ size_t _l=(size_t)(L); while(n+_l+1>cap){ cap*=2; out=(char*)realloc(out,cap); if(!out)die("out of memory"); } memcpy(out+n,(src),_l); n+=_l; }while(0)
+  while(rx_exec(P,cur,caps)){
+    UF_APP(cur,caps[0].s-cur);
+    for(const char* r=R; *r; ){
+      if(*r=='\\'&&r[1]){
+        if(r[1]>='1'&&r[1]<='9'){ int g=r[1]-'0'; if(caps[g].s)UF_APP(caps[g].s,caps[g].e-caps[g].s); r+=2; }
+        else { UF_APP(r+1,1); r+=2; }
+      } else { UF_APP(r,1); r++; }
+    }
+    if(caps[0].e==caps[0].s){ if(!*cur)break; UF_APP(cur,1); cur++; }
+    else cur=caps[0].e;
+  }
+  UF_APP(cur,strlen(cur));
+#undef UF_APP
+  out[n]=0; Cell r=uf_str_new(out,n); free(out); pushc(cx,r);
+}
+/* RSPLIT (was RXSPLIT): str pat -> list */
+static void op_rsplit(Ctx*cx){
+  Cell pat=pop(cx),st=pop(cx);
+  const char* P=uf_sptr(pat); const char* cur=uf_sptr(st);
+  Dyn*d=uf_dyn_new(8); UF_PROTECT(&d); RxCap caps[10];
+  while(rx_exec(P,cur,caps)){
+    if(caps[0].e==caps[0].s){ if(!*cur)break; cur++; continue; }
+    uf_dyn_push_str(&d,cur,(size_t)(caps[0].s-cur));
+    cur=caps[0].e;
+  }
+  uf_dyn_push_str(&d,cur,strlen(cur));
+  UF_UNPROTECT();
+  pushp(cx,d);
+}
+
+/* ================= string ops ================= */
+#ifdef _WIN32
+static int uf_glob_match(const char* pat,const char* s){
+  while(*pat){
+    if(*pat=='*'){
+      while(*pat=='*')pat++;
+      if(!*pat)return 1;
+      for(const char* t=s;;t++){ if(uf_glob_match(pat,t))return 1; if(!*t)break; }
+      return 0;
+    }
+    if(*pat=='?'){ if(!*s)return 0; pat++; s++; continue; }
+    if(*pat=='['){
+      const char* cl; if(rx_cls_find(pat+1,&cl)){
+        if(!*s)return 0;
+        int neg=0; const char* p=pat+1;
+        if(p<cl&&*p=='!'){ neg=1; p++; }
+        int ok=0;
+        while(p<cl){
+          char lo=*p++;
+          if(p<cl&&*p=='-'&&p+1<cl){ p++; char hi=*p++; if((unsigned char)*s>=(unsigned char)lo&&(unsigned char)*s<=(unsigned char)hi)ok=1; }
+          else if(*s==lo)ok=1;
+        }
+        if(neg)ok=!ok;
+        if(!ok)return 0;
+        pat=cl+1; s++; continue;
+      }
+    }
+    if(*pat=='\\'&&pat[1])pat++;
+    if(*pat!=*s)return 0;
+    if(!*s)return 0;
+    pat++; s++;
+  }
+  return *s==0;
+}
+#endif
+/* GLOB: str pat -> 0/1 */
+static void op_glob(Ctx*cx){
+  Cell pat=pop(cx),st=pop(cx);
+#ifdef _WIN32
+  pushi(cx,uf_glob_match(uf_sptr(pat),uf_sptr(st))?1:0);
+#else
+  pushi(cx,fnmatch(uf_sptr(pat),uf_sptr(st),0)==0?1:0);
+#endif
+}
+/* SPLIT: str sep -> list (true zero-copy: NUL-terminate fields in-place) */
+static void op_split(Ctx*cx){
+  Cell sep=pop(cx),st=pop(cx);
+  /* get mutable pointer — parent must be a GC Str with inline/mmap data */
+  Hdr* parent = uf_gc_find((void*)st.i);
+  char* S;
+  if(parent && parent->tag==HT_STR){
+    Str* sp=(Str*)parent;
+    S = (sp->mlen || sp->gc_parent) ? (char*)sp->mdata : sp->data;
+  } else {
+    S = (char*)uf_sptr(st); /* legacy raw char* */
+  }
+  const char* E=uf_sptr(sep);
+  if(!S)die("SPLIT: not a string");
+  if(!*E)die("SPLIT: empty separator");
+  size_t el=strlen(E);
+  Dyn*d=uf_dyn_new(8); UF_PROTECT(&d);
+  char* cur=S;
+  for(;;){
+    char* m=strstr(cur,E);
+    if(!m)break;
+    *m=0; /* NUL-terminate the field in-place */
+    Str* v=(Str*)uf_gc_alloc(sizeof(Str),0);
+    v->tag=HT_STR; v->esz=1; v->len=(size_t)(m-cur); v->mlen=0;
+    v->mdata=cur; v->gc_parent=parent; /* view: keep parent alive, own nothing */
+    uf_dyn_push(&d,uf_mkp(v));
+    cur=m+el;
+  }
+  size_t flen=strlen(cur);
+  Str* v=(Str*)uf_gc_alloc(sizeof(Str),0);
+  v->tag=HT_STR; v->esz=1; v->len=flen; v->mlen=0;
+  v->mdata=cur; v->gc_parent=parent;
+  uf_dyn_push(&d,uf_mkp(v));
+  UF_UNPROTECT();
+  pushp(cx,d);
+}
+/* JOIN: list sep -> str */
+static void op_join(Ctx*cx){
+  Cell sep=pop(cx),h=pop(cx);
+  Hdr*a=uf_handle(h,"JOIN"); if(a->tag!=HT_DYN)die("JOIN: not a list");
+  Dyn*d=(Dyn*)a;
+  const char* E=uf_sptr(sep); size_t el=strlen(E);
+  size_t cap=64; for(uint64_t i=0;i<d->len;i++)cap+=strlen(uf_sptr(d->data[i]))+el;
+  char*out=(char*)uf_alloc(cap,0); size_t n=0;
+  for(uint64_t i=0;i<d->len;i++){
+    if(i){ memcpy(out+n,E,el); n+=el; }
+    const char* s=uf_sptr(d->data[i]); size_t L=strlen(s); memcpy(out+n,s,L); n+=L;
+  }
+  out[n]=0; Cell r=uf_str_new(out,n); free(out); pushc(cx,r);
+}
+/* FIND: str sub -> idx (-1 on miss; byte index) */
+static void op_find(Ctx*cx){
+  Cell sub=pop(cx),st=pop(cx);
+  const char* S=uf_sptr(st);
+  const char* m=strstr(S,uf_sptr(sub));
+  pushi(cx,m?m-S:-1);
+}
+/* REPL: str old new -> str' (literal, replace all) */
+static void op_repl(Ctx*cx){
+  Cell nw=pop(cx),old=pop(cx),st=pop(cx);
+  const char* S=uf_sptr(st); const char* O=uf_sptr(old); const char* N=uf_sptr(nw);
+  if(!*O)die("REPL: empty pattern");
+  size_t ol=strlen(O),nl=strlen(N);
+  size_t cap=strlen(S)+64,n=0; char*out=(char*)uf_alloc(cap,0);
+  const char* cur=S;
+  for(;;){
+    const char* m=strstr(cur,O);
+    if(!m)break;
+    size_t pre=(size_t)(m-cur);
+    while(n+pre+nl+1>cap){ cap*=2; out=(char*)realloc(out,cap); if(!out)die("out of memory"); }
+    memcpy(out+n,cur,pre); n+=pre; memcpy(out+n,N,nl); n+=nl;
+    cur=m+ol;
+  }
+  size_t tail=strlen(cur);
+  while(n+tail+1>cap){ cap*=2; out=(char*)realloc(out,cap); if(!out)die("out of memory"); }
+  memcpy(out+n,cur,tail); n+=tail;
+  out[n]=0; Cell r=uf_str_new(out,n); free(out); pushc(cx,r);
+}
+/* TRIM: str -> str' */
+static void op_trim(Ctx*cx){
+  Cell st=pop(cx);
+  const char* s=uf_sptr(st); size_t n=strlen(s);
+  while(n>0&&isspace((unsigned char)s[0])){ s++; n--; }
+  while(n>0&&isspace((unsigned char)s[n-1]))n--;
+  pushc(cx,uf_str_new(s,n));
+}
+/* UP/DOWN: str -> str' (ASCII case) */
+static void op_up(Ctx*cx){ Cell st=pop(cx); const char*s=uf_sptr(st); size_t n=strlen(s); char*r=(char*)uf_alloc(n+1,0); for(size_t i=0;i<n;i++)r[i]=(s[i]>='a'&&s[i]<='z')?(char)(s[i]-32):s[i]; r[n]=0; Cell c=uf_str_new(r,n); free(r); pushc(cx,c); }
+static void op_down(Ctx*cx){ Cell st=pop(cx); const char*s=uf_sptr(st); size_t n=strlen(s); char*r=(char*)uf_alloc(n+1,0); for(size_t i=0;i<n;i++)r[i]=(s[i]>='A'&&s[i]<='Z')?(char)(s[i]+32):s[i]; r[n]=0; Cell c=uf_str_new(r,n); free(r); pushc(cx,c); }
+/* STARTS/ENDS: str affix -> 0/1 */
+static void op_starts(Ctx*cx){ Cell af=pop(cx),st=pop(cx); const char*s=uf_sptr(st); const char*a=uf_sptr(af); pushi(cx,strncmp(s,a,strlen(a))==0?1:0); }
+static void op_ends(Ctx*cx){ Cell af=pop(cx),st=pop(cx); const char*s=uf_sptr(st); const char*a=uf_sptr(af); size_t ls=strlen(s),la=strlen(a); pushi(cx,(la<=ls&&strcmp(s+ls-la,a)==0)?1:0); }
+
+/* ATOI/ATOF/ITOA/FTOA: explicit string<->number conversion */
+static void op_atoi(Ctx*cx){ Cell s=pop(cx); pushi(cx,(int64_t)strtoll(uf_sptr(s),0,10)); }
+static void op_atof(Ctx*cx){ Cell s=pop(cx); pushf(cx,strtod(uf_sptr(s),0)); }
+static void op_itoa(Ctx*cx){ Cell n=pop(cx); char b[32]; snprintf(b,sizeof(b),"%lld",(long long)uf_i(n)); pushc(cx,uf_str_new(b,strlen(b))); }
+static void op_ftoa(Ctx*cx){ Cell n=pop(cx); char b[32]; snprintf(b,sizeof(b),"%g",uf_f(n)); pushc(cx,uf_str_new(b,strlen(b))); }
+
+/* ================= sequences: sort/filter/some/every ================= */
+/* stable mergesort of a cell array with uf_cmp order; dies on incomparable */
+static void uf_msort(Cell* v, Cell* tmp, uint64_t lo, uint64_t hi){
+  if(hi-lo<2)return;
+  uint64_t mid=(lo+hi)/2;
+  uf_msort(v,tmp,lo,mid); uf_msort(v,tmp,mid,hi);
+  uint64_t i=lo,j=mid,k=lo;
+  while(i<mid&&j<hi){ int ok; int c=uf_cmp(v[i],v[j],&ok); if(!ok)die("SORT: incomparable element types"); if(c<=0)tmp[k++]=v[i++]; else tmp[k++]=v[j++]; }
+  while(i<mid)tmp[k++]=v[i++];
+  while(j<hi)tmp[k++]=v[j++];
+  for(i=lo;i<hi;i++)v[i]=tmp[i];
+}
+/* SORT: seq -> seq' (fresh, stable; list -> list, arr -> arr by tag) */
+static void op_sort(Ctx*cx){
+  Cell h=pop(cx);
+  Hdr* a=h.tag==T_PTR&&h.i?uf_gc_find((void*)h.i):0;
+  Dyn* d=uf_materialize(cx,h); UF_PROTECT(&d);
+  if(d->len){
+    Cell* tmp=(Cell*)uf_alloc(d->len*sizeof(Cell),0);
+    uf_msort(d->data,tmp,0,d->len);
+    free(tmp);
+  }
+  if(a&&(a->tag==HT_ARR||a->tag==HT_TENSOR)){
+    Hdr* r=(Hdr*)uf_gc_alloc(sizeof(Hdr)+d->len*a->esz,0);
+    UF_PROTECT(&r);
+    r->tag=a->tag; r->len=d->len; r->esz=a->esz; r->ety=a->ety;
+    for(uint64_t i=0;i<d->len;i++) uf_cseti(uf_mkp(r),(int64_t)i,d->data[i]);
+    UF_UNPROTECT(); UF_UNPROTECT();
+    pushp(cx,r); return;
+  }
+  Dyn* r=uf_dyn_new(d->len); UF_PROTECT(&r);
+  for(uint64_t i=0;i<d->len;i++)uf_dyn_push(&r,d->data[i]);
+  UF_UNPROTECT(); UF_UNPROTECT();
+  pushp(cx,r);
+}
+/* SORTKEYS: dict -> sorted key list (keys + sort fused) */
+static void op_sortkeys(Ctx*cx){
+  Cell h=pop(cx); Map*m=(Map*)uf_handle(h,"SORTKEYS");
+  Dyn*d=uf_dyn_new(m->len?m->len:1); UF_PROTECT(&d);
+  for(uint64_t i=0;i<m->cap;i++) if(m->st[i]==1) uf_dyn_push(&d,m->keys[i]);
+  if(d->len){
+    Cell* tmp=(Cell*)uf_alloc(d->len*sizeof(Cell),0);
+    uf_msort(d->data,tmp,0,d->len);
+    free(tmp);
+  }
+  UF_UNPROTECT(); pushp(cx,d);
+}
+/* TOPN: dict n -> list of [key value] pairs, top-n by value desc, ties by key asc */
+static void op_topn(Ctx*cx){
+  int64_t n=uf_i(pop(cx));
+  Cell h=pop(cx); Map*m=(Map*)uf_handle(h,"TOPN");
+  if(n<0) n=0;
+  /* collect [key value] pairs */
+  Dyn*pairs=uf_dyn_new(m->len?m->len:1); UF_PROTECT(&pairs);
+  for(uint64_t i=0;i<m->cap;i++) if(m->st[i]==1){
+    Dyn*p=uf_dyn_new(2); uf_dyn_push(&p,m->keys[i]); uf_dyn_push(&p,m->vals[i]);
+    uf_dyn_push(&pairs,uf_mkp(p));
+  }
+  /* selection sort top-n: find max value (ties: min key) each pass */
+  Dyn*result=uf_dyn_new((uint64_t)(n<(int64_t)pairs->len?(uint64_t)n:pairs->len)); UF_PROTECT(&result);
+  uint64_t plen=pairs->len;
+  for(int64_t rank=0; rank<n && plen>0; rank++){
+    uint64_t best=0;
+    Hdr*bp=(Hdr*)uf_gc_find((void*)pairs->data[0].i); Dyn*bpair=(Dyn*)bp;
+    double bestv=uf_f(bpair->data[1]); Cell bestk=bpair->data[0];
+    for(uint64_t j=1;j<plen;j++){
+      Hdr*hp=(Hdr*)uf_gc_find((void*)pairs->data[j].i); Dyn*pair=(Dyn*)hp;
+      double v=uf_f(pair->data[1]);
+      int ok; int c=uf_cmp(pair->data[0],bestk,&ok);
+      if(v>bestv || (v==bestv && ok && c<0)){ bestv=v; bestk=pair->data[0]; best=j; }
+    }
+    uf_dyn_push(&result,pairs->data[best]);
+    pairs->data[best]=pairs->data[plen-1]; plen--;
+  }
+  UF_UNPROTECT(); UF_UNPROTECT();
+  pushp(cx,result);
+}
+/* RANGEFOLD: count init fn_addr -> scalar
+   Fold over range 0..count. Each iteration pushes (acc, k) and calls
+   fn, which must leave one value (the new acc). */
+static void op_rangefold(Ctx*cx){
+  Cell f=pop(cx),acc=pop(cx); int64_t cnt=uf_i(pop(cx));
+  long fr=cx->lsp++; if(cx->lsp>=64)die("loops nested too deep");
+  cx->loops[fr].cspl=cx->csp;
+  for(int64_t k=0;k<cnt;k++){
+    pushc(cx,acc); pushi(cx,k);
+    uf_call_addr(cx,(const void*)f.i,0,-1,2); acc=pop(cx);
+  }
+  cx->lsp=fr;
+  pushc(cx,acc);
+}
+/* FILTER: list pred_addr -> list' */
+static void op_filter(Ctx*cx){
+  Cell f=pop(cx),h=pop(cx);
+  Dyn* s=uf_materialize(cx,h); UF_PROTECT(&s);
+  Dyn* r=uf_dyn_new(8); UF_PROTECT(&r);
+  for(uint64_t i=0;i<s->len;i++){
+    pushc(cx,s->data[i]); uf_call_addr(cx,(const void*)f.i,0,-1,1); Cell k=pop(cx);
+    if(uf_truthy(k)) uf_dyn_push(&r,s->data[i]);
+  }
+  UF_UNPROTECT(); UF_UNPROTECT();
+  pushp(cx,r);
+}
+/* SOME/EVERY: list pred_addr -> 0/1 (short-circuit) */
+static void op_some(Ctx*cx){
+  Cell f=pop(cx),h=pop(cx); Dyn* s=uf_materialize(cx,h); UF_PROTECT(&s);
+  int r=0;
+  for(uint64_t i=0;i<s->len;i++){ pushc(cx,s->data[i]); uf_call_addr(cx,(const void*)f.i,0,-1,1); if(uf_truthy(pop(cx))){r=1;break;} }
+  UF_UNPROTECT(); pushi(cx,r);
+}
+static void op_every(Ctx*cx){
+  Cell f=pop(cx),h=pop(cx); Dyn* s=uf_materialize(cx,h); UF_PROTECT(&s);
+  int r=1;
+  for(uint64_t i=0;i<s->len;i++){ pushc(cx,s->data[i]); uf_call_addr(cx,(const void*)f.i,0,-1,1); if(!uf_truthy(pop(cx))){r=0;break;} }
+  UF_UNPROTECT(); pushi(cx,r);
+}
+
+/* ================= vector ops + bitmap masks ================= */
+static double uf_el(Hdr*a,uint64_t i){ char*dt=uf_data(a); if(a->ety==1)return ((double*)dt)[i]; if(a->ety==3)return (double)((uint8_t*)dt)[i]; return (double)((int64_t*)dt)[i]; }
+static void uf_put_el(Hdr*a,uint64_t i,double d){ char*dt=uf_data(a); if(a->ety==1)((double*)dt)[i]=d; else if(a->ety==3)((uint8_t*)dt)[i]=(uint8_t)d; else ((int64_t*)dt)[i]=(int64_t)d; }
+static Hdr* uf_gc_tensor_new(uint64_t n){ Hdr*r=(Hdr*)uf_gc_arr_block_t((size_t)n*8,HT_TENSOR); r->tag=HT_TENSOR; r->len=n; r->esz=8; r->ety=1; return r; }
+static Hdr* uf_arr_like(Hdr*a,uint64_t n){
+  /* HT_MAT: esz is rows, not element bytes — derive byte size from ety */
+  uint64_t nb=(a->tag==HT_MAT)?(n*((a->ety==3)?1:8)):(n*a->esz);
+  /* data is fully overwritten by every caller (elementwise ops, memcpy) — no zero-fill */
+  Hdr*r=(Hdr*)uf_gc_arr_block_t(nb,a->tag); r->tag=a->tag; r->len=n; r->esz=a->esz; r->ety=a->ety; return r;
+}
+
+/* ================= GPU compute offloading (Vulkan, v13.1) =================
+   Enabled when the compiler embedded the SPIR-V blobs and defined NK_GPU
+   (automatic when glslc is present and device mode != cpu). The shims below
+   lazily initialize Vulkan, pick the device (auto = most free VRAM via
+   VK_EXT_memory_budget, discrete preferred; or the pinned --device bake),
+   and LAUNCH prebuilt kernels for eligible ops when the element count clears
+   NK_GPU_MIN (env, default 65536). Any failure or too-small workload falls
+   back to the CPU implementation — the GPU is a fast path, never a
+   correctness dependency. Kernels are float64; other element types stay CPU.
+   NOTE: `div` on the GPU yields inf/nan for zero divisors where the CPU dies
+   (documented divergence). */
+#ifdef NK_GPU
+#include <vulkan/vulkan.h>
+static VkInstance uf_vk_inst;
+static VkPhysicalDevice uf_vk_pd;
+static VkDevice uf_vk_dev;
+static VkQueue uf_vk_q;
+static uint32_t uf_vk_qf;
+static VkCommandPool uf_vk_pool;
+static VkCommandBuffer uf_vk_cb;
+static VkPipelineLayout uf_vk_playout;
+static VkDescriptorSetLayout uf_vk_dsl;
+static VkDescriptorPool uf_vk_dpool;
+static VkBuffer uf_vk_dummy;
+static VkDeviceMemory uf_vk_dummy_mem;
+static VkPipeline uf_vk_pipe[sizeof(uf_spv_all)/sizeof(uf_spv_all[0])];
+static int uf_vk_ready, uf_vk_broken;
+static long uf_gpu_min(void){ const char*e=getenv("NK_GPU_MIN"); long v=e?atol(e):65536; return v>0?v:65536; }
+/* v13.2: per-op arith offload floor. A fused region does O(ops) work per
+   element for ONE transfer — worth it on the GPU at any size. A single
+   per-op add/mul moves ~3×n×8 bytes for one op — on host-visible staging
+   (~2GB/s) that loses to the CPU fast path until n is large. Fused-region
+   and reduce paths keep the plain uf_gpu_min(). */
+static long uf_gpu_arith_min(void){ const char*e=getenv("NK_GPU_ARITH_MIN"); long v=e?atol(e):(8L<<20); return v>0?v:(8L<<20); }
+/* Static first-run matmul floor (no timing / no calibration): offload only
+   when ra*ca*cb FLOPs clear this. 512³=134M loses to the CPU even after
+   Vulkan is up (transfer+init); 1024³=1.07B wins. Default 400M sits between
+   512³ and 768³. Env NK_GPU_MATMUL_MIN overrides. */
+static long uf_gpu_matmul_min(void){ const char*e=getenv("NK_GPU_MATMUL_MIN"); long v=e?atol(e):(400L<<20); return v>0?v:(400L<<20); }
+/* auto = pick CPU when the static estimate says so; vk<N> pins GPU. */
+static int uf_dev_is_auto(void){ return !(uf_device[0]=='v' && uf_device[1]=='k'); }
+static pthread_mutex_t uf_gpu_mu = PTHREAD_MUTEX_INITIALIZER;
+static int uf_spv_index(const char*name){ for(size_t i=0;i<sizeof(uf_spv_all)/sizeof(uf_spv_all[0]);i++) if(!strcmp(uf_spv_all[i].name,name))return (int)i; return -1; }
+
+static uint64_t uf_vk_free_mem(VkPhysicalDevice pd, int have_budget, int*discrete){
+  VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd,&props);
+  *discrete = (props.deviceType==VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
+  if(have_budget){
+    VkPhysicalDeviceMemoryProperties2 mp; memset(&mp,0,sizeof mp); mp.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp; memset(&bp,0,sizeof bp); bp.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    mp.pNext=&bp;
+    vkGetPhysicalDeviceMemoryProperties2(pd,&mp);
+    uint64_t free=0;
+    for(uint32_t i=0;i<mp.memoryProperties.memoryHeapCount;i++)
+      if(mp.memoryProperties.memoryHeaps[i].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT){
+        uint64_t b=bp.heapBudget[i],u=bp.heapUsage[i];
+        free += (b>u)?(b-u):0;
+      }
+    if(free) return free;
+  }
+  vkGetPhysicalDeviceProperties2;
+  VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd,&mp);
+  uint64_t tot=0;
+  for(uint32_t i=0;i<mp.memoryHeapCount;i++) if(mp.memoryHeaps[i].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) tot+=mp.memoryHeaps[i].size;
+  return tot;
+}
+
+static void uf_vk_init_body(void);
+static void uf_vk_init(void){
+  if(uf_vk_ready||uf_vk_broken) return;
+  static pthread_once_t once=PTHREAD_ONCE_INIT;
+  pthread_once(&once, uf_vk_init_body);
+}
+static void uf_vk_init_body(void){
+  VkApplicationInfo app; memset(&app,0,sizeof app); app.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO; app.pApplicationName="nmerkar"; app.apiVersion=VK_API_VERSION_1_1;
+  VkInstanceCreateInfo ci; memset(&ci,0,sizeof ci); ci.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ci.pApplicationInfo=&app;
+  if(vkCreateInstance(&ci,0,&uf_vk_inst)!=VK_SUCCESS){ uf_vk_broken=1; return; }
+  uint32_t nd=0; vkEnumeratePhysicalDevices(uf_vk_inst,&nd,0);
+  if(!nd){ uf_vk_broken=1; return; }
+  VkPhysicalDevice* pds=(VkPhysicalDevice*)malloc(nd*sizeof(VkPhysicalDevice));
+  vkEnumeratePhysicalDevices(uf_vk_inst,&nd,pds);
+  /* device selection: auto = most free VRAM (discrete preferred); vk<N> pinned */
+  int sel=-1;
+  if(uf_device[0]=='v'&&uf_device[1]=='k'&&uf_device[2]>='0'&&uf_device[2]<='9'){
+    long want=atol(uf_device+2);
+    if((uint32_t)want>=nd){
+      char msg[2048]; int n=snprintf(msg,sizeof msg,"device '%s' requested but only %u Vulkan device(s) found:",uf_device,nd);
+      for(uint32_t i=0;i<nd&&n>0&&n<(int)sizeof(msg)-256;i++){
+        VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(pds[i],&pr);
+        n+=snprintf(msg+n,sizeof(msg)-n," vk%u: '%s',",i,pr.deviceName);
+      }
+      if(n>0&&msg[n-1]==',')msg[n-1]=0;
+      free(pds); vkDestroyInstance(uf_vk_inst,0); uf_vk_broken=1; die(msg);
+    }
+    sel=(int)atol(uf_device+2);
+  } else {
+    /* hardware first (discrete > integrated > software), most free VRAM
+       within the class (llvmpipe advertises RAM-sized budgets) */
+    uint64_t best=0; int bcls=-1;
+    for(uint32_t i=0;i<nd;i++){
+      uint32_t nec=0; vkEnumerateDeviceExtensionProperties(pds[i],0,&nec,0);
+      VkExtensionProperties* ex=(VkExtensionProperties*)malloc(nec*sizeof(VkExtensionProperties));
+      vkEnumerateDeviceExtensionProperties(pds[i],0,&nec,ex);
+      int hb=0; for(uint32_t k=0;k<nec;k++) if(!strcmp(ex[k].extensionName,"VK_EXT_memory_budget")) hb=1;
+      free(ex);
+      VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(pds[i],&pr);
+      int cls = pr.deviceType==VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU?2
+              : pr.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU?1 : 0;
+      int disc; uint64_t fm=uf_vk_free_mem(pds[i],hb,&disc);
+      if(cls>bcls||(cls==bcls&&fm>best)){ best=fm; bcls=cls; sel=(int)i; }
+    }
+  }
+  if(sel<0){ free(pds); vkDestroyInstance(uf_vk_inst,0); uf_vk_broken=1; return; }
+  uf_vk_pd=pds[sel]; free(pds);
+  uint32_t nq=0; vkGetPhysicalDeviceQueueFamilyProperties(uf_vk_pd,&nq,0);
+  VkQueueFamilyProperties* qf=(VkQueueFamilyProperties*)malloc(nq*sizeof(VkQueueFamilyProperties));
+  vkGetPhysicalDeviceQueueFamilyProperties(uf_vk_pd,&nq,qf);
+  uf_vk_qf=UINT32_MAX;
+  for(uint32_t i=0;i<nq;i++) if(qf[i].queueFlags&VK_QUEUE_COMPUTE_BIT){ uf_vk_qf=i; break; }
+  free(qf);
+  if(uf_vk_qf==UINT32_MAX){ vkDestroyInstance(uf_vk_inst,0); uf_vk_broken=1; return; }
+  float pri=1.0f;
+  VkDeviceQueueCreateInfo qci; memset(&qci,0,sizeof qci); qci.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO; qci.queueFamilyIndex=uf_vk_qf; qci.queueCount=1; qci.pQueuePriorities=&pri;
+  const char* devexts[1]; uint32_t ndevext=0;
+  uint32_t nec=0; vkEnumerateDeviceExtensionProperties(uf_vk_pd,0,&nec,0);
+  VkExtensionProperties* ex=(VkExtensionProperties*)malloc(nec*sizeof(VkExtensionProperties));
+  vkEnumerateDeviceExtensionProperties(uf_vk_pd,0,&nec,ex);
+  for(uint32_t k=0;k<nec;k++) if(!strcmp(ex[k].extensionName,"VK_EXT_memory_budget")) devexts[ndevext++]=ex[k].extensionName;
+  free(ex);
+  VkDeviceCreateInfo dci; memset(&dci,0,sizeof dci); dci.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  dci.queueCreateInfoCount=1; dci.pQueueCreateInfos=&qci;
+  dci.enabledExtensionCount=ndevext; dci.ppEnabledExtensionNames=devexts;
+  if(vkCreateDevice(uf_vk_pd,&dci,0,&uf_vk_dev)!=VK_SUCCESS){ vkDestroyInstance(uf_vk_inst,0); uf_vk_broken=1; return; }
+  vkGetDeviceQueue(uf_vk_dev,uf_vk_qf,0,&uf_vk_q);
+  VkCommandPoolCreateInfo pci; memset(&pci,0,sizeof pci); pci.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO; pci.queueFamilyIndex=uf_vk_qf; pci.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  if(vkCreateCommandPool(uf_vk_dev,&pci,0,&uf_vk_pool)!=VK_SUCCESS){ uf_vk_broken=1; return; }
+  VkCommandBufferAllocateInfo cai; memset(&cai,0,sizeof cai); cai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO; cai.commandPool=uf_vk_pool; cai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount=1;
+  if(vkAllocateCommandBuffers(uf_vk_dev,&cai,&uf_vk_cb)!=VK_SUCCESS){ uf_vk_broken=1; return; }
+  /* layouts: 3 storage buffers + 48-byte push constants */
+  VkDescriptorSetLayoutBinding lb[8];
+  for(int i=0;i<8;i++){ lb[i].binding=(uint32_t)i; lb[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].descriptorCount=1; lb[i].stageFlags=VK_SHADER_STAGE_COMPUTE_BIT; lb[i].pImmutableSamplers=0; }
+  VkDescriptorSetLayoutCreateInfo dsl; memset(&dsl,0,sizeof dsl); dsl.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; dsl.bindingCount=8; dsl.pBindings=lb;
+  vkCreateDescriptorSetLayout(uf_vk_dev,&dsl,0,&uf_vk_dsl);
+  VkPushConstantRange pr; pr.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT; pr.offset=0; pr.size=sizeof(struct UFPC);
+  VkPipelineLayoutCreateInfo pl; memset(&pl,0,sizeof pl); pl.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO; pl.setLayoutCount=1; pl.pSetLayouts=&uf_vk_dsl; pl.pushConstantRangeCount=1; pl.pPushConstantRanges=&pr;
+  vkCreatePipelineLayout(uf_vk_dev,&pl,0,&uf_vk_playout);
+  VkDescriptorPoolSize ps; ps.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; ps.descriptorCount=128;
+  VkDescriptorPoolCreateInfo dpi; memset(&dpi,0,sizeof dpi); dpi.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO; dpi.flags=VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; dpi.maxSets=16; dpi.poolSizeCount=1; dpi.pPoolSizes=&ps;
+  vkCreateDescriptorPool(uf_vk_dev,&dpi,0,&uf_vk_dpool);
+  /* dummy buffer for unused bindings */
+  VkBufferCreateInfo dbi; memset(&dbi,0,sizeof dbi); dbi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; dbi.size=16; dbi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  vkCreateBuffer(uf_vk_dev,&dbi,0,&uf_vk_dummy);
+  VkMemoryRequirements mr; vkGetBufferMemoryRequirements(uf_vk_dev,uf_vk_dummy,&mr);
+  VkMemoryAllocateInfo mai; memset(&mai,0,sizeof mai); mai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; mai.allocationSize=mr.size;
+  VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(uf_vk_pd,&mp);
+  for(uint32_t i=0;i<mp.memoryTypeCount;i++)
+    if(mp.memoryTypes[i].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT){ mai.memoryTypeIndex=i; break; }
+  vkAllocateMemory(uf_vk_dev,&mai,0,&uf_vk_dummy_mem);
+  vkBindBufferMemory(uf_vk_dev,uf_vk_dummy,uf_vk_dummy_mem,0);
+  /* pipelines from embedded SPIR-V */
+  for(size_t i=0;i<sizeof(uf_spv_all)/sizeof(uf_spv_all[0]);i++){
+    VkShaderModuleCreateInfo sm; memset(&sm,0,sizeof sm); sm.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO; sm.codeSize=uf_spv_all[i].words*4; sm.pCode=uf_spv_all[i].code;
+    VkShaderModule mod;
+    if(vkCreateShaderModule(uf_vk_dev,&sm,0,&mod)!=VK_SUCCESS){ uf_vk_broken=1; return; }
+    VkComputePipelineCreateInfo cp; memset(&cp,0,sizeof cp); cp.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO; cp.stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cp.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module=mod; cp.stage.pName="main"; cp.layout=uf_vk_playout;
+    if(vkCreateComputePipelines(uf_vk_dev,0,1,&cp,0,&uf_vk_pipe[i])!=VK_SUCCESS){ uf_vk_broken=1; return; }
+    vkDestroyShaderModule(uf_vk_dev,mod,0);
+  }
+  uf_vk_ready=1;
+}
+static int uf_vk_ensure_pipe(int k){
+  if(k<0||(size_t)k>=sizeof(uf_spv_all)/sizeof(uf_spv_all[0])) return 0;
+  if(uf_vk_pipe[k]) return 1;
+  VkShaderModuleCreateInfo sm; memset(&sm,0,sizeof sm); sm.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO; sm.codeSize=uf_spv_all[k].words*4; sm.pCode=uf_spv_all[k].code;
+  VkShaderModule mod;
+  if(vkCreateShaderModule(uf_vk_dev,&sm,0,&mod)!=VK_SUCCESS) return 0;
+  VkComputePipelineCreateInfo cp; memset(&cp,0,sizeof cp); cp.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO; cp.stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cp.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module=mod; cp.stage.pName="main"; cp.layout=uf_vk_playout;
+  int ok=vkCreateComputePipelines(uf_vk_dev,0,1,&cp,0,&uf_vk_pipe[k])==VK_SUCCESS;
+  vkDestroyShaderModule(uf_vk_dev,mod,0);
+  return ok;
+}
+
+/* v13.2 device buffer pool: ONE persistent HOST_VISIBLE (HOST_COHERENT when
+   available) allocation, suballocated per launch via offsets and grown on
+   demand. The old path did vkCreateBuffer+vkAllocateMemory+vkMapMemory (and
+   the matching destroys) per operand per op — tens of milliseconds each on
+   RADV, which is why per-op offloaded programs (blackscholes: ~40 ops) spent
+   seconds in the driver. Launches stay fully synchronous: upload, dispatch,
+   wait, download, next call reuses the pool from offset 0. Growth destroys
+   and recreates the buffer BEFORE any data is staged, so nothing is lost.
+   Region offsets are 256B-aligned (minStorageBufferOffsetAlignment ≤ 256). */
+#define UF_VK_ALIGN 256
+typedef struct { VkBuffer buf; VkDeviceMemory mem; char* mapped; VkDeviceSize cap; int coherent; } UFCache;
+static UFCache uf_vk_bpool;
+static VkFence uf_vk_fence;
+static VkDeviceSize uf_vk_al(VkDeviceSize s){ return (s+(UF_VK_ALIGN-1))&~((VkDeviceSize)UF_VK_ALIGN-1); }
+/* non-coherent cached pool: make CPU writes visible to the GPU / GPU writes
+   visible to the CPU. No-ops on a coherent heap. Offsets are pool-relative;
+   ranges are rounded out to UF_VK_ALIGN (>= any known nonCoherentAtomSize
+   multiple used here). */
+static void uf_vk_flush(VkDeviceSize off, VkDeviceSize sz){
+  if(uf_vk_bpool.coherent||!sz||!uf_vk_bpool.mem) return;
+  VkMappedMemoryRange r; memset(&r,0,sizeof r); r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  r.memory=uf_vk_bpool.mem; r.offset=off; r.size=uf_vk_al(sz);
+  vkFlushMappedMemoryRanges(uf_vk_dev,1,&r);
+}
+static void uf_vk_inval(VkDeviceSize off, VkDeviceSize sz){
+  if(uf_vk_bpool.coherent||!sz||!uf_vk_bpool.mem) return;
+  VkMappedMemoryRange r; memset(&r,0,sizeof r); r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  r.memory=uf_vk_bpool.mem; r.offset=off; r.size=uf_vk_al(sz);
+  vkInvalidateMappedMemoryRanges(uf_vk_dev,1,&r);
+}
+static int uf_vk_pool_reserve(VkDeviceSize total){
+  if(uf_vk_bpool.cap>=total&&uf_vk_bpool.buf) return 1;
+  VkDeviceSize want=uf_vk_al(total); VkDeviceSize min=64UL<<20; if(want<min)want=min;
+  if(uf_vk_bpool.buf) vkDestroyBuffer(uf_vk_dev,uf_vk_bpool.buf,0);
+  if(uf_vk_bpool.mem){ vkUnmapMemory(uf_vk_dev,uf_vk_bpool.mem); vkFreeMemory(uf_vk_dev,uf_vk_bpool.mem,0); }
+  memset(&uf_vk_pool,0,sizeof uf_vk_pool);
+  VkBufferCreateInfo bi; memset(&bi,0,sizeof bi); bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bi.size=want;
+  bi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if(vkCreateBuffer(uf_vk_dev,&bi,0,&uf_vk_bpool.buf)!=VK_SUCCESS) return 0;
+  VkMemoryRequirements mr; vkGetBufferMemoryRequirements(uf_vk_dev,uf_vk_bpool.buf,&mr);
+  VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(uf_vk_pd,&mp);
+  int found=0; VkDeviceSize sz=mr.size>want?mr.size:want;
+  /* Prefer cached host memory: region outputs are read back by the CPU after
+     the fence, and uncached coherent mappings cap that memcpy at PCIe-ish
+     speeds (~1.4GB/s here) while cached ones stream from DRAM. On AMD the
+     cached heap is typically NON-coherent, so accept it and use explicit
+     flush/invalidate barriers (uf_vk_flush/uf_vk_inval) — pass order:
+     cached+coherent, cached, coherent, any. */
+  int coherent=1;
+  for(int pass=0;pass<4&&!found;pass++)
+    for(uint32_t i=0;i<mp.memoryTypeCount;i++){
+      VkMemoryPropertyFlags f=mp.memoryTypes[i].propertyFlags;
+      int wantcached=(pass==0||pass==1), wantcoherent=(pass==0||pass==2);
+      if((mp.memoryTypes[i].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+        &&(!wantcached||(f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
+        &&(!wantcoherent||(mp.memoryTypes[i].propertyFlags&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        &&(mr.memoryTypeBits&(1u<<i))){
+        VkMemoryAllocateInfo ai; memset(&ai,0,sizeof ai); ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ai.allocationSize=sz; ai.memoryTypeIndex=i;
+        if(vkAllocateMemory(uf_vk_dev,&ai,0,&uf_vk_bpool.mem)==VK_SUCCESS){ found=1; coherent=(f&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)?1:0;
+          if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk-pool] type=%u flags=0x%x cached=%d coherent=%d cap=%lluMB\n",i,(unsigned)f,(f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT)?1:0,coherent,(unsigned long long)(sz>>20));
+          break; }
+      }
+    }
+  if(!found||vkBindBufferMemory(uf_vk_dev,uf_vk_bpool.buf,uf_vk_bpool.mem,0)!=VK_SUCCESS
+     ||vkMapMemory(uf_vk_dev,uf_vk_bpool.mem,0,sz,0,(void**)&uf_vk_bpool.mapped)!=VK_SUCCESS){
+    if(uf_vk_bpool.mem)vkFreeMemory(uf_vk_dev,uf_vk_bpool.mem,0);
+    if(uf_vk_bpool.buf)vkDestroyBuffer(uf_vk_dev,uf_vk_bpool.buf,0);
+    memset(&uf_vk_pool,0,sizeof uf_vk_pool); return 0;
+  }
+  uf_vk_bpool.cap=sz; uf_vk_bpool.coherent=coherent;
+  if(!uf_vk_fence){ VkFenceCreateInfo fci; memset(&fci,0,sizeof fci); fci.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; vkCreateFence(uf_vk_dev,&fci,0,&uf_vk_fence); }
+  return 1;
+}
+/* DEVICE_LOCAL twin of the staging pool. Matmul and fused kernels execute
+   here so shaders do not stream their working sets from host memory over
+   PCIe. The mapped pool remains the upload/download staging area. */
+static UFCache uf_vk_dl;
+static int uf_vk_dl_reserve(VkDeviceSize total){
+  if(uf_vk_dl.cap>=total&&uf_vk_dl.buf) return 1;
+  VkDeviceSize want=uf_vk_al(total); VkDeviceSize min=64UL<<20; if(want<min)want=min;
+  if(uf_vk_dl.buf) vkDestroyBuffer(uf_vk_dev,uf_vk_dl.buf,0);
+  if(uf_vk_dl.mem) vkFreeMemory(uf_vk_dev,uf_vk_dl.mem,0);
+  memset(&uf_vk_dl,0,sizeof uf_vk_dl);
+  VkBufferCreateInfo bi; memset(&bi,0,sizeof bi); bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bi.size=want;
+  bi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if(vkCreateBuffer(uf_vk_dev,&bi,0,&uf_vk_dl.buf)!=VK_SUCCESS) return 0;
+  VkMemoryRequirements mr; vkGetBufferMemoryRequirements(uf_vk_dev,uf_vk_dl.buf,&mr);
+  VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(uf_vk_pd,&mp);
+  int found=0; VkDeviceSize sz=mr.size>want?mr.size:want;
+  for(int pass=0;pass<2&&!found;pass++)
+    for(uint32_t i=0;i<mp.memoryTypeCount;i++){
+      VkMemoryPropertyFlags f=mp.memoryTypes[i].propertyFlags;
+      int ok = (mr.memoryTypeBits&(1u<<i)) && (f&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if(pass==0) ok = ok && !(f&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+      if(!ok) continue;
+      VkMemoryAllocateInfo ai; memset(&ai,0,sizeof ai); ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ai.allocationSize=sz; ai.memoryTypeIndex=i;
+      if(vkAllocateMemory(uf_vk_dev,&ai,0,&uf_vk_dl.mem)==VK_SUCCESS){ found=1; break; }
+    }
+  if(!found||vkBindBufferMemory(uf_vk_dev,uf_vk_dl.buf,uf_vk_dl.mem,0)!=VK_SUCCESS){
+    if(uf_vk_dl.mem)vkFreeMemory(uf_vk_dev,uf_vk_dl.mem,0);
+    if(uf_vk_dl.buf)vkDestroyBuffer(uf_vk_dev,uf_vk_dl.buf,0);
+    memset(&uf_vk_dl,0,sizeof uf_vk_dl); return 0;
+  }
+  uf_vk_dl.cap=sz; return 1;
+}
+/* submit the prebuilt command buffer and wait (persistent fence) */
+static int uf_vk_submit_wait(void){
+  if(!uf_vk_fence) return 0;
+  vkResetFences(uf_vk_dev,1,&uf_vk_fence);
+  VkSubmitInfo si; memset(&si,0,sizeof si); si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount=1; si.pCommandBuffers=&uf_vk_cb;
+  return vkQueueSubmit(uf_vk_q,1,&si,uf_vk_fence)==VK_SUCCESS && vkWaitForFences(uf_vk_dev,1,&uf_vk_fence,VK_TRUE,UINT64_MAX)==VK_SUCCESS;
+}
+
+/* dispatch kernel k over n work items; reads A (and B when non-null) into
+   device memory, writes R (rsz bytes) back. Returns 0 on failure. */
+static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_t bsz,void*R,size_t rsz,struct UFPC pc){
+  if(uf_vk_broken) return 0;
+  uf_vk_init();
+  if(!uf_vk_ready) return 0;
+  pthread_mutex_lock(&uf_gpu_mu);
+  if(!uf_vk_ensure_pipe(k)){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
+  double _t0=uf_nowd();
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] bufs a=%zu b=%zu r=%zu\n",asz,bsz,rsz);
+  VkDeviceSize oa=0, ob=uf_vk_al((VkDeviceSize)asz), orr=uf_vk_al(ob+(VkDeviceSize)bsz);
+  if(!uf_vk_pool_reserve(orr+uf_vk_al((VkDeviceSize)rsz))){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
+  if(A&&asz) memcpy(uf_vk_bpool.mapped+oa,A,asz);
+  if(B&&bsz) memcpy(uf_vk_bpool.mapped+ob,B,bsz);
+  uf_vk_flush(oa, (ob+(VkDeviceSize)bsz)-oa);
+  int is_mm=(k==uf_spv_index("matmul") && pc.n1>0 && pc.n3>0);
+  if(is_mm && !uf_vk_dl_reserve(orr+uf_vk_al((VkDeviceSize)rsz))) is_mm=0;
+  VkBuffer cbuf=is_mm?uf_vk_dl.buf:uf_vk_bpool.buf;
+  VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
+  VkDescriptorSet ds;
+  VkResult ar=vkAllocateDescriptorSets(uf_vk_dev,&dsai,&ds);
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] dsalloc=%d\n",(int)ar);
+  if(ar!=VK_SUCCESS){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
+  VkWriteDescriptorSet w[3]; VkDescriptorBufferInfo bi[3];
+  memset(w,0,sizeof w); memset(bi,0,sizeof bi);
+  bi[0].buffer=cbuf; bi[0].offset=oa; bi[0].range=asz?asz:16;
+  bi[1].buffer=(B&&bsz)?cbuf:uf_vk_dummy; bi[1].offset=(B&&bsz)?ob:0; bi[1].range=(B&&bsz)?bsz:16;
+  bi[2].buffer=cbuf; bi[2].offset=orr; bi[2].range=rsz?rsz:16;
+  for(int i=0;i<3;i++){ w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet=ds; w[i].dstBinding=(uint32_t)i; w[i].descriptorCount=1; w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo=&bi[i]; }
+  vkUpdateDescriptorSets(uf_vk_dev,3,w,0,0);
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] updated\n");
+  VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] run k=%d n=%llu begin\n",k,(unsigned long long)n);
+  vkBeginCommandBuffer(uf_vk_cb,&cbbi);
+  if(is_mm){
+    if(A&&asz){ VkBufferCopy c={oa,oa,(VkDeviceSize)asz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_bpool.buf,uf_vk_dl.buf,1,&c); }
+    if(B&&bsz){ VkBufferCopy c={ob,ob,(VkDeviceSize)bsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_bpool.buf,uf_vk_dl.buf,1,&c); }
+    VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
+  }
+  vkCmdBindPipeline(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_pipe[k]);
+  vkCmdPushConstants(uf_vk_cb,uf_vk_playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
+  vkCmdBindDescriptorSets(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_playout,0,1,&ds,0,0);
+  /* tiled matmul shader is local_size 16×16; everyone else is 256×1 */
+  if(k==uf_spv_index("matmul") && pc.n1>0 && pc.n3>0){
+    uint32_t gx=(uint32_t)((pc.n3+15)/16), gy=(uint32_t)((pc.n1+15)/16);
+    if(!gx)gx=1; if(!gy)gy=1;
+    vkCmdDispatch(uf_vk_cb,gx,gy,1);
+  } else {
+    uint64_t groups=(n+255)/256; if(!groups)groups=1;
+    vkCmdDispatch(uf_vk_cb,(uint32_t)(groups>0x7fffffff?0x7fffffff:groups),1,1);
+  }
+  if(is_mm&&R&&rsz){
+    VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb,0,0,0,0);
+    VkBufferCopy c={orr,orr,(VkDeviceSize)rsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_dl.buf,uf_vk_bpool.buf,1,&c);
+  }
+  vkEndCommandBuffer(uf_vk_cb);
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] submit\n");
+  int ok = uf_vk_submit_wait();
+  uf_vk_inval(orr, (VkDeviceSize)rsz);
+  if(ok&&R&&rsz) memcpy(R,uf_vk_bpool.mapped+orr,rsz);
+  if(getenv("NK_VK_DEBUG"))fprintf(stderr,"[vk] total=%.1fms\n",(uf_nowd()-_t0)*1e3);
+  vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
+  pthread_mutex_unlock(&uf_gpu_mu);
+  return ok;
+}
+
+/* ---- fused weave-task dispatch (v13.1) ----
+   One kernel launch for a whole compilable task body: inputs are the top n
+   cells of the ds (peeked, not popped — the ret epilogue drains), the task
+   kernel table follows the static library pipelines. Declines (no device,
+   non-float/mismatched inputs, below NK_GPU_MIN, any Vulkan failure) return
+   the sentinel and the CPU body runs instead. */
+static Cell uf_gpu_decline(void);
+static Cell uf_gpu_task(Ctx*cx,int k,int n){
+  if(uf_vk_broken||n<1||n>7||cx->sp<(uint64_t)n) return uf_gpu_decline();
+  Hdr* ins[7];
+  for(int j=0;j<n;j++){
+    Cell c=cx->ds[cx->sp-n+j];
+    if(!uf_numarr(c)) return uf_gpu_decline();
+    ins[j]=(Hdr*)(void*)c.i;
+    if(ins[j]->ety!=1) return uf_gpu_decline();
+    if(ins[j]->len!=ins[0]->len) return uf_gpu_decline();
+  }
+  uint64_t len=ins[0]->len;
+  if(len<(uint64_t)uf_gpu_min()) return uf_gpu_decline();
+  uf_vk_init();
+  if(!uf_vk_ready) return uf_gpu_decline();
+  if(k<0||k>=(int)(sizeof(uf_spv_all)/sizeof(uf_spv_all[0]))) return uf_gpu_decline();
+  pthread_mutex_lock(&uf_gpu_mu);
+  if(!uf_vk_ensure_pipe(k)){ pthread_mutex_unlock(&uf_gpu_mu); return uf_gpu_decline(); }
+  size_t bufsz=(size_t)len*8;
+  VkDeviceSize offs[8]; VkDeviceSize cur=0;
+  for(int j=0;j<=n;j++){ offs[j]=cur; cur=uf_vk_al(cur+(VkDeviceSize)bufsz); }
+  int ok=uf_vk_pool_reserve(cur);
+  int use_dl=ok&&uf_vk_dl_reserve(cur);
+  VkBuffer cbuf=use_dl?uf_vk_dl.buf:uf_vk_bpool.buf;
+  int dbg=getenv("NK_VK_DEBUG")!=0;
+  double _t0=dbg?uf_nowd():0;
+  Hdr* r=ok?uf_arr_like(ins[0],len):0; UF_PROTECT(&r);
+  if(ok){
+    for(int j=0;j<n;j++) memcpy(uf_vk_bpool.mapped+offs[j],uf_data(ins[j]),bufsz);
+    uf_vk_flush(offs[0], (offs[n-1]+bufsz)-offs[0]);
+    VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
+    VkDescriptorSet ds;
+    ok=vkAllocateDescriptorSets(uf_vk_dev,&dsai,&ds)==VK_SUCCESS;
+    if(ok){
+      VkWriteDescriptorSet w[8]; VkDescriptorBufferInfo bi[8];
+      memset(w,0,sizeof w); memset(bi,0,sizeof bi);
+      for(int j=0;j<=n;j++){ bi[j].buffer=cbuf; bi[j].offset=offs[j]; bi[j].range=bufsz;
+        w[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[j].dstSet=ds; w[j].dstBinding=(uint32_t)j; w[j].descriptorCount=1; w[j].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[j].pBufferInfo=&bi[j]; }
+      vkUpdateDescriptorSets(uf_vk_dev,n+1,w,0,0);
+      struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)len;
+      VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      ok=vkBeginCommandBuffer(uf_vk_cb,&cbbi)==VK_SUCCESS;
+      if(ok){
+        if(use_dl){
+          for(int j=0;j<n;j++){ VkBufferCopy c={offs[j],offs[j],(VkDeviceSize)bufsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_bpool.buf,uf_vk_dl.buf,1,&c); }
+          VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+          mb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+          vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
+        }
+        vkCmdBindPipeline(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_pipe[k]);
+        vkCmdPushConstants(uf_vk_cb,uf_vk_playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
+        vkCmdBindDescriptorSets(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_playout,0,1,&ds,0,0);
+        uint64_t groups=(len+255)/256; if(!groups)groups=1;
+        vkCmdDispatch(uf_vk_cb,(uint32_t)(groups>0x7fffffff?0x7fffffff:groups),1,1);
+        if(use_dl){
+          VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+          mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+          vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb,0,0,0,0);
+          VkBufferCopy c={offs[n],offs[n],(VkDeviceSize)bufsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_dl.buf,uf_vk_bpool.buf,1,&c);
+        }
+        vkEndCommandBuffer(uf_vk_cb);
+        ok=uf_vk_submit_wait();
+        uf_vk_inval(offs[n], (VkDeviceSize)bufsz);
+        if(ok) memcpy(uf_data(r),uf_vk_bpool.mapped+offs[n],bufsz);
+      }
+      vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
+    }
+  }
+  if(dbg)fprintf(stderr,"[vk-task] n=%llu in=%d dl=%d total=%.1fms\n",(unsigned long long)len,n,use_dl,(uf_nowd()-_t0)*1e3);
+  UF_UNPROTECT();
+  pthread_mutex_unlock(&uf_gpu_mu);
+  return ok?uf_mkp(r):uf_gpu_decline();
+}
+
+/* ---- v13.2 fused region dispatch: one kernel launch for a straight-line
+   elementwise chain in plain (non-weave) code, with up to 4 outputs. Inputs
+   arrive explicitly as Cells (compiler-passed locals). Returns 1 and fills
+   outs[0..nout) on success; 0 = declined, caller falls back to the fused CPU
+   loop / per-op path. */
+/* v15: parallel memcpy for multi-64MB staging transfers — the region
+   copy-in/copy-out was single-thread bound at ~4GB/s per core. */
+#ifdef NK_GPU
+typedef struct { char* dst; const char* src; size_t n; } UFPMC;
+static void* uf_pmc_fn(void* arg){
+  UFPMC* m=(UFPMC*)arg; memcpy(m->dst,m->src,m->n); return 0;
+}
+static void uf_memcpy_big(void* dst, const void* src, size_t n){
+  if(n < (size_t)64<<20 || getenv("NK_VK_NOPMC")){ memcpy(dst,src,n); return; }
+  enum { NTH = 4 };
+  UFPMC parts[NTH]; pthread_t th[NTH-1];
+  size_t chunk = n / NTH;
+  for(int k=0;k<NTH;k++){
+    parts[k].dst=(char*)dst+(size_t)k*chunk;
+    parts[k].src=(const char*)src+(size_t)k*chunk;
+    parts[k].n = (k==NTH-1) ? n-(size_t)(NTH-1)*chunk : chunk;
+    if(k<NTH-1) pthread_create(&th[k],0,uf_pmc_fn,&parts[k]);
+  }
+  uf_pmc_fn(&parts[NTH-1]);
+  for(int k=0;k<NTH-1;k++) pthread_join(th[k],0);
+}
+#else
+#define uf_memcpy_big memcpy
+#endif
+
+static int uf_region_try_n1(int k,int n,uint64_t rlen,uint64_t rin,int nout,Cell*ins,Cell*outs){
+  /* n==0: generator region (Idx expressions only) — rlen is the dispatch
+     length from the region's length guard; outputs are fresh float64
+     tensors. */
+  if(uf_vk_broken||n>7||nout<1||nout>4||n+nout>8) return 0;
+  if(n==0&&(rlen==0||rlen>=((uint64_t)1<<31))) return 0;
+  Hdr* hs[7];
+  for(int j=0;j<n;j++){
+    if(!uf_numarr(ins[j])) return 0;
+    hs[j]=(Hdr*)(void*)ins[j].i;
+    if(hs[j]->ety!=1) return 0;
+    if(hs[j]->len!=hs[0]->len) return 0;
+  }
+  uint64_t len=n?hs[0]->len:rlen;
+  if(len<(uint64_t)uf_gpu_min()) return 0;
+  /* Matrices must not take the elementwise fused kernel (mul is matmul). */
+  for(int j=0;j<n;j++) if(hs[j]->tag==HT_MAT) return 0;
+  /* Static first-run estimate: skip GPU when init has not happened and n
+     is below the per-op arith floor (blackscholes N=2M stays CPU).
+     Pinned vk<N> still launches. */
+  if(uf_dev_is_auto() && !uf_vk_ready && len<(uint64_t)uf_gpu_arith_min()) return 0;
+  uf_vk_init();
+  if(!uf_vk_ready) return 0;
+  if(k<0||k>=(int)(sizeof(uf_spv_all)/sizeof(uf_spv_all[0]))) return 0;
+  pthread_mutex_lock(&uf_gpu_mu);
+  if(!uf_vk_ensure_pipe(k)){ pthread_mutex_unlock(&uf_gpu_mu); return 0; }
+  size_t bufsz=(size_t)len*8;
+  VkDeviceSize offs[8]; VkDeviceSize cur=0;
+  for(int j=0;j<n+nout;j++){ offs[j]=cur; cur=uf_vk_al(cur+(VkDeviceSize)bufsz); }
+  int ok=uf_vk_pool_reserve(cur);
+  /* generator regions (n==0) have a single streaming output: the device-
+     local twin only adds a VRAM->GTT copy, so run directly on the pool */
+  int use_dl=ok&&n>0&&uf_vk_dl_reserve(cur);
+  VkBuffer cbuf=use_dl?uf_vk_dl.buf:uf_vk_bpool.buf;
+  int dbg=getenv("NK_VK_DEBUG")!=0;
+  double _t0=dbg?uf_nowd():0;
+  double _tin=0,_tsub=0,_tout=0,_tm;
+  Hdr tpl; if(n==0){ memset(&tpl,0,sizeof tpl); tpl.tag=HT_TENSOR; tpl.esz=8; tpl.ety=1; tpl.len=len; }
+  Hdr* rs[4]; for(int j=0;j<nout;j++){ rs[j]=0; UF_PROTECT(&rs[j]); }
+  if(ok){
+    if(dbg)_tm=uf_nowd();
+    for(int j=0;j<nout;j++) rs[j]=uf_arr_like(n?hs[0]:&tpl,len);
+    for(int j=0;j<n;j++) uf_memcpy_big(uf_vk_bpool.mapped+offs[j],uf_data(hs[j]),bufsz);
+    uf_vk_flush(offs[0], (offs[n-1]+bufsz)-offs[0]);
+    if(dbg){_tin=uf_nowd()-_tm;_tm=uf_nowd();}
+    VkDescriptorSetAllocateInfo dsai; memset(&dsai,0,sizeof dsai); dsai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsai.descriptorPool=uf_vk_dpool; dsai.descriptorSetCount=1; dsai.pSetLayouts=&uf_vk_dsl;
+    VkDescriptorSet ds;
+    ok=vkAllocateDescriptorSets(uf_vk_dev,&dsai,&ds)==VK_SUCCESS;
+    if(ok){
+      VkWriteDescriptorSet w[8]; VkDescriptorBufferInfo bi[8];
+      memset(w,0,sizeof w); memset(bi,0,sizeof bi);
+      for(int j=0;j<n+nout;j++){ bi[j].buffer=cbuf; bi[j].offset=offs[j]; bi[j].range=bufsz;
+        w[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[j].dstSet=ds; w[j].dstBinding=(uint32_t)j; w[j].descriptorCount=1; w[j].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[j].pBufferInfo=&bi[j]; }
+      vkUpdateDescriptorSets(uf_vk_dev,n+nout,w,0,0);
+      struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)len; pc.n1=(int64_t)rin;
+      VkCommandBufferBeginInfo cbbi; memset(&cbbi,0,sizeof cbbi); cbbi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      ok=vkBeginCommandBuffer(uf_vk_cb,&cbbi)==VK_SUCCESS;
+      if(ok){
+        if(use_dl){
+          for(int j=0;j<n;j++){ VkBufferCopy c={offs[j],offs[j],(VkDeviceSize)bufsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_bpool.buf,uf_vk_dl.buf,1,&c); }
+          VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+          mb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+          vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
+        }
+        vkCmdBindPipeline(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_pipe[k]);
+        vkCmdPushConstants(uf_vk_cb,uf_vk_playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
+        vkCmdBindDescriptorSets(uf_vk_cb,VK_PIPELINE_BIND_POINT_COMPUTE,uf_vk_playout,0,1,&ds,0,0);
+        uint64_t groups=(len+255)/256; if(!groups)groups=1;
+        vkCmdDispatch(uf_vk_cb,(uint32_t)(groups>0x7fffffff?0x7fffffff:groups),1,1);
+        if(use_dl){
+          VkMemoryBarrier mb; memset(&mb,0,sizeof mb); mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+          mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+          vkCmdPipelineBarrier(uf_vk_cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb,0,0,0,0);
+          for(int j=0;j<nout;j++){ int q=n+j; VkBufferCopy c={offs[q],offs[q],(VkDeviceSize)bufsz}; vkCmdCopyBuffer(uf_vk_cb,uf_vk_dl.buf,uf_vk_bpool.buf,1,&c); }
+        }
+        vkEndCommandBuffer(uf_vk_cb);
+        ok=uf_vk_submit_wait();
+        uf_vk_inval(offs[n], (offs[n+nout-1]+bufsz)-offs[n]);
+        if(dbg){_tsub=uf_nowd()-_tm;_tm=uf_nowd();}
+        if(ok) for(int j=0;j<nout;j++) uf_memcpy_big(uf_data(rs[j]),uf_vk_bpool.mapped+offs[n+j],bufsz);
+        if(dbg)_tout=uf_nowd()-_tm;
+      }
+      vkFreeDescriptorSets(uf_vk_dev,uf_vk_dpool,1,&ds);
+    }
+  }
+  if(dbg)fprintf(stderr,"[vk-region] n=%llu in=%d out=%d dl=%d in=%.1fms sub=%.1fms out=%.1fms total=%.1fms\n",(unsigned long long)len,n,nout,use_dl,_tin*1e3,_tsub*1e3,_tout*1e3,(uf_nowd()-_t0)*1e3);
+  for(int j=0;j<nout;j++) UF_UNPROTECT();
+  pthread_mutex_unlock(&uf_gpu_mu);
+  if(ok){ for(int j=0;j<nout;j++){ outs[j].tag=T_PTR; outs[j].i=(int64_t)(void*)rs[j]; } return 1; }
+  return 0;
+}
+static int uf_region_try(int k,int n,int nout,uint64_t rlen,Cell*ins,Cell*outs){
+  return uf_region_try_n1(k,n,rlen,1,nout,ins,outs);
+}
+static int uf_region_try2(int k,int nout,uint64_t rlen,uint64_t rin,Cell*ins,Cell*outs){
+  /* nested-domain variant: pc.n0 = rlen (product), pc.n1 = rin (inner
+     count; 1 for flat domains) */
+  return uf_region_try_n1(k,0,rlen,rin,nout,ins,outs);
+}
+
+/* ---- op shims (return a T_INT 0 Cell when declined; caller falls back) ---- */
+static Cell uf_gpu_decline(void){ Cell c; c.tag=T_INT; c.i=0; return c; }
+static Cell uf_gpu_arith(Cell a,Cell b,int op){
+  Hdr*ha=uf_numarr(a)?(Hdr*)(void*)a.i:0;
+  Hdr*hb=uf_numarr(b)?(Hdr*)(void*)b.i:0;
+  static const char* eb[4]={"eadd","esub","emul","ediv"};
+  static const char* bb_[4]={"badd","bsub","bmul","bdiv"};
+  if(ha&&hb){
+    if(ha->ety!=1||hb->ety!=1) return uf_gpu_decline();
+    uint64_t n=ha->len;
+    struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)n;
+    if(op==2&&ha->tag==HT_MAT&&hb->tag==HT_MAT){
+      uint64_t ra=ha->esz, ca=ha->len/ra, rb=hb->esz, cb=hb->len/rb;
+      if(ca!=rb) return uf_gpu_decline(); /* let CPU produce the die() */
+      pc.n1=(int64_t)ra; pc.n2=(int64_t)ca; pc.n3=(int64_t)cb;
+      Hdr*r=uf_mat_new(ra,cb,1); UF_PROTECT(&r);
+      int k=uf_spv_index("matmul");
+      int ok=k>=0&&uf_vk_run(k,ra*cb,uf_data(ha),(size_t)n*8,uf_data(hb),(size_t)hb->len*8,uf_data(r),(size_t)(ra*cb)*8,pc);
+      UF_UNPROTECT();
+      return ok?uf_mkp(r):uf_gpu_decline();
+    }
+    if(op==2&&ha->tag==HT_MAT&&hb->tag!=HT_MAT){
+      uint64_t ra=ha->esz, ca=ha->len/ra;
+      if(hb->len!=ca) return uf_gpu_decline();
+      pc.n1=(int64_t)ra; pc.n2=(int64_t)ca;
+      Hdr*r=uf_arr_like(hb,ra); UF_PROTECT(&r);
+      int k=uf_spv_index("matvec");
+      int ok=k>=0&&uf_vk_run(k,ra,uf_data(ha),(size_t)n*8,uf_data(hb),(size_t)hb->len*8,uf_data(r),(size_t)ra*8,pc);
+      UF_UNPROTECT();
+      return ok?uf_mkp(r):uf_gpu_decline();
+    }
+    if(op==2&&ha->tag!=HT_MAT&&hb->tag==HT_MAT){
+      uint64_t rb=hb->esz, cb2=hb->len/rb;
+      if(ha->len!=rb) return uf_gpu_decline();
+      pc.n1=(int64_t)rb; pc.n2=(int64_t)cb2;
+      Hdr*r=uf_arr_like(ha,cb2); UF_PROTECT(&r);
+      int k=uf_spv_index("matvec"); /* reversed: computes b·a via same kernel */
+      int ok=k>=0&&uf_vk_run(k,cb2,uf_data(hb),(size_t)hb->len*8,uf_data(ha),(size_t)n*8,uf_data(r),(size_t)cb2*8,pc);
+      UF_UNPROTECT();
+      return ok?uf_mkp(r):uf_gpu_decline();
+    }
+    if(ha->len!=hb->len) return uf_gpu_decline();
+    Hdr*r=uf_arr_like(ha,n); UF_PROTECT(&r);
+    int k=uf_spv_index(eb[op]);
+    int ok=k>=0&&uf_vk_run(k,n,uf_data(ha),(size_t)n*8,uf_data(hb),(size_t)n*8,uf_data(r),(size_t)n*8,pc);
+    UF_UNPROTECT();
+    return ok?uf_mkp(r):uf_gpu_decline();
+  }
+  /* broadcast */
+  Hdr*h=ha?ha:hb;
+  Cell sc=ha?b:a;
+  if(!h||h->ety!=1||sc.tag==T_PTR) return uf_gpu_decline();
+  uint64_t n=h->len;
+  struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)n; pc.s=uf_f(sc); pc.rev=ha?0:1;
+  Hdr*r=uf_arr_like(h,n); UF_PROTECT(&r);
+  int k=uf_spv_index(bb_[op]);
+  int ok=k>=0&&uf_vk_run(k,n,uf_data(h),(size_t)n*8,NULL,0,uf_data(r),(size_t)n*8,pc);
+  UF_UNPROTECT();
+  return ok?uf_mkp(r):uf_gpu_decline();
+}
+static int uf_gpu_reduce(const double*d,uint64_t n,const char*kname,double*out){
+  uint64_t groups=(n+255)/256;
+  double* partials=(double*)malloc(groups*sizeof(double));
+  struct UFPC pc; memset(&pc,0,sizeof pc); pc.n0=(int64_t)n;
+  int k=uf_spv_index(kname);
+  if(k<0||!uf_vk_run(k,n,d,n*8,NULL,0,partials,groups*8,pc)){ free(partials); return 0; }
+  /* second pass: reduce the partials (single group when small) */
+  double final=0;
+  if(groups==1){ final=partials[0]; }
+  else if(groups<=256){
+    double one; pc.n0=(int64_t)groups;
+    if(!uf_vk_run(k,groups,partials,groups*8,NULL,0,&one,8,pc)){ free(partials); return 0; }
+    final=one;
+  } else {
+    /* chain until one group remains */
+    uint64_t g=groups;
+    double* cur=partials;
+    while(g>1){
+      uint64_t ng=(g+255)/256;
+      double* nxt=(double*)malloc(ng*sizeof(double));
+      pc.n0=(int64_t)g;
+      if(!uf_vk_run(k,g,cur,g*8,NULL,0,nxt,ng*8,pc)){ free(cur!=partials?cur:0); free(nxt); if(cur!=partials)free(partials); return 0; }
+      if(cur!=partials) free(cur);
+      cur=nxt; g=ng;
+    }
+    final=cur[0];
+    if(cur!=partials) free(cur);
+    free(partials);
+  }
+  if(groups==1) free(partials);
+  *out=final;
+  return 1;
+}
+#endif /* UF_GPU */
+
+/* ================= polymorphic matrices (v13.1) =================
+   A matrix is HT_MAT with len=rows*cols (row-major flat), esz=rows,
+   cols=len/rows; element size derives from ety (byte=1, else 8) like Str.
+   `mul` on two matrices is matmul; matrix·vector is matvec; add/sub/div are
+   elementwise (shape-checked) or scalar-broadcast. */
+static int uf_numarr(Cell c){ if(c.tag!=T_PTR||!c.i)return 0; Hdr*h=uf_gc_find((void*)c.i); return h&&(h->tag==HT_ARR||h->tag==HT_TENSOR||h->tag==HT_MAT); }
+static Hdr* uf_mat_new(uint64_t rows,uint64_t cols,uint64_t ety){
+  if(!rows||!cols)die("matrix: zero dimension");
+  uint64_t esz=(ety==3)?1:8;
+  Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)rows*cols*esz,0);
+  h->tag=HT_MAT; h->len=rows*cols; h->esz=rows; h->ety=ety;
+  memset(h->data,0,(size_t)rows*cols*esz);
+  return h;
+}
+static void uf_dims(Hdr*m,char*buf,size_t cap){ snprintf(buf,cap,"%llux%llu",(unsigned long long)m->esz,(unsigned long long)(m->len/m->esz)); }
+/* matmul: (ra x ca)·(ca x cb); float fast path, else int64 */
+static Hdr* uf_matmul(Hdr*ha,Hdr*hb){
+  uint64_t ra=ha->esz, ca=ha->len/ra, rb=hb->esz, cb=hb->len/rb;
+  if(ca!=rb){ char da[32],db[32]; uf_dims(ha,da,sizeof da); uf_dims(hb,db,sizeof db); char m[128]; snprintf(m,sizeof m,"mul: matmul inner dims mismatch (%s · %s)",da,db); die(m); }
+  uint64_t ety=(ha->ety==1||hb->ety==1)?1:((ha->ety==3&&hb->ety==3)?3:0);
+  Hdr*r=uf_mat_new(ra,cb,ety); UF_PROTECT(&r);
+  if(ety==1){
+    const double*A=(const double*)uf_data(ha); const double*B=(const double*)uf_data(hb); double*C=(double*)uf_data(r);
+    /* 64×64 tiles keep A/B/C panels in L1/L2; the old ikj loop is fine for
+       N≤512 but thrashes L3 at the GPU-table N=2048 size. */
+    const uint64_t BS=64;
+    for(uint64_t i0=0;i0<ra;i0+=BS){
+      uint64_t i1=i0+BS; if(i1>ra)i1=ra;
+      for(uint64_t k0=0;k0<ca;k0+=BS){
+        uint64_t k1=k0+BS; if(k1>ca)k1=ca;
+        for(uint64_t j0=0;j0<cb;j0+=BS){
+          uint64_t j1=j0+BS; if(j1>cb)j1=cb;
+          for(uint64_t i=i0;i<i1;i++){
+            double*Ci=C+i*cb;
+            for(uint64_t k=k0;k<k1;k++){
+              double aik=A[i*ca+k]; if(aik==0.0)continue;
+              const double*Bk=B+k*cb;
+              for(uint64_t j=j0;j<j1;j++) Ci[j]+=aik*Bk[j];
+            }
+          }
+        }
+      }
+    }
+  } else {
+    const int64_t*A=(const int64_t*)uf_data(ha); const int64_t*B=(const int64_t*)uf_data(hb); int64_t*C=(int64_t*)uf_data(r);
+    for(uint64_t i=0;i<ra;i++) for(uint64_t k=0;k<ca;k++){ int64_t aik=A[i*ca+k]; if(!aik)continue; const int64_t*Bk=B+k*cb; int64_t*Ci=C+i*cb; for(uint64_t j=0;j<cb;j++) Ci[j]+=aik*Bk[j]; }
+  }
+  UF_UNPROTECT(); return r;
+}
+/* matrix (ra x ca) · vector (ca) -> vector (ra) */
+static Hdr* uf_matvec(Hdr*m,Hdr*v){
+  uint64_t r=m->esz, c=m->len/r;
+  if(v->len!=c){ char dm[32]; uf_dims(m,dm,sizeof dm); char msg[128]; snprintf(msg,sizeof msg,"mul: matvec dims mismatch (%s · len %llu)",dm,(unsigned long long)v->len); die(msg); }
+  uint64_t ety=(m->ety==1||v->ety==1)?1:0;
+  Hdr*res=uf_arr_like(ety==1?(m->ety==1?m:v):(m->ety==0?m:v), r);
+  /* uf_arr_like copies esz from the prototype — for a MAT prototype esz is
+     rows, wrong for a 1-D result; fix up */
+  if(res->tag==HT_MAT){ res->tag=HT_ARR; res->esz=(ety==3)?1:8; }
+  UF_PROTECT(&res);
+  for(uint64_t i=0;i<r;i++){ double s=0; for(uint64_t k=0;k<c;k++) s+=uf_el(m,i*c+k)*uf_el(v,k); uf_put_el(res,i,s); }
+  UF_UNPROTECT(); return res;
+}
+/* vector (ra) · matrix (ra x cb) -> vector (cb) */
+static Hdr* uf_vecmat(Hdr*v,Hdr*m){
+  uint64_t r=m->esz, c=m->len/r;
+  if(v->len!=r){ char dm[32]; uf_dims(m,dm,sizeof dm); char msg[128]; snprintf(msg,sizeof msg,"mul: vecmat dims mismatch (len %llu · %s)",(unsigned long long)v->len,dm); die(msg); }
+  uint64_t ety=(m->ety==1||v->ety==1)?1:0;
+  Hdr*res=uf_arr_like(ety==1?(m->ety==1?m:v):(m->ety==0?m:v), c);
+  if(res->tag==HT_MAT){ res->tag=HT_ARR; res->esz=(ety==3)?1:8; }
+  UF_PROTECT(&res);
+  for(uint64_t j=0;j<c;j++){ double s=0; for(uint64_t i=0;i<r;i++) s+=uf_el(v,i)*uf_el(m,i*c+j); uf_put_el(res,j,s); }
+  UF_UNPROTECT(); return res;
+}
+/* polymorphic + - * / for array/matrix/scalar operand mixes */
+static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn){
+  Hdr*ha=uf_numarr(a)?(Hdr*)(void*)a.i:0;
+  Hdr*hb=uf_numarr(b)?(Hdr*)(void*)b.i:0;
+  /* operands are popped from the ds before we allocate the result — keep them
+     rooted or a GC triggered by the result allocation would sweep them */
+  UF_PROTECT((void**)(void*)&a.i); UF_PROTECT((void**)(void*)&b.i);
+#ifdef NK_GPU
+  if(ha&&hb&&ha->ety==1&&hb->ety==1){
+    uint64_t work = (op==2&&ha->tag==HT_MAT&&hb->tag==HT_MAT) ? (ha->esz*(hb->len/hb->esz))
+      : (op==2&&ha->tag==HT_MAT) ? ha->esz
+      : (op==2&&hb->tag==HT_MAT) ? (hb->len/hb->esz)
+      : (ha->len>hb->len?ha->len:hb->len);
+    long _amin;
+    if(op==2&&ha->tag==HT_MAT&&hb->tag==HT_MAT){
+      if(uf_dev_is_auto()){
+        uint64_t ra=ha->esz, ca=ha->len/ra, cb=hb->len/hb->esz;
+        work = ra*ca*cb; /* static FLOP estimate — never a timed trial */
+        _amin = uf_gpu_matmul_min();
+      } else {
+        _amin = uf_gpu_min(); /* --device vk<N>: honor the pin */
+      }
+    } else if(op==2&&(ha->tag==HT_MAT||hb->tag==HT_MAT)) {
+      _amin = uf_gpu_min();
+    } else {
+      _amin = uf_gpu_arith_min();
+    }
+    if(work>=(uint64_t)_amin){
+      Cell g=uf_gpu_arith(a,b,op);
+      if(!(g.tag==T_INT&&g.i==0)){ UF_UNPROTECT(); UF_UNPROTECT(); return g; }
+    }
+  }
+  if((ha&&!hb&&ha->ety==1&&ha->len>=(uint64_t)uf_gpu_arith_min())||(hb&&!ha&&hb->ety==1&&hb->len>=(uint64_t)uf_gpu_arith_min())){
+    Cell g=uf_gpu_arith(a,b,op);
+    if(!(g.tag==T_INT&&g.i==0)){ UF_UNPROTECT(); UF_UNPROTECT(); return g; }
+  }
+#endif
+  if(ha&&hb){
+    if(op==2&&ha->tag==HT_MAT&&hb->tag==HT_MAT){ Hdr*r=uf_matmul(ha,hb); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r); }
+    if(op==2&&ha->tag==HT_MAT&&hb->tag!=HT_MAT){ Hdr*r=uf_matvec(ha,hb); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r); }
+    if(op==2&&ha->tag!=HT_MAT&&hb->tag==HT_MAT){ Hdr*r=uf_vecmat(ha,hb); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r); }
+    /* elementwise (arrays, or matrices of identical shape) */
+    if(ha->len!=hb->len){ char m[96]; snprintf(m,sizeof m,"%s: length mismatch (%llu vs %llu)",opn,(unsigned long long)ha->len,(unsigned long long)hb->len); die(m); }
+    if(ha->tag==HT_MAT&&hb->tag==HT_MAT&&ha->esz!=hb->esz){ char da[32],db[32]; uf_dims(ha,da,sizeof da); uf_dims(hb,db,sizeof db); char m[128]; snprintf(m,sizeof m,"%s: matrix shape mismatch (%s vs %s)",opn,da,db); die(m); }
+    uint64_t n=ha->len; Hdr*r=uf_arr_like(ha,n); UF_PROTECT(&r);
+    /* v13.2 f64 fast path: raw typed loops, no per-element ety/tag dispatch
+       (mirrors the matmul path) — vectorizable by cc at -O2 */
+    if(ha->ety==1&&hb->ety==1){
+      const double*A=(const double*)uf_data(ha); const double*B=(const double*)uf_data(hb); double*R=(double*)uf_data(r);
+      if(op==0){ for(uint64_t i=0;i<n;i++)R[i]=A[i]+B[i]; }
+      else if(op==1){ for(uint64_t i=0;i<n;i++)R[i]=A[i]-B[i]; }
+      else if(op==2){ for(uint64_t i=0;i<n;i++)R[i]=A[i]*B[i]; }
+      else { for(uint64_t i=0;i<n;i++){ double y=B[i]; if(y==0.0){ char m[64]; snprintf(m,sizeof m,"%s: zero divisor",opn); UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); die(m); } R[i]=A[i]/y; } }
+      UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
+    }
+    if(op==3) for(uint64_t i=0;i<n;i++) if(uf_el(hb,i)==0.0){ char m[64]; snprintf(m,sizeof m,"%s: zero divisor",opn); UF_UNPROTECT(); die(m); }
+    for(uint64_t i=0;i<n;i++){
+      double x=uf_el(ha,i),y=uf_el(hb,i);
+      double v = op==0?x+y : op==1?x-y : op==2?x*y : x/y;
+      uf_put_el(r,i,v);
+    }
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
+  }
+  /* scalar broadcast */
+  if(ha&&!hb){
+    uint64_t n=ha->len; Hdr*r=uf_arr_like(ha,n); UF_PROTECT(&r);
+    if(ha->ety==1&&ha->tag!=HT_MAT){
+      /* v13.2 f64 fast path (raw typed loop) */
+      const double*A=(const double*)uf_data(ha); double*R=(double*)uf_data(r); double d=uf_f(b);
+      if(op==3&&d==0.0){ UF_UNPROTECT(); UF_UNPROTECT(); die("div: zero divisor"); }
+      if(op==0){ for(uint64_t i=0;i<n;i++)R[i]=A[i]+d; }
+      else if(op==1){ for(uint64_t i=0;i<n;i++)R[i]=A[i]-d; }
+      else if(op==2){ for(uint64_t i=0;i<n;i++)R[i]=A[i]*d; }
+      else { for(uint64_t i=0;i<n;i++)R[i]=A[i]/d; }
+      UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
+    }
+    if(ha->ety==1||b.tag==T_FLOAT){ double d=uf_f(b); if(op==3&&d==0.0){ UF_UNPROTECT(); die("div: zero divisor"); } for(uint64_t i=0;i<n;i++){ double x=uf_el(ha,i); uf_put_el(r,i, op==0?x+d : op==1?x-d : op==2?x*d : x/d); } }
+    else { int64_t d=b.i; if(op==3&&d==0){ UF_UNPROTECT(); die("div: zero divisor"); } for(uint64_t i=0;i<n;i++){ double x=uf_el(ha,i); uf_put_el(r,i, op==0?x+(double)d : op==1?x-(double)d : op==2?x*(double)d : x/(double)d); } }
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
+  }
+  if(hb&&!ha){
+    uint64_t n=hb->len; Hdr*r=uf_arr_like(hb,n); UF_PROTECT(&r);
+    if(hb->ety==1&&hb->tag!=HT_MAT){
+      /* v13.2 f64 fast path (raw typed loop, scalar on the left) */
+      const double*B=(const double*)uf_data(hb); double*R=(double*)uf_data(r); double d=uf_f(a);
+      if(op==3&&d==0.0){ UF_UNPROTECT(); UF_UNPROTECT(); die("div: zero divisor"); }
+      if(op==0){ for(uint64_t i=0;i<n;i++)R[i]=d+B[i]; }
+      else if(op==1){ for(uint64_t i=0;i<n;i++)R[i]=d-B[i]; }
+      else if(op==2){ for(uint64_t i=0;i<n;i++)R[i]=d*B[i]; }
+      else { for(uint64_t i=0;i<n;i++)R[i]=d/B[i]; }
+      UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
+    }
+    if(hb->ety==1||a.tag==T_FLOAT){ double d=uf_f(a); if(op==3&&d==0.0){ UF_UNPROTECT(); die("div: zero divisor"); } for(uint64_t i=0;i<n;i++){ double y=uf_el(hb,i); uf_put_el(r,i, op==0?d+y : op==1?d-y : op==2?d*y : d/y); } }
+    else { int64_t d=a.i; if(op==3&&d==0){ UF_UNPROTECT(); die("div: zero divisor"); } for(uint64_t i=0;i<n;i++){ double y=uf_el(hb,i); uf_put_el(r,i, op==0?(double)d+y : op==1?(double)d-y : op==2?(double)d*y : (double)d/y); } }
+    UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); return uf_mkp(r);
+  }
+  die("poly arith: no array operand");
+}
+
+/* TRANSPOSE: mat -> mat' (rows/cols swapped) */
+static void op_transpose(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"transpose");
+  if(a->tag!=HT_MAT)die("transpose: not a matrix (build one with [rows cols] type tensor)");
+  uint64_t r=a->esz,c=a->len/r;
+  UF_PROTECT((void**)(void*)&h.i);
+#ifdef NK_GPU
+  if(a->ety==1&&(r*c)>=(uint64_t)uf_gpu_min()){
+    Hdr*g=uf_mat_new(c,r,1); UF_PROTECT(&g);
+    struct UFPC pc; memset(&pc,0,sizeof pc); pc.n1=(int64_t)r; pc.n2=(int64_t)c;
+    int k=uf_spv_index("transpose");
+    int ok=k>=0&&uf_vk_run(k,r*c,uf_data(a),(size_t)(r*c)*8,NULL,0,uf_data(g),(size_t)(r*c)*8,pc);
+    UF_UNPROTECT();
+    if(ok){ UF_UNPROTECT(); pushp(cx,g); return; }
+    /* fall through to CPU */
+  }
+#endif
+  Hdr*t=uf_mat_new(c,r,a->ety); UF_PROTECT(&t);
+  for(uint64_t i=0;i<r;i++) for(uint64_t j=0;j<c;j++) uf_put_el(t,j*r+i,uf_el(a,i*c+j));
+  UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,t);
+}
+static Hdr* uf_vcheck(Cell h,const char*op){ Hdr*a=uf_handle(h,op); if(a->tag!=HT_ARR&&a->tag!=HT_TENSOR&&a->tag!=HT_MAT)die("vector op: not an arr"); return a; }
+/* scalar arr ops: arr scalar -> arr' */
+#define UF_VSOP(NAME,EXPR,RAWEXPR,ZERO_DIE) \
+static void NAME(Ctx*cx){ Cell s=pop(cx),h=pop(cx); Hdr*a=uf_vcheck(h,#NAME); \
+  UF_PROTECT((void**)(void*)&h.i); \
+  uint64_t n=a->len; Hdr*r=uf_arr_like(a,n); UF_PROTECT(&r); \
+  if(a->ety==1&&a->tag!=HT_MAT){ const double*A=(const double*)uf_data(a); double*R=(double*)uf_data(r); double d=uf_f(s); if(ZERO_DIE&&d==0.0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)R[i]=(RAWEXPR); } \
+  else if(s.tag==T_FLOAT){ double d=uf_f(s); if(ZERO_DIE&&d==0.0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); } \
   else { int64_t d=s.i; if(ZERO_DIE&&d==0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); } \
   UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); }
 UF_VSOP(op_vadd, uf_el(a,i)+d, A[i]+d, 0)

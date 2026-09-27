@@ -617,7 +617,8 @@ pub fn emit_range(
         if i > start && targets.contains(&i) {
             vdiscard(&mut e, &mut vstack, &mut vcache);
         }
-        e.push_str(&format!("{}: ", plab(prefix, i)));
+        // C labels must precede statements, not declarations (Clang 10).
+        e.push_str(&format!("{}:; ", plab(prefix, i)));
         if suppress.contains(&i) {
             // PushAddr feeding an inlined FOR: the address is compile-time
             // known, so the push is elided entirely.

@@ -93,6 +93,8 @@ jobs:
             python: apt-get install -y --no-install-recommends python3
           - image: ubuntu:22.04
             python: apt-get install -y --no-install-recommends python3
+          - image: ubuntu:20.04
+            python: apt-get install -y --no-install-recommends python3
           - image: fedora:42
             python: dnf install -y python3
           - image: alpine:3.22
@@ -136,4 +138,29 @@ jobs:
             ! command -v cc
             NK_INSTALL_SOURCE_DIR=/work sh install.sh
             nk --device cpu '\''"fresh source install works" print'\''
+          '
+
+  legacy-toolchains:
+    name: Rust 1.70 / Ubuntu 20.04 / ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc-9, clang-10]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build from source and run QC with older compilers
+        env:
+          C_COMPILER: ${{ matrix.compiler }}
+        run: |
+          docker run --rm -e C_COMPILER -v "$GITHUB_WORKSPACE:/work" -w /work ubuntu:20.04 sh -ec '
+            apt-get update
+            apt-get install -y --no-install-recommends build-essential clang-10 python3 curl ca-certificates tar
+            mkdir -p /tmp/compat-bin
+            ln -s "/usr/bin/$C_COMPILER" /tmp/compat-bin/cc
+            export PATH="/tmp/compat-bin:$PATH"
+            NK_INSTALL_SOURCE_DIR=/work sh install.sh
+            rustc --version | grep "rustc 1.70.0 "
+            cc --version
+            python3 qc/unix.py "$(command -v nk)" "$(command -v nks)" --quick
           '

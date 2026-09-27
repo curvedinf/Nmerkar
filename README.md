@@ -83,6 +83,7 @@ nk '"Hello!" print'
 
 Supports Linux (x86_64, ARM64, ARMv7) and macOS (ARM64, Intel). Installs `nk`,
 `nks`, and the C compiler and libraries required to run Nmerkar programs.
+Source builds use an existing Rust 1.70 or newer, or install Rust 1.70 when needed.
 
 ## Usage
 

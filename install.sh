@@ -4,6 +4,7 @@
 set -eu
 
 repo_url=https://github.com/curvedinf/Nmerkar
+min_rust_version=1.70.0
 if [ "${NK_INSTALL_DIR+x}" = x ]; then
   install_dir=$NK_INSTALL_DIR
 else
@@ -47,8 +48,20 @@ esac
 check_cc() {
   command -v cc >/dev/null 2>&1 || return 1
   printf '%s\n' '#include <pthread.h>' '#include <math.h>' '#include <sys/mman.h>' \
-    'int main(void) { pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER; return pthread_mutex_lock(&m) || pthread_mutex_unlock(&m) || (sin(0.0) != 0.0); }' > "$tmp_dir/probe.c"
+    '#include <stdatomic.h>' 'static _Thread_local int local;' \
+    'int main(void) { _Atomic int n = 0; pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER; local = atomic_fetch_add(&n, 1); return pthread_mutex_lock(&m) || pthread_mutex_unlock(&m) || (sin(0.0) != 0.0) || local; }' > "$tmp_dir/probe.c"
   cc -O2 -o "$tmp_dir/probe" "$tmp_dir/probe.c" -lpthread -lm >/dev/null 2>&1 && "$tmp_dir/probe"
+}
+
+check_rust() {
+  command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1 || return 1
+  version=$(rustc --version 2>/dev/null | awk '{print $2}')
+  case "$version" in
+    *.*) major=${version%%.*}; minor=${version#*.}; minor=${minor%%.*} ;;
+    *) return 1 ;;
+  esac
+  case "$major:$minor" in *[!0-9:]*|'') return 1 ;; esac
+  [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 70 ]; }
 }
 
 install_cc() {
@@ -122,13 +135,13 @@ else
     tar --no-same-owner -xzf "$tmp_dir/source.tar.gz" -C "$tmp_dir/source" --strip-components=1 || fail 'invalid source archive'
     source_dir=$tmp_dir/source
   fi
-  if ! command -v cargo >/dev/null 2>&1; then
-    say 'Installing Rust to build Nmerkar from source.'
+  if ! check_rust; then
+    say "Installing Rust $min_rust_version to build Nmerkar from source."
     fetch https://sh.rustup.rs "$tmp_dir/rustup.sh" || fail 'could not download rustup'
-    sh "$tmp_dir/rustup.sh" -y --profile minimal --no-modify-path
+    sh "$tmp_dir/rustup.sh" -y --profile minimal --no-modify-path --default-toolchain "$min_rust_version"
     export PATH="$HOME/.cargo/bin:$PATH"
   fi
-  command -v cargo >/dev/null 2>&1 || fail 'cargo is unavailable after Rust installation'
+  check_rust || fail "Rust $min_rust_version or newer is required to build from source"
   say 'Building nk and nks from source.'
   CARGO_TARGET_DIR="$tmp_dir/target" cargo build --release --bins --manifest-path "$source_dir/comp/Cargo.toml"
   bin_dir=$tmp_dir/target/release

@@ -29,7 +29,7 @@ pub const PRELUDE: &str = r#"
 /* v10 type tags (SPEC_v10_proposal.md): 0 int, 1 float, 2 ptr, 3 byte,
    4 void, 5 arr, 6 tensor, 7 list, 8 dict, 9 str, 10 chan, 11 atom,
    12 buf, 13 obj, 14 bitmap, 15 time, 16 dur, 17 bloom, 18 iter */
-enum { T_INT=0, T_FLOAT=1, T_PTR=2, T_BYTE=3, T_TIME=15, T_DUR=16 };
+enum { T_INT=0, T_FLOAT=1, T_PTR=2, T_BYTE=3, T_TIME=15, T_DUR=16, T_BOOL=21 };
 enum { HT_ARR=5, HT_TENSOR=6, HT_DYN=7, HT_MAP=8, HT_STR=9, HT_RING=10, HT_ATOM=11, HT_BUF=12, HT_OBJ=13, HT_BITMAP=14, HT_BLOOM=17, HT_ITER=18, HT_SET=19, HT_MAT=20 };
 typedef struct { int tag; int64_t i; } Cell;
 
@@ -116,6 +116,8 @@ static Cell** uf_var_roots; static long uf_nvar_roots;
 
 static void uf_dump_cell(Cell c){
   if(c.tag==T_FLOAT) fprintf(stderr,"%g",uf_f(c));
+  else if(c.tag==T_BOOL) fprintf(stderr,c.i?"true":"false");
+  else if(c.tag==T_PTR && !c.i) fprintf(stderr,"null");
   else if(c.tag==T_PTR && c.i && uf_is_str(c)) { const char*s=uf_sptr(c); fprintf(stderr,"\"%s\"",s?s:"<null>"); }
   else if(c.tag==T_PTR && c.i) fprintf(stderr,"<ptr %p>",(void*)c.i);
   else fprintf(stderr,"%lld",(long long)c.i);
@@ -572,6 +574,7 @@ int64_t nk_argc=0; void* nk_argv=0; /* program args, reachable via EXTERN "nk_ar
 
 static inline void pushc(Ctx*cx,Cell c){ if(cx->sp>=cx->dcap){char _b[128];snprintf(_b,sizeof(_b),"stack overflow in %s (sp=%ld, cap=%ld)",uf_cur_op,cx->sp,cx->dcap);die(_b);} cx->ds[cx->sp++]=c; }
 static inline Cell uf_mki(int64_t v){ Cell c; c.tag=T_INT; c.i=v; return c; }
+static inline Cell uf_mkb(int v){ Cell c; c.tag=T_BOOL; c.i=v!=0; return c; }
 static inline Cell uf_mkp(void* v){ Cell c; c.tag=T_PTR; c.i=(int64_t)v; return c; }
 static inline double uf_fbits(int64_t i){ union{int64_t i;double f;}u;u.i=i;return u.f; }
 static inline int64_t uf_ibits(double f){ union{int64_t i;double f;}u;u.f=f;return u.i; }
@@ -605,7 +608,7 @@ static inline double uf_to_number(Cell c){
 }
 static inline int uf_truthy(Cell c){
   if(c.tag==T_FLOAT){ double d=uf_fbits(c.i); return d!=0.0 && !isnan(d); }
-  if(c.tag==T_INT || c.tag==T_BYTE)return c.i!=0;
+  if(c.tag==T_INT || c.tag==T_BYTE || c.tag==T_BOOL)return c.i!=0;
   if(c.tag==T_PTR && c.i){
     Hdr*h=uf_gc_find((void*)c.i);
     if(h){
@@ -713,7 +716,7 @@ static void* uf_alloc(size_t sz,int align); /* forward decl for string coercion 
 static Cell uf_to_string(Cell c){
   char tmp[64];
   if(c.tag==T_FLOAT){ double d=uf_fbits(c.i); if(isnan(d)) return uf_str_new("NaN",3); snprintf(tmp,sizeof(tmp),"%.17g",d); return uf_str_new(tmp,strlen(tmp)); }
-  if(c.tag==T_BYTE){ return c.i?uf_str_new("true",4):uf_str_new("false",5); }
+  if(c.tag==T_BYTE || c.tag==T_BOOL){ return c.i?uf_str_new("true",4):uf_str_new("false",5); }
   if(c.tag==T_INT){ snprintf(tmp,sizeof(tmp),"%lld",(long long)c.i); return uf_str_new(tmp,strlen(tmp)); }
   if(c.tag==T_PTR && !c.i) return uf_str_new("null",4);
   if(c.tag==T_PTR && c.i){
@@ -890,7 +893,7 @@ static void op_cast(Ctx*cx){
       return;
     case 1:
       if(h.tag==T_FLOAT) pushc(cx,h);
-      else if(h.tag==T_INT||h.tag==T_BYTE) pushf(cx,(double)h.i);
+      else if(h.tag==T_INT||h.tag==T_BYTE||h.tag==T_BOOL) pushf(cx,(double)h.i);
       else die("CAST float: not a scalar");
       return;
     case 2:
@@ -959,6 +962,7 @@ static uint64_t map_hash(Cell k){
   return uf_fnv(&k.i,8);
 }
 static int map_keyeq(Cell a,Cell b){
+  if(a.tag!=b.tag)return 0;
   if(a.tag==T_INT&&b.tag==T_INT) return a.i==b.i;
   if(a.tag==T_PTR&&b.tag==T_PTR&&a.i&&b.i){
     Hdr*ha=uf_gc_find((void*)a.i); Hdr*hb=uf_gc_find((void*)b.i);
@@ -1257,7 +1261,7 @@ static void op_fmt(Ctx*cx){ Cell f=pop(cx); int n=uf_count(uf_sptr(f)); Cell arg
 /* PRINT: v -> (smart recursive printer; top-level strings raw) */
 static void uf_print_cell(Cell c,int nested){
   if(c.tag==T_FLOAT){ double d=uf_fbits(c.i); if(isnan(d))printf("NaN"); else printf("%.17g",d); return; }
-  if(c.tag==T_BYTE){ printf(c.i?"true":"false"); return; }
+  if(c.tag==T_BYTE || c.tag==T_BOOL){ printf(c.i?"true":"false"); return; }
   if(c.tag==T_INT){ printf("%lld",(long long)c.i); return; }
   if(c.tag==T_PTR && !c.i){ printf("null"); return; }
   if(c.tag==T_PTR && c.i){
@@ -3722,9 +3726,9 @@ static Cell j_parse(JCur* j){
     UF_UNPROTECT(); return uf_mkp(d);
   }
   if(c=='"') return j_str(j);
-  if(!strncmp(j->p,"true",4)){ j->p+=4; return uf_mki(1); }
-  if(!strncmp(j->p,"false",5)){ j->p+=5; return uf_mki(0); }
-  if(!strncmp(j->p,"null",4)){ j->p+=4; return uf_mki(0); }
+  if(!strncmp(j->p,"true",4)){ j->p+=4; return uf_mkb(1); }
+  if(!strncmp(j->p,"false",5)){ j->p+=5; return uf_mkb(0); }
+  if(!strncmp(j->p,"null",4)){ j->p+=4; return uf_mkp(NULL); }
   if(c=='-'||isdigit((unsigned char)c)){
     const char* s=j->p; char* e;
     double d=strtod(s,&e);
@@ -3784,6 +3788,8 @@ static void uf_unjson_w(Cell v,char** bp,size_t* np,size_t* capp){
       default: die("UNJSON: unsupported handle (atom/chan/iter/bitmap/bloom)");
     }
   }
+  if(v.tag==T_BOOL){ if(v.i)UW("true",4); else UW("false",5); return; }
+  if(v.tag==T_PTR && !v.i){ UW("null",4); return; }
   if(v.tag==T_FLOAT){ snprintf(tmp,sizeof tmp,"%.17g",uf_f(v)); UW(tmp,strlen(tmp)); return; }
   snprintf(tmp,sizeof tmp,"%lld",(long long)v.i); UW(tmp,strlen(tmp));
 #undef UW

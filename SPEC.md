@@ -260,7 +260,10 @@ str(6→2) bool(7→3) — handle/str are ptr aliases, bool a byte alias; void i
 
 0 int, 1 float, 2 ptr, 3 byte, 4 void, 5 arr, 6 tensor, 7 list, 8 dict,
 9 str, 10 chan, 11 atom, 12 buf, 13 obj, 14 bitmap, 15 time, 16 dur,
-17 bloom, 18 iter.
+17 bloom, 18 iter, 19 set, 20 matrix, 21 JSON boolean. JSON null is
+a null pointer (tag 2, payload 0). The existing `bool` type glyph remains a
+byte alias (tag 3); a parsed JSON boolean has its own tag to keep it distinct
+from numeric bytes and integers.
 
 ## Runtime cell
 
@@ -603,8 +606,12 @@ No file-handle object type; every op is self-contained.
 
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
-| 190 | 🛁 | `parse_json` | str → v | object → dict, array → list, number → int/float, true/false → 1/0, null → 0 |
-| 191 | 🤹 | `to_json` | v → str | dict keys must be strings; atom/chan/iter/bitmap/bloom: dies |
+| 190 | 🛁 | `parse_json` | str → v | object → dict, array → list, number → int/float, true/false → tagged booleans (21), null → null pointer (2) |
+| 191 | 🤹 | `to_json` | v → str | tagged booleans → `true`/`false`, null pointer → `null`; dict keys must be strings; atom/chan/iter/bitmap/bloom: dies |
+
+JSON booleans participate in loose numeric coercion (`true` → 1, `false` → 0)
+but retain their own tag for `type_of`, strict equality, and JSON round trips.
+Bytes remain numeric when encoded as JSON.
 
 ### Iterators (tag 18)
 

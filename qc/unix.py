@@ -35,6 +35,28 @@ def main():
     hello = run(NK, "--device", "cpu", '"unix smoke" print')
     assert "unix smoke" in hello.stdout, hello.stdout
 
+    json_cases = '''
+"[true,false,null,1,0]" parse_json values!
+values to_json print
+values 0 get type_of print
+values 1 get type_of print
+values 2 get type_of print
+values 3 get type_of print
+values 0 get 1 structural_equal print
+values 0 get 1 eq print
+values 0 get 2 add print
+2 _cast byte to_json print
+values unique to_json print
+"{\\"flag\\":true,\\"empty\\":null}" parse_json obj!
+obj "flag" get to_json print
+obj "empty" get to_json print
+'''
+    json_result = run(NK, "--device", "cpu", json_cases)
+    assert json_result.stdout.splitlines() == [
+        '[true,false,null,1,0]', '21', '21', '2', '0',
+        '0', '1', '3', '2', '[true,false,null,1,0]', 'true', 'null',
+    ], json_result.stdout
+
     with tempfile.TemporaryDirectory(prefix="nk-qc-") as tmp:
         binary = Path(tmp) / "program"
         run(NK, "--device", "cpu", "-c", '"compiled" print', "-o", binary)

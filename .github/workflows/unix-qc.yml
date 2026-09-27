@@ -31,6 +31,13 @@ jobs:
       - name: Build both compilers
         working-directory: comp
         run: cargo build --release --bins
+      - name: Diagnose large weave with AddressSanitizer
+        if: matrix.os == 'ubuntu-24.04'
+        working-directory: comp
+        run: |
+          ./target/release/nk --device cpu --emit-c tests/t14_task_gpu.n -o /tmp/nk-t14
+          cc -O1 -g -fsanitize=address -fno-omit-frame-pointer -o /tmp/nk-t14-asan /tmp/nk-t14.c -lpthread -lm
+          ASAN_OPTIONS=detect_leaks=0 /tmp/nk-t14-asan
       - name: Compile and run language suite (CPU)
         run: python3 qc/unix.py comp/target/release/nk comp/target/release/nks
       - name: Stress default-GC large weave (t14, ten runs)

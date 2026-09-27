@@ -125,7 +125,15 @@ and built-ins handle JSON, text, files, and regular expressions.
 **Compose behavior.** `if`, `while`, and `for` call labeled blocks such as
 `'step`; the block is defined with `step:` and can bind inputs to named variables.
 Blocks also serve as callbacks for operations such as `filter`, and `ret` returns
-a value. Channels and threads support concurrent programs.
+a value.
+
+**Coordinate work with `weave`.** Declare `task` blocks and name other tasks as
+their inputs to form a dependency graph; `run` schedules independent work in
+parallel and waits for its result. A worker count such as `4 task worker:`
+distributes items from an iterable first input across workers, while `run summary`
+computes only the tasks needed for that result. This makes data pipelines and
+server workloads easier to compose without wiring threads by hand. Eligible
+elementwise tensor tasks can also fuse into a GPU kernel when Vulkan is available.
 
 **Compile and run.** `nk` translates a program to C, compiles it with the system
 C compiler, and runs the native result; it can also emit C or a standalone

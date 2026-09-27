@@ -210,9 +210,20 @@ static void uf_fs_gate(const char* path,int write){
 static void* uf_gc_list; /* linked list of all allocations */
 static _Atomic uint64_t uf_gc_seq = 1;
 static _Atomic int uf_gc_mt = 0; /* set to 1 when threads are spawned */
-static uint64_t uf_gc_bytes_since, uf_gc_threshold = 1<<20, uf_gc_live;
+static _Atomic uint64_t uf_gc_bytes_since;
+static uint64_t uf_gc_threshold = 1<<20, uf_gc_live;
 static int uf_gc_on = 1;
 static pthread_mutex_t uf_gc_mu = PTHREAD_MUTEX_INITIALIZER;
+/* The collector cannot scan another thread's mutable Ctx or its C locals.
+   Hold off collections from before a worker is launched until after it exits. */
+static int uf_gc_workers; /* guarded by uf_gc_mu */
+static void uf_gc_worker_enter(void){
+  atomic_store(&uf_gc_mt,1);
+  pthread_mutex_lock(&uf_gc_mu); uf_gc_workers++; pthread_mutex_unlock(&uf_gc_mu);
+}
+static void uf_gc_worker_leave(void){
+  pthread_mutex_lock(&uf_gc_mu); uf_gc_workers--; pthread_mutex_unlock(&uf_gc_mu);
+}
 /* address hash set for all allocated objects */
 static void** uf_gc_set; static uint64_t uf_gc_setcap, uf_gc_setlen;
 /* context registry: every Ctx's data stack is a precise root set */
@@ -250,17 +261,25 @@ static Ctx main_cx_store; /* fwd: defined fully below */
    Hot loops access the same 1-3 dict handles millions of times;
    the cache eliminates the hash+probe for these repeat lookups. */
 static _Thread_local void* uf_gc_cache[4] = {0,0,0,0};
+static _Thread_local int uf_gc_marking;
 static inline Hdr* uf_gc_find(void* p){
   if(!p || p==(void*)1) return 0;
   /* inline cache: check 4 recently-seen pointers */
   if(p==uf_gc_cache[0]||p==uf_gc_cache[1]||p==uf_gc_cache[2]||p==uf_gc_cache[3]) return (Hdr*)p;
-  if(!uf_gc_setcap) return 0;
+  /* Concurrent allocations may grow and replace uf_gc_set. Cache misses
+     must not inspect it while another thread is changing it. Marking already
+     owns uf_gc_mu, so it uses the unlocked lookup. */
+  int locked=atomic_load(&uf_gc_mt) && !uf_gc_marking;
+  if(locked) pthread_mutex_lock(&uf_gc_mu);
+  if(!uf_gc_setcap){ if(locked) pthread_mutex_unlock(&uf_gc_mu); return 0; }
   uint64_t i = ((uint64_t)p >> 4) * 11400714819323198485ULL >> 32; i %= uf_gc_setcap;
   while(uf_gc_set[i]){ if(uf_gc_set[i]==p){
     /* cache miss → insert: shift down, put new entry at slot 0 */
     uf_gc_cache[3]=uf_gc_cache[2]; uf_gc_cache[2]=uf_gc_cache[1]; uf_gc_cache[1]=uf_gc_cache[0]; uf_gc_cache[0]=p;
+    if(locked) pthread_mutex_unlock(&uf_gc_mu);
     return (Hdr*)p;
   } i=(i+1)%uf_gc_setcap; }
+  if(locked) pthread_mutex_unlock(&uf_gc_mu);
   return 0;
 }
 /* context registry: every Ctx's data stack is a precise root set */
@@ -332,12 +351,28 @@ static void uf_gc_setshared(UFShVar** t, long n){ for(long i=0;i<n&&i<1024;i++) 
    array published with release stores; collectors acquire-load the count.
    Slots are zeroed on pop so a concurrent marker never marks stale values. */
 #define UF_MAXTMP 1024
-typedef struct UF_TR { struct UF_TR* next; pthread_t tid; void*** slots; _Atomic int n; } UF_TR;
+typedef struct UF_TR { struct UF_TR* next; void*** slots; _Atomic int n; } UF_TR;
 static UF_TR* uf_trs; static pthread_mutex_t uf_tr_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local UF_TR* uf_tr_mine;
+static pthread_key_t uf_tr_key; static pthread_once_t uf_tr_key_once=PTHREAD_ONCE_INIT;
+static void uf_tr_destroy(void* arg){
+  UF_TR* t=(UF_TR*)arg;
+  pthread_mutex_lock(&uf_tr_mu);
+  UF_TR** pp=&uf_trs;
+  while(*pp && *pp!=t) pp=&(*pp)->next;
+  if(*pp) *pp=t->next;
+  pthread_mutex_unlock(&uf_tr_mu);
+  free(t->slots); free(t);
+}
+static void uf_tr_make_key(void){
+  if(pthread_key_create(&uf_tr_key,uf_tr_destroy)) die("GC: thread key");
+}
 static void uf_tr_init(void){
   if(uf_tr_mine) return;
-  UF_TR* t=(UF_TR*)calloc(1,sizeof(UF_TR)); t->slots=(void***)calloc(UF_MAXTMP,sizeof(void**)); t->tid=pthread_self();
+  pthread_once(&uf_tr_key_once,uf_tr_make_key);
+  UF_TR* t=(UF_TR*)calloc(1,sizeof(UF_TR)); if(!t) die("out of memory");
+  t->slots=(void***)calloc(UF_MAXTMP,sizeof(void**)); if(!t->slots) die("out of memory");
+  if(pthread_setspecific(uf_tr_key,t)) die("GC: thread key value");
   pthread_mutex_lock(&uf_tr_mu); t->next=uf_trs; uf_trs=t; pthread_mutex_unlock(&uf_tr_mu);
   uf_tr_mine=t;
 }
@@ -384,6 +419,8 @@ static void uf_gc_free_obj(Hdr* h){
 }
 static void uf_gc_collect(void){
   pthread_mutex_lock(&uf_gc_mu);
+  if(uf_gc_workers){ pthread_mutex_unlock(&uf_gc_mu); return; }
+  uf_gc_marking=1;
   uint64_t start_seq = uf_gc_seq;
   /* mark all roots */
   for(long i=0;i<uf_nvar_roots;i++) uf_mark_cell(*uf_var_roots[i]);
@@ -400,7 +437,6 @@ static void uf_gc_collect(void){
   }
   pthread_mutex_lock(&uf_tr_mu);
   for(UF_TR* t=uf_trs;t;t=t->next){
-    if(!pthread_equal(t->tid,pthread_self()) && pthread_kill(t->tid,0)==ESRCH) continue; /* dead thread: its slots are moot */
     int nt=atomic_load_explicit(&t->n,memory_order_acquire); if(nt>UF_MAXTMP)nt=UF_MAXTMP;
     for(int i=0;i<nt;i++){ void** pp=t->slots[i]; if(pp&&*pp) uf_mark_ptr(*pp); }
   }
@@ -422,9 +458,10 @@ static void uf_gc_collect(void){
   { void* q = uf_gc_list;
     while(q){ uf_gc_set_insert(q); q = ((Hdr*)q)->gc_next; }
   }
-  uf_gc_bytes_since = 0;
+  atomic_store(&uf_gc_bytes_since,0);
   /* invalidate find cache — freed objects may still be cached */
   uf_gc_cache[0]=uf_gc_cache[1]=uf_gc_cache[2]=uf_gc_cache[3]=0;
+  uf_gc_marking=0;
   pthread_mutex_unlock(&uf_gc_mu);
 }
 /* v15: large GC blocks (tensor/array data) opt into THP — the kernel is in
@@ -440,7 +477,7 @@ static void uf_gc_thp(void* p, size_t sz){ (void)p; (void)sz; }
 #endif
 static void* uf_gc_alloc(size_t sz, int align){
   sz = sz ? sz : 1;
-  if(uf_gc_on && uf_gc_bytes_since + sz > uf_gc_threshold) uf_gc_collect();
+  if(uf_gc_on && atomic_load(&uf_gc_bytes_since) + sz > uf_gc_threshold) uf_gc_collect();
   void* p = NULL;
   if(align>0){ if(posix_memalign(&p,(size_t)align,sz))die("alloc failed"); }
   else { p=malloc(sz); }
@@ -449,7 +486,7 @@ static void* uf_gc_alloc(size_t sz, int align){
   memset(p,0,sz);
   Hdr* h=(Hdr*)p;
   h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
-  uf_gc_bytes_since += sz;
+  atomic_fetch_add(&uf_gc_bytes_since,sz);
   if(atomic_load(&uf_gc_mt)){ pthread_mutex_lock(&uf_gc_mu); h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); pthread_mutex_unlock(&uf_gc_mu); }
   else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
   return p;
@@ -460,7 +497,7 @@ static void* uf_gc_alloc(size_t sz, int align){
    Hdr itself is still zeroed (gc_parent etc.). */
 static void* uf_gc_alloc_nz(size_t sz, int align){
   sz = sz ? sz : 1;
-  if(uf_gc_on && uf_gc_bytes_since + sz > uf_gc_threshold) uf_gc_collect();
+  if(uf_gc_on && atomic_load(&uf_gc_bytes_since) + sz > uf_gc_threshold) uf_gc_collect();
   void* p = NULL;
   if(align>0){ if(posix_memalign(&p,(size_t)align,sz))die("alloc failed"); }
   else { p=malloc(sz); }
@@ -469,7 +506,7 @@ static void* uf_gc_alloc_nz(size_t sz, int align){
   memset(p,0,sizeof(Hdr));
   Hdr* h=(Hdr*)p;
   h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
-  uf_gc_bytes_since += sz;
+  atomic_fetch_add(&uf_gc_bytes_since,sz);
   if(atomic_load(&uf_gc_mt)){ pthread_mutex_lock(&uf_gc_mu); h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); pthread_mutex_unlock(&uf_gc_mu); }
   else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
   return p;
@@ -481,7 +518,7 @@ static void* uf_gc_alloc_nz(size_t sz, int align){
    caller MUST set tag/len/esz/ety (arr semantics) and not realloc. */
 static void* uf_gc_arr_block_t(size_t nb, uint64_t tag){
   size_t sz=sizeof(Hdr)+nb;
-  if(uf_gc_on && uf_gc_bytes_since + sz > uf_gc_threshold) uf_gc_collect();
+  if(uf_gc_on && atomic_load(&uf_gc_bytes_since) + sz > uf_gc_threshold) uf_gc_collect();
   void* p;
   int mapped=0;
   /* only tags whose byte size reconstructs as len*esz (see free path);
@@ -501,7 +538,7 @@ static void* uf_gc_arr_block_t(size_t nb, uint64_t tag){
   Hdr* h=(Hdr*)p;
   h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
   if(mapped) h->gc_flags|=GCF_MMAP;
-  uf_gc_bytes_since += sz;
+  atomic_fetch_add(&uf_gc_bytes_since,sz);
   if(atomic_load(&uf_gc_mt)){ pthread_mutex_lock(&uf_gc_mu); h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); pthread_mutex_unlock(&uf_gc_mu); }
   else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
   return p;
@@ -1507,6 +1544,7 @@ static void* uf_worker(void*arg){
 }
 static void uf_weave(Ctx*cx,WeaveTask*ts,int n,UfRun run){
   (void)cx;
+  uf_gc_worker_enter();
   long ncpu=sysconf(_SC_NPROCESSORS_ONLN);
   long total=0; for(int i=0;i<n;i++) total += ts[i].count>1?ts[i].count:1;
   int nw=(int)total; if(ncpu>0&&(long)nw>ncpu)nw=(int)ncpu; if(nw<1)nw=1; if(nw>64)nw=64;
@@ -1520,6 +1558,7 @@ static void uf_weave(Ctx*cx,WeaveTask*ts,int n,UfRun run){
     for(int i=0;i<nw-1;i++) pthread_join(th[i],0);
   }
   uf_active_job=0;
+  uf_gc_worker_leave();
   if(getenv("NK_WEAVE_DEBUG")){
     for(int i=0;i<n;i++){
       WeaveTask*t=&ts[i];
@@ -1607,12 +1646,14 @@ static void* uf_shp_worker(void*arg){
   }
   ring_close(g->r);
   free(g);
+  uf_gc_worker_leave();
   return 0;
 }
 static void op_shp(Ctx*cx){
   Cell c=pop(cx);
   Ring*r=uf_ring_new(64);
   UfShp* g=(UfShp*)malloc(sizeof(UfShp)); if(!g)die("out of memory"); g->r=r; g->cmd=strdup(uf_sptr(c));
+  uf_gc_worker_enter();
   pthread_t th; if(pthread_create(&th,0,uf_shp_worker,g)){ ring_close(r); die("SHP: thread"); }
   pthread_detach(th);
   pushp(cx,r);
@@ -2576,6 +2617,7 @@ static void* uf_pmc_fn(void* arg){
 }
 static void uf_memcpy_big(void* dst, const void* src, size_t n){
   if(n < (size_t)64<<20 || getenv("NK_VK_NOPMC")){ memcpy(dst,src,n); return; }
+  uf_gc_worker_enter();
   enum { NTH = 4 };
   UFPMC parts[NTH]; pthread_t th[NTH-1];
   size_t chunk = n / NTH;
@@ -2587,6 +2629,7 @@ static void uf_memcpy_big(void* dst, const void* src, size_t n){
   }
   uf_pmc_fn(&parts[NTH-1]);
   for(int k=0;k<NTH-1;k++) pthread_join(th[k],0);
+  uf_gc_worker_leave();
 }
 #else
 #define uf_memcpy_big memcpy
@@ -3530,6 +3573,7 @@ static void* uf_fmatch_worker(void* arg){
   }
   ring_close(g->r);
   free(g->path); free(g->pat); free(g);
+  uf_gc_worker_leave();
   return 0;
 }
 static void op_fmatch(Ctx*cx){
@@ -3538,6 +3582,7 @@ static void op_fmatch(Ctx*cx){
   Ring* r=uf_ring_new(64);
   UfFm* g=(UfFm*)malloc(sizeof(UfFm)); if(!g)die("out of memory");
   g->r=r; g->path=strdup(uf_sptr(p)); g->pat=strdup(uf_sptr(pat));
+  uf_gc_worker_enter();
   pthread_t th; if(pthread_create(&th,0,uf_fmatch_worker,g)){ ring_close(r); die("FMATCH: thread"); }
   pthread_detach(th);
   pushp(cx,r);
@@ -3879,6 +3924,7 @@ static void* uf_spawn_worker(void* arg){
   ring_close(g->r);
   ctx_free(c);
   free(g);
+  uf_gc_worker_leave();
   return 0;
 }
 /* SPAWN: body_addr -> chan (cap 1; body's top-of-stack enqueued at end,
@@ -3893,6 +3939,7 @@ static void op_spawn(Ctx*cx){
   Ring* r=uf_ring_new(1);
   UfSpawn* g=(UfSpawn*)malloc(sizeof(UfSpawn)); if(!g)die("out of memory");
   g->body=(const void*)a.i; g->r=r;
+  uf_gc_worker_enter();
   pthread_t th; if(pthread_create(&th,0,uf_spawn_worker,g)){ ring_close(r); die("SPAWN: thread"); }
   pthread_detach(th);
   pushp(cx,r);
@@ -3903,6 +3950,7 @@ static void* uf_init_worker(void* arg){
   Ctx* c=ctx_new(1<<16,1<<12);
   uf_call_addr(c,arg,0,-1,0);
   ctx_free(c);
+  uf_gc_worker_leave();
   return 0;
 }
 "#;

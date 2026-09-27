@@ -3071,7 +3071,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         o.push_str("  if(pc==0 && cx==main_cx) {");
         for &ipc in &p.init_pcs {
             o.push_str(&format!(
-                "{{ pthread_t th; if(pthread_create(&th,0,uf_init_worker,(void*)&&L_{})) die(\"init thread\"); pthread_detach(th); }}",
+                "{{ uf_gc_worker_enter(); pthread_t th; if(pthread_create(&th,0,uf_init_worker,(void*)&&L_{})) die(\"init thread\"); pthread_detach(th); }}",
                 ipc
             ));
         }

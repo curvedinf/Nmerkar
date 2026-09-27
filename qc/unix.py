@@ -50,9 +50,7 @@ def main():
 
     cases = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 17]
     if not QUICK:
-        # t14_task_gpu.n documents a pre-existing layout-sensitive SIGSEGV.
-        # Keep it in a diagnostic job rather than making portability depend on it.
-        cases += [13, 15, 16]
+        cases += [13, 14, 15, 16]
     for number in cases:
         path, = (COMP / "tests").glob(f"t{number:02d}_*.n")
         args = [str(NK), "--device", "cpu"]
@@ -63,6 +61,8 @@ def main():
             assert result.stdout.split() == ["count:", "100000", "count2:", "25000"], result.stdout
         if number == 13:
             assert "139998" in result.stdout and "69999" in result.stdout
+        if number == 14:
+            assert "premium_sum:" in result.stdout and "sample[N-1]:" in result.stdout
     print(f"PASS: {'quick' if QUICK else 'full'} Unix QC on {os.uname().sysname} {os.uname().machine}")
 
 

@@ -51,17 +51,20 @@ jobs:
           import os
           from pathlib import Path
           import subprocess
+          import tempfile
 
-          examples = Path('README.md').read_text().split('```nmerkar\n')[1:3]
-          assert len(examples) == 2
-          expected = ['4\napples', '30']
-          for source, output in zip(examples, expected):
-              program = source.split('```', 1)[0]
-              actual = subprocess.check_output(
-                  [os.path.join(os.environ['RUNNER_TEMP'], 'nmerkar/bin/nk'), '--device', 'cpu', program],
-                  text=True,
-              ).strip()
-              assert actual.splitlines()[0:len(output.splitlines())] == output.splitlines(), (actual, output)
+          examples = Path('README.md').read_text().split('```nmerkar\n')[1:4]
+          assert len(examples) == 3
+          expected = ['4\napples', '30', '54.00']
+          with tempfile.TemporaryDirectory() as workdir:
+              for source, output in zip(examples, expected):
+                  program = source.split('```', 1)[0]
+                  actual = subprocess.check_output(
+                      [os.path.join(os.environ['RUNNER_TEMP'], 'nmerkar/bin/nk'), '--device', 'cpu', program],
+                      cwd=workdir,
+                      text=True,
+                  ).strip()
+                  assert actual.splitlines()[0:len(output.splitlines())] == output.splitlines(), (actual, output)
           PY
       - name: Stress default-GC large weave (t14, ten runs)
         if: matrix.os == 'ubuntu-24.04'

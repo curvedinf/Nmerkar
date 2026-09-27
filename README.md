@@ -127,13 +127,11 @@ and built-ins handle JSON, text, files, and regular expressions.
 Blocks also serve as callbacks for operations such as `filter`, and `ret` returns
 a value.
 
-**Coordinate work with `weave`.** Declare `task` blocks and name other tasks as
-their inputs to form a dependency graph; `run` schedules independent work in
-parallel and waits for its result. A worker count such as `4 task worker:`
-distributes items from an iterable first input across workers, while `run summary`
-computes only the tasks needed for that result. This makes data pipelines and
-server workloads easier to compose without wiring threads by hand. Eligible
-elementwise tensor tasks can also fuse into a GPU kernel when Vulkan is available.
+**Parallel pipelines with `weave`.** Process files and large datasets without
+managing threads or passing results between them by hand. Define steps as
+`task` blocks; `run` executes independent steps in parallel and passes their
+results to dependent steps. Add a worker count to spread collection items
+across cores; eligible tensor work can use a fused Vulkan GPU kernel.
 
 **Compile and run.** `nk` translates a program to C, compiles it with the system
 C compiler, and runs the native result; it can also emit C or a standalone
@@ -165,6 +163,22 @@ add_order: index!                          ; Give each loop index a name.
   ret                                      ; Return to the loop.
 price: quantity!                           ; Define a reusable helper that receives a quantity.
   ret quantity 5 mul                       ; Return the quantity times the $5 unit price.
+```
+
+A `weave` reads prices from a file, discounts them as a tensor, and totals the result.
+Running it creates `weave-prices.txt` in the current directory:
+
+```nmerkar
+"weave-prices.txt" "10\n20\n30" write_file            ; Write three sample prices to a file.
+weave                                               ; Begin a task graph.
+  task prices:                                      ; Define the file-processing task.
+    "weave-prices.txt" read_file "\n" split rows!  ; Read the file and split it into lines.
+    ret [rows 0 get parse_float rows 1 get parse_float rows 2 get parse_float] float tensor ; Convert each price to a tensor value.
+  task discounted: prices!                          ; Wait for the prices task and receive its tensor.
+    ret prices 0.9 mul                              ; Apply a 10 percent discount to each price.
+  task total: discounted!                           ; Wait for the discounted tensor.
+    ret discounted sum                              ; Sum the discounted prices.
+run total "%.2f" format print                       ; Run the graph and print 54.00.
 ```
 
 Use `nk` inline to efficiently process data with `bash`:

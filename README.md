@@ -21,7 +21,7 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | Block control | Implicit (no brackets) |
 | Typing | Dynamic and weak default, optional per value strictness |
 | Memory | Garbage collected |
-| C Imports | Direct ABI, no glue |
+| Library Ecosystem | C / C++ / Rust full compatibility |
 | Primitives | int, float, str, ptr |
 | Data structures | list, dict, arr, tensor, chan, atom, obj, bitmap, bloom, iter |
 | Concurrency | Channels, threads, dataflow DAGs with fanout |

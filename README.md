@@ -129,7 +129,7 @@ across cores; eligible tensor work can use a fused Vulkan GPU kernel.
 C compiler, and runs the native result; it can also emit C or a standalone
 binary. Eligible compute work can use a Vulkan GPU automatically when the
 toolchain and device are available, while `--device cpu` keeps it on the CPU.
-Use `nks` to run programs under a capability policy.
+`nks` runs programs in a sandbox.
 
 ## Examples
 

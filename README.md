@@ -17,7 +17,7 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 |---|---|
 | Specialization | Throwaway data processing tools |
 | Execution | Compiled (Nmerkar → C → native binary) |
-| Style | Forth-like postfix |
+| Style | Forth-like postfix but no stack manipulation |
 | Block control | Implicit (no brackets) |
 | Typing | Dynamic and weak |
 | Memory | Garbage collected |

@@ -1,5 +1,6 @@
 // ---------------- C prelude (v10) ----------------
 pub const PRELUDE: &str = r#"
+#define _GNU_SOURCE 1
 #include <stdint.h>
 #include <errno.h>
 #include <stdio.h>
@@ -10,6 +11,7 @@ pub const PRELUDE: &str = r#"
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <sched.h>
 #include <setjmp.h>
@@ -80,7 +82,7 @@ typedef struct WeaveTaskS WeaveTask;
 typedef struct WeaveJobS { WeaveTask* ts; int n; UfRun run; _Atomic int shutdown; } WeaveJob;
 
 static void die(const char*m);
-static _Thread_local const char* uf_cur_op;
+static _Thread_local const char* uf_cur_op = "<startup>";
 static void nk_run(Ctx*cx, long pc);
 static _Thread_local const void* uf_entry_addr;
 static void uf_call_addr(Ctx*cx, const void* a, long frame, long entry_pc, long nargs){
@@ -101,7 +103,6 @@ typedef struct UfTry { jmp_buf jb; struct UfTry* prev; long sp; long csp; long l
 static _Thread_local UfTry* uf_try_top = 0;
 static _Thread_local void* uf_cur_task; /* WeaveTask* for debug counters */
 static _Thread_local Ctx* uf_current_ctx = 0;
-static _Thread_local const char* uf_cur_op = "<startup>";
 static int uf_debug_mode = 0;
 static const char** uf_labnames; static long uf_labnames_n;
 static const char*** uf_ln_tab; static long* uf_ln_cnt;
@@ -487,7 +488,12 @@ static void* uf_gc_arr_block_t(size_t nb, uint64_t tag){
      HT_MAT's esz is a row count, so it stays on malloc */
   if(sz>=(size_t)2<<20&&(tag==HT_TENSOR||tag==HT_ARR)){
     p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    if(p!=MAP_FAILED){ madvise(p,sz,MADV_HUGEPAGE); mapped=1; }
+    if(p!=MAP_FAILED){
+#ifdef MADV_HUGEPAGE
+      madvise(p,sz,MADV_HUGEPAGE);
+#endif
+      mapped=1;
+    }
     else p=NULL;
   }
   if(!p){ p=malloc(sz); if(!p)die("out of memory"); }

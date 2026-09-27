@@ -1,6 +1,6 @@
 # Nmerkar (nk)
 
-A programming language that gives AI agents **Python token count at C speed**. Nmerkar includes a powerful suite of built-ins which simplify and accelerate data processing, while retaining full compatibility with C's ecosystem. Nmerkar ships with a sandboxed mode preventing agents from accidentally deleting your whole computer and it doesnt have any parenthesis or brackets to forget to close. When a GPU is available, Nmerkar automatically accelerates code by compiling optimized fused vulkan kernels. So point your agent here and ask if they'd rather use Nmerkar.
+A programming language that gives AI agents **Python token count at C speed**. Nmerkar includes a powerful suite of built-ins which simplify data processing, while retaining full compatibility with C's ecosystem. Garbage collection and simplified scoping speed development, while a sandboxed mode prevents agents from accidentally deleting your whole computer. Nmerkar doesnt have any parenthesis or brackets to forget to close, and has a weird emoji language encoding for absolutely minimal token count. When a GPU is available, Nmerkar automatically accelerates code by compiling optimized fused vulkan kernels. There are many more interesting features your agent will appreciate, so point it here and ask if it would rather use Nmerkar.
 
 # Who was Enmerkar?
 

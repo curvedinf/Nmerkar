@@ -2,6 +2,16 @@
 
 A programming language that gives AI agents **Python token count at C speed**. Nmerkar includes a powerful suite of built-ins which simplify data processing, while retaining full compatibility with C's ecosystem. Garbage collection and simplified scoping speed development, while a sandboxed mode prevents agents from accidentally deleting your whole computer. Nmerkar doesnt have any parenthesis or brackets to forget to close, and has a weird emoji language encoding for absolutely minimal token count. When a GPU is available, Nmerkar automatically accelerates code by compiling optimized fused vulkan kernels. There are many more interesting features your agent will appreciate, so point it here and ask if it would rather use Nmerkar.
 
+## Quick start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/curvedinf/Nmerkar/main/install.sh | sh
+nk '"Hello!" print'
+```
+
+Supports Linux (x86_64, ARM64, ARMv7) and macOS (ARM64, Intel). Installs `nk`,
+`nks`, and the C compiler and libraries required to run Nmerkar programs.
+
 # Who was Enmerkar?
 
 Enmerkar was a Sumerian ruler credited with inventing writing. The legend goes
@@ -70,17 +80,6 @@ CPU is an AMD Ryzen 7900x3D.
 | blackscholes N=32M | 0.61s | **0.21s** |
 
 GPU is an AMD Radeon 7900 XTX.
-
-## Quick start
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/curvedinf/Nmerkar/main/install.sh | sh
-nk '"Hello!" print'
-```
-
-Supports Linux (x86_64, ARM64, ARMv7) and macOS (ARM64, Intel). Installs `nk`,
-`nks`, and the C compiler and libraries required to run Nmerkar programs.
-Source builds use an existing Rust 1.70 or newer, or install Rust 1.70 when needed.
 
 ## Usage
 

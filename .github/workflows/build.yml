@@ -12,7 +12,7 @@ env:
 
 jobs:
   # Native builds: compile directly on the matching runner.
-  # Produces a binary named `nk` (nk.exe on Windows) for every major OS.
+  # Unix artifacts contain both commands in the layout consumed by install.sh.
   native:
     name: Native ${{ matrix.artifact }}
     strategy:
@@ -20,10 +20,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            artifact: nk-linux-x86_64
+            artifact: nmerkar-linux-x86_64
             bin: nk
           - os: macos-latest
-            artifact: nk-macos-arm64
+            artifact: nmerkar-macos-arm64
             bin: nk
           - os: windows-latest
             artifact: nk-windows-x86_64
@@ -42,18 +42,26 @@ jobs:
 
       - name: Build (release)
         working-directory: comp
-        run: cargo build --release
+        run: cargo build --release --bins
 
       - name: Smoke test (--help)
         working-directory: comp
         run: ./target/release/${{ matrix.bin }} --help
 
-      # Rename to `nk` (Windows already produces nk.exe)
-      - name: Stage binary
+      - name: Package and test Unix installer
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p staging
-          cp comp/target/release/${{ matrix.bin }} staging/nk${{ matrix.bin == 'nk.exe' && '.exe' || '' }}
+          tar -czf staging/${{ matrix.artifact }}.tar.gz -C comp/target/release nk nks
+          NK_INSTALL_ARCHIVE="$GITHUB_WORKSPACE/staging/${{ matrix.artifact }}.tar.gz" NK_INSTALL_DIR="$RUNNER_TEMP/nmerkar/bin" sh install.sh
+
+      - name: Stage Windows binary
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp comp/target/release/nk.exe staging/nk.exe
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -67,7 +75,7 @@ jobs:
   # links cross-arch natively; the smoke test runs under Rosetta 2 (preinstalled
   # on the arm64 runner images).
   cross-macos:
-    name: Cross nk-macos-x86_64
+    name: Cross nmerkar-macos-x86_64
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -84,25 +92,26 @@ jobs:
 
       - name: Build (release)
         working-directory: comp
-        run: cargo build --release --target x86_64-apple-darwin
+        run: cargo build --release --bins --target x86_64-apple-darwin
 
       - name: Smoke test (--help, via Rosetta 2)
         run: comp/target/x86_64-apple-darwin/release/nk --help
 
-      - name: Stage binary
+      - name: Package and test installer (Rosetta 2)
         run: |
           mkdir -p staging
-          cp comp/target/x86_64-apple-darwin/release/nk staging/nk
+          tar -czf staging/nmerkar-macos-x86_64.tar.gz -C comp/target/x86_64-apple-darwin/release nk nks
+          arch -x86_64 env NK_INSTALL_ARCHIVE="$GITHUB_WORKSPACE/staging/nmerkar-macos-x86_64.tar.gz" NK_INSTALL_DIR="$RUNNER_TEMP/nmerkar/bin" sh install.sh
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: nk-macos-x86_64
-          path: staging/nk
+          name: nmerkar-macos-x86_64
+          path: staging/nmerkar-macos-x86_64.tar.gz
           if-no-files-found: error
 
   # Cross-compiled Linux builds using `cross` (Docker-based, handles the
-  # linker/sysroot automatically). All produce a binary named `nk`.
+  # linker/sysroot automatically). Both commands are packaged together.
   cross-linux:
     name: Cross ${{ matrix.artifact }}
     runs-on: ubuntu-24.04
@@ -111,13 +120,13 @@ jobs:
       matrix:
         include:
           - target: aarch64-unknown-linux-gnu
-            artifact: nk-linux-arm64
+            artifact: nmerkar-linux-arm64
           - target: armv7-unknown-linux-gnueabihf
-            artifact: nk-linux-armv7
+            artifact: nmerkar-linux-armv7
           - target: x86_64-unknown-linux-musl
-            artifact: nk-linux-x86_64-musl
+            artifact: nmerkar-linux-x86_64-musl
           - target: aarch64-unknown-linux-musl
-            artifact: nk-linux-arm64-musl
+            artifact: nmerkar-linux-arm64-musl
     steps:
       - uses: actions/checkout@v7
 
@@ -136,16 +145,52 @@ jobs:
 
       - name: Build (release)
         working-directory: comp
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --bins --target ${{ matrix.target }}
 
-      - name: Stage binary
+      - name: Package both compilers
         run: |
           mkdir -p staging
-          cp comp/target/${{ matrix.target }}/release/nk staging/nk
+          tar -czf staging/${{ matrix.artifact }}.tar.gz -C comp/target/${{ matrix.target }}/release nk nks
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: staging/nk
+          path: staging/${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
+
+  test-cross-linux:
+    name: Install ${{ matrix.artifact }} in ${{ matrix.image }}
+    needs: cross-linux
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: nmerkar-linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            image: arm64v8/debian:bookworm
+            qemu: false
+          - artifact: nmerkar-linux-armv7
+            runner: ubuntu-24.04
+            image: arm32v7/debian:bookworm
+            qemu: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.qemu
+        with:
+          platforms: arm
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging
+      - name: Install in fresh container and run generated C
+        env:
+          IMAGE: ${{ matrix.image }}
+          ARCHIVE: ${{ matrix.artifact }}.tar.gz
+        run: |
+          docker run --rm -e ARCHIVE -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" sh -ec '
+            NK_INSTALL_ARCHIVE="/work/staging/$ARCHIVE" NK_INSTALL_DIR=/tmp/nmerkar/bin sh install.sh
+            /tmp/nmerkar/bin/nk --device cpu '\''"cross architecture works" print'\''
+          '

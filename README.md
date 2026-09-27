@@ -81,10 +81,20 @@ GPU is an AMD Radeon 7900 XTX.
 ## Quick start
 
 ```sh
-cd comp && cargo build --release
-./comp/target/release/nk '"Hello!\n" print'
-cargo install --path comp       # optional: install nk to PATH
+curl -fsSL https://raw.githubusercontent.com/curvedinf/Nmerkar/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+nk '"Hello!\n" print'
 ```
+
+The installer supports Linux (x86_64, ARM64, ARMv7) and macOS (ARM64, Intel).
+It installs and verifies both `nk` and `nks`, installing a C compiler and its
+development libraries if needed. Binaries go to `~/.local/bin` by default. An existing
+GitHub release is used when available; before the first release the installer
+builds from source and installs Rust if necessary. GPU/Vulkan tools and drivers
+are optional and are not installed by the CPU installer.
+
+To build manually: `cd comp && cargo build --release`, then run
+`./target/release/nk '"Hello!\n" print'`.
 
 ## Usage
 
@@ -100,27 +110,26 @@ nk somedir/                    # directory mode (auto-discovers main + init thre
 Text (`.n`) is the default encoding; dense (`.nd`) is an experimental
 token-optimized encoding.
 
-## Example
+## Examples
 
-128×128 matrix multiply, text encoding — no headers, no memory management,
-no imports, no declarations:
+A shopping list stores items in order:
 
+```nmerkar
+list groceries!                           ; Create an empty list called groceries.
+groceries "apples" append groceries!      ; Add apples to the list.
+groceries "bread" append groceries!       ; Add bread to the list.
+groceries length print                    ; Print how many items to buy.
+groceries 0 get print                     ; Print the first item.
 ```
-fi:  row! 128 'fe for ret
-fe:  col! row 128 mul col add ix!
-     A ix row col add set
-     B ix row col sub set ret
-cr:  row! 128 'dc for ret
-dc:  col! 0 acc! 128 'ij for
-     C row 128 mul col add acc set ret
-ij:  j! A row 128 mul j add get
-     B j 128 mul col add get
-     mul acc add acc! ret
-entry:
-  16384 int array A! 16384 int array B! 16384 int array C!
-  128 'fi for
-  128 'cr for
-  ret
+
+A dictionary looks up a value by name:
+
+```nmerkar
+dict inventory!                           ; Create an empty dictionary called inventory.
+inventory "apples" 12 set                 ; Record 12 apples in stock.
+inventory "bread" 4 set                   ; Record 4 loaves of bread in stock.
+inventory "apples" get print              ; Print the number of apples in stock.
+inventory "bread" contains print          ; Print whether bread is in stock.
 ```
 
 Use `nk` inline to efficiently process data with `bash`:

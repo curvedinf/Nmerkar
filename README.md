@@ -165,15 +165,17 @@ price: quantity!                           ; Define a reusable helper that recei
   ret quantity 5 mul                       ; Return the quantity times the $5 unit price.
 ```
 
-A `weave` reads prices from a file, discounts them as a tensor, and totals the result.
+A `weave` streams prices from a file, discounts them as a tensor, and totals the result.
 Running it creates `weave-prices.txt` in the current directory:
 
 ```nmerkar
 "weave-prices.txt" "10\n20\n30" write_file            ; Write three sample prices to a file.
 weave                                               ; Begin a task graph.
   task prices:                                      ; Define the file-processing task.
-    "weave-prices.txt" read_file "\n" split rows!  ; Read the file and split it into lines.
-    ret [rows 0 get parse_float rows 1 get parse_float rows 2 get parse_float] float tensor ; Convert each price to a tensor value.
+    "weave-prices.txt" list 'collect_price file_fold_lines values! ; Stream file lines into a list.
+    ret values float tensor                         ; Turn the parsed prices into a float tensor.
+  collect_price: values! line!                       ; Receive the accumulated list and the next line.
+    ret values line parse_float append              ; Parse the price and add it to the list.
   task discounted: prices!                          ; Wait for the prices task and receive its tensor.
     ret prices 0.9 mul                              ; Apply a 10 percent discount to each price.
   task total: discounted!                           ; Wait for the discounted tensor.

@@ -82,19 +82,11 @@ GPU is an AMD Radeon 7900 XTX.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/curvedinf/Nmerkar/main/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
 nk '"Hello!\n" print'
 ```
 
-The installer supports Linux (x86_64, ARM64, ARMv7) and macOS (ARM64, Intel).
-It installs and verifies both `nk` and `nks`, installing a C compiler and its
-development libraries if needed. Binaries go to `~/.local/bin` by default. An existing
-GitHub release is used when available; before the first release the installer
-builds from source and installs Rust if necessary. GPU/Vulkan tools and drivers
-are optional and are not installed by the CPU installer.
-
-To build manually: `cd comp && cargo build --release`, then run
-`./target/release/nk '"Hello!\n" print'`.
+Supports Linux (x86_64, ARM64, ARMv7) and macOS (ARM64, Intel). Installs `nk`,
+`nks`, and the C compiler and libraries required to run Nmerkar programs.
 
 ## Usage
 

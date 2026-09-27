@@ -194,6 +194,6 @@ jobs:
           ARCHIVE: ${{ matrix.artifact }}.tar.gz
         run: |
           docker run --rm --platform "$PLATFORM" -e ARCHIVE -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" sh -ec '
-            NK_INSTALL_ARCHIVE="/work/staging/$ARCHIVE" NK_INSTALL_DIR=/tmp/nmerkar/bin sh install.sh
-            /tmp/nmerkar/bin/nk --device cpu '\''"cross architecture works" print'\''
+            NK_INSTALL_ARCHIVE="/work/staging/$ARCHIVE" sh install.sh
+            nk --device cpu '\''"cross architecture works" print'\''
           '

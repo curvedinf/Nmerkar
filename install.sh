@@ -4,7 +4,16 @@
 set -eu
 
 repo_url=https://github.com/curvedinf/Nmerkar
-install_dir=${NK_INSTALL_DIR:-"$HOME/.local/bin"}
+if [ "${NK_INSTALL_DIR+x}" = x ]; then
+  install_dir=$NK_INSTALL_DIR
+else
+  # curl | sh cannot change the parent shell's PATH. Prefer an existing entry.
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) install_dir=$HOME/.local/bin ;;
+    *":/usr/local/bin:"*) install_dir=/usr/local/bin ;;
+    *) install_dir=$HOME/.local/bin ;;
+  esac
+fi
 source_ref=${NK_INSTALL_REF:-main}
 archive_override=${NK_INSTALL_ARCHIVE:-}
 source_override=${NK_INSTALL_SOURCE_DIR:-}
@@ -16,7 +25,7 @@ fail() { say "error: $*" >&2; exit 1; }
 as_root() {
   if [ "$(id -u)" -eq 0 ]; then "$@";
   elif command -v sudo >/dev/null 2>&1; then sudo "$@";
-  else fail "installing the C toolchain requires root or sudo: $*"; fi
+  else fail "root or sudo is required to run: $*"; fi
 }
 fetch() {
   if command -v curl >/dev/null 2>&1; then curl -fL --retry 2 --silent --show-error "$1" -o "$2";
@@ -101,7 +110,7 @@ fi
 
 if [ "$mode" = archive ]; then
   mkdir "$tmp_dir/package"
-  tar -xzf "$tmp_dir/nmerkar.tar.gz" -C "$tmp_dir/package" || fail 'invalid release archive'
+  tar --no-same-owner -xzf "$tmp_dir/nmerkar.tar.gz" -C "$tmp_dir/package" || fail 'invalid release archive'
   [ -f "$tmp_dir/package/nk" ] && [ -f "$tmp_dir/package/nks" ] || fail 'archive must contain both nk and nks'
   bin_dir="$tmp_dir/package"
 else
@@ -110,7 +119,7 @@ else
   else
     fetch "$repo_url/archive/refs/heads/$source_ref.tar.gz" "$tmp_dir/source.tar.gz" || fail "could not fetch source ref $source_ref"
     mkdir "$tmp_dir/source"
-    tar -xzf "$tmp_dir/source.tar.gz" -C "$tmp_dir/source" --strip-components=1 || fail 'invalid source archive'
+    tar --no-same-owner -xzf "$tmp_dir/source.tar.gz" -C "$tmp_dir/source" --strip-components=1 || fail 'invalid source archive'
     source_dir=$tmp_dir/source
   fi
   if ! command -v cargo >/dev/null 2>&1; then
@@ -125,12 +134,19 @@ else
   bin_dir=$tmp_dir/target/release
 fi
 
-mkdir -p "$install_dir"
+if ! mkdir -p "$install_dir" 2>/dev/null; then
+  as_root mkdir -p "$install_dir"
+fi
+install_as_root=0
+if [ ! -w "$install_dir" ]; then install_as_root=1; fi
+put() {
+  if [ "$install_as_root" -eq 1 ]; then as_root "$@"; else "$@"; fi
+}
 # Install atomically per binary so interrupted downloads never leave a partial executable.
 for name in nk nks; do
-  cp "$bin_dir/$name" "$install_dir/.$name.install-$$"
-  chmod 755 "$install_dir/.$name.install-$$"
-  mv -f "$install_dir/.$name.install-$$" "$install_dir/$name"
+  put cp "$bin_dir/$name" "$install_dir/.$name.install-$$"
+  put chmod 755 "$install_dir/.$name.install-$$"
+  put mv -f "$install_dir/.$name.install-$$" "$install_dir/$name"
 done
 
 "$install_dir/nk" --device cpu '"Nmerkar installed" print' > "$tmp_dir/output" || fail 'installed nk could not compile and run a program'

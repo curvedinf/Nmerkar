@@ -78,8 +78,8 @@ jobs:
         if: matrix.os == 'ubuntu-24.04-arm'
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -v "$RUNNER_TEMP:/ci" -w /work ubuntu:24.04 sh -ec '
-            NK_INSTALL_ARCHIVE=/ci/nmerkar-ci.tar.gz NK_INSTALL_DIR=/tmp/nmerkar/bin sh install.sh
-            /tmp/nmerkar/bin/nk --device cpu '\''"ARM64 works" print'\''
+            NK_INSTALL_ARCHIVE=/ci/nmerkar-ci.tar.gz sh install.sh
+            nk --device cpu '\''"ARM64 works" print'\''
           '
 
   distro:
@@ -117,9 +117,11 @@ jobs:
           INSTALL_PYTHON: ${{ matrix.python }}
         run: |
           docker run --rm -e INSTALL_PYTHON -v "$GITHUB_WORKSPACE:/work" -v "$RUNNER_TEMP:/ci" -w /work "$IMAGE" sh -ec '
-            NK_INSTALL_ARCHIVE=/ci/nmerkar-ci.tar.gz NK_INSTALL_DIR=/tmp/nmerkar/bin sh install.sh
+            NK_INSTALL_ARCHIVE=/ci/nmerkar-ci.tar.gz sh install.sh
+            command -v nk
+            command -v nks
             sh -c "$INSTALL_PYTHON"
-            python3 qc/unix.py /tmp/nmerkar/bin/nk /tmp/nmerkar/bin/nks --quick
+            python3 qc/unix.py "$(command -v nk)" "$(command -v nks)" --quick
           '
 
   source-bootstrap:
@@ -132,6 +134,6 @@ jobs:
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work ubuntu:24.04 sh -ec '
             ! command -v cargo
             ! command -v cc
-            NK_INSTALL_SOURCE_DIR=/work NK_INSTALL_DIR=/tmp/nmerkar/bin sh install.sh
-            /tmp/nmerkar/bin/nk --device cpu '\''"fresh source install works" print'\''
+            NK_INSTALL_SOURCE_DIR=/work sh install.sh
+            nk --device cpu '\''"fresh source install works" print'\''
           '

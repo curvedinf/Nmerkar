@@ -43,6 +43,7 @@ pub fn c_type(t: &str) -> &'static str {
         "float" => "double",
         "ptr" | "handle" => "void*",
         "byte" => "char",
+        "bool" => "_Bool",
         "void" => "void",
         _ => panic!("unknown C type {}", t),
     }
@@ -58,6 +59,7 @@ pub fn c_retty(t: &str) -> &'static str {
         "float" => "double",
         "ptr" | "handle" => "void*",
         "byte" => "char",
+        "bool" => "_Bool",
         "void" => "void",
         _ => panic!("unknown C type {}", t),
     }
@@ -617,7 +619,8 @@ pub fn emit_range(
         if i > start && targets.contains(&i) {
             vdiscard(&mut e, &mut vstack, &mut vcache);
         }
-        e.push_str(&format!("{}: ", plab(prefix, i)));
+        // C labels must precede statements, not declarations (Clang 10).
+        e.push_str(&format!("{}:; ", plab(prefix, i)));
         if suppress.contains(&i) {
             // PushAddr feeding an inlined FOR: the address is compile-time
             // known, so the push is elided entirely.
@@ -3071,7 +3074,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         o.push_str("  if(pc==0 && cx==main_cx) {");
         for &ipc in &p.init_pcs {
             o.push_str(&format!(
-                "{{ pthread_t th; if(pthread_create(&th,0,uf_init_worker,(void*)&&L_{})) die(\"init thread\"); pthread_detach(th); }}",
+                "{{ uf_gc_worker_enter(); pthread_t th; if(pthread_create(&th,0,uf_init_worker,(void*)&&L_{})) die(\"init thread\"); pthread_detach(th); }}",
                 ipc
             ));
         }
@@ -3392,6 +3395,7 @@ pub fn arg_cast(ct: &str, var: &str) -> String {
         "double" => format!("uf_f({})", var),
         "void*" => format!("(void*)uf_sptr({})", var),
         "char" => format!("(char){}.i", var),
+        "_Bool" => format!("(_Bool)uf_truthy({})", var),
         _ => var.to_string(),
     }
 }
@@ -3402,6 +3406,7 @@ pub fn ret_push(ret: &str, var: &str) -> String {
         "float" => format!("pushf(cx,{});", var),
         "ptr" | "handle" => format!("pushp(cx,{});", var),
         "byte" => format!("pushi(cx,(int64_t){});", var),
+        "bool" => format!("pushc(cx,uf_mkb({}));", var),
         _ => String::new(),
     }
 }

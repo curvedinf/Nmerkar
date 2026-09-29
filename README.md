@@ -1,10 +1,16 @@
 # Nmerkar (nk)
 
-A programming language that gives AI agents **Python brevity at native speed**.
-Nmerkar includes a powerful suite of built-ins which simplify and accelerate data
-processing, while retaining full compatibility with C's ecosystem. When a GPU
-is available, Nmerkar automatically accelerates code by compiling optimized
-fused vulkan kernels. Ask your agent if they'd rather use Nmerkar.
+A programming language that gives AI agents **Python token count at C speed**. Nmerkar includes a powerful suite of built-ins which simplify data processing, while retaining full compatibility with C's ecosystem. Garbage collection and simplified scoping speed development, while a sandboxed mode prevents agents from accidentally deleting your whole computer. Nmerkar doesnt have any parenthesis or brackets to forget to close, and has a weird emoji language encoding for absolutely minimal token count. When a GPU is available, Nmerkar automatically accelerates code by compiling optimized fused vulkan kernels. There are many more interesting features your agent will appreciate, so point it here and ask if it would rather use Nmerkar.
+
+## Quick start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/curvedinf/Nmerkar/main/install.sh | sh
+nk '"Hello!" print'
+```
+
+Supports Linux (x86_64, ARM64, ARMv7) and macOS (ARM64, Intel). Installs `nk`,
+`nks`, and the C compiler and libraries required to run Nmerkar programs.
 
 # Who was Enmerkar?
 
@@ -21,12 +27,12 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 |---|---|
 | Specialization | Throwaway data processing tools |
 | Execution | Compiled (Nmerkar → C → native binary) |
-| Style | Forth-like postfix |
+| Style | Forth-like postfix but no stack manipulation |
 | Block control | Implicit (no brackets) |
-| Typing | Dynamic and weak |
+| Typing | Dynamic and weak default, optional per value strictness |
 | Memory | Garbage collected |
-| C Imports | Direct ABI, no glue |
-| Primitives | int, float, str, ptr |
+| Library Ecosystem | C / C++ / Rust full compatibility |
+| Primitives | int, float, bool, byte, str, ptr |
 | Data structures | list, dict, arr, tensor, chan, atom, obj, bitmap, bloom, iter |
 | Concurrency | Channels, threads, dataflow DAGs with fanout |
 | Built-ins | Regex, JSON, shell, I/O, streaming, tensor math |
@@ -75,14 +81,6 @@ Performed on AMD Ryzen 7900x3D.
 
 Performed on AMD Radeon 7900 XTX.
 
-## Quick start
-
-```sh
-cd comp && cargo build --release
-./comp/target/release/nk '"Hello!\n" print'
-cargo install --path comp       # optional: install nk to PATH
-```
-
 ## Usage
 
 ```sh
@@ -97,27 +95,82 @@ nk somedir/                    # directory mode (auto-discovers main + init thre
 Text (`.n`) is the default encoding; dense (`.nd`) is an experimental
 token-optimized encoding.
 
-## Example
+`true` and `false` are boolean values, distinct from `1` and `0` (use
+`structural_equal` to compare types as well as values). `parse_json` preserves
+JSON booleans through lists and dicts, and `to_json` writes them back as
+`true`/`false`. Use `bool cast` to convert a value explicitly.
 
-128×128 matrix multiply, text encoding — no headers, no memory management,
-no imports, no declarations:
+## Key Concepts
 
+**Read left to right.** Nmerkar uses postfix operations: `3 4 add print`
+adds two values, then prints `7`. Each operation consumes its inputs and passes
+its result to the next one. The compiler manages the underlying stack; `total!`
+stores a value and `total` reads it. A `;` starts a comment.
+
+**Work with data.** Integers, floats, and strings can live in lists, dictionaries,
+objects, or typed arrays and tensors. The same `get`, `set`, and `length`
+operations work across several containers. Managed values are garbage collected,
+and built-ins handle JSON, text, files, and regular expressions.
+
+**Compose behavior.** `if`, `while`, and `for` call labeled blocks such as
+`'step`; the block is defined with `step:` and can bind inputs to named variables.
+Blocks also serve as callbacks for operations such as `filter`, and `ret` returns
+a value.
+
+**Parallel pipelines with `weave`.** Process files and large datasets without
+managing threads or passing results between them by hand. Define steps as
+`task` blocks; `run` executes independent steps in parallel and passes their
+results to dependent steps. Add a worker count to spread collection items
+across cores; eligible tensor work can use a fused Vulkan GPU kernel.
+
+**Compile and run.** `nk` translates a program to C, compiles it with the system
+C compiler, and runs the native result; it can also emit C or a standalone
+binary. Eligible compute work can use a Vulkan GPU automatically when the
+toolchain and device are available, while `--device cpu` keeps it on the CPU.
+`nks` runs programs in a sandbox.
+
+## Examples
+
+A shopping list stores items in order:
+
+```nmerkar
+["apples" "bread" "milk"] groceries!      ; Create a shopping list with a list literal.
+groceries "eggs" append groceries!        ; Add eggs to the existing list.
+groceries length print                    ; Print how many items to buy.
+groceries 0 get print                     ; Print the first item.
+groceries print                           ; Print the complete shopping list.
 ```
-fi:  row! 128 'fe for ret
-fe:  col! row 128 mul col add ix!
-     A ix row col add set
-     B ix row col sub set ret
-cr:  row! 128 'dc for ret
-dc:  col! 0 acc! 128 'ij for
-     C row 128 mul col add acc set ret
-ij:  j! A row 128 mul j add get
-     B j 128 mul col add get
-     mul acc add acc! ret
-entry:
-  16384 int array A! 16384 int array B! 16384 int array C!
-  128 'fi for
-  128 'cr for
-  ret
+
+A loop calls a helper to price three orders of increasing size:
+
+```nmerkar
+0 total!                                   ; Start the running total at zero.
+3 'add_order for                            ; Run add_order with indexes 0, 1, and 2.
+total print                                ; Print the total cost of all three orders.
+ret                                        ; Finish the main program before the helper blocks.
+add_order: index!                          ; Give each loop index a name.
+  index 1 add _call price total add total! ; Price one more item than the index, then add it to the total.
+  ret                                      ; Return to the loop.
+price: quantity!                           ; Define a reusable helper that receives a quantity.
+  ret quantity 5 mul                       ; Return the quantity times the $5 unit price.
+```
+
+A `weave` streams prices from a file, discounts them as a tensor, and totals the result.
+Running it creates `weave-prices.txt` in the current directory:
+
+```nmerkar
+"weave-prices.txt" "10\n20\n30" write_file            ; Write three sample prices to a file.
+weave                                               ; Begin a task graph.
+  task prices:                                      ; Define the file-processing task.
+    "weave-prices.txt" list 'collect_price file_fold_lines values! ; Stream file lines into a list.
+    ret values float tensor                         ; Turn the parsed prices into a float tensor.
+  collect_price: values! line!                       ; Receive the accumulated list and the next line.
+    ret values line parse_float append              ; Parse the price and add it to the list.
+  task discounted: prices!                          ; Wait for the prices task and receive its tensor.
+    ret prices 0.9 mul                              ; Apply a 10 percent discount to each price.
+  task total: discounted!                           ; Wait for the discounted tensor.
+    ret discounted sum                              ; Sum the discounted prices.
+run total "%.2f" format print                       ; Run the graph and print 54.00.
 ```
 
 Use `nk` inline to efficiently process data with `bash`:

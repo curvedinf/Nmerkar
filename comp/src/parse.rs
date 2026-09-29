@@ -14,7 +14,7 @@ pub fn fnv64(s: &str) -> i64 {
 }
 
 // method dispatch type key: struct names -> 1000+sid, container names -> HT_*,
-// scalar type keywords -> 0..3
+// scalar type keywords -> 0..3 or 21 (bool)
 pub fn method_typekey(name: &str, structs: &StructMap) -> Option<i64> {
     if let Some((_, _, sid)) = structs.get(name) {
         return Some(1000 + sid);
@@ -24,6 +24,7 @@ pub fn method_typekey(name: &str, structs: &StructMap) -> Option<i64> {
         "float" => Some(1),
         "ptr" | "handle" => Some(2),
         "byte" => Some(3),
+        "bool" => Some(21),
         "arr" => Some(5),
         "tensor" => Some(6),
         "dyn" | "list" => Some(7),
@@ -271,6 +272,11 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 p.ins.push(simple_ins(name))
             }
             Tok::PushI(v) => p.ins.push(Ins::PushI(v)),
+            Tok::PushBool(v) => {
+                p.ins.push(Ins::PushI(v as i64));
+                p.ins.push(Ins::PushI(21));
+                p.ins.push(simple_ins("CAST"));
+            }
             Tok::PushF(v) => p.ins.push(Ins::PushF(v)),
             Tok::PushS(s) => {
                 let idx = p.strings.len();
@@ -687,7 +693,7 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                     p.ins.push(Ins::DictLit);
                 } else if let Some(rest) = n.strip_prefix("@sizeof:") {
                     if let Some(id) = type_id(rest) {
-                        p.ins.push(Ins::PushI(if id == 3 { 1 } else { 8 }));
+                        p.ins.push(Ins::PushI(if id == 3 || id == 21 { 1 } else { 8 }));
                     } else if let Some((_, tsz, _)) = structs.get(rest) {
                         p.ins.push(Ins::PushI(*tsz));
                     } else {

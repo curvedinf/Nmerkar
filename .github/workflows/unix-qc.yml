@@ -1,0 +1,168 @@
+name: Unix QC
+
+on:
+  push:
+    branches: [main, master, 'qc/**']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unix-qc-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: ${{ matrix.os }} / installed compiler
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: comp
+      - name: Build both compilers
+        working-directory: comp
+        run: cargo build --release --bins
+      - name: Install packaged compilers and C dependencies
+        run: |
+          tar -czf "$RUNNER_TEMP/nmerkar-ci.tar.gz" -C comp/target/release nk nks
+          NK_INSTALL_ARCHIVE="$RUNNER_TEMP/nmerkar-ci.tar.gz" NK_INSTALL_DIR="$RUNNER_TEMP/nmerkar/bin" sh install.sh
+      - name: Diagnose large weave with AddressSanitizer
+        if: matrix.os == 'ubuntu-24.04'
+        working-directory: comp
+        run: |
+          "$RUNNER_TEMP/nmerkar/bin/nk" --device cpu --emit-c tests/t14_task_gpu.n -o /tmp/nk-t14
+          cc -O1 -g -fsanitize=address -fno-omit-frame-pointer -o /tmp/nk-t14-asan /tmp/nk-t14.c -lpthread -lm
+          ASAN_OPTIONS=detect_leaks=0 /tmp/nk-t14-asan
+      - name: Compile and run language suite (CPU)
+        run: python3 qc/unix.py "$RUNNER_TEMP/nmerkar/bin/nk" "$RUNNER_TEMP/nmerkar/bin/nks"
+      - name: Run README examples
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+
+          examples = Path('README.md').read_text().split('```nmerkar\n')[1:4]
+          assert len(examples) == 3
+          expected = ['4\napples', '30', '54.00']
+          with tempfile.TemporaryDirectory() as workdir:
+              for source, output in zip(examples, expected):
+                  program = source.split('```', 1)[0]
+                  actual = subprocess.check_output(
+                      [os.path.join(os.environ['RUNNER_TEMP'], 'nmerkar/bin/nk'), '--device', 'cpu', program],
+                      cwd=workdir,
+                      text=True,
+                  ).strip()
+                  assert actual.splitlines()[0:len(output.splitlines())] == output.splitlines(), (actual, output)
+          PY
+      - name: Stress default-GC large weave (t14, ten runs)
+        if: matrix.os == 'ubuntu-24.04'
+        working-directory: comp
+        run: |
+          for i in $(seq 1 10); do
+            "$RUNNER_TEMP/nmerkar/bin/nk" --device cpu tests/t14_task_gpu.n > /dev/null
+          done
+
+      - name: Verify fresh ARM64 Linux container
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -v "$RUNNER_TEMP:/ci" -w /work ubuntu:24.04 sh -ec '
+            NK_INSTALL_ARCHIVE=/ci/nmerkar-ci.tar.gz sh install.sh
+            nk --device cpu '\''"ARM64 works" print'\''
+          '
+
+  distro:
+    name: ${{ matrix.image }} / fresh install
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            python: apt-get install -y --no-install-recommends python3
+          - image: ubuntu:22.04
+            python: apt-get install -y --no-install-recommends python3
+          - image: ubuntu:20.04
+            python: apt-get install -y --no-install-recommends python3
+          - image: fedora:42
+            python: dnf install -y python3
+          - image: alpine:3.22
+            python: apk add --no-cache python3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: comp
+      - name: Build portable compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          cargo build --release --bins --target x86_64-unknown-linux-musl --manifest-path comp/Cargo.toml
+          tar -czf "$RUNNER_TEMP/nmerkar-ci.tar.gz" -C comp/target/x86_64-unknown-linux-musl/release nk nks
+      - name: Test compiler inside distro
+        env:
+          IMAGE: ${{ matrix.image }}
+          INSTALL_PYTHON: ${{ matrix.python }}
+        run: |
+          docker run --rm -e INSTALL_PYTHON -v "$GITHUB_WORKSPACE:/work" -v "$RUNNER_TEMP:/ci" -w /work "$IMAGE" sh -ec '
+            NK_INSTALL_ARCHIVE=/ci/nmerkar-ci.tar.gz sh install.sh
+            command -v nk
+            command -v nks
+            sh -c "$INSTALL_PYTHON"
+            python3 qc/unix.py "$(command -v nk)" "$(command -v nks)" --quick
+          '
+
+  source-bootstrap:
+    name: Fresh Ubuntu / source and Rust bootstrap
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install from source in a container without Rust or a C compiler
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work ubuntu:24.04 sh -ec '
+            ! command -v cargo
+            ! command -v cc
+            NK_INSTALL_SOURCE_DIR=/work sh install.sh
+            nk --device cpu '\''"fresh source install works" print'\''
+          '
+
+  legacy-toolchains:
+    name: Rust 1.70 / Ubuntu 20.04 / ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc-9, clang-10]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build from source and run QC with older compilers
+        env:
+          C_COMPILER: ${{ matrix.compiler }}
+        run: |
+          docker run --rm -e C_COMPILER -v "$GITHUB_WORKSPACE:/work" -w /work ubuntu:20.04 sh -ec '
+            apt-get update
+            apt-get install -y --no-install-recommends build-essential clang-10 python3 curl ca-certificates tar
+            mkdir -p /tmp/compat-bin
+            ln -s "/usr/bin/$C_COMPILER" /tmp/compat-bin/cc
+            export PATH="/tmp/compat-bin:$PATH"
+            NK_INSTALL_SOURCE_DIR=/work sh install.sh
+            export PATH="$HOME/.cargo/bin:$PATH"
+            rustc --version | grep "rustc 1.70.0 "
+            cc --version
+            cargo test --manifest-path trans/Cargo.toml
+            python3 qc/unix.py "$(command -v nk)" "$(command -v nks)" --quick
+          '

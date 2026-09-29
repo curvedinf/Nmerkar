@@ -71,6 +71,7 @@ pub fn emit_text(toks: &[Tok]) -> String {
         match t {
             Tok::Op(name) => o.push_str(&format!("{} ", text_mnemonic(op_index(name).expect("op")))),
             Tok::PushI(v) => o.push_str(&format!("{} ", v)),
+            Tok::PushBool(v) => o.push_str(if *v { "true " } else { "false " }),
             Tok::PushF(v) => o.push_str(&format!("{:?} ", v)),
             Tok::PushS(s) => o.push_str(&format!("\"{}\" ", escape_str(s))),
             Tok::Jump(op, l) => o.push_str(&format!("{} {} ", text_mnemonic(op_index(op).expect("jump")), l)),
@@ -270,6 +271,12 @@ pub fn emit_dense(toks: &[Tok]) -> String {
                         o.push(glyph_of(0)); // LIT
                         o.push_str(&format!("{}", v));
                     }
+                }
+                Tok::PushBool(v) => {
+                    sep_l(o);
+                    o.push_str(&lrun(if *v { 1 } else { 0 }));
+                    o.push(glyph_of(27)); // _cast with the bool type immediate
+                    o.push(char::from_u32(TYPE_BASE + 7).unwrap());
                 }
                 Tok::PushF(v) => {
                     if let Some(ls) = emit_lfloat(*v) {

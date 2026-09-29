@@ -47,10 +47,7 @@ him back to the lord. The lord was astounded and granted Enmerkar the favors.
 | dynamicgraph | 349 | 436 | 423 | **303** | 369 |
 | **total** | **2886** | 4411 | 4507 | 3078 | 3526 |
 
-Token counts use the **Qwen3** tokenizer (151,643 vocab). The first six
-benchmarks are data/tensor-shaped (Nmerkar's home turf); nqueens stresses
-control flow, bfs uses packed CSR arrays, and dynamicgraph isolates hash-map
-and small-list allocation costs.
+Token counts use the **Qwen3** tokenizer (151,643 vocab).
 
 ### Speed (CPU only, seconds, lower = faster)
 
@@ -67,7 +64,7 @@ and small-list allocation costs.
 | blackscholes N=2M | 0.05 | 0.04 | **0.04** | 0.17 | 0.07 |
 | **total** | 3.33 | **2.85** | 3.97 | 65.84 | 8.70 |
 
-CPU is an AMD Ryzen 7900x3D.
+Performed on AMD Ryzen 7900x3D.
 
 ### GPU offloading (seconds, lower = faster)
 
@@ -76,7 +73,7 @@ CPU is an AMD Ryzen 7900x3D.
 | matmul N=2048 | 1.56s | **0.26s** |
 | blackscholes N=32M | 0.61s | **0.21s** |
 
-GPU is an AMD Radeon 7900 XTX.
+Performed on AMD Radeon 7900 XTX.
 
 ## Quick start
 

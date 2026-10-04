@@ -1,0 +1,2 @@
+0 3 array a!
+a 0 get

@@ -1,0 +1,80 @@
+; array_map / array_reduce / argsort / search_sorted / transpose
+list 1 append 2 append 3 append 0 array a!
+"map dbl: " print a _addr dbl array_map print
+"map sq: " print a _addr sq array_map print
+"reduce +: " print a 0 _addr addb array_reduce print
+;float reduce
+list 1.5 append 2.5 append 0 float tensor ft!
+"reduce float: " print ft 0.5 _addr addb array_reduce print
+;fold over a list (C converts list -> float tensor)
+list 1 append 2 append 3 append 1 _addr addb array_reduce print
+;fold over a matrix
+[2 2] float tensor mm!
+mm 0 1.0 set
+mm 1 2.0 set
+mm 2 3.0 set
+mm 3 4.0 set
+"reduce mat: " print mm 0 _addr addb array_reduce print
+;map over a matrix keeps the matrix shape
+"map mat: " print mm _addr mm2 array_map print
+;argsort: stable, ties keep left index first
+list 3 append 1 append 2 append 0 array s!
+"argsort: " print s array_argsort print
+list 5 append 5 append 1 append 5 append 0 array t!
+"argsort ties: " print t array_argsort print
+list 0 array e1!
+"argsort empty: " print e1 array_argsort print
+;searchsorted: insertion point (first pos with el >= val)
+list 2 append 4 append 6 append 8 append 0 array ss!
+"ss 5: " print ss 5 array_search_sorted print
+"ss 2: " print ss 2 array_search_sorted print
+"ss 9: " print ss 9 array_search_sorted print
+"ss 1.5: " print ss 1.5 array_search_sorted print
+list 1.5 append 2.5 append 3.5 append 0 float tensor fss!
+"fss 2.6: " print fss 2.6 array_search_sorted print
+;transpose
+[2 3] float tensor m!
+m 0 1.0 set
+m 1 2.0 set
+m 2 3.0 set
+m 3 4.0 set
+m 4 5.0 set
+m 5 6.0 set
+"transpose: " print m transpose print
+"transpose len: " print m transpose length print
+"transpose type: " print m transpose type_of print
+"transpose twice: " print m transpose transpose print
+[3 2] int tensor im!
+im 0 1 set
+im 1 2 set
+im 2 3 set
+im 3 4 set
+im 4 5 set
+im 5 6 set
+"transpose int: " print im transpose print
+;mean/min/max on mixed ety
+list 1 append 3 append 2 append 0 array mi!
+"mean int: " print mi mean print
+"min int: " print mi min print
+"max int: " print mi max print
+list 1.5 append 2.5 append 0.5 append 0 float tensor mf!
+"mean f: " print mf mean print
+"min f: " print mf min print
+"max f: " print mf max print
+ret
+dbl:
+  2 mul
+  ret
+addb:
+  add
+  ret
+trb:
+  3 sub
+  ret
+sq:
+  dup
+  mul
+  ret
+mm2:
+  1.0 add
+  ret

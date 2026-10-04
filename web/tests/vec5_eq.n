@@ -1,0 +1,26 @@
+; vector equality semantics: arrays compare by pointer identity (C uf_loose_eq /
+; uf_strict_eq reduce to to_number/pointer compare for non-strings), and
+; structural_equal uses the same rule. Same arr -> 1, distinct identical arrs -> 0.
+list 1 append 2 append 3 append 0 array a!
+list 1 append 2 append 3 append 0 array b!
+"a eq a: " print a a eq print
+"a s_eq a: " print a a structural_equal print
+"b eq b: " print b b eq print
+"a eq b (distinct): " print a b eq print
+"a s_eq b (distinct): " print a b structural_equal print
+"b s_ne a (distinct): " print a b structural_not_equal print
+"mats: " print a b eq print
+[2 2 1.0 2.0 3.0 4.0] float tensor m1!
+[2 2 1.0 2.0 3.0 4.0] float tensor m2!
+"m1 s_eq m2 (distinct mats): " print m1 m2 structural_equal print
+"m1 eq m1: " print m1 m1 eq print
+;scalar sanity (numbers still compare by value)
+"3 eq 3.0: " print 3 3.0 eq print
+"3 strict 3.0: " print 3 3.0 structural_equal print
+;strictness switch: strict set -> int vs float unequal
+"3 vs 3.0: " print 3 3.0 eq print
+strict
+"strict 3 vs 3.0: " print 3 3.0 eq print
+loose
+"loose 3 vs 3.0: " print 3 3.0 eq print
+ret

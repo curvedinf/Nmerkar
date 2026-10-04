@@ -1,0 +1,4 @@
+4 0 array b!
+b 1 scalar_gt bm!
+3 0 array a!
+a bm array_gather

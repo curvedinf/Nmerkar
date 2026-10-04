@@ -1,0 +1,21 @@
+; gate t01: arithmetic, bitwise, comparisons, coercion
+10 3 div print
+10 3 rem print
+10 3 eq print
+2 3 lt print
+5 6 gt print
+0 not print
+5 3 or print
+5 3 xor print
+1 4 shl print
+256 3 shr print
+5 bnot print
+2.5 2.0 div print
+2 3 pow print
+9 sqrt print
+2 2 lte print
+2 2 gte print
+1 print
+2 print
+list 1 append 2 append 3 append length print
+-5 print

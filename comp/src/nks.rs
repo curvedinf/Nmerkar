@@ -3,15 +3,7 @@
 // repo default comp/sandbox.ufs (policy `data`, with pure/data/web/build
 // selectable via --policy).
 
-mod ast;
-mod compute;
-mod driver;
-mod emit;
-mod gen;
-mod lex;
-mod parse;
-mod prelude;
-mod sandbox;
+use nk::driver;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

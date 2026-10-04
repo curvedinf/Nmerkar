@@ -414,6 +414,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
     let mut emit_c = false;
+    let mut emit_js = false;
     let mut emit_text_f = false;
     let mut emit_dense_f = false;
     let mut compile_only = false;
@@ -456,6 +457,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 panic!("--compiler-backtrace accepts no value or `full`");
             }
             "--emit-c" => emit_c = true,
+            "--emit-js" => emit_js = true,
             "--emit-text" => emit_text_f = true,
             "--emit-dense" => emit_dense_f = true,
             "--to-text" => {
@@ -493,7 +495,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
             "-h" | "--help" => {
                 eprintln!("usage: nk [directory]                   compile+run directory (auto-discovers)");
                 eprintln!("       nk input.n... ['inline source'|-]        compile+run (cached in TMPDIR)");
-                eprintln!("       nk -c input.n... [-o output] [--emit-c|--emit-text|--emit-dense]");
+                eprintln!("       nk -c input.n... [-o output] [--emit-c|--emit-js|--emit-text|--emit-dense]");
                 eprintln!("       nk --to-text prog.nd | --to-dense prog.n   convert encodings (writes prog.n/.nd)");
                 eprintln!("       nk -s | --skill                    print agent SKILL.md template");
                 eprintln!("");
@@ -768,6 +770,18 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 eprintln!("wrote {}", path);
             }
             None => print!("{}", &csrc),
+        }
+        return;
+    }
+    if emit_js {
+        let js = crate::gen_js::gen_js(&parsed, &structs);
+        match &output {
+            Some(o) => {
+                let path = format!("{}.js", o);
+                fs::write(&path, &js).unwrap_or_else(|e| panic!("cannot write {}: {}", path, e));
+                eprintln!("wrote {}", path);
+            }
+            None => print!("{}", &js),
         }
         return;
     }

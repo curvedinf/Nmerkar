@@ -1,0 +1,18 @@
+; spawn1 — spawn + chan lifecycle + atom ops.
+; The spawned body is a bare `ret`, which enqueues 0 to the result chan and
+; closes it; a dequeue after the close yields the sentinel 0. Atoms exercise
+; set/get/fetch-add/cas. Expected output (8 lines):
+;   0, 0, <chan>, 5, 9, 1, 0, 77
+'spaw spawn c!
+c dequeue print
+c dequeue print
+c print
+5 atomic a!
+a atomic_get print
+a 9 atomic_set
+a 3 atomic_add print
+a 12 77 cas print
+a 12 78 cas print
+a atomic_get print
+ret
+spaw: ret

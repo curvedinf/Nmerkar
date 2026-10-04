@@ -1,0 +1,3 @@
+3 0 array a!
+3 0 array b!
+a b array_div

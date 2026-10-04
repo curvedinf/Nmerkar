@@ -217,7 +217,7 @@ fn f64_expr(v: &VEntry) -> String {
 // semantics at runtime (float dominates); bitwise ops require both Int.
 fn infer_bin_type(h: &str, a: VType, b: VType) -> VType {
     match h {
-        "op_lt" | "op_gt" | "op_lte" | "op_gte" | "op_eq" => VType::Int,
+        "op_lt" | "op_gt" | "op_lte" | "op_gte" | "op_eq" | "op_shr" => VType::Int,
         "op_and" | "op_or" | "op_xor" => {
             if a == VType::Int && b == VType::Int { VType::Int } else { VType::Unknown }
         }
@@ -886,10 +886,10 @@ pub fn emit_range(
                     "op_eq"  => Some("uf_ceq"),
                     "op_or"  => Some("uf_cor"),
                     "op_xor" => Some("uf_cxor"),
+                    "op_shr" => Some("uf_cshr"),
                     _ => None,
                 };
                 let un = match *h {
-                    "op_shr" => Some("uf_cshr"),
                     "op_inc" => Some("uf_cinc"),
                     "op_dec" => Some("uf_cdec"),
                     "op_not" => Some("uf_cnot"),
@@ -972,7 +972,21 @@ pub fn emit_range(
                             "op_eq" => Some("=="),
                             _ => None,
                         };
-                        if let Some(op) = op_str {
+                        if *h == "op_shr" {
+                            // SPEC: `a b shr` = logical a>>b (binary). A raw
+                            // C `>>` is only folded when the amount is a
+                            // literal in [0,64): shift counts >= the width are
+                            // UB in C. Everything else takes the runtime
+                            // helper, which dies on non-ints / out-of-range.
+                            match b.expr.trim_end_matches("LL").parse::<i64>() {
+                                Ok(n) if rt == VType::Int && n >= 0 && n < 64 => {
+                                    vpush_cond(&mut e, &mut vstack, &mut vtmp,
+                                        format!("({} >> {})", a.expr, b.expr), VType::Int, &a.expr, &b.expr)
+                                }
+                                _ => { vpush_cell(&mut e, &mut vstack, &mut vtmp,
+                                    &format!("{}({},{})", f, cell_of(&a), cell_of(&b))); }
+                            }
+                        } else if let Some(op) = op_str {
                             vpush_cond(&mut e, &mut vstack, &mut vtmp,
                                 format!("({} {} {})", a.expr, op, b.expr), rt, &a.expr, &b.expr);
                         } else if let Some(op) = cmp_str {
@@ -1024,7 +1038,6 @@ pub fn emit_range(
                         let op_str = match *h {
                             "op_inc" => Some("+1"),
                             "op_dec" => Some("-1"),
-                            "op_shr" => Some(">>1"),
                             _ => None,
                         };
                         if let Some(op) = op_str {
@@ -2409,8 +2422,8 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                 Ins::PushF(_) => type_stack.push((VType::Float, false)),
                 Ins::PushS(_) | Ins::PushAddr(_) => type_stack.push((VType::Unknown, true)),
                 Ins::Simple(h) => {
-                    let bin = matches!(*h, "op_add"|"op_sub"|"op_mul"|"op_and"|"op_div"|"op_rem"|"op_lt"|"op_gt"|"op_lte"|"op_gte"|"op_eq"|"op_or"|"op_xor");
-                    let un = matches!(*h, "op_shr"|"op_inc"|"op_dec"|"op_not");
+                    let bin = matches!(*h, "op_add"|"op_sub"|"op_mul"|"op_and"|"op_div"|"op_rem"|"op_lt"|"op_gt"|"op_lte"|"op_gte"|"op_eq"|"op_or"|"op_xor"|"op_shr");
+                    let un = matches!(*h, "op_inc"|"op_dec"|"op_not");
                     if bin {
                         let b = type_stack.pop().unwrap_or((VType::Unknown, true));
                         let a = type_stack.pop().unwrap_or((VType::Unknown, true));

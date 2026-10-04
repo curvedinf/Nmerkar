@@ -1,0 +1,8 @@
+weave
+  task a: b!
+    ret 1
+  task b: a!
+    ret 2
+run a
+print
+ret

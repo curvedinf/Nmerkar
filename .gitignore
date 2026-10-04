@@ -10,6 +10,11 @@ bench/data/
 bench/results/
 .bench-venv/
 
+# web deliverable: web/{nk.js,example.html} are the committed built files;
+# build.sh regenerates them in place from the templates
+# web/nk.wrapper.js + web/example.template.html (nk.js bakes the wasm,
+# example.html bakes the example sources)
+
 # integration-test fixtures (t08 writes/reads these)
 tests/out.txt
 tests/fem.txt

@@ -1,0 +1,36 @@
+; gate t05: iterators + json (mirrors comp/tests/t07_iter.n minus try/retry/spawn)
+; iterators
+0 5 range iter 'dbl iter_map collect length print
+0 5 range iter 'dbl iter_map collect 3 get print
+0 10 range iter 'ev iter_filter collect length print
+; next
+0 3 range iter it!
+it next v! m!
+v print
+m print
+it next v! m!
+v print
+m print
+it next _! _!
+it next v! m!
+v print
+m print
+; dict iter yields keys
+dict d! d "k1" 1 set d "k2" 2 set
+d iter collect length print
+; str iter yields bytes
+"AB" iter collect 1 get print
+; json / unjson
+"{\"a\": 1, \"b\": [1, 2, 3], \"s\": \"hi\"}" parse_json j!
+j "a" get print
+j "b" get 2 get print
+j "s" get print
+j to_json print
+"[1.5, 2]" parse_json 0 get print
+; format
+"kim" "L: %s" format print
+41 "N: %d" format print
+ret
+; --- quotation bodies ---
+dbl: n! ret n 2 mul
+ev: n! ret n 2 rem 0 eq

@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nmerkar — JavaScript target</title>
+<style>
+  html, body { margin: 0; height: 100%; font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  body { display: flex; flex-direction: column; }
+  #bar { padding: 8px 12px; border-bottom: 1px solid #ccc; }
+  #bar label { margin-right: 4px; }
+  #src, #out { flex: 1; margin: 0; padding: 10px 12px; border: 0; resize: none; overflow: auto; font: inherit; box-sizing: border-box; }
+  #src { border-bottom: 1px solid #ccc; }
+  #out { white-space: pre-wrap; background: #f7f7f7; }
+  button, select { font: inherit; }
+</style>
+</head>
+<body>
+<div id="bar"><label for="ex">example</label><select id="ex"></select> <button id="run">Run</button><span id="hint" style="color:#888"> Ctrl+Enter</span></div>
+<textarea id="src" spellcheck="false"></textarea>
+<pre id="out"></pre>
+<!-- baked by web/build.sh: JSON object mapping example name to source text,
+     taken from the repo's existing programs under examples/ -->
+<script type="application/json" id="ex-samples">__EX_SAMPLES__</script>
+<script src="nk.js"></script>
+<script>
+(function () {
+  "use strict";
+  var src = document.getElementById("src");
+  var out = document.getElementById("out");
+  var sel = document.getElementById("ex");
+  var btn = document.getElementById("run");
+  var EX = JSON.parse(document.getElementById("ex-samples").textContent);
+  var NAMES = Object.keys(EX);
+  NAMES.forEach(function (n) {
+    var o = document.createElement("option");
+    o.value = n;
+    o.textContent = n;
+    sel.appendChild(o);
+  });
+  sel.value = NAMES[0];
+  src.value = EX[NAMES[0]];
+  sel.addEventListener("change", function () { src.value = EX[sel.value]; });
+  function go() {
+    out.textContent = "compiling…";
+    nk.compile(src.value).then(function (prog) {
+      out.textContent = "running…";
+      return prog.run();
+    }).then(function (r) {
+      var t = (r.output || "") + (r.err || "");
+      if (r.error) t += (t ? "\n" : "") + "nk: " + r.error;
+      if (r.rc !== 0) t += "\n[exit " + r.rc + "]";
+      out.textContent = t === "" ? "(no output)" : t;
+    }).catch(function (e) {
+      out.textContent = (e && e.message) ? e.message : String(e);
+    });
+  }
+  btn.addEventListener("click", go);
+  src.addEventListener("keydown", function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); go(); }
+  });
+})();
+</script>
+</body>
+</html>

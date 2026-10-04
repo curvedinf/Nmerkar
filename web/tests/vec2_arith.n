@@ -1,0 +1,76 @@
+; elementwise + scalar vector arith, matmul/matvec/vecmat, broadcast
+list 1 append 2 append 3 append 0 array a!
+list 4 append 5 append 6 append 0 array b!
+"a+b: " print a b array_add print
+"a-b: " print a b array_sub print
+"a*b: " print a b array_mul print
+"a/b: " print a b array_div print
+"a+b core: " print a b add print
+;a broadcast scalar (scalar on top)
+"a*2: " print a 2 mul print
+"a+1: " print a 1 add print
+"a-1: " print a 1 sub print
+"a/2: " print a 2 div print
+; elementwise max/min
+"a max b: " print a b array_max print
+"a min b: " print a b array_min print
+; float vectors
+2 float tensor fa!
+fa 0 1.5 set
+fa 1 2.5 set
+2 float tensor fb!
+fb 0 0.5 set
+fb 1 1.5 set
+"fa+fb: " print fa fb array_add print
+"fa*fb: " print fa fb array_mul print
+"fa/fb: " print fa fb array_div print
+"fa max fb: " print fa fb array_max print
+"fa*3: " print fa 3.0 scalar_mul print
+; matrices
+[2 3] float tensor m!
+m 0 1.0 set
+m 1 2.0 set
+m 2 3.0 set
+m 3 4.0 set
+m 4 5.0 set
+m 5 6.0 set
+[2 3] float tensor o!
+o 0 7.0 set
+o 1 8.0 set
+o 2 9.0 set
+o 3 10.0 set
+o 4 11.0 set
+o 5 12.0 set
+[3 2] float tensor n!
+n 0 7.0 set
+n 1 8.0 set
+n 2 9.0 set
+n 3 10.0 set
+n 4 11.0 set
+n 5 12.0 set
+"m*o: " print m o mul print
+"m*n (matvec): " print m n mul print
+3 float tensor v!
+v 0 1.0 set
+v 1 1.0 set
+v 2 1.0 set
+"m*v: " print m v mul print
+"v*m: " print v m mul print
+"m+o: " print m o add print
+"m*2: " print m 2.0 scalar_mul print
+"m+1: " print m 1.0 scalar_add print
+"m/2: " print m 2.0 scalar_div print
+"m-m: " print m m array_sub print
+; int mat mul
+[2 2] int tensor im!
+im 0 1 set
+im 1 2 set
+im 2 3 set
+im 3 4 set
+[2 2] int tensor ip!
+ip 0 5 set
+ip 1 6 set
+ip 2 7 set
+ip 3 8 set
+"im*ip: " print im ip mul print
+ret

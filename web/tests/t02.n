@@ -1,0 +1,23 @@
+; gate t02: string ops (mirrors comp/tests/t04_str.n minus the shell op)
+"foo" "bar" concat print
+list 1 append 2 append list 3 append concat length print
+"hello world" 0 5 slice print
+"hello" 2 -1 slice print
+list 10 append 20 append 30 append 40 append 1 3 slice length print
+"a,b,c" "," split length print
+"a,b,c" "," split 1 get print
+list "x" append "y" append ", " join print
+"hello" "llo" find print
+"hello" "l" "L" replace_all print
+"  hi  " trim print
+"abc" uppercase print
+"ABC" lowercase print
+"hello" "he" starts_with print
+"hello" "lo" ends_with print
+"abc123" "[0-9]+" regex_match m!
+m 0 get print
+"a1b2" "[0-9]" "X" regex_replace print
+"a1b2c" "[0-9]" regex_split length print
+"file.txt" "*.txt" glob_match print
+"abc" "abc" eq print
+"abc" "abd" lt print

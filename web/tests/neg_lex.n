@@ -1,0 +1,3 @@
+; negative gate: identifier starting with an underscore is a lex error
+_x 5 print
+ret

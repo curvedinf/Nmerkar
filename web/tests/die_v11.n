@@ -1,0 +1,5 @@
+3 0 array a!
+4 0 array b!
+a 1 scalar_gt x!
+b 1 scalar_gt y!
+x y bitmap_and

@@ -1,0 +1,4 @@
+"abc" 0 _addr f array_reduce
+f:
+  add
+  ret

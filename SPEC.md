@@ -1244,8 +1244,142 @@ Codegen optimizations (`comp/src/gen.rs`):
   inline copy. Depth cap 8.
 - **Deferred variable stores**: SETV writes a temp cache within a block; dirty
   temps flushed at block boundaries.
+- **`shr` literal fold**: `a b shr` folds to raw C `>>` only when the shift
+  amount is a literal in [0,64) and the operand type is Int; everything else
+  calls `uf_cshr` (logical shift; dies on non-int or out-of-range, per the
+  opcode table). A raw C `>>` on a shift count ≥ the width is UB, so only the
+  safe literal range is folded.
 
 Linking: always `-lpthread -lm` plus `-l<name>` per USE.
+
+## JavaScript target
+
+`nk --emit-js prog.n [-o out]` emits a self-contained ES5 JavaScript program
+instead of C (no cc step). Single input only — no MTU, no directory mode.
+`-o` appends `.js` when absent.
+
+**Emission layout**: the shared runtime prelude (`comp/src/js_prelude.rs`,
+exported as `RT`), the program's string table (`__STRS`), the machine state
+(`rt`, `st`, `iv`), the code-address table (`__NKAD`), one `F_<pc>` function per
+dynamic code segment (a segment is the instruction range until the next pc
+execution can re-enter: 0, any `_addr`/`_call`/goto target, any weave task, or
+the entry label), and finally the `__NK_API` handle:
+
+```
+__NK_API = { rt, output(), err(), run(env) }
+```
+
+`run(env)` runs the whole program (main's local base is restored on return)
+and resolves to `{output, err, rc, error?}` — `output`/`err` are the merged
+stdout/stderr of the run, `rc` the exit code (0 clean, the exit op's value, 1
+on a runtime error), and `error` the die message when the run fails. `env`
+(all keys optional): `argv` (the program's argv; `argv[0]` is the program
+name — when omitted the program sees `["nk"]`, mirroring native, where the
+argc is never 0), `stdin` (the text of the input stream; `scan` and the
+stdio emulation read a cursor into it), `fs` (an in-memory name → text
+file table for the file ops and `fopen`, see Filesystem model). The emitted
+tail auto-runs only under node (`require.main === module`), writes the
+output to stdout, and on a runtime error writes `nk: <msg>` to stderr and
+exits with the run's rc. `module.exports = __NK_API`.
+
+**Op coverage**: every live opcode has a JavaScript implementation (the
+`RT` op table in `comp/src/js_prelude.rs`, 1:1 with the C prelude's set —
+core/containers/strings/regex, vector/tensor/matrix ops, iterators,
+threads (`spawn`/`chan`/shared-atomic), error containment (`try`/`retry`),
+time, file IO, shell ops, FFI, argv, JSON, bloom, compute). The rejected
+shapes:
+
+- `exports`, `methods`, and init-threads programs are codegen errors
+  (`<thing>: not supported by the JavaScript target`); `_syscall` and
+  `send` die at runtime with the same message.
+- GPU compute: no Vulkan offload — the emitted program always takes the
+  CPU code paths (the `--device` flag is accepted and has no effect, as if
+  `--device cpu` were always in force).
+- `cap`/`caps` return the fixed unrestricted-CPU values (the capability
+  gates are a native-runtime mechanism).
+
+**Weave semantics**: task cycles are rejected at parse time, exactly as
+native (`WEAVE: cycle in task DAG`). Non-fanout weaves run the tasks
+*sequentially* in deterministic topological order (Kahn, ties broken by
+smallest task index); fanout (`N task`) runs the body once per item of
+`inputs[0]`, sequentially in item order (the native target runs the items
+concurrently). Each task's inputs are resolved before it runs, so results
+match the concurrent C execution for the corpus.
+
+**Runtime contract** (mirrors the C target): `print` accumulates into
+`rt.out` (merged by `output()`/`run`); a die resolves the run with the
+partial output preserved alongside the error message. i64 arithmetic wraps
+(BigInt masked to 64 bits); floats are IEEE-754 doubles. `type_of` tag
+ids: i:0 f:1 null/addr:2 byte:3 list:7 dict:8 str:9 iter:18 bool:21.
+Reading an unassigned shared/local slot yields 0; a local `x!` store
+passes the value through, a shared store consumes it (as in C). Loop
+nesting is capped at 64. `for` leaves the first iteration's count-slot
+cell (the stale count, or what the first iteration last wrote into it),
+as in the inlined C. A while loop leaves the stack as it found it: the
+cond's pass-through residual is truncated after every body and left on
+the break path, as in C. Non-int index keys read the raw union bits
+exactly as the C prelude (float → bits, string → decimal parse,
+null/list/dict → 0, code/iter → pointer bits).
+
+**Filesystem model** (`env.fs`): an in-memory name → text table. `fopen`
+returns NULL for an unknown name in any mode (including `w`), mirroring
+the sandbox filesystem; writes to known names update the table; the file
+ops (`read_file`, `write_file`, `mmap`, `slurp`, `spit`, `feach`, …) and
+the libc-stdio FFI subset (the glibc symbols `import c"…"` may use, over
+`stdin`/`stdout`/`stderr`/`nk_argc`/`nk_argv` and the `env.fs` table) read
+and write the same model. `stdin` is the `env.stdin` text, consumed by
+a cursor.
+
+**Shell ops** (`sh`, `shp`, `exec`): need node's `child_process`,
+delivered by the host (the `nkNode.cp` parameter of `web/nk.js`) or
+an in-scope `require`. Under node they run synchronously (`spawnSync`);
+`shp` enqueues the captured stdout lines onto its channel and closes it
+on exit. In a browser `sh`/`exec` die (`JavaScript target: shell
+requires node`) and `shp` yields an empty closed channel (the native
+spawn-fail path). `exec` children inherit the native fds in the C target;
+since the parent's std streams are block-buffered, their writes reach the
+parent's pipe before the parent's own output — the JS target mirrors that
+byte order by queueing the captured child output and prepending it to the
+merged `output`/`err` at result time.
+
+**Wasm library API**: the compiler builds for `wasm32-unknown-unknown`
+(`cargo build --release --target wasm32-unknown-unknown` in `comp/`) with
+`comp/src/wasm_api.rs` exporting a C-ABI: `nk_js_alloc(len)`, `nk_js_free(ptr)`,
+`nk_js_compile(src,len) → ptr to [status:u8][payload][NUL]` (status 0 =
+emitted JS, 1 = error message), `nk_js_msg_off()`, plus `memory`. The heap
+is one stable 16 MiB chunk; its last 128 KiB is the panic-message region.
+On this toolchain a Rust panic *aborts* the instance (the prebuilt
+`panic_unwind` lacks the unwind strategy, so `catch_unwind` cannot fire):
+the panic hook writes the message, NUL-terminated, into the region before
+the abort, and the caller must read the region from the dead instance's
+still-readable linear memory, then re-instantiate the module.
+
+**`web/` layer**: `web/build.sh` builds the compiler for
+`wasm32-unknown-unknown` (`--lib` cdylib), inlines the wasm (base64) into
+`web/nk.js`, and bakes the sources of the repo's own example programs into
+`web/example.html` — both built in place from the committed templates
+`web/nk.wrapper.js` (the `__WASM_B64__` placeholder) and
+`web/example.template.html` (the `__EX_SAMPLES__` placeholder). The page is
+self-contained, openable from `file://`, and carries a selector over the
+baked-in examples.
+`web/nk.js` exposes the compiler as a library: `nk.compile(src) →
+Promise<Program>`, and `Program.run(env) → Promise<{output, err, rc,
+error?}>` — a runnable JS handle of the compiled program (see Runtime
+contract, Filesystem model, and Shell ops above).
+
+**Parity gate**: `node web/tests/run_js.cjs` runs the full corpus against
+the committed `web/nk.js` bundle with the native `nk` as oracle —
+`comp/tests` t01–t17,
+all `examples/` (including the single-file GNU transpiler targets and
+`text/`), all nine `bench/src` programs, and the `web/tests/*.n`
+micro-gates (with `neg_*.n` rejection checks). Each gate compares rc,
+stdout, and stderr of a native run and a JS run of the same source,
+with per-gate compiler flags, `argv`, `stdin`, and fixture `fs`; bare
+epoch timestamp lines are normalized on both sides. Corpus exclusions:
+the multi-TU fixtures (`examples/mtu/`, `examples/dirtest/` — the JS
+emission is single-input only) and `text/chat.n` (loops forever;
+compile-only check). The shell ops run under node in the gate's
+environment.
 
 ## Totals
 

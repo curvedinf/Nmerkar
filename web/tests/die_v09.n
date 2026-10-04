@@ -1,0 +1,5 @@
+3 0 array a!
+3 0 array b!
+4 0 array c!
+c 1 scalar_gt wc!
+a b wc array_where

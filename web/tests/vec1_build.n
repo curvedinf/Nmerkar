@@ -1,0 +1,52 @@
+; vector/tensor construction, element get/set, smart print, len/typeof
+5 0 array a!
+a 0 7 set
+a 1 9 set
+a 2 2 set
+a 3 3 set
+a 4 1 set
+"a: " print a print
+a length print
+"a[2]: " print a 2 get print
+"typeof arr: " print a type_of print
+; build from list (list on the stack, type on top)
+list 4 append 5 append 6 append 0 array b!
+"b: " print b print
+b 1 get print
+b length print
+; float tensor
+[1.5 2.5 3.5] float tensor c!
+"c: " print c print
+c 2 get print
+"typeof tensor: " print c type_of print
+; byte + bool arrays
+[10 20 30] byte array db!
+"byte: " print db print
+db 1 get print
+[1 0 2] bool array dbb!
+"bool: " print dbb print
+dbb 2 get print
+; matrix construction + flat indexing + print
+[2 3] float tensor m!
+m 0 1.0 set
+m 1 2.0 set
+m 2 3.0 set
+m 3 4.0 set
+m 4 5.0 set
+m 5 6.0 set
+"m: " print m print
+"m[3]: " print m 3 get print
+"m len: " print m length print
+"m type: " print m type_of print
+; filled matrix
+[2 2 1.0 2.0 3.0 4.0] float tensor f!
+"f: " print f print
+f 2 get print
+f length print
+; zero-filled tensor
+4 0 tensor zt!
+"zt: " print zt print
+; sum reductions
+"sum(a): " print a sum print
+"sum(c): " print c sum print
+ret

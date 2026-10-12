@@ -1810,3 +1810,76 @@ pub fn lex_source(src: &str) -> Vec<(u32, Tok)> {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_mnemonics_unique_across_live_ops() {
+        // the text-mode reverse lookup (mnemonic_index) depends on this
+        let mut seen: Vec<&'static str> = Vec::new();
+        for i in 0..OP_NAMES.len() {
+            if OP_NAMES[i].starts_with('~') || text_mnemonic(i) == "~retired" {
+                continue;
+            }
+            let m = text_mnemonic(i);
+            assert!(
+                !seen.contains(&m),
+                "mnemonic `{}` is shared by slot {} and an earlier live slot",
+                m, i
+            );
+            seen.push(m);
+        }
+        assert_eq!(seen.len(), 203);
+    }
+
+    #[test]
+    fn text_lexer_smoke() {
+        let toks = lex_source("entry:\n  3 4 add print\n  ret\n");
+        assert_eq!(toks.len(), 6);
+        assert!(matches!(toks[0], (1, Tok::Entry)));
+        assert!(matches!(toks[1], (2, Tok::PushI(3))));
+        assert!(matches!(toks[2], (2, Tok::PushI(4))));
+        assert!(matches!(toks[3], (2, Tok::Op("ADD"))));
+        assert!(matches!(toks[4], (2, Tok::Op("PRINT"))));
+        assert!(matches!(toks[5], (3, Tok::Op("RET"))));
+    }
+
+    #[test]
+    fn retired_jmp_rejected_as_lex_diagnostic() {
+        let d = crate::diag::catch_diag(|| {
+            lex_source("jmp foo\n");
+        });
+        assert_eq!(d.stage, "lex");
+        assert_eq!(d.line, Some(1));
+        assert_eq!(d.message, "text lex error at token 1: jmp removed — use entry/if/while/for");
+    }
+
+    #[test]
+    fn encoding_detection_switches_on_u13000() {
+        // l-space digits and v-space names only exist in dense mode; any
+        // char >= U+13000 routes the source to the dense lexer
+        let toks = lex_source(&format!("{} {}", l_glyph(3), l_glyph(4)));
+        assert!(matches!(toks[0], (1, Tok::PushI(3))));
+        assert!(matches!(toks[1], (1, Tok::PushI(4))));
+        let toks = lex_source(&format!("{}!", v_glyph(0)));
+        match &toks[0] {
+            (_, Tok::LocalSet(n)) => assert_eq!(n, "v0"),
+            t => panic!("expected LocalSet(v0), got {:?}", t),
+        }
+        // the boundary itself: chars >= U+13000 route dense; a delimiter
+        // glyph (DELIM_BASE = U+13100) is legal there and invisible
+        assert!(lex_source("\u{13100}").is_empty());
+        // just below the boundary the text lexer owns the source — it turns
+        // any non-whitespace run into an ident instead of rejecting it
+        let toks = lex_source("\u{12FFF}");
+        assert!(matches!(toks[0], (_, Tok::Ident(_))));
+        // ASCII-only source stays on the text path (the dense lexer would
+        // reject bare ASCII digits as unexpected characters)
+        let toks = lex_source("3 4");
+        assert!(matches!(toks[0], (1, Tok::PushI(3))));
+        assert!(matches!(toks[1], (1, Tok::PushI(4))));
+    }
+}
+

@@ -2541,3 +2541,91 @@ pub fn check_strictness(p: &mut Parsed) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // the single-TU pipeline the driver and compile_js run: parse, then the
+    // post-merge passes (labels are module-mangled by the merge)
+    fn parse_src(src: &str) -> Parsed {
+        let caps = Caps::unrestricted();
+        let mut structs: StructMap = HashMap::new();
+        let tu = parse(lex_source(src), &mut structs, &caps);
+        merge_tus(vec![tu], vec!["main".to_string()], &[false])
+    }
+
+    #[test]
+    fn parses_minimal_program() {
+        let caps = Caps::unrestricted();
+        let mut structs = StructMap::new();
+        let p = parse(lex_source("entry:\n  3 4 add print\n  ret\n"), &mut structs, &caps);
+        assert_eq!(p.entry_label.as_deref(), Some("entry"));
+        assert_eq!(p.labels.get("entry"), Some(&0), "entry label must sit at pc 0");
+        assert_eq!(p.ins.len(), 5);
+        assert!(matches!(p.ins[0], Ins::PushI(3)));
+        assert!(matches!(p.ins[1], Ins::PushI(4)));
+        assert!(matches!(p.ins[2], Ins::Simple("op_add")));
+        assert!(matches!(p.ins[3], Ins::Simple("op_print")));
+        assert!(matches!(p.ins[4], Ins::Ret));
+        assert_eq!(p.ins_lines, vec![2, 2, 2, 2, 3]);
+    }
+
+    #[test]
+    fn label_arity_error_is_a_parse_diagnostic() {
+        let d = crate::diag::catch_diag(|| {
+            let p = parse_src("entry:\n  _call big\n  ret\nbig: n!\n  ret n\n");
+            check_label_arity(&p);
+        });
+        assert_eq!(d.stage, "parse");
+        assert_eq!(d.line, Some(2));
+        assert_eq!(
+            d.message,
+            "label 'main:big' declares 1 parameter(s) (n) but the call site leaves only 0 value(s) on the stack (missing 1) — missing arguments are no longer filled with null; provide all arguments or declare fewer bindings"
+        );
+    }
+
+    #[test]
+    fn label_arity_accepts_a_satisfied_call() {
+        let p = parse_src("entry:\n  5 _call dbl ret\ndbl: n!\n  ret n n add\n");
+        check_label_arity(&p); // must not panic
+    }
+
+    #[test]
+    fn strictness_accepts_non_coercing_uses_and_erases_markers() {
+        // slices of comp/tests/t17_strict.n (s1, s2): explicit conversion and
+        // structural_equal accept strict values; `loose` clears before arithmetic
+        let mut p = parse_src(
+            "entry:\n  5 strict x!\n  x 5 structural_equal print\n  \"41\" strict parse_int loose 1 add print\n  ret\n",
+        );
+        check_strictness(&mut p);
+        assert!(
+            !p.ins.iter().any(|i| matches!(i, Ins::Strict | Ins::Loose)),
+            "the strictness pass must erase the compile-time markers"
+        );
+    }
+
+    #[test]
+    fn strictness_rejects_implicit_coercion() {
+        let d = crate::diag::catch_diag(|| {
+            let mut p = parse_src("entry:\n  3 strict 4 add print\n  ret\n");
+            check_strictness(&mut p);
+        });
+        assert_eq!(d.stage, "parse");
+        assert_eq!(d.line, Some(2));
+        assert_eq!(
+            d.message,
+            "strict: a strict value cannot be implicitly coerced by `add` — convert explicitly (parse_int/parse_float/format_int/format_float, structural_equal), or apply `loose` first"
+        );
+        // a strict value held in a variable names the variable in the message
+        let d = crate::diag::catch_diag(|| {
+            let mut p = parse_src("entry:\n  5 strict x!\n  x 4 add print\n  ret\n");
+            check_strictness(&mut p);
+        });
+        assert!(
+            d.message.ends_with(" (value of variable 'x')"),
+            "provenance suffix missing: {}",
+            d.message
+        );
+    }
+}

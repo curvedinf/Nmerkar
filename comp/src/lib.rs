@@ -16,6 +16,10 @@ pub mod parse;
 pub mod prelude;
 pub mod sandbox;
 
+// SPEC.md's opcode claims, enforced against the lex.rs tables (test-only).
+#[cfg(test)]
+mod spec_contract;
+
 // Compile a single translation unit to JavaScript-target output: the
 // self-contained ES5 script the web glue and node auto-run consume.
 // `compile_js` panics on unsupported constructs (the same panic the native

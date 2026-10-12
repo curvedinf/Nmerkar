@@ -94,3 +94,58 @@ macro_rules! user_err {
         $crate::diag::fail($crate::diag::Diagnostic::user($stage, $line, format!($($arg)+)))
     };
 }
+
+/// Catch a compile error and return its `Diagnostic` payload (test-only).
+/// The panic hook is silenced for the duration — the hook swap is
+/// process-global, so callers serialize on one lock.
+#[cfg(test)]
+pub(crate) fn catch_diag<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> Diagnostic {
+    static HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev);
+    match r {
+        Ok(()) => panic!("expected a compile error, but the call returned"),
+        Err(p) => *p.downcast::<Diagnostic>().expect("panic payload is a Diagnostic"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_json_escapes_message_and_omits_absent_line() {
+        let d = Diagnostic::user("lex", Some(3), "a\"b\\c\nd\te\u{1f}f".to_string());
+        assert_eq!(
+            d.to_json(),
+            "{\"kind\":\"error\",\"stage\":\"lex\",\"line\":3,\"message\":\"a\\\"b\\\\c\\nd\\te\\u001ff\"}"
+        );
+        let d = Diagnostic::user("gen", None, "boom".to_string());
+        assert_eq!(d.to_json(), "{\"kind\":\"error\",\"stage\":\"gen\",\"message\":\"boom\"}");
+        assert!(!d.to_json().contains("\"line\""), "line: None must omit the field");
+    }
+
+    #[test]
+    fn display_prints_only_the_message() {
+        let d = Diagnostic::user("parse", Some(7), "something broke".to_string());
+        assert_eq!(format!("{}", d), "something broke");
+        assert!(!format!("{}", d).contains("parse"));
+    }
+
+    #[test]
+    fn payload_message_prefers_diagnostic_then_strings() {
+        // one branch of the downcast chain per payload type
+        let d = Diagnostic::user("lex", None, "diag msg".to_string());
+        assert_eq!(payload_message(&d), Some("diag msg".to_string()));
+        let s = String::from("plain panic");
+        assert_eq!(payload_message(&s), Some("plain panic".to_string()));
+        let r = &"static str panic"[..];
+        assert_eq!(payload_message(&r), Some("static str panic".to_string()));
+        // any other payload type yields None
+        assert_eq!(payload_message(&42i64), None);
+    }
+}
+

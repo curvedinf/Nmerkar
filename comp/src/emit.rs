@@ -394,3 +394,28 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
     o.push('\n');
     o
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The conversion contract (the same pipeline the driver's --to-dense /
+    // --to-text runs): lex → resolve implicit loads → emit. Text → dense →
+    // text must reproduce the canonical text form (the emit_text spelling —
+    // single-space separated, trailing newline), and the dense output must
+    // be a fixed point of re-encoding. Names must be vN-shaped because dense
+    // encodes them as v-space slots (other names are canonicalized to slots
+    // on the way through).
+    #[test]
+    fn text_dense_text_round_trip() {
+        let src = "entry:\n  3 4 add print\n  \"a\\nb\" print\n  5 v0!\n  v0 print\n  [1 2 3] length print\n  ret\n";
+        let toks = resolve_implicit_loads(&lex_source(src));
+        let text = emit_text(&toks);
+        let dense = emit_dense(&toks);
+
+        let toks2 = resolve_implicit_loads(&lex_source(&dense));
+        assert_eq!(emit_text(&toks2), text, "text -> dense -> text must reproduce the canonical text");
+        let dense2 = emit_dense(&resolve_implicit_loads(&lex_source(&emit_text(&toks2))));
+        assert_eq!(dense2, dense, "dense must be a fixed point of the round trip");
+    }
+}

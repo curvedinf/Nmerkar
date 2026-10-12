@@ -3497,3 +3497,29 @@ pub fn ret_push(ret: &str, var: &str) -> String {
 }
 
 // ---------------- driver ----------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lex::lex_source;
+    use crate::parse::{check_label_arity, check_strictness, merge_tus, parse};
+    use crate::sandbox::Caps;
+
+    // codegen only: the returned C text must carry the runtime entry points;
+    // nothing here invokes cc
+    #[test]
+    fn gen_emits_main_run_and_entry_label() {
+        let src = "entry:\n  \"hello\" print\n  ret\n";
+        let mut structs = StructMap::new();
+        let caps = Caps::unrestricted();
+        let tu = parse(lex_source(src), &mut structs, &caps);
+        let mut p = merge_tus(vec![tu], vec!["main".to_string()], &[false]);
+        check_label_arity(&p);
+        check_strictness(&mut p);
+        let c = gen(&p, &structs, false, false, false, "");
+        assert!(c.contains("int main("), "generated C must define main");
+        assert!(c.contains("nk_run(main_cx,0)"), "main must enter through nk_run");
+        assert!(c.contains("&&L_0"), "the entry label's dispatch target is missing");
+        assert!(c.contains("\"entry\""), "the entry label name must reach the error-site table");
+    }
+}

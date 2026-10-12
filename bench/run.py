@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import os,sys,json,subprocess,time,platform
 from pathlib import Path
-PROJ=Path("/home/chase/Projects/uflux")  # TODO: update to the nmerkar repo path after the move
+PROJ=Path(__file__).resolve().parent.parent  # repo root, wherever it's checked out
 BENCH=PROJ/"bench"
 DATA=BENCH/"data"
 RESULTS=BENCH/"results"
 NK=PROJ/"comp"/"target"/"release"/"nk"
-RESULTS.mkdir(exist_ok=True)
+RESULTS.mkdir(parents=True,exist_ok=True)
 from transformers import AutoTokenizer
 tok=AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 def count_tokens(path):
@@ -53,17 +53,17 @@ def compile_all():
     le_nk_bin=BENCH/"src"/"logextract"/"logextract_nk"
     rc,t,out,err=run_cmd([str(NK),"-c",str(le_nk_src),"-o",str(le_nk_bin)])
     results["uf_logextract"]=(rc==0,t)
-    print(f"  uFlux logextract: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+    print(f"  Nmerkar logextract: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
     an_nk_src=BENCH/"src"/"analytics"/"analytics.n"
     an_nk_bin=BENCH/"src"/"analytics"/"analytics_nk"
     rc,t,out,err=run_cmd([str(NK),"-c",str(an_nk_src),"-o",str(an_nk_bin)])
     results["uf_analytics"]=(rc==0,t)
-    print(f"  uFlux analytics: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+    print(f"  Nmerkar analytics: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
     mb_nk_src=BENCH/"src"/"mandelbrot"/"mandelbrot.n"
     mb_nk_bin=BENCH/"src"/"mandelbrot"/"mandelbrot_nk"
     rc,t,out,err=run_cmd([str(NK),"-c",str(mb_nk_src),"-o",str(mb_nk_bin)])
     results["uf_mandelbrot"]=(rc==0,t)
-    print(f"  uFlux mandelbrot: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+    print(f"  Nmerkar mandelbrot: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
     mb_cpp_src=BENCH/"src"/"mandelbrot"/"mandelbrot.cpp"
     mb_cpp_bin=BENCH/"src"/"mandelbrot"/"mandelbrot_cpp"
     rc,t,out,err=run_cmd(["g++","-std=c++17","-O2","-o",str(mb_cpp_bin),str(mb_cpp_src)])
@@ -76,7 +76,7 @@ def compile_all():
     sn_nk_bin=BENCH/"src"/"spectralnorm"/"spectralnorm_nk"
     rc,t,out,err=run_cmd([str(NK),"-c",str(sn_nk_src),"-o",str(sn_nk_bin)])
     results["uf_spectralnorm"]=(rc==0,t)
-    print(f"  uFlux spectralnorm: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
+    print(f"  Nmerkar spectralnorm: {'OK' if rc==0 else 'FAIL'} ({t:.1f}s)")
     sn_cpp_src=BENCH/"src"/"spectralnorm"/"spectralnorm.cpp"
     sn_cpp_bin=BENCH/"src"/"spectralnorm"/"spectralnorm_cpp"
     rc,t,out,err=run_cmd(["g++","-std=c++17","-O2","-o",str(sn_cpp_bin),str(sn_cpp_src)])

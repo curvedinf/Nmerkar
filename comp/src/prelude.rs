@@ -1,5 +1,10 @@
 // ---------------- C prelude (v10) ----------------
+// Embedded C runtime, prepended to every generated program (C target).
+// Defines the static op_* opcode functions dispatched by the run loop that
+// gen.rs emits, plus the GC substrate, containers/strings/vectors, threads
+// (spawn/weave), sandbox gates, and the optional Vulkan offload path.
 pub const PRELUDE: &str = r#"
+/* ================= system includes ================= */
 #define _GNU_SOURCE 1
 #include <stdint.h>
 #include <errno.h>
@@ -26,6 +31,7 @@ pub const PRELUDE: &str = r#"
 #include <fnmatch.h>
 #endif
 
+/* ================= value representation: type tags, Cell, GC object headers ================= */
 /* v10 type tags (SPEC_v10_proposal.md): 0 int, 1 float, 2 ptr, 3 byte,
    4 void, 5 arr, 6 tensor, 7 list, 8 dict, 9 str, 10 chan, 11 atom,
    12 buf, 13 obj, 14 bitmap, 15 time, 16 dur, 17 bloom, 18 iter */
@@ -54,6 +60,7 @@ enum { IT_LIST=0, IT_ARR, IT_DICT, IT_STR, IT_CHAN, IT_BITMAP, IT_MAP, IT_FILTER
 typedef struct { UFHDR; Cell src; int kind; int64_t idx; Cell f; Cell g; } Iter;
 static char* uf_data(Hdr*a){ return a->tag==HT_DYN ? (char*)((Dyn*)a)->data : (char*)a->data; }
 
+/* ================= execution context: locals tables, Ctx, call/loop stacks ================= */
 /* v11: per-label local frame sizes. Indexed by instruction PC; zero means
    the label has no locals. Populated by the generated code's uf_init_locals(). */
 static long* uf_local_counts; /* [pc] = frame size */
@@ -137,6 +144,7 @@ static inline double uf_fbits(int64_t i);
 static inline double uf_f(Cell c);
 static Cell** uf_var_roots; static long uf_nvar_roots;
 
+/* ---- crash dump (debug mode): call stacks, locals, shared vars, other threads ---- */
 static void uf_dump_cell(Cell c){
   if(c.tag==T_FLOAT) fprintf(stderr,"%g",uf_f(c));
   else if(c.tag==T_BOOL) fprintf(stderr,c.i?"true":"false");
@@ -499,6 +507,7 @@ static void uf_tr_init(void){
   if(_i<UF_MAXTMP){ _t->slots[_i]=(void**)(pp); atomic_store_explicit(&_t->n,_i+1,memory_order_release); } }while(0)
 #define UF_UNPROTECT() do{ UF_TR* _t=uf_tr_mine; if(_t){ int _i=atomic_load_explicit(&_t->n,memory_order_relaxed); \
   if(_i>0){ atomic_store_explicit(&_t->n,_i-1,memory_order_release); _t->slots[_i-1]=0; } } }while(0)
+/* ---- GC mark: per-tag reachability ---- */
 static void uf_mark_cell(Cell c);
 static void uf_mark_obj(Hdr* h);
 static void uf_mark_ptr(void* p){
@@ -537,6 +546,7 @@ static void uf_gc_free_obj(Hdr* h){
   }
   free(h);
 }
+/* ---- GC collect: mark roots, sweep, rebuild the address set ---- */
 static void uf_gc_collect(void){
   pthread_mutex_lock(&uf_gc_mu);
   if(uf_gc_workers){ pthread_mutex_unlock(&uf_gc_mu); return; }
@@ -596,6 +606,7 @@ static void uf_gc_thp(void* p, size_t sz){
 #else
 static void uf_gc_thp(void* p, size_t sz){ (void)p; (void)sz; }
 #endif
+/* ---- GC alloc paths: zeroed / no-zero / large mmap'd blocks + static literals ---- */
 static void* uf_gc_alloc(size_t sz, int align){
   sz = sz ? sz : 1;
   if(uf_gc_on && atomic_load(&uf_gc_bytes_since) + sz > uf_gc_threshold) uf_gc_collect();
@@ -684,6 +695,7 @@ static void uf_gc_init(void){
 }
 static void op_gc(Ctx*cx){ (void)cx; uf_gc_collect(); }
 
+/* ================= context allocation + main-thread static stacks ================= */
 static Ctx* ctx_new(long dcap,long ccap){ Ctx*c=(Ctx*)calloc(1,sizeof(Ctx)); if(!c)die("out of memory"); c->ds=(Cell*)malloc(dcap*sizeof(Cell)); c->cs=(const void**)malloc(ccap*sizeof(void*)); c->rsps=(long*)malloc(ccap*sizeof(long)); c->locals=(Cell*)calloc(65536,sizeof(Cell)); c->local_frames=(long*)malloc(65536*sizeof(long)); c->call_pcs=(long*)malloc(ccap*sizeof(long)); if(!c->ds||!c->cs||!c->rsps||!c->locals||!c->local_frames||!c->call_pcs)die("out of memory"); c->dcap=dcap; c->ccap=ccap; c->local_cap=65536; c->local_fcap=65536; c->call_ccap=ccap; c->site=-1; atomic_store(&uf_gc_mt,1); ctx_register(c); return c; }
 static void ctx_free(Ctx*c){ ctx_unregister(c); free(c->ds); free((void*)c->cs); free(c->rsps); free(c->locals); free(c->local_frames); free(c->call_pcs); free(c); }
 static Cell main_ds[1<<20]; static const void* main_cs[1<<16];
@@ -694,6 +706,7 @@ static Ctx main_cx_store = { main_ds, 0, 1<<20, main_cs, 0, 1<<16, main_rsps, {{
 static Ctx* main_cx = &main_cx_store;
 int64_t nk_argc=0; void* nk_argv=0; /* program args, reachable via EXTERN "nk_argc"/"nk_argv" + LOADX, or ARGV */
 
+/* ================= cell semantics: stack ops, constructors, coercion, equality, arithmetic ================= */
 static inline void pushc(Ctx*cx,Cell c){ if(cx->sp>=cx->dcap){char _b[128];snprintf(_b,sizeof(_b),"stack overflow in %s (sp=%ld, cap=%ld)",uf_cur_op,cx->sp,cx->dcap);die(_b);} cx->ds[cx->sp++]=c; }
 static inline Cell uf_mki(int64_t v){ Cell c; c.tag=T_INT; c.i=v; return c; }
 static inline Cell uf_mkb(int v){ Cell c; c.tag=T_BOOL; c.i=v!=0; return c; }
@@ -705,6 +718,7 @@ static inline int64_t uf_i(Cell c){ if(c.tag==T_PTR&&c.i&&uf_is_str(c)) return s
 static inline Cell uf_mkf(double v){ Cell c; c.tag=T_FLOAT; c.i=uf_ibits(v); return c; }
 static inline Cell uf_fromf(double v){ return uf_mkf(v); }
 static inline int uf_zero(Cell c){ return c.tag==T_FLOAT?(int64_t)uf_fbits(c.i)==0:c.i==0; }
+/* ---- universal numeric coercion (uf_to_number) ---- */
 static inline double uf_to_number(Cell c){
   if(c.tag==T_INT)return (double)c.i;
   if(c.tag==T_FLOAT)return uf_fbits(c.i);
@@ -728,6 +742,7 @@ static inline double uf_to_number(Cell c){
   }
   return (double)c.i;
 }
+/* ---- truthiness + loose/strict equality ---- */
 static inline int uf_truthy(Cell c){
   if(c.tag==T_FLOAT){ double d=uf_fbits(c.i); return d!=0.0 && !isnan(d); }
   if(c.tag==T_INT || c.tag==T_BYTE || c.tag==T_BOOL)return c.i!=0;
@@ -769,6 +784,7 @@ static inline int uf_strict_eq(Cell a,Cell b){
   }
   return a.i==b.i;
 }
+/* ---- arithmetic primitives: scalar, ptr/str, array dispatch ---- */
 static int uf_numarr(Cell c);
 static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn);
 static Hdr* uf_arr_like(Hdr*a,uint64_t n);
@@ -868,6 +884,7 @@ static inline void pushi(Ctx*cx,int64_t v){ pushc(cx,uf_mki(v)); }
 static inline void pushf(Ctx*cx,double v){ pushc(cx,uf_mkf(v)); }
 static inline void pushp(Ctx*cx,void* v){ pushc(cx,uf_mkp(v)); }
 static inline Cell pop(Ctx*cx){ if(cx->sp<=0){char _b[128];snprintf(_b,sizeof(_b),"stack underflow in %s (sp=%ld)",uf_cur_op,cx->sp);die(_b);} return cx->ds[--cx->sp]; }
+/* ================= opcode implementations: arithmetic, comparison, bit ops ================= */
 static void op_nop(Ctx*cx){ (void)cx; }
 
 static int uf_numarr(Cell c);
@@ -926,6 +943,7 @@ static void op_shl(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(a.tag==T_FLOAT||b.tag==
 static void op_bnot(Ctx*cx){ Cell a=pop(cx); if(a.tag==T_FLOAT||a.tag==T_PTR)die("BNOT: ints only"); pushi(cx,~a.i); }
 static void op_orelse(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_truthy(a)?a:b); }
 
+/* ================= typed array / tensor / matrix constructors + clone ================= */
 static void* uf_alloc(size_t sz,int align){ void*p=NULL; if(align>0){ if(posix_memalign(&p,(size_t)align,sz?sz:1))die("alloc failed"); } else { p=malloc(sz?sz:1); } if(!p)die("out of memory"); return p; }
 static void op_arrn(Ctx*cx,uint64_t tag,int align){ int64_t ty=pop(cx).i; Cell top=pop(cx); int64_t esz=(ty==3||ty==T_BOOL)?1:8; if(top.tag==T_PTR && top.i && uf_gc_find((void*)top.i) && ((Hdr*)(void*)top.i)->tag==HT_DYN){
     /* v13: `list type array` — copy the list's elements into a typed array */
@@ -1090,6 +1108,7 @@ static int64_t uf_obj_off(Hdr* a, Cell k){
 }
 
 /* ================= uniform container protocol ================= */
+/* ---- dict: open-addressing hash map (FNV keys, tombstone deletes) ---- */
 static uint64_t uf_fnv(const void*p,size_t n){ const unsigned char*s=(const unsigned char*)p; uint64_t h=1469598103934665603ULL; for(size_t i=0;i<n;i++){ h^=s[i]; h*=1099511628211ULL; } return h; }
 static uint64_t map_hash(Cell k){
   if(k.tag==T_INT) return (uint64_t)k.i; /* identity — dense 0..n-1 keys (bfs) */
@@ -1129,6 +1148,7 @@ static void map_del(Map*m,Cell k){
   uint64_t i=map_hash(k)%m->cap;
   for(;;){ if(m->st[i]==0)return; if(m->st[i]==1&&map_keyeq(m->keys[i],k)){ m->st[i]=2; m->len--; return; } i=(i+1)%m->cap; }
 }
+/* ---- list: grow-by-move cell vector ---- */
 static Dyn* uf_dyn_new(uint64_t cap){ if(!cap)cap=1; Dyn*d=(Dyn*)uf_gc_alloc(sizeof(Dyn)+cap*sizeof(Cell),0); d->tag=HT_DYN; d->len=0; d->esz=sizeof(Cell); d->cap=cap; return d; }
 /* grow-with-move: returns the (possibly new) list; old handle is reclaimed by GC */
 static Dyn* uf_dyn_push2(Dyn*d,Cell c){ if(d->len>=d->cap){ Dyn*n=uf_dyn_new(d->cap*2); memcpy(n->data,d->data,d->len*sizeof(Cell)); n->len=d->len; d=n; } d->data[d->len++]=c; return d; }
@@ -1344,6 +1364,7 @@ static void op_slice(Ctx*cx){
   die("SLICE: unsupported handle");
 }
 
+/* ---- raw memory: buf, load/store, malloc/free, sizeof ---- */
 static void op_buf(Ctx*cx){ int64_t sz=pop(cx).i; if(sz<0)die("negative BUF size"); Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)sz,0); h->tag=HT_BUF; h->len=(uint64_t)sz; h->esz=1; h->gc_flags|=GCF_PINNED; memset(h->data,0,(size_t)sz); pushp(cx,h); }
 static void op_bufcopy(Ctx*cx){ int64_t n=pop(cx).i; Cell s=pop(cx),d=pop(cx); if(n>0)memmove(((void*)d.i),((void*)s.i),(size_t)n); }
 static void op_loadx(Ctx*cx){ Cell a=pop(cx); if(a.tag==T_PTR&&a.i){ Hdr*h=uf_gc_find((void*)a.i); if(h&&h->tag==HT_STR){ pushi(cx,(int64_t)(unsigned char)uf_sptr(a)[0]); return; } } pushi(cx,*(int64_t*)((void*)a.i)); }
@@ -1664,6 +1685,7 @@ static void uf_run_fanout(WeaveJob* j, WeaveTask* t){
   t->result=uf_mkp(f.results);
   pthread_mutex_destroy(&rmu);
 }
+/* ---- weave worker loop: claim ready tasks, run, publish ---- */
 static void* uf_worker(void*arg){
   WeaveJob*j=(WeaveJob*)arg;
   for(;;){
@@ -2337,6 +2359,7 @@ static Hdr* uf_arr_like(Hdr*a,uint64_t n){
    (documented divergence). */
 #ifdef NK_GPU
 #include <vulkan/vulkan.h>
+/* ---- Vulkan device init + pipeline cache ---- */
 static VkInstance uf_vk_inst;
 static VkPhysicalDevice uf_vk_pd;
 static VkDevice uf_vk_dev;
@@ -3169,6 +3192,7 @@ static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn){
   die("poly arith: no array operand");
 }
 
+/* ================= vector ops: transpose, elementwise/scalar, bitmaps, reductions ================= */
 /* TRANSPOSE: mat -> mat' (rows/cols swapped) */
 static void op_transpose(Ctx*cx){
   Cell h=pop(cx); Hdr*a=uf_handle(h,"transpose");

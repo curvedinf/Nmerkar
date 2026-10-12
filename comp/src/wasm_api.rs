@@ -75,14 +75,11 @@ fn heap() -> std::sync::MutexGuard<'static, Option<Heap>> {
 }
 
 fn panic_hook(info: &std::panic::PanicHookInfo<'_>) {
-    // The payload is the panic message (no "panicked at" decoration).
-    let msg: String = if let Some(s) = info.payload().downcast_ref::<&str>() {
-        s.to_string()
-    } else if let Some(s) = info.payload().downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
-    };
+    // Diagnostic payloads (user compile errors) carry their message directly;
+    // legacy `panic!` payloads are the plain message (no "panicked at"
+    // decoration).
+    let msg: String = crate::diag::payload_message(info.payload())
+        .unwrap_or_else(|| "unknown panic".to_string());
     let base = BASE.load(Ordering::Relaxed);
     if base == 0 {
         return; // heap never started; nowhere to write
@@ -179,11 +176,5 @@ pub extern "C" fn nk_js_compile(src: u32, len: u32) -> u32 {
 }
 
 fn payload_msg(p: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = p.downcast_ref::<String>() {
-        return s.clone();
-    }
-    if let Some(s) = p.downcast_ref::<&str>() {
-        return s.to_string();
-    }
-    "compile failed".to_string()
+    crate::diag::payload_message(p.as_ref()).unwrap_or_else(|| "compile failed".to_string())
 }

@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::lex::*;
 use crate::sandbox::Caps;
+use crate::user_err;
 use std::collections::{HashMap, VecDeque};
 
 // FNV-1a 64 over bytes (matches uf_fnv in the C prelude)
@@ -37,9 +38,9 @@ pub fn method_typekey(name: &str, structs: &StructMap) -> Option<i64> {
     }
 }
 
-// sandbox: compile-time capability gate for opcodes. Panics with the op,
+// sandbox: compile-time capability gate for opcodes. Reports the op,
 // capability, active policy, and remedy when a gated op is denied.
-fn gate_op(name: &str, caps: &Caps) {
+fn gate_op(name: &str, caps: &Caps, line: u32) {
     let (cap, need, mnem): (&str, &str, &str) = match name {
         "SH" => ("proc", "proc", "shell"),
         "SHP" => ("proc", "proc", "shell_stream"),
@@ -64,7 +65,9 @@ fn gate_op(name: &str, caps: &Caps) {
         _ => return,
     };
     if !caps.cap(cap) {
-        panic!(
+        user_err!(
+            "sandbox",
+            Some(line),
             "sandbox: `{}` is disabled — capability `{}` is denied by policy '{}' ({}); allow it in a sandbox config, or run under a broader policy (e.g. `nks --policy build`)",
             mnem, need, caps.policy_name, caps.origin
         );
@@ -155,7 +158,7 @@ fn is_hard_boundary(t: &(u32, Tok)) -> bool {
     ) || matches!(&t.1, Tok::Ident(n) if n.starts_with('@'))
 }
 
-fn retired_op_panic(name: &str) -> ! {
+fn retired_op_panic(name: &str, line: u32) -> ! {
     let retired_name = match name {
         "~1" => "dup",
         "~2" => "ovr",
@@ -164,7 +167,7 @@ fn retired_op_panic(name: &str) -> ! {
         "~5" => "pick",
         _ => name,
     };
-    panic!("'{}' is retired in v12 — use named variables instead", retired_name)
+    user_err!("parse", Some(line), "'{}' is retired in v12 — use named variables instead", retired_name)
 }
 
 fn empty_parsed() -> Parsed {
@@ -225,9 +228,9 @@ impl<'a> ParseCtx<'a> {
                 Tok::Op("STRICT") => pi(&mut self.p, Ins::Strict, line),
                 Tok::Op("LOOSE") => pi(&mut self.p, Ins::Loose, line),
                 Tok::Op("CAST") => self.parse_cast(line),
-                Tok::Op(name) if name.starts_with('~') => retired_op_panic(name),
+                Tok::Op(name) if name.starts_with('~') => retired_op_panic(name, line),
                 Tok::Op(name) => {
-                    gate_op(name, self.caps);
+                    gate_op(name, self.caps, line);
                     pi(&mut self.p, simple_ins(name), line)
                 }
                 Tok::PushI(v) => pi(&mut self.p, Ins::PushI(v), line),
@@ -259,17 +262,17 @@ impl<'a> ParseCtx<'a> {
                 Tok::AddLocal(n) => self.parse_rmw(n, false, false, line),
                 Tok::IncGlobal(n) => self.parse_rmw(n, true, true, line),
                 Tok::AddGlobal(n) => self.parse_rmw(n, true, false, line),
-                Tok::Import(im) => self.parse_import(im),
+                Tok::Import(im) => self.parse_import(im, line),
                 Tok::ManifestImport(im) => self.parse_manifest_import(im),
                 Tok::Export(n) => self.pending_export = Some(n),
-                Tok::Use(n) => self.parse_use(n),
+                Tok::Use(n) => self.parse_use(n, line),
                 Tok::Mod(n) => self.p.modname = Some(n),
                 Tok::Pub => self.pending_pub = true,
                 Tok::Extern(n) => self.parse_extern(n, line),
                 Tok::MacroDef(n, body) => {
                     self.macros.insert(n, body);
                 }
-                Tok::StructDef(n, fields) => self.parse_struct(n, fields),
+                Tok::StructDef(n, fields) => self.parse_struct(n, fields, line),
                 Tok::Method(tname) => self.pending_method = Some(tname),
                 Tok::Sys(n) => self.parse_syscall(n, line),
                 Tok::Task { name, count, body } => self.parse_task(name, count, body, line),
@@ -367,9 +370,9 @@ impl<'a> ParseCtx<'a> {
                     pi(&mut self.p, Ins::Call(label), line);
                 }
             }
-            "JMP" => panic!("jmp removed — use entry/if/while/for"),
-            "JZ" => panic!("jz removed — use if/ifelse/while"),
-            "JE" => panic!("je removed — use if/ifelse"),
+            "JMP" => user_err!("parse", Some(line), "jmp removed — use entry/if/while/for"),
+            "JZ" => user_err!("parse", Some(line), "jz removed — use if/ifelse/while"),
+            "JE" => user_err!("parse", Some(line), "je removed — use if/ifelse"),
             _ => unreachable!(),
         }
     }
@@ -388,7 +391,7 @@ impl<'a> ParseCtx<'a> {
 
     fn parse_set_local(&mut self, n: String, line: u32) {
         if self.macros.contains_key(&n) {
-            panic!("name '{}' collides with a macro — macros take precedence over implicit loads; rename one", n);
+            user_err!("parse", Some(line), "name '{}' collides with a macro — macros take precedence over implicit loads; rename one", n);
         }
         if is_multi_return(self.p.ins.last(), &self.q) {
             // v12 destructuring bind: name! after a multi-return op
@@ -405,7 +408,7 @@ impl<'a> ParseCtx<'a> {
             let pattern = collect_destructure(Bind::Discard, &mut self.q);
             emit_destructure(pattern, &mut self.p, &mut self.dtemp_ctr, line);
         } else {
-            panic!("_! is only valid inside a destructuring bind");
+            user_err!("parse", Some(line), "_! is only valid inside a destructuring bind");
         }
     }
 
@@ -428,9 +431,11 @@ impl<'a> ParseCtx<'a> {
         }
     }
 
-    fn parse_import(&mut self, im: Import) {
+    fn parse_import(&mut self, im: Import, line: u32) {
         if !self.caps.cap("ffi.import") {
-            panic!(
+            user_err!(
+                "sandbox",
+                Some(line),
                 "sandbox: `import c\"{}\"(...)` is disabled — capability `ffi.import` is denied by policy '{}' ({}); raw FFI declarations are only available under a policy that allows them",
                 im.name, self.caps.policy_name, self.caps.origin
             );
@@ -448,13 +453,15 @@ impl<'a> ParseCtx<'a> {
         }
     }
 
-    fn parse_use(&mut self, n: String) {
+    fn parse_use(&mut self, n: String, line: u32) {
         if !self.caps.module_allowed(&n) {
             let list = match &self.caps.module_allow {
                 Some(l) if !l.is_empty() => format!("; allowed modules: {}", l.join(", ")),
                 _ => String::new(),
             };
-            panic!(
+            user_err!(
+                "sandbox",
+                Some(line),
                 "sandbox: module `use \"{}\"` is denied by policy '{}' ({}){} — add it with `allow-module {}` in an allowed sandbox config, or run under a policy that permits it",
                 n, self.caps.policy_name, self.caps.origin, list, n
             );
@@ -465,7 +472,9 @@ impl<'a> ParseCtx<'a> {
     }
     fn parse_extern(&mut self, n: String, line: u32) {
         if !self.caps.cap("ffi.import") {
-            panic!(
+            user_err!(
+                "sandbox",
+                Some(line),
                 "sandbox: `extern \"{}\"` is disabled — capability `ffi.import` is denied by policy '{}' ({}); extern symbols are only available under a policy that allows them",
                 n, self.caps.policy_name, self.caps.origin
             );
@@ -476,7 +485,7 @@ impl<'a> ParseCtx<'a> {
         pi(&mut self.p, Ins::Extern(n), line);
     }
 
-    fn parse_struct(&mut self, n: String, fields: Vec<(String, String)>) {
+    fn parse_struct(&mut self, n: String, fields: Vec<(String, String)>, line: u32) {
         // v13: obj fields are stored as full Cells (16 bytes: tag +
         // int64 payload), so the layout strides by sizeof(Cell) —
         // 8-byte strides made adjacent fields overlap.
@@ -487,7 +496,7 @@ impl<'a> ParseCtx<'a> {
                 Some(_) => 16,
                 None => match self.structs.get(fty) {
                     Some((_, tsz, _)) => *tsz,
-                    None => panic!("STRUCT {}: unknown field type {}", n, fty),
+                    None => user_err!("parse", Some(line), "STRUCT {}: unknown field type {}", n, fty),
                 },
             };
             let align = sz.min(16);
@@ -501,7 +510,9 @@ impl<'a> ParseCtx<'a> {
 
     fn parse_syscall(&mut self, n: usize, line: u32) {
         if !self.caps.cap("raw.syscall") {
-            panic!(
+            user_err!(
+                "sandbox",
+                Some(line),
                 "sandbox: `_syscall {}` is disabled — capability `raw.syscall` is denied by policy '{}' ({}); syscalls are never available in sandboxed policies",
                 n, self.caps.policy_name, self.caps.origin
             );
@@ -513,7 +524,7 @@ impl<'a> ParseCtx<'a> {
         // one input (checked at RUN where the input is resolved)
         if let Some(c) = count {
             if !(1..=64).contains(&c) {
-                panic!("WEAVE: task {} worker count {} out of range 1..64", name, c);
+                user_err!("parse", Some(line), "WEAVE: task {} worker count {} out of range 1..64", name, c);
             }
         }
         // v13: leading binding tokens in the body are the task's input
@@ -530,7 +541,7 @@ impl<'a> ParseCtx<'a> {
                     inputs.push(Param::Global(nm.clone()));
                     body.remove(0);
                 }
-                Some((_, Tok::Discard)) => panic!("WEAVE: task {} input `_!` needs a task name", name),
+                Some((_, Tok::Discard)) => user_err!("parse", Some(line), "WEAVE: task {} input `_!` needs a task name", name),
                 _ => break,
             }
         }
@@ -586,11 +597,11 @@ impl<'a> ParseCtx<'a> {
                 };
                 match names.iter().position(|x| *x == inp_name) {
                     Some(i) => idxs.push(i),
-                    None => panic!("WEAVE: task {} has unknown input {}", n, inp_name),
+                    None => user_err!("parse", Some(line), "WEAVE: task {} has unknown input {}", n, inp_name),
                 }
             }
             if *count > 1 && idxs.is_empty() {
-                panic!("WEAVE: fanout task {} ({} workers) must have at least one input", n, count);
+                user_err!("parse", Some(line), "WEAVE: fanout task {} ({} workers) must have at least one input", n, count);
             }
             metas.push(WeaveMeta { name: n.clone(), pc: *self.p.labels.get(n).unwrap_or(&0), inputs: idxs, count: *count });
         }
@@ -609,7 +620,7 @@ impl<'a> ParseCtx<'a> {
             }
         }
         if done.iter().any(|d| !d) {
-            panic!("WEAVE: cycle in task DAG");
+            user_err!("parse", Some(line), "WEAVE: cycle in task DAG");
         }
         // v13: `run <name>` names a terminal task. Tasks not reachable
         // from the terminal become orphans: they stay in scope (their
@@ -619,7 +630,7 @@ impl<'a> ParseCtx<'a> {
         if let Some(t) = &terminal {
             match names.iter().position(|x| *x == t) {
                 Some(i) => terminal_idx = Some(i),
-                None => panic!("WEAVE: run names unknown task {}", t),
+                None => user_err!("parse", Some(line), "WEAVE: run names unknown task {}", t),
             }
         }
         if let Some(ti) = terminal_idx {
@@ -681,7 +692,7 @@ impl<'a> ParseCtx<'a> {
         }
         if let Some(tname) = self.pending_method.take() {
             let tk = method_typekey(&tname, self.structs)
-                .unwrap_or_else(|| panic!("METHOD: unknown type {}", tname));
+                .unwrap_or_else(|| user_err!("parse", Some(line), "METHOD: unknown type {}", tname));
             self.p.methods.push((tk, fnv64(&n), n.clone()));
         }
         if let Some(x) = self.pending_export.take() {
@@ -748,42 +759,42 @@ impl<'a> ParseCtx<'a> {
             } else if let Some((_, tsz, _)) = self.structs.get(rest) {
                 pi(&mut self.p, Ins::PushI(*tsz), line);
             } else {
-                panic!("SIZEOF: unknown type {}", rest);
+                user_err!("parse", Some(line), "SIZEOF: unknown type {}", rest);
             }
         } else if let Some(rest) = n.strip_prefix("@offset:") {
             let parts: Vec<&str> = rest.splitn(2, '.').collect();
             if parts.len() != 2 {
-                panic!("OFFSET needs Struct.field, got {}", rest);
+                user_err!("parse", Some(line), "OFFSET needs Struct.field, got {}", rest);
             }
             let (fs, _, _) = self.structs
                 .get(parts[0])
-                .unwrap_or_else(|| panic!("OFFSET: unknown struct {}", parts[0]));
+                .unwrap_or_else(|| user_err!("parse", Some(line), "OFFSET: unknown struct {}", parts[0]));
             let off = fs
                 .iter()
                 .find(|(f, _)| f == parts[1])
-                .unwrap_or_else(|| panic!("OFFSET: no field {} in {}", parts[1], parts[0]));
+                .unwrap_or_else(|| user_err!("parse", Some(line), "OFFSET: no field {} in {}", parts[1], parts[0]));
             pi(&mut self.p, Ins::PushI(off.1), line);
         } else if let Some(rest) = n.strip_prefix("@objsize:") {
             let (_, tsz, sid) = self.structs
                 .get(rest)
-                .unwrap_or_else(|| panic!("OBJ: unknown struct {}", rest));
+                .unwrap_or_else(|| user_err!("parse", Some(line), "OBJ: unknown struct {}", rest));
             // size in low 32 bits, struct id above (op_obj splits them)
             pi(&mut self.p, Ins::PushI(tsz | (sid << 32)), line);
         } else if let Some(rest) = n.strip_prefix("@cast:") {
             let (_, _, sid) = self.structs
                 .get(rest)
-                .unwrap_or_else(|| panic!("CAST: unknown struct {}", rest));
+                .unwrap_or_else(|| user_err!("parse", Some(line), "CAST: unknown struct {}", rest));
             pi(&mut self.p, Ins::PushI(1000 + sid), line);
         } else if let Some(body) = self.macros.get(&n).cloned() {
             self.expand_depth += 1;
             if self.expand_depth > 1024 {
-                panic!("macro expansion too deep (recursive macro?)");
+                user_err!("parse", Some(line), "macro expansion too deep (recursive macro?)");
             }
             for t2 in body.into_iter().rev() {
                 self.q.push_front(t2);
             }
         } else if is_reserved(&n) {
-            panic!("'{}' is a reserved word (opcode mnemonic)", n);
+            user_err!("parse", Some(line), "'{}' is a reserved word (opcode mnemonic)", n);
         } else {
             // v15: a bare name is an implicit variable load
             pi(&mut self.p, Ins::LocalGet(n), line);
@@ -817,7 +828,9 @@ fn check_label_bodies_end_with_ret(p: &Parsed) {
         // body may not end with them.
         match &p.ins[last] {
             Ins::Ret | Ins::Break | Ins::Cont | Ins::Goto(_) | Ins::IfElse => {}
-            _ => panic!(
+            _ => user_err!(
+                "parse",
+                Some(p.ins_lines[last]),
                 "label '{}': body must end with `ret` — falling off the end of a label is a v13 compile error",
                 name
             ),
@@ -906,7 +919,7 @@ fn check_loop_exits_in_loop(p: &Parsed) {
                 None => false,
             };
             if !ok {
-                panic!("{} outside a loop (compile error)",
+                user_err!("parse", Some(p.ins_lines[i]), "{} outside a loop (compile error)",
                     if matches!(ins, Ins::Break) { "break" } else { "cont" });
             }
         }
@@ -1144,7 +1157,15 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
             distinct.sort();
             distinct.dedup();
             if distinct.len() > 1 {
-                panic!(
+                let first_line = p
+                    .ins
+                    .iter()
+                    .zip(p.ins_lines.iter())
+                    .find(|(x, _)| matches!(x, Ins::LocalSet(m) if m.as_str() == *n))
+                    .map(|(_, &l)| l);
+                user_err!(
+                    "parse",
+                    first_line,
                     "name collision: '{}' is assigned in {} distinct bodies — declare it shared with a top-level assignment, or rename per body",
                     n, distinct.len()
                 );
@@ -1168,7 +1189,7 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
             }
             let owners = assigned_in.get(n.as_str()).cloned().unwrap_or_default();
             if owners.is_empty() {
-                panic!("name '{}' is read but never assigned anywhere — assign it (top level declares a shared var) before use", n);
+                user_err!("parse", Some(p.ins_lines[i]), "name '{}' is read but never assigned anywhere — assign it (top level declares a shared var) before use", n);
             }
             // local: every referencing body must be an assigning body
             if !owners.contains(&b) {
@@ -1177,7 +1198,9 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
                 } else {
                     format!("assigned in bodies {:?}", owners.iter().map(|o| label_of(*o)).collect::<Vec<_>>())
                 };
-                panic!(
+                user_err!(
+                    "parse",
+                    Some(p.ins_lines[i]),
                     "name collision: '{}' is {} but used in {} — declare it shared with a top-level assignment, or rename",
                     n, decl, label_of(b)
                 );
@@ -1460,7 +1483,8 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
         m.ins_files.push(tu_idx);
         for name in &tu.pubs {
             if m.labels.contains_key(name) {
-                panic!("duplicate PUB label {}", name);
+                let ln = tu.label_lines.get(&tu.labels[name]).copied();
+                user_err!("parse", ln, "duplicate PUB label {}", name);
             }
             m.labels.insert(name.clone(), tu.labels[name] + off);
             if let Some(ln) = tu.label_lines.get(&tu.labels[name]) {
@@ -1835,7 +1859,9 @@ pub fn check_label_arity(p: &Parsed) {
                                     })
                                     .collect();
                                 let missing = arity as i64 - if d > 0 { d } else { 0 };
-                                panic!(
+                                user_err!(
+                                    "parse",
+                                    Some(p.ins_lines[i]),
                                     "label '{}' declares {} parameter(s) ({}) but the call site leaves only {} value(s) on the stack (missing {}) — missing arguments are no longer filled with null; provide all arguments or declare fewer bindings",
                                     l, arity, pnames.join(" "), d, missing
                                 );
@@ -2002,7 +2028,7 @@ struct SEntry {
     prov: Vec<String>, // taint keys of variables holding this value
 }
 
-fn strict_err(op: &str, what: &str, prov: &[String]) -> ! {
+fn strict_err(op: &str, what: &str, prov: &[String], line: u32) -> ! {
     let src = if prov.is_empty() {
         String::new()
     } else {
@@ -2012,7 +2038,9 @@ fn strict_err(op: &str, what: &str, prov: &[String]) -> ! {
             .collect();
         format!(" (value of variable {})", names.join(", "))
     };
-    panic!(
+    user_err!(
+        "parse",
+        Some(line),
         "strict: {} cannot be implicitly coerced by `{}` — convert explicitly (parse_int/parse_float/format_int/format_float, structural_equal), or apply `loose` first{}",
         what, op, src
     )
@@ -2185,7 +2213,7 @@ pub fn check_strictness(p: &mut Parsed) {
                             }
                             if val_strict {
                                 if is_coercing(h) {
-                                    strict_err(&strict_op_mnem(h), "a strict value", &provs);
+                                    strict_err(&strict_op_mnem(h), "a strict value", &provs, p.ins_lines[i]);
                                 }
                                 for k in &provs {
                                     vars.insert(k.clone(), true);
@@ -2204,7 +2232,9 @@ pub fn check_strictness(p: &mut Parsed) {
                                 if matches!(h, "op_filter" | "op_some" | "op_every") {
                                     if let Some(&tp) = p.labels.get(l) {
                                         if ret_region.get(&tp).copied().unwrap_or(false) {
-                                            panic!(
+                                            user_err!(
+                                                "parse",
+                                                Some(p.ins_lines[i]),
                                                 "strict: label '{}' returns a strict value and `{}` applies truthiness to it — return an explicit comparison from the label, or apply `loose` before its `ret`",
                                                 disp(l),
                                                 strict_op_mnem(h)
@@ -2228,7 +2258,7 @@ pub fn check_strictness(p: &mut Parsed) {
                         } else {
                             let cond = s[s.len() - 2].clone();
                             if cond.strict && !cond.addr {
-                                strict_err("if", "a strict condition", &cond.prov);
+                                strict_err("if", "a strict condition", &cond.prov, p.ins_lines[i]);
                             }
                             s.truncate(s.len() - 2);
                             stack = Some(s);
@@ -2243,7 +2273,7 @@ pub fn check_strictness(p: &mut Parsed) {
                         } else {
                             let cond = s[s.len() - 3].clone();
                             if cond.strict && !cond.addr {
-                                strict_err("if_else", "a strict condition", &cond.prov);
+                                strict_err("if_else", "a strict condition", &cond.prov, p.ins_lines[i]);
                             }
                             s.truncate(s.len() - 3);
                             stack = Some(s);
@@ -2265,7 +2295,9 @@ pub fn check_strictness(p: &mut Parsed) {
                         if let Ins::PushAddr(cl) = &p.ins[i - 2] {
                             if let Some(&tp) = p.labels.get(cl) {
                                 if ret_region.get(&tp).copied().unwrap_or(false) {
-                                    panic!(
+                                    user_err!(
+                                        "parse",
+                                        Some(p.ins_lines[i]),
                                         "strict: label '{}' returns a strict value and `while` applies truthiness to it — return an explicit comparison from the label, or apply `loose` before its `ret`",
                                         disp(cl)
                                     );

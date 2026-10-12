@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::lex::*;
+use crate::user_err;
 use std::collections::HashMap;
 
 // ---------------- round-trip emitters (v9) ----------------
@@ -241,7 +242,7 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
         let i = *next;
         *next += 1;
         if i >= 64 {
-            panic!("emit-dense: more than 64 distinct label/var names");
+            user_err!("emit", None, "emit-dense: more than 64 distinct label/var names");
         }
         names.insert(n.to_string(), i);
         slot_glyphs(i)
@@ -316,7 +317,7 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
                 Tok::Use(n) => o.push_str(&format!("{}\"{}\"", glyph_of(78), escape_str(n))),
                 Tok::Mod(n) => o.push_str(&format!("{}\"{}\"", glyph_of(79), escape_str(n))),
                 Tok::Pub => o.push_str(&format!("{}", glyph_of(80))),
-                Tok::Method(_) => panic!("emit-dense: METHOD was removed in v10"),
+                Tok::Method(_) => user_err!("emit", None, "emit-dense: METHOD was removed in v10"),
                 Tok::MacroDef(n, body) => {
                     o.push_str(&format!("{}{} {{ ", glyph_of(28), n));
                     rec(body, names, next, weave, o);

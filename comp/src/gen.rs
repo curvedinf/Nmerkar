@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::prelude::PRELUDE;
+use crate::user_err;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 
@@ -46,7 +47,7 @@ pub fn c_type(t: &str) -> &'static str {
         "byte" => "char",
         "bool" => "_Bool",
         "void" => "void",
-        _ => panic!("unknown C type {}", t),
+        _ => user_err!("gen", None, "unknown C type {}", t),
     }
 }
 
@@ -62,7 +63,7 @@ pub fn c_retty(t: &str) -> &'static str {
         "byte" => "char",
         "bool" => "_Bool",
         "void" => "void",
-        _ => panic!("unknown C type {}", t),
+        _ => user_err!("gen", None, "unknown C type {}", t),
     }
 }
 
@@ -594,7 +595,7 @@ pub fn emit_range(
     suppress_flush: bool,
 ) {
     let resolve = |name: &str| -> usize {
-        *p.labels.get(name).unwrap_or_else(|| panic!("undefined label {}", name))
+        *p.labels.get(name).unwrap_or_else(|| user_err!("gen", None, "undefined label {}", name))
     };
     let mut vstack: Vec<VEntry> = Vec::new();
     let mut vcache: Vec<(String, String, bool)> = Vec::new();
@@ -3063,7 +3064,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool, profile: bool, coverage
     }
     // label -> instruction index
     let resolve = |name: &str| -> usize {
-        *p.labels.get(name).unwrap_or_else(|| panic!("undefined label {}", name))
+        *p.labels.get(name).unwrap_or_else(|| user_err!("gen", None, "undefined label {}", name))
     };
     o.push_str("\nstatic void nk_run(Ctx*cx, long pc){\n  uf_current_ctx=cx;\n  if(pc<0){ goto *(void*)uf_entry_addr; }\n  /* v11: set up the entry label's local frame (v13: capacity-checked) */\n  cx->local_frames[cx->local_fsp++]=cx->local_base; cx->local_base+=uf_lc(pc); if(cx->local_base>cx->local_cap)die(\"local frame overflow\");\n");
     // v14: spawn frame lookup — body address -> frame size (spawned bodies

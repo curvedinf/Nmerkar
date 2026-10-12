@@ -21,6 +21,7 @@
 
 use crate::ast::*;
 use crate::js_prelude::JS_PRELUDE;
+use crate::user_err;
 use std::collections::{HashMap, HashSet};
 
 // Ops with a runtime implementation in js_prelude.rs (the RT export list).
@@ -140,7 +141,7 @@ fn guard_pop(o: &mut String, x: usize, off: usize, p: &Parsed, store: Option<&st
 fn resolve_label(p: &Parsed, name: &str) -> usize {
     *p.labels
         .get(name)
-        .unwrap_or_else(|| panic!("undefined label {}", name))
+        .unwrap_or_else(|| user_err!("gen_js", None, "undefined label {}", name))
 }
 
 // Find the ListStart/DictStart index that pairs with the literal at `i`.
@@ -199,7 +200,7 @@ fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
         }
         Ins::Simple(h) => {
             if !is_js_op(h) {
-                panic!("{}: not supported by the JavaScript target", h);
+                user_err!("gen_js", Some(p.ins_lines[i]), "{}: not supported by the JavaScript target", h);
             }
             // op_drop with a declared `_!` parameter: guarded consume-pop, no
             // flush (the C target continues before the vflush)
@@ -728,13 +729,13 @@ fn emit_segment(o: &mut String, start: usize, end: usize, p: &Parsed, ctx: &Ctx)
 pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
     // ---- compile-time rejections: constructs with no JS runtime model ----
     if !p.exports.is_empty() {
-        panic!("exports: not supported by the JavaScript target");
+        user_err!("gen_js", None, "exports: not supported by the JavaScript target");
     }
     if !p.methods.is_empty() {
-        panic!("methods: not supported by the JavaScript target");
+        user_err!("gen_js", None, "methods: not supported by the JavaScript target");
     }
     if !p.init_pcs.is_empty() {
-        panic!("init threads: not supported by the JavaScript target");
+        user_err!("gen_js", None, "init threads: not supported by the JavaScript target");
     }
 
     // continuation-body labels (mirrors gen.rs DISCARD_RET_LABELS): every
@@ -795,7 +796,7 @@ pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
                         }
                     }
                     None => {
-                        panic!("weave task cycle: not supported by the JavaScript target")
+                        user_err!("gen_js", Some(p.ins_lines[wi]), "weave task cycle: not supported by the JavaScript target")
                     }
                 }
             }

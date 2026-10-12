@@ -398,6 +398,8 @@ pub fn type_id(kw: &str) -> Option<i64> {
     }
 }
 
+use crate::user_err;
+
 // ---------------- lexer ----------------
 pub struct Lexer {
     chars: Vec<char>,
@@ -451,7 +453,7 @@ impl Lexer {
         }
     }
     fn err(&self, msg: &str) -> ! {
-        panic!("lex error at char {} (line {}): {}", self.pos, self.line, msg)
+        user_err!("lex", Some(self.line), "lex error at char {} (line {}): {}", self.pos, self.line, msg)
     }
     fn lex_ident(&mut self) -> String {
         let mut s = String::new();
@@ -1264,12 +1266,12 @@ pub fn is_bad_ident(name: &str) -> bool {
 }
 
 /// Combined reserved-word and _-prefix check for identifiers
-pub fn check_ident(name: &str, what: &str) {
+pub fn check_ident(line: u32, name: &str, what: &str) {
     if is_bad_ident(name) {
-        panic!("text lex error: {}: {} — identifiers may not start with '_'", what, name);
+        user_err!("lex", Some(line), "text lex error: {}: {} — identifiers may not start with '_'", what, name);
     }
     if is_reserved(name) {
-        panic!("text lex error: {}: {} is a reserved word", what, name);
+        user_err!("lex", Some(line), "text lex error: {}: {} is a reserved word", what, name);
     }
 }
 
@@ -1414,11 +1416,12 @@ impl TextLexer {
         t
     }
     fn err(&self, msg: &str) -> ! {
-        panic!("text lex error at token {}: {}", self.pos, msg)
+        user_err!("lex", Some(self.line()), "text lex error at token {}: {}", self.pos, msg)
     }
     fn name_token(&mut self, what: &str) -> String {
+        let l = self.line();
         let t = self.next().unwrap_or_else(|| self.err(&format!("{} needs a name", what)));
-        check_ident(&t, what);
+        check_ident(l, &t, what);
         t
     }
     // stop: 0 = eof, 1 = '}', 3 = ']', 5 = "task"/"run" (weave body end)
@@ -1477,7 +1480,7 @@ impl TextLexer {
                     let nm = self.name_token("addr");
                     out.push((l, Tok::Jump("ADDR", nm)));
                 } else {
-                    check_ident(label, "addr");
+                    check_ident(l, label, "addr");
                     out.push((l, Tok::Jump("ADDR", label.to_string())));
                 }
                 continue;
@@ -1489,7 +1492,7 @@ impl TextLexer {
                         out.push((l, Tok::Entry));
                         continue;
                     }
-                    check_ident(name, "label");
+                    check_ident(l, name, "label");
                     out.push((l, Tok::LabelDef(name.to_string())));
                     continue;
                 }
@@ -1502,7 +1505,7 @@ impl TextLexer {
                         out.push((l, Tok::Discard));
                         continue;
                     }
-                    check_ident(name, "variable");
+                    check_ident(l, name, "variable");
                     out.push((l, Tok::LocalSet(name.to_string())));
                     continue;
                 }
@@ -1516,7 +1519,7 @@ impl TextLexer {
             if let Some(name) = tok.strip_suffix("++") {
                 if !name.is_empty() && !tok.starts_with('+') {
                     self.pos += 1;
-                    check_ident(name, "variable");
+                    check_ident(l, name, "variable");
                     out.push((l, Tok::IncLocal(name.to_string())));
                     continue;
                 }
@@ -1525,7 +1528,7 @@ impl TextLexer {
             if let Some(name) = tok.strip_suffix("+=") {
                 if !name.is_empty() && !tok.starts_with('+') {
                     self.pos += 1;
-                    check_ident(name, "variable");
+                    check_ident(l, name, "variable");
                     out.push((l, Tok::AddLocal(name.to_string())));
                     continue;
                 }
@@ -1600,7 +1603,7 @@ impl TextLexer {
                                         && parse_text_num(t).is_none() && unquote(t).is_none()
                                         && !t.starts_with('\'') => {
                                         let t = self.next().unwrap();
-                                        check_ident(&t, "run terminal");
+                                        check_ident(l, &t, "run terminal");
                                         Some(t)
                                     }
                                     _ => None,

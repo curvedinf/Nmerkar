@@ -8,6 +8,7 @@ use crate::gen::*;
 use crate::lex::*;
 use crate::parse::*;
 use crate::sandbox::*;
+use crate::user_err;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -26,7 +27,7 @@ static ORIGINAL_RUST_BACKTRACE: OnceLock<Option<std::ffi::OsString>> = OnceLock:
 /// Collect all .n/.nd files in dir, sorted for deterministic compilation order.
 fn collect_uf_files(dir: &std::path::Path) -> Vec<String> {
     let mut files: Vec<String> = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("cannot read dir {}: {}", dir.display(), e))
+        .unwrap_or_else(|e| user_err!("driver", None, "cannot read dir {}: {}", dir.display(), e))
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let p = e.path();
@@ -78,7 +79,7 @@ fn collect_init_dir(
 
     // recurse into nested init subdirs
     let subdirs: Vec<std::path::PathBuf> = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("cannot read dir {}: {}", dir.display(), e))
+        .unwrap_or_else(|e| user_err!("driver", None, "cannot read dir {}: {}", dir.display(), e))
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .map(|e| e.path())
@@ -103,7 +104,7 @@ fn discover_directory(root: &str) -> (Vec<String>, Vec<bool>) {
     } else if rootpath.join("main.nd").exists() {
         rootpath.join("main.nd").to_string_lossy().to_string()
     } else {
-        panic!("nk: no main.n found in {}", root);
+        user_err!("driver", None, "nk: no main.n found in {}", root);
     };
     files.push(main_file);
     init_flags.push(false);
@@ -121,7 +122,7 @@ fn discover_directory(root: &str) -> (Vec<String>, Vec<bool>) {
 
     // subdirs with init.n
     let subdirs: Vec<std::path::PathBuf> = fs::read_dir(rootpath)
-        .unwrap_or_else(|e| panic!("cannot read dir {}: {}", rootpath.display(), e))
+        .unwrap_or_else(|e| user_err!("driver", None, "cannot read dir {}: {}", rootpath.display(), e))
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .map(|e| e.path())
@@ -411,6 +412,46 @@ pub fn configure_compiler_backtrace(args: &[String]) {
 }
 
 pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
+    // User-facing compile errors unwind as Diagnostic payloads; present them
+    // here with a stable exit code instead of panic noise. Internal panics
+    // keep the full default treatment (location + RUST_BACKTRACE) and exit
+    // 101. The hook must not print for Diagnostics — the catch below does.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if info.payload().downcast_ref::<crate::diag::Diagnostic>().is_some() {
+            return;
+        }
+        default_hook(info);
+    }));
+    // --diag=json must survive the `--` boundary rule: only compiler flags
+    // before `--` select the diagnostic format.
+    let mut diag_json = false;
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "--" => break,
+            "--diag=json" => diag_json = true,
+            _ => {}
+        }
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_inner(args, baked_sb, bin_is_nks)
+    })) {
+        Ok(()) => {}
+        Err(payload) => match payload.downcast_ref::<crate::diag::Diagnostic>() {
+            Some(d) if d.kind == crate::diag::DiagKind::User => {
+                if diag_json {
+                    eprintln!("{}", d.to_json());
+                } else {
+                    eprintln!("{}", d.message);
+                }
+                std::process::exit(1);
+            }
+            _ => std::process::exit(101),
+        },
+    }
+}
+
+fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
     let mut emit_c = false;
@@ -443,13 +484,13 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
             }
             "-o" => {
                 i += 1;
-                output = Some(args.get(i).unwrap_or_else(|| panic!("-o needs an argument")).clone());
+                output = Some(args.get(i).unwrap_or_else(|| user_err!("driver", None, "-o needs an argument")).clone());
             }
             "-c" => compile_only = true,
             "--gc-threshold" => {
                 i += 1;
-                gc_threshold = Some(args.get(i).unwrap_or_else(|| panic!("--gc-threshold needs a byte value (e.g. 1000000)")).parse::<u64>()
-                    .unwrap_or_else(|e| panic!("--gc-threshold: {}", e)));
+                gc_threshold = Some(args.get(i).unwrap_or_else(|| user_err!("driver", None, "--gc-threshold needs a byte value (e.g. 1000000)")).parse::<u64>()
+                    .unwrap_or_else(|e| user_err!("driver", None, "--gc-threshold: {}", e)));
             }
             "--gc-off" => gc_off = true,
             "--mt" => force_mt = true,
@@ -457,8 +498,9 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
             "--coverage" => coverage = true,
             "--debug" | "-D" => debug = true,
             "--compiler-backtrace" | "--compiler-backtrace=full" => {},
+            "--diag=json" => {},
             s if s.starts_with("--compiler-backtrace=") => {
-                panic!("--compiler-backtrace accepts no value or `full`");
+                user_err!("driver", None, "--compiler-backtrace accepts no value or `full`");
             }
             "--emit-c" => emit_c = true,
             "--emit-js" => emit_js = true,
@@ -474,25 +516,25 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
             }
             "--policy" => {
                 i += 1;
-                policy = Some(args.get(i).unwrap_or_else(|| panic!("--policy needs a name (e.g. pure, data, web, build)")).clone());
+                policy = Some(args.get(i).unwrap_or_else(|| user_err!("driver", None, "--policy needs a name (e.g. pure, data, web, build)")).clone());
             }
             "--sandbox" => {
                 i += 1;
-                sandbox_files.push(args.get(i).unwrap_or_else(|| panic!("--sandbox needs a config file path")).clone());
+                sandbox_files.push(args.get(i).unwrap_or_else(|| user_err!("driver", None, "--sandbox needs a config file path")).clone());
             }
             "--workspace" => {
                 i += 1;
-                workspace_roots.push(args.get(i).unwrap_or_else(|| panic!("--workspace needs a directory path")).clone());
+                workspace_roots.push(args.get(i).unwrap_or_else(|| user_err!("driver", None, "--workspace needs a directory path")).clone());
             }
             "--caps" => show_caps = true,
             "--device" => {
                 i += 1;
-                let d = args.get(i).unwrap_or_else(|| panic!("--device needs a spec: cpu, auto, or vk<N> (e.g. vk0)")).clone();
+                let d = args.get(i).unwrap_or_else(|| user_err!("driver", None, "--device needs a spec: cpu, auto, or vk<N> (e.g. vk0)")).clone();
                 let ok = d == "cpu" || d == "auto"
                     || (d.starts_with("vk") && d[2..].chars().all(|c| c.is_ascii_digit()) && d.len() > 2)
                     || (d.starts_with("vulkan") && d[6..].chars().all(|c| c.is_ascii_digit()) && d.len() > 6);
                 if !ok {
-                    panic!("unknown device '{}' — use cpu, auto, or vk<N> (e.g. vk0)", d);
+                    user_err!("driver", None, "unknown device '{}' — use cpu, auto, or vk<N> (e.g. vk0)", d);
                 }
                 device = Some(d);
             }
@@ -505,6 +547,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 eprintln!("");
                 eprintln!("  compiler diagnostics:");
                 eprintln!("       --compiler-backtrace[=full]  show a Rust compiler backtrace on panic");
+                eprintln!("       --diag=json                  print compile errors as one JSON line on stderr");
                 eprintln!("");
                 eprintln!("  runtime flags (baked into compiled binary):");
                 eprintln!("       --gc-threshold N   GC collection threshold in bytes (default: 1MB)");
@@ -530,7 +573,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 print!("{}", skill_template());
                 return;
             }
-            s if s.starts_with('-') && s.is_ascii() && s != "-" => panic!("unknown option {}", s),
+            s if s.starts_with('-') && s.is_ascii() && s != "-" => user_err!("driver", None, "unknown option {}", s),
             s => inputs.push(s.to_string()),
         }
         i += 1;
@@ -565,10 +608,10 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let mut runtime_cfgs: Vec<SandboxFile> = Vec::new();
     for f in &sandbox_files {
         let src = fs::read_to_string(f)
-            .unwrap_or_else(|e| panic!("cannot read sandbox config {}: {}", f, e));
+            .unwrap_or_else(|e| user_err!("driver", None, "cannot read sandbox config {}: {}", f, e));
         let mut sf = parse_ufs(&src, f);
         if !sf.policies.is_empty() {
-            panic!("sandbox config {} defines [policy] sections — runtime configs may only tighten, not define policies", f);
+            user_err!("driver", None, "sandbox config {} defines [policy] sections — runtime configs may only tighten, not define policies", f);
         }
         sf.policies.clear();
         runtime_cfgs.push(sf);
@@ -627,7 +670,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         let (src, defmod) = if input == "-" {
             let mut s = String::new();
             use std::io::Read as _;
-            std::io::stdin().read_to_string(&mut s).unwrap_or_else(|e| panic!("cannot read stdin: {}", e));
+            std::io::stdin().read_to_string(&mut s).unwrap_or_else(|e| user_err!("driver", None, "cannot read stdin: {}", e));
             (s, "main".to_string())
         } else {
             match fs::read_to_string(input) {
@@ -645,7 +688,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 Err(_) if last && !input.ends_with(".nd") && !input.ends_with(".n") => {
                     (input.clone(), "main".to_string())
                 }
-                Err(e) => panic!("cannot read {}: {}", input, e),
+                Err(e) => user_err!("driver", None, "cannot read {}: {}", input, e),
             }
         };
         let mut toks = lex_source(&src);
@@ -670,7 +713,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         let mut manifest_toks = Vec::new();
         for u in &uses {
             let msrc = find_manifest(u, base_path)
-                .unwrap_or_else(|| panic!("USE\"{}\": no mods/{}.ufm found (searched near input, CWD/mods, ~/.nk/mods, NKMODPATH)", u, u));
+                .unwrap_or_else(|| user_err!("driver", None, "USE\"{}\": no mods/{}.ufm found (searched near input, CWD/mods, ~/.nk/mods, NKMODPATH)", u, u));
             hash_src.push_str(&msrc);
             let mut mt = lex_source(&msrc);
             // manifest imports are exempt from ffi.import gating: loading the
@@ -692,11 +735,11 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         let s = if emit_text_f { emit_text(&toks) } else { emit_dense(&toks) };
         let derived = if convert && output.is_none() {
             if inputs.len() != 1 {
-                panic!("--to-text/--to-dense take exactly one input file (or use -o)");
+                user_err!("driver", None, "--to-text/--to-dense take exactly one input file (or use -o)");
             }
             let inp = &inputs[0];
             if inp == "-" || !std::path::Path::new(inp).exists() {
-                panic!("--to-text/--to-dense need a file input (or use -o with inline source)");
+                user_err!("driver", None, "--to-text/--to-dense need a file input (or use -o with inline source)");
             }
             let stem = inp.strip_suffix(".nd").or_else(|| inp.strip_suffix(".n")).unwrap_or(inp);
             Some(format!("{}.{}", stem, if emit_text_f { "n" } else { "nd" }))
@@ -705,7 +748,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         };
         match output.as_ref().or(derived.as_ref()) {
             Some(o) => {
-                fs::write(o, &s).unwrap_or_else(|e| panic!("cannot write {}: {}", o, e));
+                fs::write(o, &s).unwrap_or_else(|e| user_err!("driver", None, "cannot write {}: {}", o, e));
                 eprintln!("wrote {}", o);
             }
             None => print!("{}", s),
@@ -773,7 +816,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         match &output {
             Some(o) => {
                 let path = format!("{}.c", o);
-                fs::write(&path, &csrc).unwrap_or_else(|e| panic!("cannot write {}: {}", path, e));
+                fs::write(&path, &csrc).unwrap_or_else(|e| user_err!("driver", None, "cannot write {}: {}", path, e));
                 eprintln!("wrote {}", path);
             }
             None => print!("{}", &csrc),
@@ -785,7 +828,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         match &output {
             Some(o) => {
                 let path = format!("{}.js", o);
-                fs::write(&path, &js).unwrap_or_else(|e| panic!("cannot write {}: {}", path, e));
+                fs::write(&path, &js).unwrap_or_else(|e| user_err!("driver", None, "cannot write {}: {}", path, e));
                 eprintln!("wrote {}", path);
             }
             None => print!("{}", &js),
@@ -795,14 +838,14 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     if compile_only {
         let out = output.unwrap_or_else(|| "a.out".to_string());
         let tmpc = format!("{}.ufc.c", out);
-        fs::write(&tmpc, &csrc).unwrap_or_else(|e| panic!("cannot write {}: {}", tmpc, e));
+        fs::write(&tmpc, &csrc).unwrap_or_else(|e| user_err!("driver", None, "cannot write {}: {}", tmpc, e));
         let mut cc_args: Vec<String> = if debug { vec!["-O0".into(), "-g".into()] } else { vec!["-O3".into()] };
         cc_args.extend(["-w".into(), "-o".into(), out, tmpc.clone()]);
         let status = Command::new("cc")
             .args(&cc_args)
             .args(&links)
             .status()
-            .unwrap_or_else(|e| panic!("failed to run cc: {}", e));
+            .unwrap_or_else(|e| user_err!("driver", None, "failed to run cc: {}", e));
         if !status.success() {
             eprintln!("cc failed; C source kept at {}", tmpc);
             std::process::exit(1);
@@ -819,12 +862,12 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     }
     let dir = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
     let cdir = std::path::Path::new(&dir).join("nk-cache");
-    fs::create_dir_all(&cdir).unwrap_or_else(|e| panic!("cannot create {}: {}", cdir.display(), e));
+    fs::create_dir_all(&cdir).unwrap_or_else(|e| user_err!("driver", None, "cannot create {}: {}", cdir.display(), e));
     let bin = cdir.join(format!("{:016x}", h));
     let bins = bin.to_string_lossy().to_string();
     if !bin.exists() {
         let tmpc = cdir.join(format!("{:016x}.c", h));
-        fs::write(&tmpc, &csrc).unwrap_or_else(|e| panic!("cannot write {}: {}", tmpc.display(), e));
+        fs::write(&tmpc, &csrc).unwrap_or_else(|e| user_err!("driver", None, "cannot write {}: {}", tmpc.display(), e));
         let mut cc_args: Vec<String> = if debug { vec!["-O0".into(), "-g".into()] } else { vec!["-O3".into()] };
         cc_args.extend(["-w".into(), "-o".into(), bins.clone()]);
         cc_args.push(tmpc.to_string_lossy().to_string());
@@ -832,7 +875,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
             .args(&cc_args)
             .args(&links)
             .status()
-            .unwrap_or_else(|e| panic!("failed to run cc: {}", e));
+            .unwrap_or_else(|e| user_err!("driver", None, "failed to run cc: {}", e));
         if !status.success() {
             eprintln!("uf: cc failed; C kept at {}", tmpc.display());
             std::process::exit(1);
@@ -852,7 +895,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         }
     }
     let status = program.status()
-        .unwrap_or_else(|e| panic!("failed to run {}: {}", bins, e));
+        .unwrap_or_else(|e| user_err!("driver", None, "failed to run {}: {}", bins, e));
     #[cfg(unix)]
     if status.code().is_none() {
         use std::os::unix::process::ExitStatusExt;

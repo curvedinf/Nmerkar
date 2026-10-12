@@ -13,6 +13,7 @@
 // capability denied anywhere stays denied; workspace roots intersect; module
 // allowlists intersect. Runtime files cannot define selectable policies.
 
+use crate::user_err;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -122,7 +123,7 @@ fn parse_rules(lines: &[(usize, String)], file: &str) -> (Rules, Option<String>)
             "allow-module" => r.allow_module.extend(vals),
             "deny-module" => r.deny_module.extend(vals),
             "name" if vals.len() == 1 => name = Some(vals[0].clone()),
-            _ => panic!("{}:{}: unknown config key `{}` (expected deny/allow/workspace/allow-module/deny-module/name)", file, lineno, key),
+            _ => user_err!("sandbox", Some(*lineno as u32), "{}:{}: unknown config key `{}` (expected deny/allow/workspace/allow-module/deny-module/name)", file, lineno, key),
         }
     }
     (r, name)
@@ -149,12 +150,12 @@ pub fn parse_ufs(src: &str, file: &str) -> SandboxFile {
         if let Some(name) = line.strip_prefix("[policy ") {
             let name = name.trim_end_matches(']').trim().to_string();
             if name.is_empty() {
-                panic!("{}:{}: empty policy name", file, i + 1);
+                user_err!("sandbox", Some((i + 1) as u32), "{}:{}: empty policy name", file, i + 1);
             }
             let flushed = std::mem::take(&mut section);
             flush(flushed, &mut sf, &mut cur);
             if sf.policies.contains_key(&name) {
-                panic!("{}:{}: duplicate policy `{}`", file, i + 1, name);
+                user_err!("sandbox", Some((i + 1) as u32), "{}:{}: duplicate policy `{}`", file, i + 1, name);
             }
             cur = Some(name);
         } else {
@@ -360,7 +361,7 @@ pub fn effective(
             Some(p) => Some(
                 sf.policies
                     .get(p)
-                    .unwrap_or_else(|| panic!("sandbox: no baked policy `{}` (available: {})", p, policy_list(sf))),
+                    .unwrap_or_else(|| user_err!("sandbox", None, "sandbox: no baked policy `{}` (available: {})", p, policy_list(sf))),
             ),
             None => None,
         };
@@ -377,7 +378,7 @@ pub fn effective(
         }
         caps.is_sandboxed = true;
     } else if let Some(p) = selected_policy {
-        panic!("sandbox: --policy `{}` given but this build has no baked policies", p);
+        user_err!("sandbox", None, "sandbox: --policy `{}` given but this build has no baked policies", p);
     }
 
     for rf in runtime_files {

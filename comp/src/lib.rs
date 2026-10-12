@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod compute;
 pub mod driver;
+pub mod diag;
 pub mod emit;
 pub mod gen;
 pub mod gen_js;

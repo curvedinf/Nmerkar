@@ -1453,6 +1453,25 @@ byte-for-byte.
 
 `dbg` uses the same site builder: `dbg L<line> [<label>]: <value>` on stderr.
 
+### Compiler diagnostics and exit codes
+
+Compile-time errors are structured diagnostics: internally they carry a kind
+(user error vs internal invariant), a stage (`lex`, `parse`, `gen`, `gen_js`,
+`emit`, `sandbox`, `driver`), a source line when known, and the message. The
+CLI prints the bare message to stderr (no panic noise) and exits:
+
+- **1** — user error: bad source, sandbox denial, bad flags, unreadable
+  input, output-write or `cc` failure.
+- **101** — internal compiler error (a bug in `nk`); the default panic
+  report is preserved, and `--compiler-backtrace` / `RUST_BACKTRACE` apply.
+
+`--diag=json` switches the failure report from the human message to a single
+JSON line on stderr: `{"kind":"error","stage":"parse","line":3,"message":"…"}`
+(`line` omitted when unknown). `nk --emit-js`'s wasm build surface
+(`nk_js_compile`) returns the same message text as its error payload. A
+compiler unit test (`comp/src/spec_contract.rs`) keeps this document's opcode
+totals in lockstep with `comp/src/lex.rs`.
+
 ### `--profile` and `--coverage` (native target)
 
 Compile-time cost-center instrumentation: the generated C ticks one counter at the

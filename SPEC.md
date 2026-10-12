@@ -14,6 +14,16 @@ loops, open-addressing hashes, Timsort, streaming channels); structured control
 flow; self-contained scripts (file I/O, argv, shell-out, regex, JSON in core);
 garbage-collected (scripts never `free` managed objects).
 
+## Revision status
+
+Current revision: **v15**. Not backward compatible with v14.1 (bare names are
+implicit loads — the `@` varget suffix is gone; dense label defs need the 🏷
+marker; dense struct immediates use the 📏 📍 📦 🎭 tag glyphs). Per-operation
+history is in `SPEC_HISTORY.md`; this document is the current specification
+only. Opcode totals are kept in lockstep with `comp/src/lex.rs` by a compiler
+unit test (`comp/src/spec_contract.rs`), so the counts in this file cannot
+drift from the implementation silently.
+
 ## Source encodings
 
 Text is the default encoding. Two encodings, identical semantics, auto-detected:
@@ -34,7 +44,7 @@ auto-detection).
 
 | space | range | contents |
 |-------|-------|----------|
-| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 199 live |
+| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 203 live (201 with dense glyphs; `cap`/`caps` are text-only) |
 | v-space | U+1F941+ interleaved with other emoji | variable/label name atoms, runs fold |
 | l-space | U+1F130+ (enclosed alphanumerics) | base-64 digit atoms (self-evaluating numbers) |
 | delimiters | U+13100..U+13108 | chat-template delimiters, stripped pre-compilation |
@@ -51,7 +61,9 @@ A bare `"..."` self-evaluates (pushes a string handle).
 
 ## Numbers (l-space grammar)
 
-l-space atoms are base-64 digits: atom U+133A4+i has digit value i (0..63).
+l-space atoms are base-64 digits: the 64 codepoints of the `L_SPACE` table
+in `comp/src/lex.rs` (U+1F130..U+1F1FD, each a single token); an atom's digit
+value is its index in that table (0..63).
 
 ```
 number := ['-'] lrun ['.' lrun] ['e' ['-'] lrun]
@@ -342,9 +354,12 @@ The same applies to `tensor`. Elements are coerced to the element type
 
 ## Opcode reference
 
-218 slots (0..217); **195 live opcodes**. Each live opcode has a unique
-dense glyph; the text mnemonics are the full-word/`snake_case` names listed
-below. Glyph assignments are 1:1 and final in `comp/src/lex.rs`.
+222 slots (0..221); **203 live opcodes**. Each live opcode except the
+text-only `cap`/`caps` (no dense glyph — they cannot be written in dense
+source) has a unique dense glyph; the text mnemonics are the full-word/
+`snake_case` names listed below. Glyph assignments are 1:1 and final in
+`comp/src/lex.rs`. Retired slots are not listed; slot 83 (`ENDT`) is retired
+in place — its glyph is reserved but its mnemonic resolves to nothing.
 
 ### Core stack, memory, and I/O
 
@@ -434,8 +449,8 @@ coerce their operands via the universal coercion rules.
 | 104 | 😕 | `div` | a b → a/b | int truncates toward zero; float f64. b=0: dies |
 | 105 | 🚚 | `rem` | a b → a%b | C remainder (sign follows dividend). b=0: dies |
 | 106 | 🤤 | `eq` | a b → 0/1 | loose equality (==); coerces per universal coercion rules |
-| 212 | 🥡 | `structural_equal` | a b → 0/1 | strict equality (===); types and values must match |
-| 213 | 🥢 | `structural_not_equal` | a b → 0/1 | strict inequality (!==) |
+| 212 | 🥙 | `structural_equal` | a b → 0/1 | strict equality (===); types and values must match |
+| 213 | 🥚 | `structural_not_equal` | a b → 0/1 | strict inequality (!==) |
 | 107 | 🌙 | `lt` | a b → 0/1 | numeric or string lexicographic |
 | 108 | 😖 | `gt` | a b → 0/1 | as lt |
 | 109 | 🚛 | `not` | a → 0/1 | 1 if a==0 |
@@ -550,6 +565,8 @@ Calendar arithmetic, durations, truncation, time-series joins are library code
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
 | 85 | 🌑 | `shell` | cmd → list | returns `[out, err, status]`; -1 spawn failure, 128+signal |
+| 86 |  | `cap` | "name" → 0/1 | query a capability (text-only — no dense glyph); see "Capability discovery" |
+| 87 |  | `caps` | → dict | effective capability report (text-only — no dense glyph); see "Capability discovery" |
 | 88 | 😑 | `shell_stream` | cmd → chan | detached thread feeds stdout line-by-line (cap 64) |
 | 89 | 🚖 | `execute` | list → status | no shell; list is argv (elem 0 = program) |
 
@@ -1280,7 +1297,8 @@ __NK_API = { rt, output(), err(), run(env) }
 
 `run(env)` runs the whole program (main's local base is restored on return)
 and resolves to `{output, err, rc, error?}` — `output`/`err` are the merged
-stdout/stderr of the run, `rc` the exit code (0 clean, the exit op's value, 1
+stdout/stderr of the run, `rc` the exit code (0 clean, the value passed to
+the FFI `exit` symbol, 1
 on a runtime error), and `error` the die message when the run fails. `env`
 (all keys optional): `argv` (the program's argv; `argv[0]` is the program
 name — when omitted the program sees `["nk"]`, mirroring native, where the
@@ -1298,9 +1316,10 @@ threads (`spawn`/`chan`/shared-atomic), error containment (`try`/`retry`),
 time, file IO, shell ops, FFI, argv, JSON, bloom, compute). The rejected
 shapes:
 
-- `exports`, `methods`, and init-threads programs are codegen errors
-  (`<thing>: not supported by the JavaScript target`); `_syscall` and
-  `send` die at runtime with the same message.
+- programs that `export`, and init-threads programs, are codegen errors
+  (`exports: not supported by the JavaScript target`, `init threads: not
+  supported by the JavaScript target`); `_syscall` dies at runtime with
+  `syscalls: not supported by the JavaScript target`.
 - GPU compute: no Vulkan offload — the emitted program always takes the
   CPU code paths (the `--device` flag is accepted and has no effect, as if
   `--device cpu` were always in force).
@@ -1333,7 +1352,8 @@ null/list/dict → 0, code/iter → pointer bits).
 **Filesystem model** (`env.fs`): an in-memory name → text table. `fopen`
 returns NULL for an unknown name in any mode (including `w`), mirroring
 the sandbox filesystem; writes to known names update the table; the file
-ops (`read_file`, `write_file`, `mmap`, `slurp`, `spit`, `feach`, …) and
+ops (`read_file`, `write_file`, `mmap`, `file_each_line`,
+`file_fold_lines`, `file_split_lines`, …) and
 the libc-stdio FFI subset (the glibc symbols `import c"…"` may use, over
 `stdin`/`stdout`/`stderr`/`nk_argc`/`nk_argv` and the `env.fs` table) read
 and write the same model. `stdin` is the `env.stdin` text, consumed by
@@ -1378,7 +1398,7 @@ contract, Filesystem model, and Shell ops above).
 
 **Parity gate**: `node web/tests/run_js.cjs` runs the full corpus against
 the committed `web/nk.js` bundle with the native `nk` as oracle —
-`comp/tests` t01–t17,
+`comp/tests` t01–t19,
 all `examples/` (including the single-file GNU transpiler targets and
 `text/`), all nine `bench/src` programs, and the `web/tests/*.n`
 micro-gates (with `neg_*.n` rejection checks). Each gate compares rc,
@@ -1392,8 +1412,8 @@ environment.
 
 ## Totals
 
-218 opcode slots (0..217); **195 live opcodes**. Every live opcode has a
-unique dense glyph codepoint.
+222 opcode slots (0..221); **203 live opcodes**. 201 of them have unique
+dense glyph codepoints (`cap`/`caps` are text-only).
 
 ## Non-goals
 

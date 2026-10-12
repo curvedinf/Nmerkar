@@ -7,7 +7,8 @@ use crate::ast::*;
 pub const DELIM_BASE: u32 = 0x13100;
 pub const TYPE_BASE: u32 = 0x13110;
 
-// Opcode glyphs (194 live ops). Index = OP_NAMES array position.
+// Opcode glyphs (203 live ops; 201 glyphed — `cap`/`caps` are text-only,
+// slot 0 means no glyph). Index = OP_NAMES array position.
 // All colored emoji (U+1F300+), each exactly one Qwen3 token.
 pub const OP_GLYPHS: [u32; 222] = [
     0x1F300, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1F682, 0x1F910,
@@ -1240,7 +1241,6 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "ENTRY" => "entry",
         "HASARGS" => "has_args", "ARGI" => "arg_index", "SORTKEYS" => "sort_keys", "TOPN" => "top_n",
         "RANGEFOLD" => "range_reduce",
-        "TRANSPOSE" => "transpose",
         "TRANSPOSE" => "transpose",
         "SEQ" => "structural_equal", "SNE" => "structural_not_equal",
         "STRICT" => "strict", "LOOSE" => "loose",

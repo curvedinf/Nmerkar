@@ -41,12 +41,12 @@ pub enum Tok {
     Mod(String),                 // MOD"name" — translation-unit name
     Pub,                         // PUB — export the next label def globally
     Method(String),              // METHOD TypeName: — register the next label as a method
-    Task { name: String, count: Option<i64>, body: Vec<Tok> }, // inside WEAVE..RUN; leading body tokens are input bindings
+    Task { name: String, count: Option<i64>, body: Vec<(u32, Tok)> }, // inside WEAVE..RUN; leading body tokens are input bindings
     TaskEnd(String),             // internal: end of task body, holds skip label
     Wrun(Option<String>),        // RUN — schedule the collected tasks; optional terminal task
-    List(Vec<Tok>),              // v13: [ expr ... ] list-literal contents (closed)
-    Dict(Vec<Tok>),              // v13: { key val ... } dict-literal contents (closed)
-    MacroDef(String, Vec<Tok>),
+    List(Vec<(u32, Tok)>),      // v13: [ expr ... ] list-literal contents (closed); (line, tok)
+    Dict(Vec<(u32, Tok)>),      // v13: { key val ... } dict-literal contents (closed); (line, tok)
+    MacroDef(String, Vec<(u32, Tok)>),
     StructDef(String, Vec<(String, String)>), // field name, type name
     Sys(usize),                // arity immediate (default 0)
     Ident(String),             // macro invocation site
@@ -109,6 +109,20 @@ pub struct WeaveMeta {
 
 pub struct Parsed {
     pub ins: Vec<Ins>,
+    // source line per instruction (parallel to `ins`; 0 = synthesized).
+    // Filled by the parser, rewritten in lockstep by every pass that changes
+    // `ins` length (the resolve_locals Nop compaction, merge_tus).
+    pub ins_lines: Vec<u32>,
+    // label pc -> source line of the label definition (0 = synthesized).
+    pub label_lines: HashMap<usize, u32>,
+    // label pc -> original (unmangled) label name: the error-site table
+    // reports the name the user wrote, not the cross-TU mangled one.
+    pub label_names: HashMap<usize, String>,
+    // source file per instruction (index into `file_names`; 0 in a single-TU
+    // program). Used by the error-site table for multi-TU messages.
+    pub ins_files: Vec<usize>,
+    // source file stems, one per translation unit (merge order).
+    pub file_names: Vec<String>,
     pub labels: HashMap<String, usize>,
     pub imports: Vec<Import>,
     pub exports: Vec<(String, String)>, // C name, label

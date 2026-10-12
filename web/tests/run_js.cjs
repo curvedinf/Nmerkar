@@ -24,7 +24,7 @@
 //   compileOnly expect nk.compile to resolve; never run
 "use strict";
 
-const { execFileSync } = require("child_process");
+const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -112,6 +112,8 @@ const SPECS = [
   ["comp/tests/t15_shared.n", {}],
   ["comp/tests/t16_auto_device.n", { flags: ["--device", "cpu"], argv: ["512"] }],
   ["comp/tests/t17_strict.n", {}],
+  ["comp/tests/t18_debug.n", {}],
+  ["comp/tests/t19_checkfail.n", {}],
   // examples: repo example programs
   ["examples/hello.n", {}],
   ["examples/fib.n", {}],
@@ -167,18 +169,14 @@ function oracle(f, spec) {
     args.push("--");
     args.push(...spec.argv);
   }
-  const opt = { cwd: ROOT, encoding: "utf8", maxBuffer: 1 << 26, timeout: 300000 };
-  if (spec.stdin !== undefined) opt.input = spec.stdin;
-  try {
-    const stdout = execFileSync(NK, args, opt);
-    return { rc: 0, stdout, stderr: "" };
-  } catch (e) {
-    return {
-      rc: e.status === null ? 1 : e.status,
-      stdout: e.stdout == null ? "" : e.stdout.toString(),
-      stderr: e.stderr == null ? "" : e.stderr.toString(),
-    };
-  }
+  // spawnSync (not execFileSync): the latter drops the child's stderr on a
+  // successful run, and gates like t18_debug print to stderr and succeed.
+  const r = spawnSync(NK, args, { cwd: ROOT, encoding: "utf8", maxBuffer: 1 << 26, timeout: 300000, input: spec.stdin });
+  return {
+    rc: r.status === null ? 1 : r.status,
+    stdout: r.stdout == null ? "" : r.stdout,
+    stderr: r.stderr == null ? "" : r.stderr,
+  };
 }
 
 async function jsRun(src, spec) {

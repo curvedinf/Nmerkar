@@ -34,7 +34,7 @@ auto-detection).
 
 | space | range | contents |
 |-------|-------|----------|
-| opcodes | U+1F300+ (emoji) | 218 slots (0..217), 195 live |
+| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 199 live |
 | v-space | U+1F941+ interleaved with other emoji | variable/label name atoms, runs fold |
 | l-space | U+1F130+ (enclosed alphanumerics) | base-64 digit atoms (self-evaluating numbers) |
 | delimiters | U+13100..U+13108 | chat-template delimiters, stripped pre-compilation |
@@ -706,6 +706,15 @@ struct *name* to its compiler-assigned id at compile time.
 | 211 | 🥘 | `range_reduce` | count init label → scalar | fold over range 0..count; label `(acc i → acc)` called per iteration |
 | 215 | 🔒 | `strict` | v → v | mark the value strict — no implicit coercion from then on (compile-time; see "Strictness") |
 | 216 | 🔓 | `loose` | v → v | remove strictness from the value (compile-time) |
+
+### Debugging ops (218–221)
+
+| idx | | mn | stack | notes |
+|----|---|----|----|-------|
+| 218 | 🔍 | `dbg` | v → v | peek-print the stack top to **stderr**: `dbg <site>: <value>`; same smart rendering as `print`; the stack is not changed |
+| 219 | 🎯 | `check` | v → — | one-token assert: pops the condition; a falsy value dies `check failed` at that source site |
+| 220 | 🕒 | `timer` | → int | monotonic clock in nanoseconds (int cell); only differences are meaningful — the base differs across targets and clocks |
+| 221 | 📊 | `memstats` | → dict | GC stats `{gc, objs, live, alloc}`: collections run, live objects, live bytes, total bytes allocated (native GC; the JS target's heap is host-managed, so all four read 0 there) |
 
 ### Modules & directives
 
@@ -1403,6 +1412,84 @@ encoding. Supported subset, libc IMPORT preamble, emission model
 `fr`/`rv` shared-register early-return guards), and the gated
 test pathways (system-binary round-trips plus per-operation output gates)
 are documented in `trans/README.md`.
+
+## Debugging and profiling
+
+### Error site (always on, both targets)
+
+Every runtime failure carries the source site of the failing instruction:
+
+```
+nk: L<line> [label] <message>
+```
+
+`<line>` is the 1-based source line; `<label>` the innermost enclosing label. In a
+multi-TU program the owning file's stem is prefixed: `nk: <stem>:L<line> [label]
+<message>`. Instructions with no source line (macro bodies, container literals,
+synthesized `ret` epilogues) fall back to the plain `nk: <message>`. The JavaScript
+target formats the same site identically (the message lands in `r.error` /
+`Program.run`'s rejected promise); gates compare the reconstructed streams
+byte-for-byte.
+
+`dbg` uses the same site builder: `dbg L<line> [<label>]: <value>` on stderr.
+
+### `--profile` and `--coverage` (native target)
+
+Compile-time cost-center instrumentation: the generated C ticks one counter at the
+head of every label body (`if(uf_prof_on)uf_prof_t(i);`). With neither flag the
+generated program contains no instrumentation (zero cost). The report is written to
+stderr after `main` returns — a program that `die`s exits before the report.
+
+`--profile` (sorted by ns, descending; `%` = share of the total; the `total` row
+lasts):
+
+```
+--- nk profile ---
+label         line   calls            ns     %
+spin            14     30            860  46.7
+entry            3      1            980  53.3
+total                             1840 100.0
+```
+
+`ns` accumulates time while the label body was in flight (delta between the
+label's entry ticks); `calls` counts entries. One row per label — synthetic
+loop/continuation bodies included, under their mangled names. Spawned workers tick
+the same global atomics, so the table reflects them only as far as they had run.
+
+`--coverage` (hits per label, source order; uncovered labels show 0):
+
+```
+--- nk coverage ---
+label         line  hits
+entry            3     1
+dead            10     0
+1 of 2 labels uncovered
+```
+
+`--profile --coverage` together prints both tables (profile first). Both flags are
+baked into the cache key; they change nothing at the language level.
+
+### All-thread crash dump (`-D`, native target)
+
+The existing `-D` crash dump (failing thread's call stack, locals, shared vars) is
+extended with every other live thread:
+
+```
+  other threads (best effort):
+  thread #1:
+    #0  bump (pc=17)
+  thread #2: (no call frames)
+```
+
+Best effort: the workers run concurrently and their stacks are read without their
+locks — a frame can look stale. The shared-vars section is not repeated.
+
+### JavaScript-target boundary
+
+The four debugging ops work on the JS target and are parity-gated.
+`--profile`, `--coverage`, and the all-thread dump are **native target only**: the
+wasm bundle has no equivalent instrumentation hook, and the JS host heap exposes no
+stats to `memstats` (hence its zeros there).
 
 ## Sandboxing and capabilities
 

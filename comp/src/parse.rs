@@ -71,11 +71,11 @@ fn gate_op(name: &str, caps: &Caps) {
     }
 }
 
-pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
-    let mut macros: HashMap<String, Vec<Tok>> = HashMap::new();
+pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Parsed {
+    let mut macros: HashMap<String, Vec<(u32, Tok)>> = HashMap::new();
     let imports: Vec<Import> = Vec::new();
     // v12: destructuring bind helpers
-    fn is_multi_return(ins: Option<&Ins>, q: &VecDeque<Tok>) -> bool {
+    fn is_multi_return(ins: Option<&Ins>, q: &VecDeque<(u32, Tok)>) -> bool {
         match ins {
             // v13: a bind-run of >=2 (the current bind plus at least one more
             // in the queue) after a `_call` destructures the callee's returned
@@ -95,16 +95,16 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 "op_sh" | "op_try" | "op_retry" | "op_match" | "op_scan" | "op_next")),
         }
     }
-    fn is_bind(t: &Tok) -> bool {
-        matches!(t, Tok::LocalSet(_) | Tok::SetV(_) | Tok::Discard)
+    fn is_bind(t: &(u32, Tok)) -> bool {
+        matches!(&t.1, Tok::LocalSet(_) | Tok::SetV(_) | Tok::Discard)
     }
     #[derive(Clone)]
     enum Bind { Local(String), Global(String), Discard }
-    fn collect_destructure(first: Bind, q: &mut VecDeque<Tok>) -> Vec<Bind> {
+    fn collect_destructure(first: Bind, q: &mut VecDeque<(u32, Tok)>) -> Vec<Bind> {
         let mut pattern = vec![first];
         while let Some(t2) = q.front() {
             if !is_bind(t2) { break; }
-            match q.pop_front().unwrap() {
+            match q.pop_front().unwrap().1 {
                 Tok::LocalSet(name) => pattern.push(Bind::Local(name)),
                 Tok::SetV(name) => pattern.push(Bind::Global(name)),
                 Tok::Discard => pattern.push(Bind::Discard),
@@ -113,21 +113,25 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
         }
         pattern
     }
-    fn emit_destructure(pattern: Vec<Bind>, p: &mut Parsed, dtemp_ctr: &mut usize) {
+    fn pi(p: &mut Parsed, ins: Ins, line: u32) {
+        p.ins.push(ins);
+        p.ins_lines.push(line);
+    }
+    fn emit_destructure(pattern: Vec<Bind>, p: &mut Parsed, dtemp_ctr: &mut usize, line: u32) {
         let temp = format!("ufdt{}", *dtemp_ctr);
         *dtemp_ctr += 1;
-        p.ins.push(Ins::LocalSet(temp.clone()));
+        pi(p, Ins::LocalSet(temp.clone()), line);
         for (i, bind) in pattern.iter().enumerate() {
-            p.ins.push(Ins::LocalGet(temp.clone()));
-            p.ins.push(Ins::PushI(i as i64));
-            p.ins.push(Ins::Simple("op_getq"));
+            pi(p, Ins::LocalGet(temp.clone()), line);
+            pi(p, Ins::PushI(i as i64), line);
+            pi(p, Ins::Simple("op_getq"), line);
             match bind {
-                Bind::Local(name) => p.ins.push(Ins::LocalSet(name.clone())),
+                Bind::Local(name) => pi(p, Ins::LocalSet(name.clone()), line),
                 Bind::Global(name) => {
                     if !p.vars.contains(name) {
                         p.vars.push(name.clone());
                     }
-                    p.ins.push(Ins::SetV(name.clone()));
+                    pi(p, Ins::SetV(name.clone()), line);
                 }
                 Bind::Discard => {}
             }
@@ -136,6 +140,7 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
     let mut dtemp_ctr = 0usize;
     let mut p = Parsed {
         ins: Vec::new(),
+        ins_lines: Vec::new(),
         labels: HashMap::new(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -152,8 +157,12 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
         local_names: HashMap::new(),
         label_params: HashMap::new(),
         param_pcs: HashMap::new(),
+        label_lines: HashMap::new(),
+        label_names: HashMap::new(),
+        ins_files: Vec::new(),
+        file_names: Vec::new(),
     };
-    let mut q: VecDeque<Tok> = toks.into();
+    let mut q: VecDeque<(u32, Tok)> = toks.into();
     let mut pending_export: Option<String> = None;
     let mut pending_pub = false;
     let mut pending_method: Option<String> = None;
@@ -167,12 +176,12 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
     // next statement boundary (label, directive, task, another ret, or a
     // literal closer). In valid v13 code the ret is the last statement of its
     // body, so the operand is exactly the return expression.
-    fn is_stmt_boundary(t: &Tok) -> bool {
+    fn is_stmt_boundary(t: &(u32, Tok)) -> bool {
         is_hard_boundary(t)
-            || matches!(t, Tok::List(_) | Tok::Dict(_))
+            || matches!(&t.1, Tok::List(_) | Tok::Dict(_))
     }
-    fn is_hard_boundary(t: &Tok) -> bool {
-        matches!(t,
+    fn is_hard_boundary(t: &(u32, Tok)) -> bool {
+        matches!(&t.1,
             Tok::LabelDef(_) | Tok::Task { .. } | Tok::TaskEnd(_) | Tok::Wrun(_)
             | Tok::Entry | Tok::MacroDef(..) | Tok::StructDef(..) | Tok::Import(_)
             | Tok::Export(_) | Tok::Use(_) | Tok::Mod(_) | Tok::Pub
@@ -181,15 +190,15 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
             // last statement, and `expr if_else ret` (v12 style) covers
             // branch-returning rets via the real-stack fallback
             | Tok::Op("RET" | "IF" | "IFELSE" | "WHILE" | "FOR")
-        ) || matches!(t, Tok::Ident(n) if n.starts_with('@'))
+        ) || matches!(&t.1, Tok::Ident(n) if n.starts_with('@'))
     }
-    while let Some(t) = q.pop_front() {
+    while let Some((line, t)) = q.pop_front() {
         match t {
             Tok::Op("RET") => {
-                let mut operand: Vec<Tok> = Vec::new();
+                let mut operand: Vec<(u32, Tok)> = Vec::new();
                 let mut first = true;
                 while let Some(t2) = q.front() {
-                    if is_hard_boundary(t2) || (!first && matches!(t2, Tok::List(_) | Tok::Dict(_))) {
+                    if is_hard_boundary(t2) || (!first && matches!(&t2.1, Tok::List(_) | Tok::Dict(_))) {
                         break;
                     }
                     first = false;
@@ -197,27 +206,27 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 }
                 if operand.is_empty() {
                     // bare ret — return null
-                    p.ins.push(Ins::Ret);
+                    pi(&mut p, Ins::Ret, line);
                 } else {
                     // rewrite `ret X...` into `flush X... ret`: flush the
                     // values pushed before the operand to the real stack, so
                     // the ret's count rule sees only the values the operand
                     // itself leaves (strays get drained at the return)
-                    q.push_front(Tok::Op("RET"));
+                    q.push_front((line, Tok::Op("RET")));
                     for t2 in operand.into_iter().rev() {
                         q.push_front(t2);
                     }
-                    q.push_front(Tok::Ident("@flush".to_string()));
+                    q.push_front((line, Tok::Ident("@flush".to_string())));
                 }
             }
-            Tok::Op("FOR") => p.ins.push(Ins::For),
-            Tok::Op("IF") => p.ins.push(Ins::If),
-            Tok::Op("IFELSE") => p.ins.push(Ins::IfElse),
-            Tok::Op("WHILE") => p.ins.push(Ins::While),
-            Tok::Op("BREAK") => p.ins.push(Ins::Break),
-            Tok::Op("CONT") => p.ins.push(Ins::Cont),
-            Tok::Op("STRICT") => p.ins.push(Ins::Strict),
-            Tok::Op("LOOSE") => p.ins.push(Ins::Loose),
+            Tok::Op("FOR") => pi(&mut p, Ins::For, line),
+            Tok::Op("IF") => pi(&mut p, Ins::If, line),
+            Tok::Op("IFELSE") => pi(&mut p, Ins::IfElse, line),
+            Tok::Op("WHILE") => pi(&mut p, Ins::While, line),
+            Tok::Op("BREAK") => pi(&mut p, Ins::Break, line),
+            Tok::Op("CONT") => pi(&mut p, Ins::Cont, line),
+            Tok::Op("STRICT") => pi(&mut p, Ins::Strict, line),
+            Tok::Op("LOOSE") => pi(&mut p, Ins::Loose, line),
             Tok::Op("CAST") => {
                 // v14.1: _cast between all static-castable types. The
                 // immediate stays prefix preprocessing: a literal operand
@@ -235,25 +244,25 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 };
                 match (ty_lit, val_lit) {
                     (Some(0), Some((v, true))) => {
-                        p.ins.pop();
-                        p.ins.pop();
-                        p.ins.push(Ins::PushI(v as i64));
+                        p.ins.pop(); p.ins_lines.pop();
+                        p.ins.pop(); p.ins_lines.pop();
+                        pi(&mut p, Ins::PushI(v as i64), line);
                     }
                     (Some(0), Some((v, false))) => {
-                        p.ins.pop();
-                        p.ins.pop();
-                        p.ins.push(Ins::PushI(v as i64));
+                        p.ins.pop(); p.ins_lines.pop();
+                        p.ins.pop(); p.ins_lines.pop();
+                        pi(&mut p, Ins::PushI(v as i64), line);
                     }
                     (Some(1), Some((v, true))) => {
-                        p.ins.pop();
-                        p.ins.pop();
-                        p.ins.push(Ins::PushF(v));
+                        p.ins.pop(); p.ins_lines.pop();
+                        p.ins.pop(); p.ins_lines.pop();
+                        pi(&mut p, Ins::PushF(v), line);
                     }
                     (Some(1), Some((_, false))) => {
                         // float -> float: the cast is the identity
-                        p.ins.pop();
+                        p.ins.pop(); p.ins_lines.pop();
                     }
-                    _ => p.ins.push(simple_ins("CAST")),
+                    _ => pi(&mut p, simple_ins("CAST"), line),
                 }
             }
             Tok::Op(name) if name.starts_with('~') => {
@@ -269,27 +278,27 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
             }
             Tok::Op(name) => {
                 gate_op(name, caps);
-                p.ins.push(simple_ins(name))
+                pi(&mut p, simple_ins(name), line)
             }
-            Tok::PushI(v) => p.ins.push(Ins::PushI(v)),
+            Tok::PushI(v) => pi(&mut p, Ins::PushI(v), line),
             Tok::PushBool(v) => {
-                p.ins.push(Ins::PushI(v as i64));
-                p.ins.push(Ins::PushI(21));
-                p.ins.push(simple_ins("CAST"));
+                pi(&mut p, Ins::PushI(v as i64), line);
+                pi(&mut p, Ins::PushI(21), line);
+                pi(&mut p, simple_ins("CAST"), line);
             }
-            Tok::PushF(v) => p.ins.push(Ins::PushF(v)),
+            Tok::PushF(v) => pi(&mut p, Ins::PushF(v), line),
             Tok::PushS(s) => {
                 let idx = p.strings.len();
                 p.strings.push(s);
-                p.ins.push(Ins::PushS(idx));
+                pi(&mut p, Ins::PushS(idx), line);
             }
             Tok::Jump(op, label) => match op {
-                "ADDR" => p.ins.push(Ins::PushAddr(label)),
+                "ADDR" => pi(&mut p, Ins::PushAddr(label), line),
                 "CALL" => {
                     if let Some(ii) = p.imports.iter().position(|im| im.name == label) {
-                        p.ins.push(Ins::CallExt(ii));
+                        pi(&mut p, Ins::CallExt(ii), line);
                     } else {
-                        p.ins.push(Ins::Call(label));
+                        pi(&mut p, Ins::Call(label), line);
                     }
                 }
                 "JMP" => panic!("jmp removed — use entry/if/while/for"),
@@ -301,19 +310,19 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 if is_multi_return(p.ins.last(), &q) {
                     // v12 destructuring bind: ^name! after a multi-return op
                     let pattern = collect_destructure(Bind::Global(n), &mut q);
-                    emit_destructure(pattern, &mut p, &mut dtemp_ctr);
+                    emit_destructure(pattern, &mut p, &mut dtemp_ctr, line);
                 } else {
                     if !p.vars.contains(&n) {
                         p.vars.push(n.clone());
                     }
-                    p.ins.push(Ins::SetV(n));
+                    pi(&mut p, Ins::SetV(n), line);
                 }
             }
             Tok::GetV(n) => {
                 if !p.vars.contains(&n) {
                     p.vars.push(n.clone());
                 }
-                p.ins.push(Ins::GetV(n));
+                pi(&mut p, Ins::GetV(n), line);
             }
             Tok::LocalSet(n) => {
                 if macros.contains_key(&n) {
@@ -322,44 +331,44 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 if is_multi_return(p.ins.last(), &q) {
                     // v12 destructuring bind: name! after a multi-return op
                     let pattern = collect_destructure(Bind::Local(n), &mut q);
-                    emit_destructure(pattern, &mut p, &mut dtemp_ctr);
+                    emit_destructure(pattern, &mut p, &mut dtemp_ctr, line);
                 } else {
-                    p.ins.push(Ins::LocalSet(n));
+                    pi(&mut p, Ins::LocalSet(n), line);
                 }
             }
             Tok::LocalGet(n) => {
-                p.ins.push(Ins::LocalGet(n));
+                pi(&mut p, Ins::LocalGet(n), line);
             }
             Tok::Discard => {
                 if is_multi_return(p.ins.last(), &q) {
                     // v12 destructuring bind: leading _! after a multi-return op
                     let pattern = collect_destructure(Bind::Discard, &mut q);
-                    emit_destructure(pattern, &mut p, &mut dtemp_ctr);
+                    emit_destructure(pattern, &mut p, &mut dtemp_ctr, line);
                 } else {
                     panic!("_! is only valid inside a destructuring bind");
                 }
             }
             Tok::IncLocal(n) => {
-                p.ins.push(Ins::PushI(1));
-                p.ins.push(Ins::LocalGet(n.clone()));
-                p.ins.push(simple_ins("ADD"));
-                p.ins.push(Ins::LocalSet(n));
+                pi(&mut p, Ins::PushI(1), line);
+                pi(&mut p, Ins::LocalGet(n.clone()), line);
+                pi(&mut p, simple_ins("ADD"), line);
+                pi(&mut p, Ins::LocalSet(n), line);
             }
             Tok::AddLocal(n) => {
-                p.ins.push(Ins::LocalGet(n.clone()));
-                p.ins.push(simple_ins("ADD"));
-                p.ins.push(Ins::LocalSet(n));
+                pi(&mut p, Ins::LocalGet(n.clone()), line);
+                pi(&mut p, simple_ins("ADD"), line);
+                pi(&mut p, Ins::LocalSet(n), line);
             }
             Tok::IncGlobal(n) => {
-                p.ins.push(Ins::PushI(1));
-                p.ins.push(Ins::GetV(n.clone()));
-                p.ins.push(simple_ins("ADD"));
-                p.ins.push(Ins::SetV(n));
+                pi(&mut p, Ins::PushI(1), line);
+                pi(&mut p, Ins::GetV(n.clone()), line);
+                pi(&mut p, simple_ins("ADD"), line);
+                pi(&mut p, Ins::SetV(n), line);
             }
             Tok::AddGlobal(n) => {
-                p.ins.push(Ins::GetV(n.clone()));
-                p.ins.push(simple_ins("ADD"));
-                p.ins.push(Ins::SetV(n));
+                pi(&mut p, Ins::GetV(n.clone()), line);
+                pi(&mut p, simple_ins("ADD"), line);
+                pi(&mut p, Ins::SetV(n), line);
             }
             Tok::Import(im) => {
                 if !caps.cap("ffi.import") {
@@ -407,7 +416,7 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 if !p.externs.contains(&n) {
                     p.externs.push(n.clone());
                 }
-                p.ins.push(Ins::Extern(n));
+                pi(&mut p, Ins::Extern(n), line);
             }
             Tok::MacroDef(n, body) => {
                 macros.insert(n, body);
@@ -442,7 +451,7 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                         n, caps.policy_name, caps.origin
                     );
                 }
-                p.ins.push(Ins::Sys(n))
+                pi(&mut p, Ins::Sys(n), line)
             }
             Tok::Task { name, count, body } => {
                 // v10 fanout: count literal 1..64; count > 1 requires exactly
@@ -455,25 +464,26 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 // v13: leading binding tokens in the body are the task's input
                 // bindings (task name! makes that task's result a parameter)
                 let mut inputs: Vec<Param> = Vec::new();
-                let mut body: Vec<Tok> = body;
+                let mut body: Vec<(u32, Tok)> = body;
                 loop {
                     match body.first() {
-                        Some(Tok::LocalSet(nm)) => {
+                        Some((_, Tok::LocalSet(nm))) => {
                             inputs.push(Param::Local(nm.clone()));
                             body.remove(0);
                         }
-                        Some(Tok::SetV(nm)) => {
+                        Some((_, Tok::SetV(nm))) => {
                             inputs.push(Param::Global(nm.clone()));
                             body.remove(0);
                         }
-                        Some(Tok::Discard) => panic!("WEAVE: task {} input `_!` needs a task name", name),
+                        Some((_, Tok::Discard)) => panic!("WEAVE: task {} input `_!` needs a task name", name),
                         _ => break,
                     }
                 }
                 let skip = format!("__wskip{}", weave_ctr);
                 weave_ctr += 1;
-                p.ins.push(Ins::Goto(skip.clone()));
+                pi(&mut p, Ins::Goto(skip.clone()), line);
                 p.labels.insert(name.clone(), p.ins.len());
+                p.label_lines.insert(p.ins.len(), line);
                 // task bodies are self-contained: their labels are task-local,
                 // so two tasks may reuse the same v-names
                 let prefix = format!("{}/", name);
@@ -482,18 +492,18 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 for (k, par) in inputs.iter().rev().enumerate() {
                     let pc = p.ins.len();
                     match par {
-                        Param::Local(nm) => p.ins.push(Ins::LocalSet(nm.clone())),
+                        Param::Local(nm) => pi(&mut p, Ins::LocalSet(nm.clone()), line),
                         Param::Global(nm) => {
                             if !p.vars.contains(nm) {
                                 p.vars.push(nm.clone());
                             }
-                            p.ins.push(Ins::SetV(nm.clone()));
+                            pi(&mut p, Ins::SetV(nm.clone()), line);
                         }
                         Param::Discard => unreachable!(),
                     }
                     p.param_pcs.insert(pc, inputs.len() - 1 - k);
                 }
-                q.push_front(Tok::TaskEnd(skip));
+                q.push_front((line, Tok::TaskEnd(skip)));
                 for t in body.into_iter().rev() {
                     q.push_front(t);
                 }
@@ -503,19 +513,20 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 // v13: the task body ends with the user's explicit `ret`;
                 // the skip label just marks where the next unit begins
                 p.labels.insert(skip, p.ins.len());
+                p.label_lines.insert(p.ins.len(), line);
             }
             Tok::List(body) => {
                 let mut lbody = body;
-                lbody.push(Tok::Ident("@listlit".to_string()));
-                lbody.insert(0, Tok::Ident("@liststart".to_string()));
+                lbody.push((line, Tok::Ident("@listlit".to_string())));
+                lbody.insert(0, (line, Tok::Ident("@liststart".to_string())));
                 for t in lbody.into_iter().rev() {
                     q.push_front(t);
                 }
             }
             Tok::Dict(body) => {
                 let mut dbody = body;
-                dbody.push(Tok::Ident("@dictlit".to_string()));
-                dbody.insert(0, Tok::Ident("@dictstart".to_string()));
+                dbody.push((line, Tok::Ident("@dictlit".to_string())));
+                dbody.insert(0, (line, Tok::Ident("@dictstart".to_string())));
                 for t in dbody.into_iter().rev() {
                     q.push_front(t);
                 }
@@ -614,12 +625,13 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                             p.vars.push(m.name.clone());
                         }
                     }
-                    p.ins.push(Ins::Weave(metas));
+                    pi(&mut p, Ins::Weave(metas), line);
                 }
                 cur_weave.clear();
             }
             Tok::LabelDef(n) => {
                 p.labels.insert(n.clone(), p.ins.len());
+                p.label_lines.insert(p.ins.len(), line);
                 if pending_pub {
                     p.pubs.push(n.clone());
                     pending_pub = false;
@@ -639,7 +651,7 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 // holds the args in push order, last on top).
                 let mut params: Vec<Param> = Vec::new();
                 while let Some(t2) = q.front() {
-                    match t2 {
+                    match &t2.1 {
                         Tok::LocalSet(name) => {
                             params.push(Param::Local(name.clone()));
                             q.pop_front();
@@ -661,14 +673,14 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                 for (k, par) in params.iter().rev().enumerate() {
                     let pc = p.ins.len();
                     match par {
-                        Param::Local(name) => p.ins.push(Ins::LocalSet(name.clone())),
+                        Param::Local(name) => pi(&mut p, Ins::LocalSet(name.clone()), line),
                         Param::Global(name) => {
                             if !p.vars.contains(name) {
                                 p.vars.push(name.clone());
                             }
-                            p.ins.push(Ins::SetV(name.clone()));
+                            pi(&mut p, Ins::SetV(name.clone()), line);
                         }
-                        Param::Discard => p.ins.push(Ins::Simple("op_drop")),
+                        Param::Discard => pi(&mut p, Ins::Simple("op_drop"), line),
                     }
                     // guard offset: the k-th pop (0-based, reversed emission)
                     // pops only when the caller left (arity - k) cells; see
@@ -678,24 +690,25 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
             }
             Tok::Entry => {
                 p.labels.insert("entry".to_string(), p.ins.len());
+                p.label_lines.insert(p.ins.len(), line);
                 p.entry_label = Some("entry".to_string());
             }
             Tok::Ident(n) => {
                 if n == "@flush" {
-                    p.ins.push(Ins::Flush);
+                    pi(&mut p, Ins::Flush, line);
                 } else if n == "@liststart" {
-                    p.ins.push(Ins::ListStart);
+                    pi(&mut p, Ins::ListStart, line);
                 } else if n == "@dictstart" {
-                    p.ins.push(Ins::DictStart);
+                    pi(&mut p, Ins::DictStart, line);
                 } else if n == "@listlit" {
-                    p.ins.push(Ins::ListLit);
+                    pi(&mut p, Ins::ListLit, line);
                 } else if n == "@dictlit" {
-                    p.ins.push(Ins::DictLit);
+                    pi(&mut p, Ins::DictLit, line);
                 } else if let Some(rest) = n.strip_prefix("@sizeof:") {
                     if let Some(id) = type_id(rest) {
-                        p.ins.push(Ins::PushI(if id == 3 || id == 21 { 1 } else { 8 }));
+                        pi(&mut p, Ins::PushI(if id == 3 || id == 21 { 1 } else { 8 }), line);
                     } else if let Some((_, tsz, _)) = structs.get(rest) {
-                        p.ins.push(Ins::PushI(*tsz));
+                        pi(&mut p, Ins::PushI(*tsz), line);
                     } else {
                         panic!("SIZEOF: unknown type {}", rest);
                     }
@@ -711,18 +724,18 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                         .iter()
                         .find(|(f, _)| f == parts[1])
                         .unwrap_or_else(|| panic!("OFFSET: no field {} in {}", parts[1], parts[0]));
-                    p.ins.push(Ins::PushI(off.1));
+                    pi(&mut p, Ins::PushI(off.1), line);
                 } else if let Some(rest) = n.strip_prefix("@objsize:") {
                     let (_, tsz, sid) = structs
                         .get(rest)
                         .unwrap_or_else(|| panic!("OBJ: unknown struct {}", rest));
                     // size in low 32 bits, struct id above (op_obj splits them)
-                    p.ins.push(Ins::PushI(tsz | (sid << 32)));
+                    pi(&mut p, Ins::PushI(tsz | (sid << 32)), line);
                 } else if let Some(rest) = n.strip_prefix("@cast:") {
                     let (_, _, sid) = structs
                         .get(rest)
                         .unwrap_or_else(|| panic!("CAST: unknown struct {}", rest));
-                    p.ins.push(Ins::PushI(1000 + sid));
+                    pi(&mut p, Ins::PushI(1000 + sid), line);
                 } else if let Some(body) = macros.get(&n).cloned() {
                     expand_depth += 1;
                     if expand_depth > 1024 {
@@ -735,10 +748,15 @@ pub fn parse(toks: Vec<Tok>, structs: &mut StructMap, caps: &Caps) -> Parsed {
                     panic!("'{}' is a reserved word (opcode mnemonic)", n);
                 } else {
                     // v15: a bare name is an implicit variable load
-                    p.ins.push(Ins::LocalGet(n));
+                    pi(&mut p, Ins::LocalGet(n), line);
                 }
             }
         }
+    }
+    p.ins_files = vec![0; p.ins.len()];
+    p.file_names = vec![p.modname.clone().unwrap_or_else(|| "main".to_string())];
+    for (n, &pc) in &p.labels {
+        p.label_names.entry(pc).or_insert_with(|| n.clone());
     }
     let _ = imports;
     // v13: every label body must end with `ret` (a path that falls off the end
@@ -1167,6 +1185,8 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
         // pcs that attributed wrong arities to shifted labels
         let mut newpc: Vec<usize> = vec![0; p.ins.len()];
         let mut new_body: Vec<usize> = Vec::with_capacity(p.ins.len());
+        let mut new_lines: Vec<u32> = Vec::with_capacity(p.ins.len());
+        let mut new_files: Vec<usize> = Vec::with_capacity(p.ins.len());
         let mut w = 0;
         for r in 0..p.ins.len() {
             // Labels on a Nop'd instruction (e.g. `full: x++` whose PushI(1)
@@ -1175,10 +1195,14 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
             if !matches!(p.ins[r], Ins::Nop) {
                 p.ins[w] = p.ins[r].clone();
                 new_body.push(ins_body[r]);
+                new_lines.push(p.ins_lines[r]);
+                new_files.push(p.ins_files[r]);
                 w += 1;
             }
         }
         p.ins.truncate(w);
+        p.ins_lines = new_lines;
+        p.ins_files = new_files;
         ins_body.clear();
         ins_body.extend(new_body);
         let map = |pc: usize| -> usize { if pc < newpc.len() { newpc[pc] } else { w } };
@@ -1188,6 +1212,10 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
         for (pc, ps) in old_lps { p.label_params.insert(map(pc), ps); }
         let old_params = std::mem::take(&mut p.param_pcs);
         for (pc, off) in old_params { p.param_pcs.insert(map(pc), off); }
+        let old_ll = std::mem::take(&mut p.label_lines);
+        for (pc, ln) in old_ll { p.label_lines.insert(map(pc), ln); }
+        let old_ln = std::mem::take(&mut p.label_names);
+        for (pc, nm) in old_ln { p.label_names.insert(map(pc), nm); }
     }
 
 
@@ -1235,14 +1263,14 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
         }
     }
 }
-pub fn prefix_task_labels(body: Vec<Tok>, prefix: &str) -> Vec<Tok> {
+pub fn prefix_task_labels(body: Vec<(u32, Tok)>, prefix: &str) -> Vec<(u32, Tok)> {
     body.into_iter()
-        .map(|t| match t {
+        .map(|(ln, t)| (ln, match t {
             Tok::LabelDef(n) => Tok::LabelDef(format!("{}{}", prefix, n)),
             Tok::Jump(op, l) => Tok::Jump(op, format!("{}{}", prefix, l)),
             Tok::MacroDef(n, mbody) => Tok::MacroDef(n, prefix_task_labels(mbody, prefix)),
             other => other,
-        })
+        }))
         .collect()
 }
 
@@ -1254,7 +1282,11 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
     let mut tu_shared: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut m = Parsed {
         ins: Vec::new(),
+        ins_lines: Vec::new(),
+        ins_files: Vec::new(),
+        file_names: Vec::new(),
         labels: HashMap::new(),
+        label_names: HashMap::new(),
         imports: Vec::new(),
         exports: Vec::new(),
         externs: Vec::new(),
@@ -1270,7 +1302,9 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
         local_names: HashMap::new(),
         label_params: HashMap::new(),
         param_pcs: HashMap::new(),
+        label_lines: HashMap::new(),
     };
+    let file_names = mods.clone();
     for (tu_idx, (tu, defmod)) in tus.into_iter().zip(mods).enumerate() {
         let modname = tu.modname.clone().unwrap_or(defmod);
         let off = m.ins.len();
@@ -1309,7 +1343,7 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
                 l.clone()
             }
         };
-        for ins in &tu.ins {
+        for (li, ins) in tu.ins.iter().enumerate() {
             m.ins.push(match ins {
                 Ins::PushI(v) => Ins::PushI(*v),
                 Ins::PushF(v) => Ins::PushF(*v),
@@ -1354,17 +1388,28 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
                 Ins::Break => Ins::Break,
                 Ins::Cont => Ins::Cont,
             });
+            m.ins_lines.push(tu.ins_lines[li]);
+            m.ins_files.push(tu_idx);
         }
         for (name, idx) in &tu.labels {
             m.labels.insert(format!("{}:{}", modname, name), idx + off);
+            m.label_names.entry(idx + off).or_insert_with(|| name.clone());
+            if let Some(ln) = tu.label_lines.get(idx) {
+                m.label_lines.insert(idx + off, *ln);
+            }
         }
         // a TU's top-level flow must not fall through into the next TU
         m.ins.push(Ins::Ret);
+        m.ins_lines.push(0);
+        m.ins_files.push(tu_idx);
         for name in &tu.pubs {
             if m.labels.contains_key(name) {
                 panic!("duplicate PUB label {}", name);
             }
             m.labels.insert(name.clone(), tu.labels[name] + off);
+            if let Some(ln) = tu.label_lines.get(&tu.labels[name]) {
+                m.label_lines.entry(tu.labels[name] + off).or_insert(*ln);
+            }
             m.pubs.push(name.clone());
         }
         for (tk, mh, l) in &tu.methods {
@@ -1399,6 +1444,7 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
             m.param_pcs.insert(pc + off, k);
         }
     }
+    m.file_names = file_names;
     resolve_locals(&mut m, tu_shared);
     m
 }
@@ -1585,6 +1631,7 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "RANGEFOLD" => "op_rangefold",
         "TRANSPOSE" => "op_transpose",
         "DCAST" => "op_dcast",
+        "DBG" => "op_dbg", "CHECK" => "op_check", "TIMER" => "op_timer", "MEMSTATS" => "op_memstats",
 
         other => panic!("no helper for {}", other),
     };
@@ -1612,6 +1659,7 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         "op_arr" | "op_tensor" => (2, 1),
         "op_cast" => (2, 1),
         "op_dcast" => (2, 1),
+        "op_dbg" => (0, 0), "op_check" => (1, 0), "op_timer" => (0, 1), "op_memstats" => (0, 1),
         // vector
         "op_vadd" | "op_vsub" | "op_vmul" | "op_vdiv" => (2, 1),
         "op_veadd" | "op_vesub" | "op_vemul" | "op_vediv" | "op_vemax" | "op_vemin" => (2, 1),

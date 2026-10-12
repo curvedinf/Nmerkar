@@ -9,7 +9,7 @@ pub const TYPE_BASE: u32 = 0x13110;
 
 // Opcode glyphs (194 live ops). Index = OP_NAMES array position.
 // All colored emoji (U+1F300+), each exactly one Qwen3 token.
-pub const OP_GLYPHS: [u32; 218] = [
+pub const OP_GLYPHS: [u32; 222] = [
     0x1F300, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1F682, 0x1F910,
     0x1F302, 0x1F602, 0x1F683, 0x1F911, 0x1F303, 0x1FA94, 0x1FA91, 0x1FA92,
     0x1F603, 0x1F684, 0x1F912, 0x1F304, 0x1F604, 0x1F685, 0x1FA90, 0x1F913,
@@ -41,6 +41,7 @@ pub const OP_GLYPHS: [u32; 218] = [
     0x1F500,
     0x1F512, 0x1F513,
     0x1F501,
+    0x1F50D, 0x1F3AF, 0x1F552, 0x1F4CA,
 ];
 
 // v-space: base-64 digits for variable/label name atoms (colored emoji).
@@ -121,10 +122,10 @@ pub fn glyph_type_id(c: char) -> Option<i64> {
     }
 }
 
-// 218 opcode slots (0..=217). Retired indices use "~NN" placeholders: they
+// 222 opcode slots (0..=221). Retired indices use "~NN" placeholders: they
 // have no glyph, no text mnemonic, and no runtime helper — any use is a
 // compile error (unassigned glyph / unknown identifier).
-pub const OP_NAMES: [&str; 218] = [
+pub const OP_NAMES: [&str; 222] = [
     "LIT", "~1", "~2", "~3", "~4", "~5", "ADD", "SUB", "MUL", "AND", "SHR", "INC", "DEC",
     "POW", "SQRT", "LTE", "FOR", "CALL", "RET", "OBJ", "GET", "SET", "GTE", "ARR", "SHUTDOWN", "~25",
     "CLONE", "CAST", "MACRO", "TENSOR", "~30", "~31", "~32", "SETV", "GETV", "STR", "CAT", "FMT",
@@ -167,6 +168,7 @@ pub const OP_NAMES: [&str; 218] = [
     "TRANSPOSE",
     "STRICT", "LOOSE",
     "DCAST",
+    "DBG", "CHECK", "TIMER", "MEMSTATS",
 ];
 
 pub fn op_index(name: &str) -> Option<usize> {
@@ -376,6 +378,10 @@ pub fn op_usage(name: &str) -> &'static str {
         "STRICT" => "v → v | mark value strict (no implicit coercion; compile-time)",
         "LOOSE" => "v → v | remove strictness from value (compile-time)",
         "DCAST" => "v type → v' | dynamic cast: explicit universal coercion (int/float/ptr/byte/str tag 9/struct id)",
+        "DBG" => "v → v | peek: print 'dbg <site>: <value>' to stderr (smart rendering, no pop)",
+        "CHECK" => "v → — | one-token assert: a falsy value dies 'check failed' at this line",
+        "TIMER" => "— → ns | push monotonic clock in nanoseconds (int; only differences are meaningful)",
+        "MEMSTATS" => "— → dict | GC stats {gc: collects, objs: live objects, live: live bytes, alloc: total alloc bytes}",
         _ => "",
     }
 }
@@ -395,6 +401,7 @@ pub fn type_id(kw: &str) -> Option<i64> {
 pub struct Lexer {
     chars: Vec<char>,
     pos: usize,
+    line: u32,
     // v13: true when the previous token was RET — a number directly after
     // `ret` is the return operand, never a weave worker count
     prev_ret: bool,
@@ -402,7 +409,7 @@ pub struct Lexer {
 
 impl Lexer {
     fn new(src: &str) -> Self {
-        Lexer { chars: src.chars().collect(), pos: 0, prev_ret: false }
+        Lexer { chars: src.chars().collect(), pos: 0, line: 1, prev_ret: false }
     }
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
@@ -410,10 +417,17 @@ impl Lexer {
     fn at(&self, off: usize) -> Option<char> {
         self.chars.get(self.pos + off).copied()
     }
+    // advance one char, counting newlines (single source of line truth)
+    fn bump(&mut self) {
+        if self.chars.get(self.pos) == Some(&'\n') {
+            self.line += 1;
+        }
+        self.pos += 1;
+    }
     fn next(&mut self) -> Option<char> {
         let c = self.peek();
         if c.is_some() {
-            self.pos += 1;
+            self.bump();
         }
         c
     }
@@ -421,14 +435,14 @@ impl Lexer {
         loop {
             match self.peek() {
                 Some(c) if c.is_whitespace() => {
-                    self.pos += 1;
+                    self.bump();
                 }
                 Some(';') => {
                     while let Some(c) = self.peek() {
                         if c == '\n' {
                             break;
                         }
-                        self.pos += 1;
+                        self.bump();
                     }
                 }
                 _ => break,
@@ -436,14 +450,14 @@ impl Lexer {
         }
     }
     fn err(&self, msg: &str) -> ! {
-        panic!("lex error at char {}: {}", self.pos, msg)
+        panic!("lex error at char {} (line {}): {}", self.pos, self.line, msg)
     }
     fn lex_ident(&mut self) -> String {
         let mut s = String::new();
         while let Some(c) = self.peek() {
             if c.is_ascii_alphanumeric() || c == '_' {
                 s.push(c);
-                self.pos += 1;
+                self.bump();
             } else {
                 break;
             }
@@ -459,7 +473,7 @@ impl Lexer {
     }
     fn lex_string(&mut self) -> String {
         // assumes current char is '"'
-        self.pos += 1;
+        self.bump();
         let mut s = String::new();
         loop {
             match self.next() {
@@ -492,7 +506,7 @@ impl Lexer {
                 }
                 name.push_str(&i.to_string());
                 first = false;
-                self.pos += 1;
+                self.bump();
             } else {
                 break;
             }
@@ -507,7 +521,7 @@ impl Lexer {
             let cp = c as u32;
             if let Some(d) = l_index(cp) {
                 ds.push(d);
-                self.pos += 1;
+                self.bump();
             } else {
                 break;
             }
@@ -535,7 +549,7 @@ impl Lexer {
         let mut is_float = false;
         let mut frac = 0.0f64;
         if self.peek() == Some('.') {
-            self.pos += 1;
+            self.bump();
             let ds = self.lrun();
             if ds.is_empty() {
                 self.err("'.' in a number must be followed by an l-run");
@@ -552,9 +566,9 @@ impl Lexer {
         }
         let mut exp: i64 = 0;
         if self.peek() == Some('e') {
-            self.pos += 1;
+            self.bump();
             let eneg = if self.peek() == Some('-') {
-                self.pos += 1;
+                self.bump();
                 true
             } else {
                 false
@@ -581,14 +595,14 @@ impl Lexer {
         Tok::PushF(f)
     }
     // lex the whole source
-    fn lex(&mut self) -> Vec<Tok> {
+    fn lex(&mut self) -> Vec<(u32, Tok)> {
         let mut out = Vec::new();
         self.lex_into(&mut out, 0);
         out
     }
     // lex until EOF (stop=0), until matching '}' (1), until ']' (3),
     // until the TASK or WRUN glyph (5, not consumed)
-    fn lex_into(&mut self, out: &mut Vec<Tok>, stop: u8) {
+    fn lex_into(&mut self, out: &mut Vec<(u32, Tok)>, stop: u8) {
         loop {
             self.skip_ws();
             let c = match self.peek() {
@@ -602,15 +616,15 @@ impl Lexer {
             };
             let cp = c as u32;
             if cp >= DELIM_BASE && cp <= DELIM_BASE + 8 {
-                self.pos += 1;
+                self.bump();
                 continue; // delimiters are invisible
             }
             if stop == 1 && c == '}' {
-                self.pos += 1;
+                self.bump();
                 return;
             }
             if stop == 3 && c == ']' {
-                self.pos += 1;
+                self.bump();
                 return;
             }
             if stop == 5 && (opcode_index(c) == Some(82) || opcode_index(c) == Some(84)) {
@@ -639,7 +653,7 @@ impl Lexer {
             // ---- l-space: self-evaluating base-64 number ----
             if is_l(cp) {
                 self.prev_ret = false;
-                out.push(self.lex_lnumber(false));
+                out.push((self.line, self.lex_lnumber(false)));
                 continue;
             }
             // ---- v14: ^ removed — plain names; shared vars are declared by
@@ -657,44 +671,44 @@ impl Lexer {
                 self.skip_ws();
                 let g = self.peek();
                 if g == Some('!') || g.map_or(false, |c| opcode_index(c) == Some(33)) {
-                    self.pos += 1;
-                    out.push(Tok::LocalSet(name));
+                    self.bump();
+                    out.push((self.line, Tok::LocalSet(name)));
                 } else if g == Some('+') && self.at(1) == Some('+') {
                     // v15: dense name++ / name+= round-trip (emit writes them)
                     self.pos += 2;
-                    out.push(Tok::IncLocal(name));
+                    out.push((self.line, Tok::IncLocal(name)));
                 } else if g == Some('+') && self.at(1) == Some('=') {
                     self.pos += 2;
-                    out.push(Tok::AddLocal(name));
+                    out.push((self.line, Tok::AddLocal(name)));
                 } else if g == Some(GLYPH_LABEL_DEF) {
-                    self.pos += 1;
-                    out.push(Tok::LabelDef(name));
+                    self.bump();
+                    out.push((self.line, Tok::LabelDef(name)));
                 } else {
                     // v15: bare names load implicitly (`@` varget removed)
-                    out.push(Tok::LocalGet(name));
+                    out.push((self.line, Tok::LocalGet(name)));
                 }
                 continue;
             }
             // ---- v15 immediate tags: compile-time struct-name operands ----
             if c == GLYPH_TAG_SIZEOF || c == GLYPH_TAG_OFFSET || c == GLYPH_TAG_OBJSIZE || c == GLYPH_TAG_CAST {
                 self.prev_ret = false;
-                self.pos += 1;
+                self.bump();
                 self.skip_ws();
                 let sym = self.tag_name("tag operand");
                 if c == GLYPH_TAG_SIZEOF {
-                    out.push(Tok::Ident(format!("@sizeof:{}", sym)));
+                    out.push((self.line, Tok::Ident(format!("@sizeof:{}", sym))));
                 } else if c == GLYPH_TAG_OFFSET {
                     if self.peek() == Some('.') {
-                        self.pos += 1;
+                        self.bump();
                         let field = self.tag_name("offset field");
-                        out.push(Tok::Ident(format!("@offset:{}.{}", sym, field)));
+                        out.push((self.line, Tok::Ident(format!("@offset:{}.{}", sym, field))));
                     } else {
-                        out.push(Tok::Ident(format!("@offset:{}", sym)));
+                        out.push((self.line, Tok::Ident(format!("@offset:{}", sym))));
                     }
                 } else if c == GLYPH_TAG_OBJSIZE {
-                    out.push(Tok::Ident(format!("@objsize:{}", sym)));
+                    out.push((self.line, Tok::Ident(format!("@objsize:{}", sym))));
                 } else {
-                    out.push(Tok::Ident(format!("@cast:{}", sym)));
+                    out.push((self.line, Tok::Ident(format!("@cast:{}", sym))));
                 }
                 continue;
             }
@@ -708,26 +722,26 @@ impl Lexer {
             // ---- ASCII tokens ----
             match c {
                 '[' => {
-                    self.pos += 1;
+                    self.bump();
                     let mut body = Vec::new();
                     self.lex_into(&mut body, 3);
-                    out.push(Tok::List(body));
+                    out.push((self.line, Tok::List(body)));
                     continue;
                 }
                 '{' => {
-                    self.pos += 1;
+                    self.bump();
                     let mut body = Vec::new();
                     self.lex_into(&mut body, 1);
-                    out.push(Tok::Dict(body));
+                    out.push((self.line, Tok::Dict(body)));
                     continue;
                 }
                 '\'' => {
                     // ADDR: '<label> (v-run or ASCII)
                     self.prev_ret = false;
-                    self.pos += 1;
+                    self.bump();
                     self.skip_ws();
                     let label = self.jump_label("ADDR");
-                    out.push(Tok::Jump("ADDR", label));
+                    out.push((self.line, Tok::Jump("ADDR", label)));
                     continue;
                 }
                 '+' => self.err("'+' removed in v13 — use `add`"),
@@ -739,16 +753,16 @@ impl Lexer {
                 '"' => {
                     // bare string self-evaluates (PushS)
                     self.prev_ret = false;
-                    out.push(Tok::PushS(self.lex_string()));
+                    out.push((self.line, Tok::PushS(self.lex_string())));
                     continue;
                 }
                 '-' => {
                     // v13: '-' is only part of a number literal — always a sign
-                    self.pos += 1;
+                    self.bump();
                     self.skip_ws();
                     match self.peek() {
                         Some(g) if is_l(g as u32) => {
-                            out.push(self.lex_lnumber(true));
+                            out.push((self.line, self.lex_lnumber(true)));
                         }
                         _ => self.err("stray '-' (v13 has no SUB symbol — use `sub`; a sign needs an l-run after it)"),
                     }
@@ -761,13 +775,13 @@ impl Lexer {
             // ---- bare type glyph: pushes the type id ----
             if let Some(id) = glyph_type_id(c) {
                 self.prev_ret = false;
-                self.pos += 1;
-                out.push(Tok::PushI(id));
+                self.bump();
+                out.push((self.line, Tok::PushI(id)));
                 continue;
             }
             // ---- opcode glyphs (custom table + legacy aliases) ----
             if let Some(idx) = opcode_index(c) {
-                self.pos += 1;
+                self.bump();
                 self.prev_ret = idx == 18; // RET glyph
                 self.lex_op(idx, out);
                 continue;
@@ -779,19 +793,19 @@ impl Lexer {
                     self.err(&format!("identifier '{}' — identifiers may not start with '_'", name));
                 }
                 if name == "_" && (self.peek() == Some('!') || self.peek().map_or(false, |c| opcode_index(c) == Some(33))) {
-                    self.pos += 1;
-                    out.push(Tok::Discard);
+                    self.bump();
+                    out.push((self.line, Tok::Discard));
                     continue;
                 }
                 if name == "true" || name == "false" {
-                    out.push(Tok::PushBool(name == "true"));
+                    out.push((self.line, Tok::PushBool(name == "true")));
                     continue;
                 }
                 if self.peek() == Some(':') {
-                    self.pos += 1;
-                    out.push(Tok::LabelDef(name));
+                    self.bump();
+                    out.push((self.line, Tok::LabelDef(name)));
                 } else {
-                    out.push(Tok::Ident(name));
+                    out.push((self.line, Tok::Ident(name)));
                 }
                 continue;
             }
@@ -820,11 +834,11 @@ impl Lexer {
         label
     }
 
-    fn lex_op(&mut self, idx: usize, out: &mut Vec<Tok>) {
+    fn lex_op(&mut self, idx: usize, out: &mut Vec<(u32, Tok)>) {
         self.lex_op_inner(idx, out);
     }
 
-    fn lex_op_inner(&mut self, idx: usize, out: &mut Vec<Tok>) {
+    fn lex_op_inner(&mut self, idx: usize, out: &mut Vec<(u32, Tok)>) {
         let name = OP_NAMES[idx];
         match name {
             "LIT" => {
@@ -833,15 +847,15 @@ impl Lexer {
                 let cp = c as u32;
                 if let Some(id) = glyph_type_id(c) {
                     // type glyph after LIT: push the type id (like `LIT int`)
-                    self.pos += 1;
-                    out.push(Tok::PushI(id));
+                    self.bump();
+                    out.push((self.line, Tok::PushI(id)));
                 } else if is_l(cp) {
                     // l-run number after LIT (same grammar as a bare l-run)
-                    out.push(self.lex_lnumber(false));
+                    out.push((self.line, self.lex_lnumber(false)));
                 } else if c.is_ascii_alphabetic() {
                     let kw = self.lex_ident();
                     match type_id(&kw) {
-                        Some(id) => out.push(Tok::PushI(id)),
+                        Some(id) => out.push((self.line, Tok::PushI(id))),
                         None => self.err(&format!("unknown type keyword {}", kw)),
                     }
                 } else {
@@ -851,20 +865,20 @@ impl Lexer {
                             || matches!(c, 'x' | 'X' | 'a'..='f' | 'A'..='F' | '.' | '+' | '-' | '_')
                         {
                             s.push(c);
-                            self.pos += 1;
+                            self.bump();
                         } else {
                             break;
                         }
                     }
                     let s = s.replace('_', "");
                     if s.starts_with("0x") || s.starts_with("0X") {
-                        out.push(Tok::PushI(
+                        out.push((self.line, Tok::PushI(
                             i64::from_str_radix(&s[2..], 16).unwrap_or_else(|_| self.err("bad hex literal")),
-                        ));
+                        )));
                     } else if s.contains('.') || s.contains('e') || s.contains('E') {
-                        out.push(Tok::PushF(s.parse().unwrap_or_else(|_| self.err("bad float literal"))));
+                        out.push((self.line, Tok::PushF(s.parse().unwrap_or_else(|_| self.err("bad float literal")))));
                     } else {
-                        out.push(Tok::PushI(s.parse().unwrap_or_else(|_| self.err("bad int literal"))));
+                        out.push((self.line, Tok::PushI(s.parse().unwrap_or_else(|_| self.err("bad int literal")))));
                     }
                 }
             }
@@ -873,7 +887,7 @@ impl Lexer {
                 if self.peek() != Some('"') {
                     self.err("STR must be followed by a string literal");
                 }
-                out.push(Tok::PushS(self.lex_string()));
+                out.push((self.line, Tok::PushS(self.lex_string())));
             }
             "JMP" | "JZ" | "JE" | "CALL" | "ADDR" => {
                 self.skip_ws();
@@ -881,10 +895,10 @@ impl Lexer {
                 if name == "JMP" { self.err("jmp removed — use entry/if/while/for"); }
                 if name == "JZ" { self.err("jz removed — use if/ifelse/while"); }
                 if name == "JE" { self.err("je removed — use if/ifelse"); }
-                out.push(Tok::Jump(OP_NAMES[idx], label));
+                out.push((self.line, Tok::Jump(OP_NAMES[idx], label)));
             }
             "ENTRY" => {
-                out.push(Tok::Entry);
+                out.push((self.line, Tok::Entry));
             }
             "IMPORT" => {
                 self.skip_ws();
@@ -921,38 +935,38 @@ impl Lexer {
                 self.skip_ws();
                 // accept "->" or bare ">" (paper typo tolerated)
                 if self.peek() == Some('-') {
-                    self.pos += 1;
+                    self.bump();
                 }
                 if self.next() != Some('>') {
                     self.err("IMPORT: expected '->'");
                 }
                 self.skip_ws();
                 let ret = self.lex_ident();
-                out.push(Tok::Import(Import { name: fname, params, ret }));
+                out.push((self.line, Tok::Import(Import { name: fname, params, ret })));
             }
             "EXPORT" => {
                 self.skip_ws();
                 if self.peek() != Some('"') {
                     self.err("EXPORT must be followed by \"name\"");
                 }
-                out.push(Tok::Export(self.lex_string()));
+                out.push((self.line, Tok::Export(self.lex_string())));
             }
             "USE" => {
                 self.skip_ws();
                 if self.peek() != Some('"') {
                     self.err("USE must be followed by \"name\"");
                 }
-                out.push(Tok::Use(self.lex_string()));
+                out.push((self.line, Tok::Use(self.lex_string())));
             }
             "MOD" => {
                 self.skip_ws();
                 if self.peek() != Some('"') {
                     self.err("MOD must be followed by \"name\"");
                 }
-                out.push(Tok::Mod(self.lex_string()));
+                out.push((self.line, Tok::Mod(self.lex_string())));
             }
             "PUB" => {
-                out.push(Tok::Pub);
+                out.push((self.line, Tok::Pub));
             }
             "WEAVE" => {
                 // v13: [count l-run] TASK <name v-run> [':'] body, repeated until
@@ -963,7 +977,7 @@ impl Lexer {
                     self.skip_ws();
                     match self.peek() {
                         Some(g) if opcode_index(g) == Some(84) => {
-                            self.pos += 1;
+                            self.bump();
                             let terminal = match self.peek() {
                                 Some(g2) if is_v(g2 as u32) => {
                                     let t = self.fold_slots();
@@ -972,7 +986,7 @@ impl Lexer {
                                 }
                                 _ => None,
                             };
-                            out.push(Tok::Wrun(terminal));
+                            out.push((self.line, Tok::Wrun(terminal)));
                             break;
                         }
                         Some(g) if is_l(g as u32) || opcode_index(g) == Some(82) => {
@@ -984,7 +998,7 @@ impl Lexer {
                                 }
                             }
                             match self.peek() {
-                                Some(g2) if opcode_index(g2) == Some(82) => self.pos += 1,
+                                Some(g2) if opcode_index(g2) == Some(82) => self.bump(),
                                 _ => self.err("WEAVE: expected TASK glyph after worker count"),
                             }
                             self.skip_ws();
@@ -994,12 +1008,12 @@ impl Lexer {
                             };
                             self.skip_ws();
                             if self.peek() == Some(':') {
-                                self.pos += 1;
+                                self.bump();
                                 self.skip_ws();
                             }
                             let mut body = Vec::new();
                             self.lex_into(&mut body, 5);
-                            out.push(Tok::Task { name, count, body });
+                            out.push((self.line, Tok::Task { name, count, body }));
                         }
                         _ => self.err("WEAVE: expected task name or RUN"),
                     }
@@ -1011,7 +1025,7 @@ impl Lexer {
                 if self.peek() != Some('"') {
                     self.err("EXTERN must be followed by \"symbol\"");
                 }
-                out.push(Tok::Extern(self.lex_string()));
+                out.push((self.line, Tok::Extern(self.lex_string())));
             }
             "MACRO" => {
                 self.skip_ws();
@@ -1025,7 +1039,7 @@ impl Lexer {
                 }
                 let mut body = Vec::new();
                 self.lex_into(&mut body, 1);
-                out.push(Tok::MacroDef(mname, body));
+                out.push((self.line, Tok::MacroDef(mname, body)));
             }
             "STRUCT" => {
                 self.skip_ws();
@@ -1063,15 +1077,15 @@ impl Lexer {
                         None => self.err("STRUCT: unterminated body"),
                     }
                 }
-                out.push(Tok::StructDef(sname, fields));
+                out.push((self.line, Tok::StructDef(sname, fields)));
             }
             "SIZEOF" => {
                 self.skip_ws();
                 if let Some(c) = self.peek() {
                     if let Some(id) = glyph_type_id(c) {
-                        self.pos += 1;
-                        out.push(Tok::PushI(id));
-                        out.push(Tok::Op("SIZEOF"));
+                        self.bump();
+                        out.push((self.line, Tok::PushI(id)));
+                        out.push((self.line, Tok::Op("SIZEOF")));
                         return;
                     }
                     if c.is_ascii_alphabetic() {
@@ -1079,11 +1093,11 @@ impl Lexer {
                         if is_bad_ident(&sym) {
                             self.err(&format!("sizeof: '{}' — identifiers may not start with '_'", sym));
                         }
-                        out.push(Tok::Ident(format!("@sizeof:{}", sym)));
+                        out.push((self.line, Tok::Ident(format!("@sizeof:{}", sym))));
                         return;
                     }
                 }
-                out.push(Tok::Op("SIZEOF"));
+                out.push((self.line, Tok::Op("SIZEOF")));
             }
             "OFFSET" => {
                 self.skip_ws();
@@ -1092,11 +1106,11 @@ impl Lexer {
                     self.err(&format!("offset: '{}' — identifiers may not start with '_'", sym));
                 }
                 if self.peek() == Some('.') {
-                    self.pos += 1;
+                    self.bump();
                     let field = self.lex_ident();
-                    out.push(Tok::Ident(format!("@offset:{}.{}", sym, field)));
+                    out.push((self.line, Tok::Ident(format!("@offset:{}.{}", sym, field))));
                 } else if !sym.is_empty() {
-                    out.push(Tok::Ident(format!("@offset:{}", sym)));
+                    out.push((self.line, Tok::Ident(format!("@offset:{}", sym))));
                 } else {
                     self.err("OFFSET needs Struct.field");
                 }
@@ -1109,9 +1123,9 @@ impl Lexer {
                 if let Some(c) = self.peek() {
                     if let Some(id) = glyph_type_id(c) {
                         // type-glyph immediate: push the id, then the op
-                        self.pos += 1;
-                        out.push(Tok::PushI(id));
-                        out.push(Tok::Op(OP_NAMES[idx]));
+                        self.bump();
+                        out.push((self.line, Tok::PushI(id)));
+                        out.push((self.line, Tok::Op(OP_NAMES[idx])));
                         return;
                     }
                     if c.is_ascii_alphabetic() {
@@ -1120,21 +1134,21 @@ impl Lexer {
                             self.err(&format!("{}: type name '{}' — identifiers may not start with '_'", name, kw));
                         }
                         if let Some(id) = type_id(&kw) {
-                            out.push(Tok::PushI(id));
+                            out.push((self.line, Tok::PushI(id)));
                         } else if name == "OBJ" {
                             // struct name: resolved at parse time via @objsize
-                            out.push(Tok::Ident(format!("@objsize:{}", kw)));
+                            out.push((self.line, Tok::Ident(format!("@objsize:{}", kw))));
                         } else if name == "CAST" {
                             // struct name: checked downcast via @cast
-                            out.push(Tok::Ident(format!("@cast:{}", kw)));
+                            out.push((self.line, Tok::Ident(format!("@cast:{}", kw))));
                         } else {
                             self.err(&format!("unknown type keyword {}", kw));
                         }
-                        out.push(Tok::Op(OP_NAMES[idx]));
+                        out.push((self.line, Tok::Op(OP_NAMES[idx])));
                         return;
                     }
                 }
-                out.push(Tok::Op(OP_NAMES[idx]));
+                out.push((self.line, Tok::Op(OP_NAMES[idx])));
             }
             "SYS" => {
                 self.skip_ws();
@@ -1144,15 +1158,15 @@ impl Lexer {
                     if c.is_ascii_digit() {
                         n = n * 10 + (c as usize - '0' as usize);
                         got = true;
-                        self.pos += 1;
+                        self.bump();
                     } else {
                         break;
                     }
                 }
-                out.push(Tok::Sys(if got { n } else { 0 }));
+                out.push((self.line, Tok::Sys(if got { n } else { 0 })));
             }
             _ => {
-                out.push(Tok::Op(OP_NAMES[idx]));
+                out.push((self.line, Tok::Op(OP_NAMES[idx])));
             }
         }
     }
@@ -1231,6 +1245,7 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "SEQ" => "structural_equal", "SNE" => "structural_not_equal",
         "STRICT" => "strict", "LOOSE" => "loose",
         "DCAST" => "cast",
+        "DBG" => "dbg", "CHECK" => "check", "TIMER" => "timer", "MEMSTATS" => "memstats",
         other => other, // "~NN" retired placeholders: never a valid source token
     }
 }
@@ -1260,13 +1275,18 @@ pub fn check_ident(name: &str, what: &str) {
 
 // split text source into whitespace-delimited tokens; strings keep their
 // quotes, '{' '}' are own tokens, ';' comments to end of line
-pub fn text_tokens(src: &str) -> Vec<String> {
+// (line, token) pairs: line = 1-based source line where the token starts
+pub fn text_tokens(src: &str) -> Vec<(u32, String)> {
     let chars: Vec<char> = src.chars().collect();
     let mut v = Vec::new();
     let mut i = 0;
+    let mut line = 1u32;
     while i < chars.len() {
         let c = chars[i];
         if c.is_whitespace() {
+            if c == '\n' {
+                line += 1;
+            }
             i += 1;
             continue;
         }
@@ -1277,10 +1297,14 @@ pub fn text_tokens(src: &str) -> Vec<String> {
             continue;
         }
         if c == '"' {
+            let tl = line;
             let mut s = String::from("\"");
             i += 1;
             while i < chars.len() {
                 let c = chars[i];
+                if c == '\n' {
+                    line += 1;
+                }
                 s.push(c);
                 i += 1;
                 if c == '\\' && i < chars.len() {
@@ -1292,11 +1316,11 @@ pub fn text_tokens(src: &str) -> Vec<String> {
                     break;
                 }
             }
-            v.push(s);
+            v.push((tl, s));
             continue;
         }
         if c == '{' || c == '}' || c == '[' || c == ']' {
-            v.push(c.to_string());
+            v.push((line, c.to_string()));
             i += 1;
             continue;
         }
@@ -1305,7 +1329,7 @@ pub fn text_tokens(src: &str) -> Vec<String> {
             s.push(chars[i]);
             i += 1;
         }
-        v.push(s);
+        v.push((line, s));
     }
     v
 }
@@ -1368,7 +1392,7 @@ pub fn parse_text_num(tok: &str) -> Option<Tok> {
 }
 
 pub struct TextLexer {
-    toks: Vec<String>,
+    toks: Vec<(u32, String)>,
     pos: usize,
     // v13: true when the previous token was a bare `ret`
     prev_ret: bool,
@@ -1376,7 +1400,11 @@ pub struct TextLexer {
 
 impl TextLexer {
     fn peek(&self) -> Option<&str> {
-        self.toks.get(self.pos).map(|s| s.as_str())
+        self.toks.get(self.pos).map(|t| t.1.as_str())
+    }
+    // line of the token at the current position
+    fn line(&self) -> u32 {
+        self.toks.get(self.pos).map(|t| t.0).unwrap_or(1)
     }
     fn next(&mut self) -> Option<String> {
         let t = self.peek().map(|s| s.to_string());
@@ -1394,8 +1422,9 @@ impl TextLexer {
         t
     }
     // stop: 0 = eof, 1 = '}', 3 = ']', 5 = "task"/"run" (weave body end)
-    fn run(&mut self, out: &mut Vec<Tok>, stop: u8) {
+    fn run(&mut self, out: &mut Vec<(u32, Tok)>, stop: u8) {
         loop {
+            let l = self.line();
             let tok = match self.peek() {
                 None => {
                     if stop != 0 {
@@ -1418,7 +1447,7 @@ impl TextLexer {
                 return;
             }
             if stop == 5 && !self.prev_ret && parse_text_num(&tok).is_some()
-                && self.toks.get(self.pos + 1).map(|t| t.as_str() == "task").unwrap_or(false) {
+                && self.toks.get(self.pos + 1).map(|t| t.1.as_str() == "task").unwrap_or(false) {
                 // a numeric literal directly before `task` is the next task's
                 // fanout worker count — leave it unconsumed
                 return;
@@ -1427,29 +1456,29 @@ impl TextLexer {
                 self.pos += 1;
                 let mut body = Vec::new();
                 self.run(&mut body, 3);
-                out.push(Tok::List(body));
+                out.push((l, Tok::List(body)));
                 continue;
             }
             if tok == "{" {
                 self.pos += 1;
                 let mut body = Vec::new();
                 self.run(&mut body, 1);
-                out.push(Tok::Dict(body));
+                out.push((l, Tok::Dict(body)));
                 continue;
             }
             if let Some(s) = unquote(&tok) {
                 self.pos += 1;
-                out.push(Tok::PushS(s));
+                out.push((l, Tok::PushS(s)));
                 continue;
             }
             if let Some(label) = tok.strip_prefix('\'') {
                 self.pos += 1;
                 if label.is_empty() {
-                    let l = self.name_token("addr");
-                    out.push(Tok::Jump("ADDR", l));
+                    let nm = self.name_token("addr");
+                    out.push((l, Tok::Jump("ADDR", nm)));
                 } else {
                     check_ident(label, "addr");
-                    out.push(Tok::Jump("ADDR", label.to_string()));
+                    out.push((l, Tok::Jump("ADDR", label.to_string())));
                 }
                 continue;
             }
@@ -1457,11 +1486,11 @@ impl TextLexer {
                 if !name.is_empty() && name != "'" {
                     self.pos += 1;
                     if name == "entry" {
-                        out.push(Tok::Entry);
+                        out.push((l, Tok::Entry));
                         continue;
                     }
                     check_ident(name, "label");
-                    out.push(Tok::LabelDef(name.to_string()));
+                    out.push((l, Tok::LabelDef(name.to_string())));
                     continue;
                 }
             }
@@ -1470,11 +1499,11 @@ impl TextLexer {
                     self.pos += 1;
                     // v12: _! is the destructuring discard token
                     if name == "_" {
-                        out.push(Tok::Discard);
+                        out.push((l, Tok::Discard));
                         continue;
                     }
                     check_ident(name, "variable");
-                    out.push(Tok::LocalSet(name.to_string()));
+                    out.push((l, Tok::LocalSet(name.to_string())));
                     continue;
                 }
             }
@@ -1488,7 +1517,7 @@ impl TextLexer {
                 if !name.is_empty() && !tok.starts_with('+') {
                     self.pos += 1;
                     check_ident(name, "variable");
-                    out.push(Tok::IncLocal(name.to_string()));
+                    out.push((l, Tok::IncLocal(name.to_string())));
                     continue;
                 }
             }
@@ -1497,7 +1526,7 @@ impl TextLexer {
                 if !name.is_empty() && !tok.starts_with('+') {
                     self.pos += 1;
                     check_ident(name, "variable");
-                    out.push(Tok::AddLocal(name.to_string()));
+                    out.push((l, Tok::AddLocal(name.to_string())));
                     continue;
                 }
             }
@@ -1511,21 +1540,21 @@ impl TextLexer {
                 "*" => self.err("'*' removed in v13 — use `mul`"),
                 "&" => self.err("'&' removed in v13 — use `and`"),
                 "=" => self.err("= (je) removed — use if/ifelse"),
-                "pub" => out.push(Tok::Pub),
+                "pub" => out.push((l, Tok::Pub)),
                 "use" | "export" | "extern" | "mod" => {
                     let n = self.next().unwrap_or_else(|| self.err(&format!("{} needs \"name\"", tok)));
                     let n = unquote(&n).unwrap_or_else(|| self.err(&format!("{} needs \"name\"", tok)));
-                    out.push(match tok.as_str() {
+                    out.push((l, match tok.as_str() {
                         "use" => Tok::Use(n),
                         "export" => Tok::Export(n),
                         "mod" => Tok::Mod(n),
                         _ => Tok::Extern(n),
-                    });
+                    }));
                 }
                 "import" => {
                     // one token: c"name"(params)->ret
                     let n = self.next().unwrap_or_else(|| self.err("import needs a binding"));
-                    out.push(self.parse_import(&n));
+                    out.push((l, self.parse_import(&n)));
                 }
                 "macro" => {
                     let n = self.name_token("macro");
@@ -1534,7 +1563,7 @@ impl TextLexer {
                     }
                     let mut body = Vec::new();
                     self.run(&mut body, 1);
-                    out.push(Tok::MacroDef(n, body));
+                    out.push((l, Tok::MacroDef(n, body)));
                 }
                 "struct" => {
                     let n = self.name_token("struct");
@@ -1557,7 +1586,7 @@ impl TextLexer {
                         }
                         fields.push((parts[0].to_string(), parts[1].to_string()));
                     }
-                    out.push(Tok::StructDef(n, fields));
+                    out.push((l, Tok::StructDef(n, fields)));
                 }
                 "weave" => {
                     loop {
@@ -1576,7 +1605,7 @@ impl TextLexer {
                                     }
                                     _ => None,
                                 };
-                                out.push(Tok::Wrun(terminal));
+                                out.push((l, Tok::Wrun(terminal)));
                                 break;
                             }
                             Some(_) => {
@@ -1603,7 +1632,7 @@ impl TextLexer {
                                 }
                                 let mut body = Vec::new();
                                 self.run(&mut body, 5);
-                                out.push(Tok::Task { name, count, body });
+                                out.push((l, Tok::Task { name, count, body }));
                             }
                             None => self.err("weave: unterminated (missing run)"),
                         }
@@ -1614,9 +1643,9 @@ impl TextLexer {
                 "_lit" => {
                     let n = self.next().unwrap_or_else(|| self.err("lit needs an operand"));
                     if let Some(id) = type_id(&n) {
-                        out.push(Tok::PushI(id));
+                        out.push((l, Tok::PushI(id)));
                     } else if let Some(t) = parse_text_num(&n) {
-                        out.push(t);
+                        out.push((l, t));
                     } else {
                         self.err(&format!("lit: bad operand {}", n));
                     }
@@ -1625,15 +1654,15 @@ impl TextLexer {
                 "jz" => self.err("jz removed — use if/ifelse/while"),
                 "je" => self.err("je removed — use if/ifelse"),
                 "_call" => {
-                    let l = self.name_token("call");
-                    out.push(Tok::Jump("CALL", l));
+                    let nm = self.name_token("call");
+                    out.push((l, Tok::Jump("CALL", nm)));
                 }
                 "entry" => {
-                    out.push(Tok::Entry);
+                    out.push((l, Tok::Entry));
                 }
                 "_addr" => {
-                    let l = self.name_token("addr");
-                    out.push(Tok::Jump("ADDR", l));
+                    let nm = self.name_token("addr");
+                    out.push((l, Tok::Jump("ADDR", nm)));
                 }
                 "_syscall" => {
                     let n = match self.peek() {
@@ -1642,30 +1671,30 @@ impl TextLexer {
                     };
                     if let Some(n) = n {
                         self.pos += 1;
-                        out.push(Tok::Sys(n));
+                        out.push((l, Tok::Sys(n)));
                     } else {
-                        out.push(Tok::Sys(0));
+                        out.push((l, Tok::Sys(0)));
                     }
                 }
                 "_size_of" => {
                     match self.peek() {
                         Some(t) if type_id(t).is_some() => {
                             let id = type_id(self.next().unwrap().as_str()).unwrap();
-                            out.push(Tok::PushI(id));
-                            out.push(Tok::Op("SIZEOF"));
+                            out.push((l, Tok::PushI(id)));
+                            out.push((l, Tok::Op("SIZEOF")));
                         }
                         Some(_) => {
                             let sym = self.name_token("size_of");
-                            out.push(Tok::Ident(format!("@sizeof:{}", sym)));
+                            out.push((l, Tok::Ident(format!("@sizeof:{}", sym))));
                         }
-                        None => out.push(Tok::Op("SIZEOF")),
+                        None => out.push((l, Tok::Op("SIZEOF"))),
                     }
                 }
                 "_offset" => {
                     let sym = self.next().unwrap_or_else(|| self.err("offset needs Struct.field"));
                     let parts: Vec<&str> = sym.splitn(2, '.').collect();
                     if parts.len() == 2 {
-                        out.push(Tok::Ident(format!("@offset:{}", sym)));
+                        out.push((l, Tok::Ident(format!("@offset:{}", sym))));
                     } else {
                         self.err("offset needs Struct.field");
                     }
@@ -1681,28 +1710,28 @@ impl TextLexer {
                     match self.peek() {
                         Some(t) if type_id(t).is_some() => {
                             let id = type_id(self.next().unwrap().as_str()).unwrap();
-                            out.push(Tok::PushI(id));
-                            out.push(Tok::Op(name));
+                            out.push((l, Tok::PushI(id)));
+                            out.push((l, Tok::Op(name)));
                         }
                         Some(t) if !is_reserved(t) && !is_bad_ident(t) && !t.ends_with(':') && !t.ends_with('!') && !t.ends_with('@') && parse_text_num(t).is_none() && unquote(t).is_none() && !t.starts_with('\'') => {
                             let kw = self.next().unwrap();
                             if name == "OBJ" {
-                                out.push(Tok::Ident(format!("@objsize:{}", kw)));
+                                out.push((l, Tok::Ident(format!("@objsize:{}", kw))));
                             } else if name == "CAST" {
-                                out.push(Tok::Ident(format!("@cast:{}", kw)));
+                                out.push((l, Tok::Ident(format!("@cast:{}", kw))));
                             } else {
                                 self.err(&format!("{}: unknown type {}", name, kw));
                             }
-                            out.push(Tok::Op(name));
+                            out.push((l, Tok::Op(name)));
                         }
-                        _ => out.push(Tok::Op(name)),
+                        _ => out.push((l, Tok::Op(name))),
                     }
                 }
-                "scan" | "print" => out.push(Tok::Op(if tok == "scan" { "SCAN" } else { "PRINT" })),
+                "scan" | "print" => out.push((l, Tok::Op(if tok == "scan" { "SCAN" } else { "PRINT" }))),
                 "_str" => {
                     let n = self.next().unwrap_or_else(|| self.err("str needs a string"));
                     match unquote(&n) {
-                        Some(s) => out.push(Tok::PushS(s)),
+                        Some(s) => out.push((l, Tok::PushS(s))),
                         None => self.err("str needs a string"),
                     }
                 }
@@ -1715,16 +1744,16 @@ impl TextLexer {
                 }
                 _ => {
                     if tok == "true" || tok == "false" {
-                        out.push(Tok::PushBool(tok == "true"));
+                        out.push((l, Tok::PushBool(tok == "true")));
                     } else if let Some(idx) = mnemonic_index(&tok) {
                         // plain opcode with no operand handling
-                        out.push(Tok::Op(OP_NAMES[idx]));
+                        out.push((l, Tok::Op(OP_NAMES[idx])));
                     } else if let Some(id) = type_id(&tok) {
                         // v13: bare type keywords push their type id
                         // (e.g. `[1 2] int array`, `x _cast int`)
-                        out.push(Tok::PushI(id));
+                        out.push((l, Tok::PushI(id)));
                     } else if let Some(t) = parse_text_num(&tok) {
-                        out.push(t);
+                        out.push((l, t));
                     } else if tok.starts_with('@') {
                         // v15: '@'-prefixed idents are compiler-internal
                         // sentinels (@flush, @sizeof:Name, …) — never valid
@@ -1733,7 +1762,7 @@ impl TextLexer {
                     } else if is_bad_ident(&tok) {
                         self.err(&format!("identifier '{}' — identifiers may not start with '_'", tok));
                     } else {
-                        out.push(Tok::Ident(tok));
+                        out.push((l, Tok::Ident(tok)));
                     }
                 }
             }
@@ -1767,7 +1796,7 @@ impl TextLexer {
 }
 
 // lex one source, auto-detecting the encoding: any char >= U+13000 -> dense
-pub fn lex_source(src: &str) -> Vec<Tok> {
+pub fn lex_source(src: &str) -> Vec<(u32, Tok)> {
     if src.chars().any(|c| c as u32 >= 0x13000) {
         Lexer::new(src).lex()
     } else {

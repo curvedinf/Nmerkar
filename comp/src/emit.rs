@@ -28,9 +28,9 @@ fn glyph_of(idx: usize) -> char {
 // at parse time). Encoding converters work on lexed tokens, so resolve here:
 // '@'-sentinels and macro names stay Ident; every other bare name becomes an
 // implicit LocalGet (dense slot-encodes it; text prints it bare).
-pub fn resolve_implicit_loads(toks: &[Tok]) -> Vec<Tok> {
-    fn collect_macros(toks: &[Tok], out: &mut std::collections::HashSet<String>) {
-        for t in toks {
+pub fn resolve_implicit_loads(toks: &[(u32, Tok)]) -> Vec<(u32, Tok)> {
+    fn collect_macros(toks: &[(u32, Tok)], out: &mut std::collections::HashSet<String>) {
+        for (_, t) in toks {
             match t {
                 Tok::MacroDef(n, _) => {
                     out.insert(n.clone());
@@ -42,9 +42,9 @@ pub fn resolve_implicit_loads(toks: &[Tok]) -> Vec<Tok> {
     }
     let mut macros = std::collections::HashSet::new();
     collect_macros(toks, &mut macros);
-    fn walk(toks: &[Tok], macros: &std::collections::HashSet<String>) -> Vec<Tok> {
+    fn walk(toks: &[(u32, Tok)], macros: &std::collections::HashSet<String>) -> Vec<(u32, Tok)> {
         toks.iter()
-            .map(|t| match t {
+            .map(|(ln, t)| (*ln, match t {
                 Tok::Ident(n) if !n.starts_with('@') && !macros.contains(n) => Tok::LocalGet(n.clone()),
                 Tok::List(b) => Tok::List(walk(b, macros)),
                 Tok::Dict(b) => Tok::Dict(walk(b, macros)),
@@ -54,19 +54,19 @@ pub fn resolve_implicit_loads(toks: &[Tok]) -> Vec<Tok> {
                     body: walk(body, macros),
                 },
                 other => other.clone(),
-            })
+            }))
             .collect()
     }
     walk(toks, &macros)
 }
 
 // dense -> text: mnemonics; glyph names "v57" are already valid text idents
-pub fn emit_text(toks: &[Tok]) -> String {
+pub fn emit_text(toks: &[(u32, Tok)]) -> String {
     let mut o = String::new();
     let mut in_weave = false;
     let mut i = 0;
     while i < toks.len() {
-        let t = &toks[i];
+        let (_, t) = &toks[i];
         i += 1;
         match t {
             Tok::Op(name) => o.push_str(&format!("{} ", text_mnemonic(op_index(name).expect("op")))),
@@ -108,10 +108,10 @@ pub fn emit_text(toks: &[Tok]) -> String {
                     o.push_str(&format!("_offset {} ", rest));
                 } else if let Some(rest) = n.strip_prefix("@objsize:") {
                     o.push_str(&format!("_obj {} ", rest));
-                    if matches!(toks.get(i), Some(Tok::Op(op)) if *op == "OBJ") { i += 1; }
+                    if matches!(toks.get(i), Some((_, Tok::Op(op))) if *op == "OBJ") { i += 1; }
                 } else if let Some(rest) = n.strip_prefix("@cast:") {
                     o.push_str(&format!("_cast {} ", rest));
-                    if matches!(toks.get(i), Some(Tok::Op(op)) if *op == "CAST") { i += 1; }
+                    if matches!(toks.get(i), Some((_, Tok::Op(op))) if *op == "CAST") { i += 1; }
                 } else {
                     o.push_str(&format!("{} ", n));
                 }
@@ -215,7 +215,7 @@ fn emit_lfloat(v: f64) -> Option<String> {
     None
 }
 
-pub fn emit_dense(toks: &[Tok]) -> String {
+pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
     fn is_slot(n: &str) -> Option<u32> {
         n.strip_prefix('v').and_then(|d| d.parse::<u32>().ok()).filter(|&i| i < 64)
     }
@@ -256,8 +256,8 @@ pub fn emit_dense(toks: &[Tok]) -> String {
     fn sep_l(o: &mut String) {
         if o.chars().last().map_or(false, |c| is_l(c as u32)) { o.push(' '); }
     }
-    fn rec(toks: &[Tok], names: &mut HashMap<String, u32>, next: &mut u32, weave: &mut bool, o: &mut String) {
-        for t in toks {
+    fn rec(toks: &[(u32, Tok)], names: &mut HashMap<String, u32>, next: &mut u32, weave: &mut bool, o: &mut String) {
+        for (_, t) in toks {
             match t {
                 Tok::Op(name) => {
                     let idx = op_index(name).expect("op");

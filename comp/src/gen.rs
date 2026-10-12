@@ -1,10 +1,11 @@
 use crate::ast::*;
 use crate::prelude::PRELUDE;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 
 // Set by gen() when --debug is active; read by emit_range() to skip register caching.
 static UF_DEBUG: AtomicBool = AtomicBool::new(false);
+static UF_PROF_MODE: AtomicI8 = AtomicI8::new(0); /* bit 1 = --profile, bit 2 = --coverage */
 
 // v13.1 strict arity: describe the guarded param pop at instruction pc as
 // (label name, declared arity, param name) for the runtime die message.
@@ -620,7 +621,13 @@ pub fn emit_range(
             vdiscard(&mut e, &mut vstack, &mut vcache);
         }
         // C labels must precede statements, not declarations (Clang 10).
-        e.push_str(&format!("{}:; ", plab(prefix, i)));
+        // cx->site marks the instruction in flight so die()/dbg can report
+        // its source line (the table is uf_sites in the prelude).
+        e.push_str(&format!("{}:; cx->site={}; ", plab(prefix, i), i));
+        // --profile/--coverage: tick the cost center at every label body head
+        if UF_PROF_MODE.load(Ordering::Relaxed) != 0 && p.label_names.contains_key(&i) {
+            e.push_str(&format!("if(uf_prof_on)uf_prof_t({}); ", i));
+        }
         if suppress.contains(&i) {
             // PushAddr feeding an inlined FOR: the address is compile-time
             // known, so the push is elided entirely.
@@ -2835,8 +2842,9 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
 }
 
 static DISCARD_RET_LABELS: std::sync::OnceLock<std::collections::HashSet<usize>> = std::sync::OnceLock::new();
-pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
+pub fn gen(p: &Parsed, structs: &StructMap, debug: bool, profile: bool, coverage: bool) -> String {
     UF_DEBUG.store(debug, Ordering::Relaxed);
+    UF_PROF_MODE.store((if profile { 1 } else { 0 }) | (if coverage { 2 } else { 0 }), Ordering::Relaxed);
     // continuation-body labels: while/for/if CALL these and discard the
     // return, so a multi-value ret inside one must not build a return list
     // (it cost an allocation per iteration in loop-heavy programs)
@@ -2908,7 +2916,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
     for (i, s) in p.strings.iter().enumerate() {
         let blen = s.len();
         o.push_str(&format!(
-            "static struct {{ void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t mlen; const char* mdata; char d[{}]; }} uf_sl{} = {{0,0,0,9,{},1,0,0,0,\"{}\"}};\n",
+            "static struct {{ void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t sz; uint64_t mlen; const char* mdata; char d[{}]; }} uf_sl{} = {{0,0,0,9,{},1,0,0,0,0,\"{}\"}};\n",
             blen + 1,
             i,
             blen,
@@ -3006,6 +3014,64 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
         o.push_str("static void uf_init_locals(void){}\n");
     }
     o.push_str("static long uf_lc(long pc){ return (pc>=0&&(unsigned long)pc<(unsigned long)(sizeof(uf_lc_v)/sizeof(uf_lc_v[0])))?uf_lc_v[pc]:0; }\n");
+    // ---- error-site table (always on): one entry per instruction holding
+    // the innermost enclosing label and the instruction's source line.
+    // die() and the dbg op format it; unknown sites (0 line) keep the
+    // plain message.
+    {
+        // display names: the original (unmangled) label name — the table
+        // reports what the user wrote
+        let mut disp: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        for (n, &pc) in &p.labels {
+            disp.entry(pc)
+                .or_insert_with(|| p.label_names.get(&pc).cloned().unwrap_or_else(|| n.clone()));
+        }
+        let mut labs: Vec<(usize, String)> = disp.into_iter().collect();
+        labs.sort_by_key(|&(pc, _)| pc);
+        let mut li = 0usize;
+        let mut cur: Option<&String> = None;
+        let mut entries = String::new();
+        for i in 0..n_ins {
+            while li < labs.len() && labs[li].0 <= i {
+                cur = Some(&labs[li].1);
+                li += 1;
+            }
+            let line = p.ins_lines.get(i).copied().unwrap_or(0);
+            let file = p.ins_files.get(i).copied().unwrap_or(0);
+            let lab = match cur {
+                Some(n) => format!("\"{}\"", n),
+                None => "0".to_string(),
+            };
+            entries.push_str(&format!("{{{},{},(unsigned){}}},", lab, file, line));
+        }
+        o.push_str(&format!("static const UfSite uf_sites_v[] = {{{}}};\n", entries));
+        if p.file_names.len() > 1 {
+            o.push_str(&format!(
+                "static const char* const uf_files_v[] = {{{}}};\n",
+                p.file_names.iter().map(|f| format!("\"{}\"", f)).collect::<Vec<_>>().join(",")
+            ));
+        }
+    }
+    // ---- profiling/coverage label tables (--profile / --coverage) ----
+    let n_labs;
+    if UF_PROF_MODE.load(Ordering::Relaxed) != 0 {
+        let mut disp: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        for (n, &pc) in &p.labels {
+            disp.entry(pc)
+                .or_insert_with(|| p.label_names.get(&pc).cloned().unwrap_or_else(|| n.clone()));
+        }
+        let mut labs: Vec<(usize, String)> = disp.into_iter().collect();
+        labs.sort_by_key(|&(pc, _)| pc);
+        n_labs = labs.len();
+        o.push_str(&format!(
+            "static const long uf_prof_lbls[] = {{{}}};\nstatic const char* const uf_prof_labs[] = {{{}}};\nstatic const unsigned uf_prof_lines[] = {{{}}};\n",
+            labs.iter().map(|&(pc, _)| pc.to_string()).collect::<Vec<_>>().join(","),
+            labs.iter().map(|lab| format!("\"{}\"", lab.1)).collect::<Vec<_>>().join(","),
+            labs.iter().map(|&(pc, _)| p.label_lines.get(&pc).copied().unwrap_or(0).to_string()).collect::<Vec<_>>().join(",")
+        ));
+    } else {
+        n_labs = 0;
+    }
     // label -> instruction index
     let resolve = |name: &str| -> usize {
         *p.labels.get(name).unwrap_or_else(|| panic!("undefined label {}", name))
@@ -3319,7 +3385,23 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool) -> String {
     let dbg_init = if debug {
         "uf_debug_mode=1;uf_vnames=uf_vnames_v;uf_init_labnames();uf_init_local_names();"
     } else { "" };
-    o.push_str(&format!("int main(int argc,char**argv){{nk_argc=argc;nk_argv=(void*)argv;uf_init_reflection();uf_init_locals();{}uf_init_lits({});uf_gc_setshared({});uf_gc_init();nk_run(main_cx,0);return 0;}}\n", dbg_init, lits_arg, roots_arg));
+    let sites_init = format!(
+        "uf_sites=uf_sites_v;uf_nsites={};{}",
+        n_ins,
+        if p.file_names.len() > 1 {
+            format!("uf_files=uf_files_v;uf_nfiles={};", p.file_names.len())
+        } else {
+            String::new()
+        }
+    );
+    let prof_mode = UF_PROF_MODE.load(Ordering::Relaxed);
+    let prof_init = if prof_mode != 0 {
+        format!("uf_prof_init({},{});", n_ins, prof_mode)
+    } else { String::new() };
+    let prof_end = if prof_mode != 0 {
+        format!("uf_prof_report(uf_prof_lbls,uf_prof_labs,uf_prof_lines,{});", n_labs)
+    } else { String::new() };
+    o.push_str(&format!("int main(int argc,char**argv){{nk_argc=argc;nk_argv=(void*)argv;{}uf_init_reflection();uf_init_locals();{}{}uf_init_lits({});uf_gc_setshared({});uf_gc_init();nk_run(main_cx,0);{}return 0;}}\n", sites_init, dbg_init, prof_init, lits_arg, roots_arg, prof_end));
     o
 }
 

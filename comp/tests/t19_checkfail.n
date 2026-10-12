@@ -1,0 +1,6 @@
+; t19_checkfail.n — a failing check: one-token assert dies with the source
+; site in the message; both targets must fail byte-identically.
+; Expected: rc=1, stderr "nk: L5 [entry] check failed\n"
+entry:
+1 2 eq check
+ret

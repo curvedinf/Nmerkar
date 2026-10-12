@@ -423,6 +423,8 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let mut gc_threshold: Option<u64> = None;
     let mut gc_off = false;
     let mut force_mt = false;
+    let mut profile = false;
+    let mut coverage = false;
     let mut debug = false;
     // sandbox / compute flags
     let mut policy: Option<String> = None;
@@ -451,6 +453,8 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
             }
             "--gc-off" => gc_off = true,
             "--mt" => force_mt = true,
+            "--profile" => profile = true,
+            "--coverage" => coverage = true,
             "--debug" | "-D" => debug = true,
             "--compiler-backtrace" | "--compiler-backtrace=full" => {},
             s if s.starts_with("--compiler-backtrace=") => {
@@ -507,6 +511,8 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 eprintln!("       --gc-off            disable garbage collector entirely");
                 eprintln!("       --mt                force multi-threaded allocator (use mutex even if single-threaded)");
                 eprintln!("       --debug, -D         enable crash dump (stack trace + local/shared var dump on runtime errors)");
+                eprintln!("       --profile             per-label cost-center table on exit (calls, ns, pct of total; native target)");
+                eprintln!("       --coverage            per-label hit table on exit (uncovered labels marked; native target)");
                 eprintln!("       --                  pass remaining args to the program");
                 eprintln!("");
                 eprintln!("  sandbox flags (see SPEC.md — Sandboxing and capabilities):");
@@ -598,11 +604,13 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let mut structs: StructMap = HashMap::new();
     let mut tus: Vec<Parsed> = Vec::new();
     let mut mods: Vec<String> = Vec::new();
-    let mut emit_toks: Vec<Tok> = Vec::new();
+    let mut emit_toks: Vec<(u32, Tok)> = Vec::new();
     // the cache key must change whenever the codegen/runtime changes, so fold
     // in the compiler executable's own mtime (rebuild => new cache entries)
     let mut hash_src = String::from("codegen-rev: v13-sandbox-compute\n");
     if debug { hash_src.push_str("debug-mode\n"); }
+    if profile { hash_src.push_str("profile-mode\n"); }
+    if coverage { hash_src.push_str("coverage-mode\n"); }
     hash_src.push_str(&caps.describe());
     hash_src.push_str(&format!("device={}\n", device.as_deref().unwrap_or("auto")));
     if let Ok(exe) = env::current_exe() {
@@ -650,7 +658,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         // USE"name" manifests prepend to the TU that asked for them
         let uses: Vec<String> = toks
             .iter()
-            .filter_map(|t| match t {
+            .filter_map(|(_, t)| match t {
                 Tok::Use(n) => Some(n.clone()),
                 _ => None,
             })
@@ -668,8 +676,8 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
             // manifest imports are exempt from ffi.import gating: loading the
             // module was itself gated by the ffi.use module policy
             for t in mt.iter_mut() {
-                if let Tok::Import(im) = t {
-                    *t = Tok::ManifestImport(im.clone());
+                if let (ln, Tok::Import(im)) = t {
+                    *t = (*ln, Tok::ManifestImport(im.clone()));
                 }
             }
             manifest_toks.append(&mut mt);
@@ -738,7 +746,7 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     // regions fuse on CPU regardless of GPU availability (gen guards the GPU
     // try in #ifdef NK_GPU); kidx only matters when the prefix defined it
     compute::register_region_kernels(region_kernels);
-    let mut csrc = gen(&parsed, &structs, debug);
+    let mut csrc = gen(&parsed, &structs, debug, profile, coverage);
     if let Some(prefix) = gpu_prefix {
         csrc = format!("{}{}", prefix, csrc);
     }

@@ -37,7 +37,7 @@ typedef struct { int tag; int64_t i; } Cell;
    allocation list; gc_flags holds the mark bit, pin bit, mmap bit and the
    allocation sequence (objects younger than a collection's start are never
    swept, which closes the alloc-then-publish race window). */
-#define UFHDR void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety
+#define UFHDR void* gc_next; void* gc_parent; uint64_t gc_flags; uint64_t tag; uint64_t len; uint64_t esz; uint64_t ety; uint64_t sz
 #define GCF_MARK 1
 #define GCF_PINNED 2
 #define GCF_MMAP 4
@@ -73,6 +73,7 @@ typedef struct CtxS {
   long* local_frames; long local_fsp; long local_fcap;
   long* call_pcs; long call_csp; long call_ccap; /* debug: callee PCs parallel to cs[] */
   struct CtxS* gc_prev;
+  long site; /* error-site table index: the instruction currently executing */
 } Ctx;
 
 /* weave job: task array + scheduler entry. Defined early so op_shutdown can
@@ -107,7 +108,29 @@ static int uf_debug_mode = 0;
 static const char** uf_labnames; static long uf_labnames_n;
 static const char*** uf_ln_tab; static long* uf_ln_cnt;
 static const char** uf_vnames;
+/* error-site table (always on): one entry per instruction, published by the
+   generated code before the run loop. die() and the dbg op format the
+   current site as "L<line> [label]" (or "<file>.n:L<line> [label]" in a
+   multi-TU program). */
+typedef struct { const char* lab; int file; unsigned line; } UfSite;
+static const UfSite* uf_sites = 0; static long uf_nsites = 0;
+static const char* const* uf_files = 0; static long uf_nfiles = 0;
+/* Build the site head for cx into buf: "<stem>:L<line> [label]" /
+   "L<line> [label]"; empty when the site is unknown. */
+static void uf_site(char*buf,size_t n,Ctx*cx){
+  buf[0]=0;
+  if(!cx||!uf_sites||(unsigned long)cx->site>=(unsigned long)uf_nsites)return;
+  UfSite s=uf_sites[cx->site];
+  if(!s.line)return;
+  char lab[160];
+  snprintf(lab,sizeof(lab),s.lab?" [%s]":"",s.lab);
+  if(uf_nfiles>1&&s.file>=0&&s.file<uf_nfiles)
+    snprintf(buf,n,"%s:L%u%s",uf_files[s.file],(unsigned)s.line,lab);
+  else
+    snprintf(buf,n,"L%u%s",(unsigned)s.line,lab);
+}
 /* Forward declarations for crash dump functions */
+static Ctx* uf_ctxs[512]; static _Atomic int uf_nctxs; /* tentative defs; the real objects are defined with the GC section below */
 static int uf_is_str(Cell c);
 static const char* uf_sptr(Cell c);
 static inline double uf_fbits(int64_t i);
@@ -154,13 +177,106 @@ static void uf_crash_dump(Ctx*cx){
     uf_dump_cell(*uf_var_roots[i]);
     fprintf(stderr,"\n");
   }
+  /* other live threads (Go all-goroutine-style): snapshot each worker's
+     call stack. Best effort — the workers run concurrently and their stacks
+     are read without their locks, so a frame can look stale or torn. */
+  int nctx=atomic_load_explicit(&uf_nctxs,memory_order_relaxed);
+  int nthreads=0;
+  for(int k=0;k<nctx;k++){ Ctx* c=uf_ctxs[k]; if(c&&c!=cx)nthreads++; }
+  if(nthreads){
+    fprintf(stderr,"  other threads (best effort):\n");
+    for(int k=0;k<nctx;k++){
+      Ctx* c=uf_ctxs[k];
+      if(!c||c==cx)continue;
+      if(c->call_csp<=0){ fprintf(stderr,"  thread #%d: (no call frames)\n",k); continue; }
+      fprintf(stderr,"  thread #%d:\n",k);
+      for(long i=c->call_csp-1;i>=0;i--){
+        long pc=c->call_pcs[i];
+        const char* nm=(pc<0)?"(body entry)":((pc>=0&&pc<uf_labnames_n)?uf_labnames[pc]:0);
+        fprintf(stderr,"    #%ld  %s (pc=%ld)\n", c->call_csp-1-i, nm?nm:"<unknown>", pc);
+      }
+    }
+  }
   fprintf(stderr,"--- end crash dump ---\n\n");
 }
 
 static void die(const char*m){
   if(uf_try_top){ UfTry*t=uf_try_top; longjmp(t->jb,1); }
   if(uf_debug_mode && uf_current_ctx) uf_crash_dump(uf_current_ctx);
-  fprintf(stderr,"nk: %s\n",m); exit(1);
+  char sh[320];
+  uf_site(sh,sizeof(sh),uf_current_ctx);
+  if(sh[0])fprintf(stderr,"nk: %s %s\n",sh,m);
+  else fprintf(stderr,"nk: %s\n",m);
+  exit(1);
+}
+
+/* ---- profiling / coverage (baked in with --profile / --coverage) ----
+   uf_prof_init(n, mode): n = instruction count (array size), mode bit 1 =
+   profile table, bit 2 = coverage table. uf_prof_t(i) ticks cost center i
+   (a label body head); relaxed atomics so spawned threads share the same
+   counters. Per-thread `last` timestamps keep deltas honest when workers
+   interleave on the same label. The report at main exit therefore reflects
+   workers only as far as they had run. */
+static int uf_prof_on = 0, uf_prof_mode = 0;
+static long uf_profn = 0;
+static _Atomic long* uf_prof_cnt;
+static _Atomic long long* uf_prof_ns;
+static __thread long long* uf_prof_last;
+static void uf_prof_init(long n, int mode){
+  if(!mode)return;
+  uf_profn=n; uf_prof_mode=mode;
+  uf_prof_cnt=calloc((size_t)n,sizeof(long));
+  uf_prof_ns=calloc((size_t)n,sizeof(long long));
+  uf_prof_on=1;
+}
+static void uf_prof_t(int i){
+  if(!uf_prof_on)return;
+  long long* lp=uf_prof_last;
+  if(!lp){ lp=(long long*)calloc((size_t)uf_profn,2*sizeof(long long)); memset(lp,0xff,(size_t)uf_profn*sizeof(long long)); uf_prof_last=lp; }
+  struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+  long long now=(long long)ts.tv_sec*1000000000LL+(long long)ts.tv_nsec;
+  long long l=lp[i];
+  if(l>=0){
+    long long d=now-l; if(d<0)d=0;
+    atomic_fetch_add_explicit(&uf_prof_ns[i],d,memory_order_relaxed);
+  }
+  lp[i]=now;
+  atomic_fetch_add_explicit(&uf_prof_cnt[i],1,memory_order_relaxed);
+}
+static int uf_prof_cmp(const void*a, const void*b){
+  long long na=atomic_load_explicit(&uf_prof_ns[*(const long*)a],memory_order_relaxed);
+  long long nb=atomic_load_explicit(&uf_prof_ns[*(const long*)b],memory_order_relaxed);
+  return (nb>na)-(nb<na);
+}
+static void uf_prof_report(const long* lbls, const char* const* labs, const unsigned* lines, long nl){
+  if(!uf_prof_on)return;
+  if(uf_prof_mode&1){
+    long* idx=(long*)malloc((size_t)nl*sizeof(long));
+    long long tns=0;
+    for(long i=0;i<nl;i++){ idx[i]=lbls[i]; tns+=atomic_load_explicit(&uf_prof_ns[lbls[i]],memory_order_relaxed); }
+    qsort(idx,(size_t)nl,sizeof(long),uf_prof_cmp);
+    fprintf(stderr,"--- nk profile ---\n");
+    fprintf(stderr,"%-12s %5s %7s %13s %5s\n","label","line","calls","ns","%");
+    for(long i=0;i<nl;i++){
+      long pc=idx[i];
+      long r=0; while(r<nl&&lbls[r]!=pc)r++; /* row in the name/line tables */
+      long c=atomic_load_explicit(&uf_prof_cnt[pc],memory_order_relaxed);
+      long long ns=atomic_load_explicit(&uf_prof_ns[pc],memory_order_relaxed);
+      double pct=tns?100.0*(double)ns/(double)tns:0.0;
+      fprintf(stderr,"%-12s %5u %7ld %13lld %5.1f\n",labs[r],lines[r],c,ns,pct);
+    }
+    fprintf(stderr,"%-12s %5s %7s %13lld %5.1f\n","total","","",tns,tns?100.0:0.0);
+    free(idx);
+  }
+  if(uf_prof_mode&2){
+    long unc=0;
+    for(long i=0;i<nl;i++) if(!atomic_load_explicit(&uf_prof_cnt[lbls[i]],memory_order_relaxed))unc++;
+    fprintf(stderr,"--- nk coverage ---\n");
+    fprintf(stderr,"%-12s %5s %5s\n","label","line","hits");
+    for(long i=0;i<nl;i++)
+      fprintf(stderr,"%-12s %5u %5ld\n",labs[i],lines[i],(long)atomic_load_explicit(&uf_prof_cnt[lbls[i]],memory_order_relaxed));
+    fprintf(stderr,"%ld of %ld labels uncovered\n",unc,nl);
+  }
 }
 
 /* ================= sandbox capability state =================
@@ -213,7 +329,8 @@ static void* uf_gc_list; /* linked list of all allocations */
 static _Atomic uint64_t uf_gc_seq = 1;
 static _Atomic int uf_gc_mt = 0; /* set to 1 when threads are spawned */
 static _Atomic uint64_t uf_gc_bytes_since;
-static uint64_t uf_gc_threshold = 1<<20, uf_gc_live;
+static uint64_t uf_gc_threshold = 1<<20;
+static _Atomic uint64_t uf_gc_live = 0, uf_gc_alloc_total = 0, uf_gc_collections = 0;
 static int uf_gc_on = 1;
 static pthread_mutex_t uf_gc_mu = PTHREAD_MUTEX_INITIALIZER;
 /* The collector cannot scan another thread's mutable Ctx or its C locals.
@@ -406,6 +523,7 @@ static void uf_mark_obj(Hdr* h){
 struct WeaveJobS; static struct WeaveJobS* uf_active_job;
 static void uf_weave_mark(struct WeaveJobS* j);
 static void uf_gc_free_obj(Hdr* h){
+  atomic_fetch_sub(&uf_gc_live, h->sz);
   /* v15: large ARR/TENSOR blocks are whole-block mmap'd (aligned VMA gets
      real THP; malloc's offset mmap does not) — munmap instead of free */
   if((h->gc_flags&GCF_MMAP)&&(h->tag==HT_TENSOR||h->tag==HT_ARR)){
@@ -422,6 +540,7 @@ static void uf_gc_free_obj(Hdr* h){
 static void uf_gc_collect(void){
   pthread_mutex_lock(&uf_gc_mu);
   if(uf_gc_workers){ pthread_mutex_unlock(&uf_gc_mu); return; }
+  atomic_fetch_add(&uf_gc_collections,1);
   uf_gc_marking=1;
   uint64_t start_seq = uf_gc_seq;
   /* mark all roots */
@@ -488,6 +607,7 @@ static void* uf_gc_alloc(size_t sz, int align){
   memset(p,0,sz);
   Hdr* h=(Hdr*)p;
   h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
+  h->sz = sz; atomic_fetch_add(&uf_gc_alloc_total,sz); atomic_fetch_add(&uf_gc_live,sz);
   atomic_fetch_add(&uf_gc_bytes_since,sz);
   if(atomic_load(&uf_gc_mt)){ pthread_mutex_lock(&uf_gc_mu); h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); pthread_mutex_unlock(&uf_gc_mu); }
   else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
@@ -508,6 +628,7 @@ static void* uf_gc_alloc_nz(size_t sz, int align){
   memset(p,0,sizeof(Hdr));
   Hdr* h=(Hdr*)p;
   h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
+  h->sz = sz; atomic_fetch_add(&uf_gc_alloc_total,sz); atomic_fetch_add(&uf_gc_live,sz);
   atomic_fetch_add(&uf_gc_bytes_since,sz);
   if(atomic_load(&uf_gc_mt)){ pthread_mutex_lock(&uf_gc_mu); h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); pthread_mutex_unlock(&uf_gc_mu); }
   else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
@@ -540,6 +661,7 @@ static void* uf_gc_arr_block_t(size_t nb, uint64_t tag){
   Hdr* h=(Hdr*)p;
   h->gc_flags = ((uint64_t)atomic_fetch_add(&uf_gc_seq,1))<<GCF_SEQSHIFT;
   if(mapped) h->gc_flags|=GCF_MMAP;
+  h->sz = sz; atomic_fetch_add(&uf_gc_alloc_total,sz); atomic_fetch_add(&uf_gc_live,sz);
   atomic_fetch_add(&uf_gc_bytes_since,sz);
   if(atomic_load(&uf_gc_mt)){ pthread_mutex_lock(&uf_gc_mu); h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); pthread_mutex_unlock(&uf_gc_mu); }
   else { h->gc_next=uf_gc_list; uf_gc_list=p; uf_gc_set_insert_fast(p); }
@@ -562,13 +684,13 @@ static void uf_gc_init(void){
 }
 static void op_gc(Ctx*cx){ (void)cx; uf_gc_collect(); }
 
-static Ctx* ctx_new(long dcap,long ccap){ Ctx*c=(Ctx*)calloc(1,sizeof(Ctx)); if(!c)die("out of memory"); c->ds=(Cell*)malloc(dcap*sizeof(Cell)); c->cs=(const void**)malloc(ccap*sizeof(void*)); c->rsps=(long*)malloc(ccap*sizeof(long)); c->locals=(Cell*)calloc(65536,sizeof(Cell)); c->local_frames=(long*)malloc(65536*sizeof(long)); c->call_pcs=(long*)malloc(ccap*sizeof(long)); if(!c->ds||!c->cs||!c->rsps||!c->locals||!c->local_frames||!c->call_pcs)die("out of memory"); c->dcap=dcap; c->ccap=ccap; c->local_cap=65536; c->local_fcap=65536; c->call_ccap=ccap; atomic_store(&uf_gc_mt,1); ctx_register(c); return c; }
+static Ctx* ctx_new(long dcap,long ccap){ Ctx*c=(Ctx*)calloc(1,sizeof(Ctx)); if(!c)die("out of memory"); c->ds=(Cell*)malloc(dcap*sizeof(Cell)); c->cs=(const void**)malloc(ccap*sizeof(void*)); c->rsps=(long*)malloc(ccap*sizeof(long)); c->locals=(Cell*)calloc(65536,sizeof(Cell)); c->local_frames=(long*)malloc(65536*sizeof(long)); c->call_pcs=(long*)malloc(ccap*sizeof(long)); if(!c->ds||!c->cs||!c->rsps||!c->locals||!c->local_frames||!c->call_pcs)die("out of memory"); c->dcap=dcap; c->ccap=ccap; c->local_cap=65536; c->local_fcap=65536; c->call_ccap=ccap; c->site=-1; atomic_store(&uf_gc_mt,1); ctx_register(c); return c; }
 static void ctx_free(Ctx*c){ ctx_unregister(c); free(c->ds); free((void*)c->cs); free(c->rsps); free(c->locals); free(c->local_frames); free(c->call_pcs); free(c); }
 static Cell main_ds[1<<20]; static const void* main_cs[1<<16];
 static long main_rsps[1<<16];
 static Cell main_locals[65536]; static long main_local_frames[65536];
 static long main_call_pcs[1<<16];
-static Ctx main_cx_store = { main_ds, 0, 1<<20, main_cs, 0, 1<<16, main_rsps, {{0,0,0}}, 0, main_locals, 0, 65536, main_local_frames, 0, 65536, main_call_pcs, 0, 1<<16, 0 };
+static Ctx main_cx_store = { main_ds, 0, 1<<20, main_cs, 0, 1<<16, main_rsps, {{0,0,0}}, 0, main_locals, 0, 65536, main_local_frames, 0, 65536, main_call_pcs, 0, 1<<16, 0, -1 };
 static Ctx* main_cx = &main_cx_store;
 int64_t nk_argc=0; void* nk_argv=0; /* program args, reachable via EXTERN "nk_argc"/"nk_argv" + LOADX, or ARGV */
 
@@ -1274,40 +1396,65 @@ static char* uf_fmt(const char*f,Cell*a,int n){
 }
 static void op_fmt(Ctx*cx){ Cell f=pop(cx); int n=uf_count(uf_sptr(f)); Cell args[16]; if(n>16)die("FMT: too many args"); for(int k=n-1;k>=0;k--) args[k]=pop(cx); char*s=uf_fmt(uf_sptr(f),args,n); Cell r=uf_str_new(s,strlen(s)); free(s); pushc(cx,r); }
 /* PRINT: v -> (smart recursive printer; top-level strings raw) */
+static int uf_dbg_out = 0; /* 0 = stdout, 1 = stderr (the dbg op redirects) */
+#define UFP(f,...) fprintf(uf_dbg_out?stderr:stdout,f,##__VA_ARGS__)
 static void uf_print_cell(Cell c,int nested){
-  if(c.tag==T_FLOAT){ double d=uf_fbits(c.i); if(isnan(d))printf("NaN"); else printf("%.17g",d); return; }
-  if(c.tag==T_BOOL){ printf(c.i?"true":"false"); return; }
-  if(c.tag==T_INT){ printf("%lld",(long long)c.i); return; }
-  if(c.tag==T_PTR && !c.i){ printf("null"); return; }
+  if(c.tag==T_FLOAT){ double d=uf_fbits(c.i); if(isnan(d))UFP("NaN"); else UFP("%.17g",d); return; }
+  if(c.tag==T_BOOL){ UFP(c.i?"true":"false"); return; }
+  if(c.tag==T_INT){ UFP("%lld",(long long)c.i); return; }
+  if(c.tag==T_PTR && !c.i){ UFP("null"); return; }
   if(c.tag==T_PTR && c.i){
     Hdr*h=uf_gc_find((void*)c.i);
-    if(!h){ printf("<ptr %p>",(void*)c.i); return; }
+    if(!h){ UFP("<ptr %p>",(void*)c.i); return; }
     if(h->tag==HT_STR){
       const char*s=uf_sbytes((Str*)h);
       if(nested){
-        printf("\"");
+        UFP("\"");
         for(const char*p=s;*p;p++){
-          if(*p=='"')printf("\\\"");
-          else if(*p=='\\')printf("\\\\");
-          else if(*p=='\n')printf("\\n");
-          else if(*p=='\t')printf("\\t");
-          else if(*p=='\r')printf("\\r");
-          else printf("%c",*p);
+          if(*p=='"')UFP("\\\"");
+          else if(*p=='\\')UFP("\\\\");
+          else if(*p=='\n')UFP("\\n");
+          else if(*p=='\t')UFP("\\t");
+          else if(*p=='\r')UFP("\\r");
+          else UFP("%c",*p);
         }
-        printf("\"");
-      } else { printf("%s",s); }
+        UFP("\"");
+      } else { UFP("%s",s); }
       return;
     }
-    if(h->tag==HT_DYN){ Dyn*d=(Dyn*)h; printf("["); for(uint64_t i=0;i<d->len;i++){ if(i)printf(","); uf_print_cell(d->data[i],1); } printf("]"); return; }
-    if(h->tag==HT_ARR||h->tag==HT_TENSOR||h->tag==HT_MAT){ printf("["); for(uint64_t i=0;i<h->len;i++){ if(i)printf(","); uf_print_cell(uf_cidx(c,(int64_t)i),1); } printf("]"); return; }
-    if(h->tag==HT_MAP){ Map*m=(Map*)h; printf("{"); int first=1; for(uint64_t i=0;i<m->cap;i++) if(m->st[i]==1){ if(!first)printf(","); first=0; uf_print_cell(m->keys[i],1); printf(":"); uf_print_cell(m->vals[i],1); } printf("}"); return; }
-    if(h->tag==HT_OBJ){ printf("[object Object]"); return; }
-    printf("<%s>",h->tag==HT_BUF?"buf":h->tag==HT_RING?"chan":h->tag==HT_ATOM?"atom":h->tag==HT_ITER?"iter":h->tag==HT_BITMAP?"bitmap":h->tag==HT_BLOOM?"bloom":"object");
+    if(h->tag==HT_DYN){ Dyn*d=(Dyn*)h; UFP("["); for(uint64_t i=0;i<d->len;i++){ if(i)UFP(","); uf_print_cell(d->data[i],1); } UFP("]"); return; }
+    if(h->tag==HT_ARR||h->tag==HT_TENSOR||h->tag==HT_MAT){ UFP("["); for(uint64_t i=0;i<h->len;i++){ if(i)UFP(","); uf_print_cell(uf_cidx(c,(int64_t)i),1); } UFP("]"); return; }
+    if(h->tag==HT_MAP){ Map*m=(Map*)h; UFP("{"); int first=1; for(uint64_t i=0;i<m->cap;i++) if(m->st[i]==1){ if(!first)UFP(","); first=0; uf_print_cell(m->keys[i],1); UFP(":"); uf_print_cell(m->vals[i],1); } UFP("}"); return; }
+    if(h->tag==HT_OBJ){ UFP("[object Object]"); return; }
+    UFP("<%s>",h->tag==HT_BUF?"buf":h->tag==HT_RING?"chan":h->tag==HT_ATOM?"atom":h->tag==HT_ITER?"iter":h->tag==HT_BITMAP?"bitmap":h->tag==HT_BLOOM?"bloom":"object");
     return;
   }
-  printf("%lld",(long long)c.i);
+  UFP("%lld",(long long)c.i);
 }
 static void op_print(Ctx*cx){ Cell v=pop(cx); uf_print_cell(v,0); printf("\n"); }
+/* DBG: v -> v | peek-print the stack top to stderr: "dbg <site>: <value>" */
+static void op_dbg(Ctx*cx){
+  if(cx->sp<=0)die("dbg: empty stack");
+  char buf[128]; uf_site(buf,sizeof buf,cx);
+  uf_dbg_out=1;
+  UFP("dbg %s: ",buf);
+  uf_print_cell(cx->ds[cx->sp-1],0);
+  UFP("\n");
+  uf_dbg_out=0;
+}
+/* CHECK: v -> - | one-token assert: a falsy value dies "check failed" at this line */
+static void op_check(Ctx*cx){ Cell v=pop(cx); if(!uf_truthy(v))die("check failed"); }
+/* TIMER: - -> ns | monotonic clock, nanoseconds (int; only differences are meaningful) */
+static void op_timer(Ctx*cx){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); pushi(cx,(int64_t)ts.tv_sec*1000000000LL+(int64_t)ts.tv_nsec); }
+/* MEMSTATS: - -> dict | GC stats {gc, objs, live, alloc} */
+static void op_memstats(Ctx*cx){
+  Map*m=uf_map_new(); UF_PROTECT((void**)(void*)&m);
+  map_put(m,uf_str_new("gc",2),uf_mki((int64_t)atomic_load(&uf_gc_collections)));
+  map_put(m,uf_str_new("objs",4),uf_mki((int64_t)uf_gc_setlen));
+  map_put(m,uf_str_new("live",4),uf_mki((int64_t)atomic_load(&uf_gc_live)));
+  map_put(m,uf_str_new("alloc",5),uf_mki((int64_t)atomic_load(&uf_gc_alloc_total)));
+  pushp(cx,m);
+}
 /* SCAN: fmt -> list */
 static void op_scan(Ctx*cx){
   Cell f=pop(cx); const char*p=uf_sptr(f); Dyn* dl=uf_dyn_new(8); UF_PROTECT(&dl); int n=0;

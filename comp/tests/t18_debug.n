@@ -1,0 +1,19 @@
+; t18_debug.n — the debugging op quartet: dbg (peek top to stderr with the
+; source site), check (one-token assert), timer (monotonic clock, ns),
+; and memstats (gc stats dict). Raw timer values are never printed — the
+; two targets keep different clocks — so the timer is exercised for
+; bounds only; memstats is executed but never printed either (host heap
+; counters legitimately differ).
+; Expected: stdout "100\n"; stderr "dbg L9 [entry]: 42\n"
+entry:
+42 dbg
+3 check
+timer x!
+30 'spin for
+timer y!
+y x sub 0 gt check
+memstats z!
+100 print
+ret
+spin:
+1 1 add drop ret

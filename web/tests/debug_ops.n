@@ -1,0 +1,11 @@
+; debug_ops.n — JS-runtime micro-gate for the debugging quartet: dbg
+; (stderr parity), check pass, timer bounds, memstats (not printed).
+; Expected: stdout "ok\n"; stderr "dbg L5: 9\n"
+9 dbg
+1 check
+timer a!
+timer b!
+b a sub 0 gte check
+memstats c!
+"ok" print
+ret

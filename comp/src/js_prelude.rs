@@ -68,19 +68,33 @@ var RT = (function () {
     // env: the run environment (argv, stdin text, in-memory file table) —
     // the node tail and the web glue set rt.reg.env before the entry runs
     var reg = { tasks: [], chans: [], timers: 0, gen: 0, settle: null, G: {}, out: [], err: [], env: { argv: [], stdin: "", fs: {} } };
-    var rt = { st: [], iv: [], G: reg.G, L: [], lb: 0, lsp: 0, out: reg.out, opName: "<startup>", curN: 0, reg: reg };
+    var rt = { st: [], iv: [], G: reg.G, L: [], lb: 0, lsp: 0, out: reg.out, opName: "<startup>", curN: 0, site: -1, reg: reg };
     reg.tasks.push({ rt: rt, exit: 0 });
     return rt;
   }
   // A spawned task: fresh stack/frame, the same shared vars and registry.
   function taskRt(reg) {
-    var rt = { st: [], iv: [], G: reg.G, L: [], lb: 0, lsp: 0, out: reg.out, opName: "<startup>", curN: 0, reg: reg };
+    var rt = { st: [], iv: [], G: reg.G, L: [], lb: 0, lsp: 0, out: reg.out, opName: "<startup>", curN: 0, site: -1, reg: reg };
     reg.tasks.push({ rt: rt, exit: 0 });
     return rt;
   }
   var BREAK = { nkBreak: 1 };
   var CONT = { nkCont: 1 };
-  function die(rt, m) { var e = new Error(m); e.nkErr = 1; e.nkMsg = m; throw e; }
+  // Site head for die/dbg: "L<line> [label]", or "<stem>:L<line> [label]"
+  // in a multi-TU program; "" when the site is unknown. Reads the __SITES
+  // table the codegen emits (null-safe: the prelude must also stand alone).
+  // Mirrors the C uf_site helper.
+  function siteHead(rt) {
+    var S = (typeof __SITES === "undefined") ? null : __SITES;
+    if (!S || !rt || !(rt.site >= 0) || rt.site >= S.length) return "";
+    var e = S[rt.site];
+    if (!e[2]) return "";
+    var lab = e[0] ? " [" + e[0] + "]" : "";
+    var F = (typeof __SF === "undefined") ? null : __SF;
+    if (F && F.length > 1) return F[e[1]] + ":L" + e[2] + lab;
+    return "L" + e[2] + lab;
+  }
+  function die(rt, m) { var h = siteHead(rt); var fm = h ? h + " " + m : m; var e = new Error(fm); e.nkErr = 1; e.nkMsg = fm; throw e; }
   function dieE(m) { var e = new Error(m); e.nkErr = 1; e.nkMsg = m; return e; }
   // Normalize a task-level failure (task error, break/cont escaping a
   // spawned body, foreign throw) to a nk-die error.
@@ -2974,6 +2988,29 @@ var RT = (function () {
     var v = pop(rt, "print");
     rt.out.push(printCell(rt, v, 0) + "\n");
   }
+  // DBG: v -> v | peek-print the stack top to stderr: "dbg <site>: <value>".
+  function op_dbg(rt) {
+    if (!rt.st.length) die(rt, "dbg: empty stack");
+    var v = rt.st[rt.st.length - 1];
+    rt.reg.err.push("dbg " + siteHead(rt) + ": " + printCell(rt, v, 0) + "\n");
+  }
+  // CHECK: v -> - | one-token assert: a falsy value dies "check failed" at this line.
+  function op_check(rt) { var v = pop(rt, "check"); if (!truthy(v)) die(rt, "check failed"); }
+  // TIMER: - -> ns | monotonic clock in nanoseconds (only differences are meaningful).
+  function op_timer(rt) {
+    var ns = (typeof process !== "undefined" && process.hrtime) ? process.hrtime.bigint()
+      : BigInt(Math.round((performance.now() + performance.timeOrigin) * 1e9));
+    rt.st.push(I(ns));
+  }
+  // MEMSTATS: - -> dict | GC stats {gc, objs, live, alloc}. The JS heap is
+  // host-managed (the runtime keeps no collector or allocator), so all four
+  // counters read 0 here; the native target reports real numbers.
+  function op_memstats(rt) {
+    var m = mapNew();
+    mapPut(m, S("gc"), I(0)); mapPut(m, S("objs"), I(0));
+    mapPut(m, S("live"), I(0)); mapPut(m, S("alloc"), I(0));
+    rt.st.push(D(m));
+  }
 
   // ===================== program args / gc / time / bloom ================
   // GC: C op_gc collects; JS is fully managed, no observable effect.
@@ -3689,6 +3726,7 @@ var RT = (function () {
     op_filter: op_filter, op_some: op_some, op_every: op_every,
     op_unique: op_unique, op_flat: op_flat, op_json: op_json,
     op_unjson: op_unjson, op_print: op_print, op_fmt: op_fmt,
+    op_dbg: op_dbg, op_check: op_check, op_timer: op_timer, op_memstats: op_memstats,
     op_malloc: op_malloc, op_free: op_free, op_buf: op_buf,
     op_bufcopy: op_bufcopy, op_loadx: op_loadx, op_storex: op_storex,
     op_chan: op_chan, op_enq: op_enq, op_deq: op_deq, op_close: op_close,

@@ -29,7 +29,7 @@ const JS_OPS: &[&str] = &[
     "op_add", "op_sub", "op_mul", "op_and", "op_or", "op_xor", "op_shl", "op_shr", "op_bnot",
     "op_inc", "op_dec", "op_pow", "op_sqrt", "op_div", "op_rem", "op_lt", "op_gt", "op_lte",
     "op_gte", "op_eq", "op_seq", "op_sne", "op_not", "op_orelse", "op_drop", "op_cast",
-    "op_dcast", "op_typeof", "op_len", "op_list", "op_dict", "op_get", "op_getq", "op_set",
+    "op_dcast", "op_dbg", "op_check", "op_timer", "op_memstats", "op_typeof", "op_len", "op_list", "op_dict", "op_get", "op_getq", "op_set",
     "op_del", "op_has", "op_keys", "op_cat", "op_slice", "op_push", "op_lpop", "op_range",
     "op_glob", "op_split", "op_join", "op_find", "op_repl", "op_trim", "op_up", "op_down",
     "op_starts", "op_ends", "op_atoi", "op_atof", "op_itoa", "op_ftoa", "op_match",
@@ -170,6 +170,9 @@ fn find_lit_start(p: &Parsed, i: usize, seg_start: usize) -> usize {
 
 // Emit one instruction at index x of the segment starting at seg_start.
 fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
+    // mark the instruction in flight: die() formats its source line (the
+    // __SITES table mirrors the C uf_sites)
+    o.push_str(&format!("rt.site={};\n", i));
     match &p.ins[i] {
         Ins::PushI(v) => {
             o.push_str(&format!("iv.push(RT.I({}n));\n", v));
@@ -901,6 +904,41 @@ pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
         ));
     }
     o.push_str("};\n");
+    // error-site table (mirrors the C uf_sites_v): per instruction,
+    // [innermost label name or null, file index, source line]. die() formats
+    // it as "L<line> [label]"; __SF (multi-TU only) carries the file stems.
+    {
+        let mut disp: HashMap<usize, String> = HashMap::new();
+        for (n, &pc) in &p.labels {
+            disp.entry(pc)
+                .or_insert_with(|| p.label_names.get(&pc).cloned().unwrap_or_else(|| n.clone()));
+        }
+        let mut labs: Vec<(usize, String)> = disp.into_iter().collect();
+        labs.sort_by_key(|&(pc, _)| pc);
+        let mut li = 0usize;
+        let mut cur: Option<&String> = None;
+        let mut entries = String::new();
+        for i in 0..p.ins.len() {
+            while li < labs.len() && labs[li].0 <= i {
+                cur = Some(&labs[li].1);
+                li += 1;
+            }
+            let line = p.ins_lines.get(i).copied().unwrap_or(0);
+            let file = p.ins_files.get(i).copied().unwrap_or(0);
+            let lab = match cur {
+                Some(n) => format!("\"{}\"", n),
+                None => "null".to_string(),
+            };
+            entries.push_str(&format!("[{},{},{}],", lab, file, line));
+        }
+        o.push_str(&format!("var __SITES=[{}];\n", entries));
+        if p.file_names.len() > 1 {
+            o.push_str(&format!(
+                "var __SF=[{}];\n",
+                p.file_names.iter().map(|f| format!("\"{}\"", f)).collect::<Vec<_>>().join(",")
+            ));
+        }
+    }
     // segments, ascending (function declarations hoist, so forward calls work).
     // F_0 is always the REAL segment [0, next_dyn): with an entry label its
     // pc may be a plain label (e.g. a v0 body) and __NKAD[0] must reach it.

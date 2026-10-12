@@ -12,12 +12,12 @@
 // `fr = {drain, base}` argument each function carries.
 //
 // Semantics follow the C target (gen.rs) instruction for instruction.
-// Divergences: exports, methods, and init threads are compile-time
-// rejections; syscalls and methods (send) are runtime dies; weave fanout
-// runs items sequentially in item order; shell ops need node (in the
-// browser, shp yields an empty channel); time ops accept the "unix"
-// format only; cap/caps report the unrestricted-CPU model; the scan cursor
-// reads env.stdin. See SPEC.md ("JavaScript target").
+// Divergences: exports and init threads are compile-time rejections;
+// syscalls are runtime dies; weave fanout runs items sequentially in item
+// order; shell ops need node (in the browser, shp yields an empty channel);
+// time ops accept the "unix" format only; cap/caps report the
+// unrestricted-CPU model; the scan cursor reads env.stdin. See SPEC.md
+// ("JavaScript target").
 
 use crate::ast::*;
 use crate::js_prelude::JS_PRELUDE;
@@ -72,8 +72,7 @@ fn float_to_js(f: f64) -> String {
     }
 }
 
-struct Ctx<'a> {
-    p: &'a Parsed,
+struct Ctx {
     ins_body: Vec<usize>,
     targets: HashSet<usize>, // every label pc
     discard: HashSet<usize>, // continuation-body labels (ret value dropped)
@@ -844,7 +843,6 @@ pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
         .unwrap_or(0);
 
     let ctx = Ctx {
-        p,
         ins_body,
         targets,
         discard,

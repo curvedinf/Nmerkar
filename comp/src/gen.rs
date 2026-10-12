@@ -181,17 +181,6 @@ fn is_simple_expr(s: &str) -> bool {
     !s.contains('(') && !s.contains(')')
 }
 
-// If the vstack entry at `idx` has a compound expression, materialize it into a
-// C temp so it isn't evaluated multiple times (dup/ovr copy the entry).
-fn materialize_at(e: &mut String, vs: &mut Vec<VEntry>, n: &mut usize, idx: usize) {
-    if idx < vs.len() && !is_simple_expr(&vs[idx].expr) {
-        let name = format!("t{}", *n);
-        *n += 1;
-        e.push_str(&format!("{} {}={};", c_type_of(vs[idx].ty), name, vs[idx].expr));
-        vs[idx].expr = name;
-    }
-}
-
 // Push a binary-op result: inline (no temp) when both operands are simple,
 // otherwise materialize as a temp variable as before.
 fn vpush_cond(e: &mut String, vs: &mut Vec<VEntry>, n: &mut usize,
@@ -2842,7 +2831,7 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
 }
 
 static DISCARD_RET_LABELS: std::sync::OnceLock<std::collections::HashSet<usize>> = std::sync::OnceLock::new();
-pub fn gen(p: &Parsed, structs: &StructMap, debug: bool, profile: bool, coverage: bool) -> String {
+pub fn gen(p: &Parsed, structs: &StructMap, debug: bool, profile: bool, coverage: bool, runtime_cfg: &str) -> String {
     UF_DEBUG.store(debug, Ordering::Relaxed);
     UF_PROF_MODE.store((if profile { 1 } else { 0 }) | (if coverage { 2 } else { 0 }), Ordering::Relaxed);
     // continuation-body labels: while/for/if CALL these and discard the
@@ -3401,7 +3390,7 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool, profile: bool, coverage
     let prof_end = if prof_mode != 0 {
         format!("uf_prof_report(uf_prof_lbls,uf_prof_labs,uf_prof_lines,{});", n_labs)
     } else { String::new() };
-    o.push_str(&format!("int main(int argc,char**argv){{nk_argc=argc;nk_argv=(void*)argv;{}uf_init_reflection();uf_init_locals();{}{}uf_init_lits({});uf_gc_setshared({});uf_gc_init();nk_run(main_cx,0);{}return 0;}}\n", sites_init, dbg_init, prof_init, lits_arg, roots_arg, prof_end));
+    o.push_str(&format!("int main(int argc,char**argv){{nk_argc=argc;nk_argv=(void*)argv;{}uf_init_reflection();uf_init_locals();{}{}uf_init_lits({});uf_gc_setshared({});{}uf_gc_init();nk_run(main_cx,0);{}return 0;}}\n", sites_init, dbg_init, prof_init, lits_arg, roots_arg, runtime_cfg, prof_end));
     o
 }
 

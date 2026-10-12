@@ -746,10 +746,6 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     // regions fuse on CPU regardless of GPU availability (gen guards the GPU
     // try in #ifdef NK_GPU); kidx only matters when the prefix defined it
     compute::register_region_kernels(region_kernels);
-    let mut csrc = gen(&parsed, &structs, debug, profile, coverage);
-    if let Some(prefix) = gpu_prefix {
-        csrc = format!("{}{}", prefix, csrc);
-    }
     // bake runtime config into the generated binary
     let mut config_lines = c_bake(&caps, device.as_deref().unwrap_or("auto"));
     if let Some(t) = gc_threshold {
@@ -761,7 +757,10 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     if force_mt {
         config_lines.push_str("  atomic_store(&uf_gc_mt,1);\n");
     }
-    let csrc = csrc.replace("uf_gc_init();", &format!("{}uf_gc_init();", config_lines));
+    let mut csrc = gen(&parsed, &structs, debug, profile, coverage, &config_lines);
+    if let Some(prefix) = gpu_prefix {
+        csrc = format!("{}{}", prefix, csrc);
+    }
 
     // effective link line: pthread always (weave/chan/atom substrate), -l per USE
     let mut links: Vec<String> = vec!["-lpthread".to_string(), "-lm".to_string()];

@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::lex::*;
 use crate::sandbox::Caps;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 // FNV-1a 64 over bytes (matches uf_fnv in the C prelude)
 pub fn fnv64(s: &str) -> i64 {
@@ -176,10 +176,6 @@ pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Par
     // next statement boundary (label, directive, task, another ret, or a
     // literal closer). In valid v13 code the ret is the last statement of its
     // body, so the operand is exactly the return expression.
-    fn is_stmt_boundary(t: &(u32, Tok)) -> bool {
-        is_hard_boundary(t)
-            || matches!(&t.1, Tok::List(_) | Tok::Dict(_))
-    }
     fn is_hard_boundary(t: &(u32, Tok)) -> bool {
         matches!(&t.1,
             Tok::LabelDef(_) | Tok::Task { .. } | Tok::TaskEnd(_) | Tok::Wrun(_)
@@ -1125,10 +1121,8 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
                 );
             }
         }
-        // rewrite: shared names become SetV/GetV; RMW placeholders expand
-        // (fixups carry the RMW's own body so slot analysis stays correct)
+        // rewrite: shared names become SetV/GetV
         for (i, ins) in p.ins.iter_mut().enumerate() {
-            let rmw_body = ins_body[i];
             match ins {
                 Ins::LocalSet(n) => {
                     let shadowed = body_params
@@ -1740,15 +1734,6 @@ pub fn check_label_arity(p: &Parsed) {
         }
         best.map(|(_, n)| n).unwrap_or(0)
     };
-    let label_name_at = |pc: usize| -> String {
-        let mut best: Option<(usize, String)> = None;
-        for (name, &lpc) in &p.labels {
-            if lpc <= pc && best.as_ref().map_or(true, |(b, _)| lpc > *b) {
-                best = Some((lpc, name.clone()));
-            }
-        }
-        best.map(|(_, n)| n).unwrap_or_else(|| "<top>".to_string())
-    };
     let mut depth: Option<i64> = Some(0);
     let mut list_marks: Vec<i64> = Vec::new();
     for (i, ins) in p.ins.iter().enumerate() {
@@ -2047,7 +2032,7 @@ pub fn check_strictness(p: &mut Parsed) {
     let mut param_taint: HashMap<(usize, usize), bool> = HashMap::new(); // (label pc, param idx)
     let mut ret_region: HashMap<usize, bool> = HashMap::new(); // label pc -> its own rets
     let mut ret_body: HashMap<usize, bool> = HashMap::new(); // body owner pc -> any ret in body
-    let mut taint_param = |tp: usize,
+    let taint_param = |tp: usize,
                            k: usize,
                            param_taint: &mut HashMap<(usize, usize), bool>|
      -> bool {

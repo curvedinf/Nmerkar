@@ -14,7 +14,7 @@
 // sum/mean/min/max, transpose — all on float64 (double) arrays/tensors/
 // matrices. Other element types and int64 workloads stay on the CPU.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::process::Command;
 
 pub trait ComputeBackend {
@@ -369,11 +369,6 @@ pub struct TaskKernel {
     pub glsl: String,
 }
 
-fn expr_to_glsl(e: &TExpr, idx: &str) -> String {
-    let (pre, v) = glsl_parts(e, idx, &mut 0);
-    let _ = pre;
-    v
-}
 /// (prelude statements, value expression). While-loops must hoist: GLSL has
 /// no statement-expressions, so control flow emits as declarations before the
 /// assignment site and leaves its result in a temp.
@@ -437,7 +432,7 @@ fn glsl_parts(e: &TExpr, idx: &str, ctr: &mut usize) -> (String, String) {
         TExpr::While { inits, cond, updates, result } => {
             let mut pre = String::new();
             let mut initv = Vec::new();
-            for (ty, e0) in inits {
+            for (_, e0) in inits {
                 let (p, v) = sub(e0, ctr);
                 pre.push_str(&p);
                 initv.push(v);
@@ -498,7 +493,6 @@ pub fn task_glsl(name: &str, ninputs: usize, expr: &TExpr) -> String {
 /// Analyze all weave tasks in a parsed program; returns the compilable ones.
 pub fn analyze_tasks(p: &crate::ast::Parsed) -> Vec<TaskKernel> {
     use crate::ast::Ins;
-    use std::collections::HashMap;
     // collect task entry pcs from every Weave
     let mut task_pcs: Vec<(usize, String)> = Vec::new();
     for ins in &p.ins {
@@ -556,7 +550,6 @@ fn analyze_one_task(p: &crate::ast::Parsed, tpc: usize) -> Option<(usize, TExpr)
     #[derive(Clone)]
     enum V {
         E(TExpr),
-        Opaque,
     }
     #[derive(Hash, PartialEq, Eq)]
     enum Slot {
@@ -623,10 +616,7 @@ fn analyze_one_task(p: &crate::ast::Parsed, tpc: usize) -> Option<(usize, TExpr)
                     } else {
                         let bv = match stack.pop() { Some(v) => v, None => return task_dbg_none(line!()) };
                         let av = match stack.pop() { Some(v) => v, None => return task_dbg_none(line!()) };
-                        let (ae, be) = match (av, bv) {
-                            (V::E(ae), V::E(be)) => (ae, be),
-                            _ => return None,
-                        };
+                        let (V::E(ae), V::E(be)) = (av, bv);
                         (ae, be)
                     };
                     let e = match *h {
@@ -660,7 +650,6 @@ fn analyze_one_task(p: &crate::ast::Parsed, tpc: usize) -> Option<(usize, TExpr)
     let final_v = match stack.pop() { Some(v) => v, None => return task_dbg_none(line!()) };
     let expr = match final_v {
         V::E(e) => e,
-        V::Opaque => return None,
     };
     // fused tasks must actually use at least one input
     let uses_input = match &expr {
@@ -796,29 +785,7 @@ fn expr_uses_input(e: &TExpr) -> bool {
     }
 }
 
-fn expr_has_div(e: &TExpr) -> bool {
-    match e {
-        TExpr::Input(_) | TExpr::Const(_) => false,
-        TExpr::Div(_, _) => true,
-        TExpr::Add(a, b) | TExpr::Sub(a, b) | TExpr::Mul(a, b) => expr_has_div(a) || expr_has_div(b),
-        TExpr::Sqrt(a) => expr_has_div(a),
-        TExpr::Cat(a, b) => expr_has_div(a) || expr_has_div(b),
-        TExpr::At(a, _) => expr_has_div(a),
-        TExpr::Idx(_) => false,
-        TExpr::State(_) => false,
-        TExpr::Dom(_) | TExpr::DomLen(_) => false,
-        TExpr::Cmp(_, a, b) => expr_has_div(a) || expr_has_div(b),
-        TExpr::And(a, b) => expr_has_div(a) || expr_has_div(b),
-        TExpr::Not(a) => expr_has_div(a),
-        TExpr::While { inits, cond, updates, result } => {
-            expr_has_div(result) || expr_has_div(cond)
-                || inits.iter().any(|(_, e)| expr_has_div(e))
-                || updates.iter().any(expr_has_div)
-        }
-    }
-}
-
-/// TExpr as C over per-element input reads (mirrors expr_to_glsl): Input(j)
+/// TExpr as C over per-element input reads (mirrors glsl_parts): Input(j)
 /// reads `_a{j}[idx]` directly so Shift/Cat positions work; `idx` defaults to
 /// the fused loop's element index. Division carries an inline zero-divisor
 /// check so the fused loop keeps the per-op `die("div: zero divisor")`
@@ -1069,7 +1036,6 @@ fn simulate_fold_body(
     #[derive(Clone)]
     enum V {
         E(TExpr),
-        Opaque,
     }
     let mut stack: Vec<V> = vec![V::E(acc), V::E(TExpr::Const(elem))];
     let mut locals: std::collections::HashMap<BSlot, V> = std::collections::HashMap::new();
@@ -1358,7 +1324,6 @@ fn walk_one_region(
     #[derive(Clone)]
     enum V {
         E(TExpr),
-        Opaque,
     }
     let mut stack: Vec<V> = Vec::new();
     let mut locals: HashMap<Slot, V> = HashMap::new();
@@ -1471,10 +1436,9 @@ fn walk_one_region(
                     if let (Ins::PushAddr(bl), cnt_ins) = (&p.ins[i - 1], &p.ins[i - 2]) {
                         let bpc = p.labels.get(bl).copied();
                         // count: Const or a shared scalar (recorded as length guard)
-                        let (n_elems, guard): (Option<TExpr>, Option<String>) = match cnt_ins {
-                            Ins::PushI(v) => (Some(TExpr::Const(*v as f64)), None),
-                            Ins::GetV(g) => (None, Some(g.clone())),
-                            _ => (None, None),
+                        let guard: Option<String> = match cnt_ins {
+                            Ins::GetV(g) => Some(g.clone()),
+                            _ => None,
                         };
                         if let Some(bpc) = bpc {
                             // body label binds exactly one param (k)
@@ -1876,7 +1840,7 @@ fn walk_one_region(
                                                 let to_nm: std::collections::HashMap<String, usize> = state.iter().enumerate()
                                                     .map(|(i2, s2)| (key(s2), i2)).collect();
                                                 let fl0: std::collections::HashMap<String, TExpr> = fl.iter()
-                                                    .filter_map(|(k2, v2)| match v2 { V::E(e) => Some((key(k2), e.clone())), _ => None })
+                                                    .map(|(k2, V::E(e))| (key(k2), e.clone()))
                                                     .collect();
                                                 let condr = sim_scalar_label(p, cpc, &to_nm, &fl0, &outer);
                                                 let bodyr = sim_scalar_label(p, bpc, &to_nm, &fl0, &outer);
@@ -1890,7 +1854,7 @@ fn walk_one_region(
                                                         });
                                                     if cst.len() == 1 && input_free {
                                                         let cond_expr = cst[0].clone();
-                                                        let inits: Vec<(STy, TExpr)> = state.iter().enumerate().map(|(i2, s2)| {
+                                                        let inits: Vec<(STy, TExpr)> = state.iter().enumerate().map(|(_, s2)| {
                                                             let ie = fl0.get(&key(s2)).cloned().unwrap_or(TExpr::Const(0.0));
                                                             let ty = match ie { TExpr::Const(c) if c == c.trunc() && c.abs() < 9e15 => STy::I, _ => STy::F };
                                                             (ty, ie)
@@ -2251,10 +2215,8 @@ fn walk_one_region(
                                         let hit = |ex: &TExpr| go_idx(ex, &idxs);
                                         stack.iter().any(|v| match v {
                                             V::E(ex) => hit(ex),
-                                            _ => false,
                                         }) || locals.values().any(|v| match v {
                                             V::E(ex) => hit(ex),
-                                            _ => false,
                                         })
                                     };
                                     let mut bound_names: Vec<String> = vec![g.clone()];

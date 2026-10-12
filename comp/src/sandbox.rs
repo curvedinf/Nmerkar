@@ -40,15 +40,6 @@ enum Tri {
     Denied,
 }
 
-impl Tri {
-    fn as_i64(self) -> i64 {
-        match self {
-            Tri::Allowed => 1,
-            Tri::Denied => 0,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct Rules {
     allow: Vec<String>,

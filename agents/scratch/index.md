@@ -1,0 +1,8 @@
+# Scratch index
+
+- [Dev Skills installation](dev-skills-install.md): source revision, destination
+  mapping, adaptations, conflicts; self-improvement enabled.
+
+Durable project working notes belong here and are included in Git. Organize
+records by goal or topic and link them from this index as they are created.
+Disposable files belong in the ignored `../tmp/` directory.

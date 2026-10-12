@@ -18,3 +18,7 @@ bench/results/
 # integration-test fixtures (t08 writes/reads these)
 tests/out.txt
 tests/fem.txt
+
+# dev-skills: disposable scratch (durable notes live in the Git-versioned
+# agents/scratch/)
+/agents/tmp/

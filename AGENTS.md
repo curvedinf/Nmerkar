@@ -70,3 +70,99 @@ Key gotchas not to re-derive: string escapes limited to `\n \t \r \0 \\ \"`. Lin
 - Transpiler is a Rust crate (`cd trans && cargo build --release` → `target/release/trans`); unit tests via `cargo test`, behavior via `bash trans/run_tests.sh`.
 - Compiler cache key includes its own binary mtime — rebuilding auto-invalidates old cached outputs.
 - **Any change to language semantics, opcodes, encodings, or behavior must be documented in `SPEC.md` in the same changeset.**
+
+## Dev Skills
+
+Process skills from [curvedinf/dev-skills](https://github.com/curvedinf/dev-skills)
+(MIT, `agents/skills/LICENSE`), installed at commit
+[eec75da](https://github.com/curvedinf/dev-skills/tree/eec75da909fc954cd970cc3921859f9884a66a84);
+install record: `agents/scratch/dev-skills-install.md`. Passive skills are
+persistent conventions that apply within their routed scope; activated skills
+are explicitly requested workflows; triggered skills are workflows initiated
+by a non-user event when their conditions hold. Skill bodies live at
+`agents/skills/<passive|activated|triggered>/<name>/SKILL.md`; a keyword is a routing
+hint, not permission to start another task. Load the workflow matching the
+requested outcome and only the passive conventions routed for that work.
+This file's own sections (Repository Layout, Build, Running Programs,
+Testing, Development Notes) define this repository's policy and take
+precedence over any imported convention.
+
+| Request terms | Read |
+| --- | --- |
+| install dev-skills, project-wide, agent-wide | [install-dev-skills](agents/skills/activated/install-dev-skills/SKILL.md) |
+| claims, citations, uncertainty | [evidence-discipline](agents/skills/passive/evidence-discipline/SKILL.md) |
+| scope, requirements, ownership | [contract-discipline](agents/skills/passive/contract-discipline/SKILL.md) |
+| pre-commit, PID/PII, secrets, privacy leaks | [security-hygiene-check](agents/skills/triggered/security-hygiene-check/SKILL.md) |
+| commit, push, merge, branches | [git-discipline](agents/skills/passive/git-discipline/SKILL.md) |
+| test cadence, nightly, release gates | [testing-doctrine](agents/skills/passive/testing-doctrine/SKILL.md) |
+| wording, terminology, examples | [documentation-style](agents/skills/passive/documentation-style/SKILL.md) |
+| checkpoint, resume, history | [scratch-space](agents/skills/passive/scratch-space/SKILL.md) |
+| periodic workflow, timed skill, shared timers | [design-time-triggered-skill](agents/skills/activated/design-time-triggered-skill/SKILL.md) |
+| fresh session, weekly compaction | [maintain-scratch](agents/skills/triggered/maintain-scratch/SKILL.md) |
+| create skill, author workflow | [design-skill](agents/skills/activated/design-skill/SKILL.md) |
+| correction, workflow gap, refine, self-improvement | [refine-skill](agents/skills/triggered/refine-skill/SKILL.md) |
+| README, onboarding, quickstart | [polish-docs](agents/skills/activated/polish-docs/SKILL.md) |
+| debug, crash, regression | [diagnose-and-repair](agents/skills/activated/diagnose-and-repair/SKILL.md) |
+| test plan, acceptance, coverage gaps | [design-validation](agents/skills/activated/design-validation/SKILL.md) |
+| benchmark, compare, feasibility | [run-experiment](agents/skills/activated/run-experiment/SKILL.md) |
+| continuous optimization, metrics | [indefinite-loop](agents/skills/activated/indefinite-loop/SKILL.md) |
+| delegate, parallelize, handoff | [coordinate-work](agents/skills/activated/coordinate-work/SKILL.md) |
+| review, audit, PR findings | [audit-and-resolve](agents/skills/activated/audit-and-resolve/SKILL.md) |
+| deploy, migrate, resume job | [operate-workflow](agents/skills/activated/operate-workflow/SKILL.md) |
+
+Switch workflows when the objective changes; preserve the shared goal
+record. Cross-links provide related guidance; they do not require loading
+the whole collection or invoking every linked workflow.
+
+### Authoring conventions
+
+Use [design-skill](agents/skills/activated/design-skill/SKILL.md) for skill creation and
+[refine-skill](agents/skills/triggered/refine-skill/SKILL.md) for evidence-backed
+maintenance.
+
+- Specify outcomes and consequential decision criteria; delegate execution
+  mechanics. Prefer precise verbs and established terms over explanatory
+  padding.
+- Remove tutorials, micromanagement, repeated policy, and speculative edge
+  cases. Every sentence costs attention.
+- Keep skills portable and self-contained; add supporting files only for
+  necessary task-specific material. Check format and links after edits.
+- `README.md` is for humans (value, proof, adoption path); `AGENTS.md` is
+  for computers (routing, constraints, commands, decision rules). Keep agent
+  operating instructions out of README and promotional prose out of AGENTS.
+
+### Scratch space
+
+Use [scratch-space](agents/skills/passive/scratch-space/SKILL.md) for durable,
+Git-versioned task notes in `agents/scratch/` with a small `index.md` linking
+active goals; one record per goal, never ignore the directory, and include
+relevant note updates when committing authorized work. Disposable files go
+in the ignored `agents/tmp/`; retain reusable evidence in durable storage.
+
+### Self-improvement
+
+Always read and consider [refine-skill](agents/skills/triggered/refine-skill/SKILL.md)
+— a cross-cutting metaskill, not an optional route. At the end of each task,
+before the final response, evaluate user corrections, recurring friction,
+workflow gaps, and verified reusable lessons; when self-improvement is
+enabled, apply one evidence-backed refinement pass within the task's write
+scope, validate any edits, and include them in the authorized task commit.
+No evidence means no edit; refinement does not recursively trigger itself.
+
+Self-improvement: enabled.
+
+### Reference skill libraries
+
+Use as inspiration, not requirements; check licenses before copying
+material.
+
+| Library | Useful ideas to examine |
+| --- | --- |
+| [Anthropic skills](https://github.com/anthropics/skills) | Self-contained packaging, concise entrypoints, supporting resources. |
+| [Obra Superpowers](https://github.com/obra/superpowers) | Composable processes, explicit workflow transitions, skill validation. Adapt ideas without importing the methodology. |
+| [Vercel agent-skills](https://github.com/vercel-labs/agent-skills) | Clear use conditions, impact-based prioritization, focused skill separation. |
+| [Hermes bundled skills](https://github.com/NousResearch/hermes-agent/tree/main/skills) | Default skill architecture, capability-focused discovery, evidence-driven refinement. |
+
+The [Agent Skills specification](https://agentskills.io/specification) is a
+format reference for portable packaging, not a library. Verify current
+external content when relying on it.

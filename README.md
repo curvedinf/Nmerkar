@@ -221,3 +221,122 @@ nk --device vk0 prog.n  # pin a specific Vulkan device
 Nmerkar's project includes a transpiler which converts simple C programs and
 libraries to Nmerkar-native versions. This allows automated creation of training
 data for language models.
+
+## Observability
+
+Nmerkar is designed for agents that compile, run, and fix programs in a tight
+loop, so observability is part of the language rather than an add-on. Every
+runtime failure carries the source site of the instruction that failed, on both
+the native and JavaScript targets:
+
+```
+nk: L<line> [label] <message>
+```
+
+In a multi-file program the owning file's stem is prefixed
+(`nk: mb:L3 [pubf] DIV: division by zero`); instructions with no source line
+(macro bodies, synthesized epilogues) fall back to the plain message.
+
+Four debug ops work on both targets:
+
+- `dbg` peeks the stack top and renders it on stderr like `print`
+  (`dbg L8 [entry]: 200000`), without popping it
+- `check` dies at that line with `check failed` when its operand is falsy
+  (exit code 1)
+- `timer` pushes the monotonic clock in nanoseconds (only differences are
+  meaningful)
+- `memstats` pushes the native GC's counters as a dict: `{gc, objs, live, alloc}`
+
+```nmerkar
+; the four debug ops in one small program
+entry:
+  100000 v0!          ; v0 = a value to observe
+  timer v1!           ; v1 = monotonic clock, nanoseconds
+  v0 2 mul v0!        ; some work
+  timer v2!
+  v2 v1 sub "elapsed=%d ns" format print
+  v0 dbg              ; peek at v0 on stderr
+  v0 0 gt check       ; die "check failed" if v0 is falsy
+  memstats v3!        ; v3 = {gc, objs, live, alloc}
+  v3 "gc" get "gc collections=%d" format print
+  ret
+```
+
+```
+$ nk debug.n
+dbg L8 [entry]: 200000
+elapsed=270 ns
+gc collections=0
+```
+
+The native target adds two report flags. Both are compiled in only when
+requested (zero cost otherwise) and write to stderr after `main` returns, so a
+program that dies exits before the report; together they print both tables:
+
+```sh
+nk --profile prog.n     # per-label call counts and time
+nk --coverage prog.n    # per-label hit counts
+```
+
+```
+--- nk profile ---
+label         line   calls            ns     %
+v3              13      21          1020  51.3
+v4              16      20           970  48.7
+entry            2       1             0   0.0
+total                               1990 100.0
+
+--- nk coverage ---
+label         line  hits
+entry            2     1
+v3              13    21
+v4              16    20
+0 of 3 labels uncovered
+```
+
+`nk -D prog.n` extends the crash dump: after the failing thread's stack, one
+best-effort block per other live thread (`thread #1:` / `#0  bump (pc=17)`).
+The four debug ops and error sites also work on the JavaScript target;
+`--profile`, `--coverage`, and the all-thread dump are native-only (see
+Javascript Compiler).
+
+Normative semantics: SPEC.md, "Debugging and profiling".
+
+## Javascript Compiler
+
+The same source compiles either to a native binary or to plain JavaScript.
+`--emit-js` writes a standalone `.js` file that runs directly under Node —
+stdout, stderr, exit code, and die messages match the native target:
+
+```sh
+nk --emit-js prog.n -o prog    # writes prog.js
+node prog.js
+```
+
+For the browser, `web/nk.js` (rebuild with `sh web/build.sh`) is a single-file
+bundle of the compiler. `web/example.html` is a working example page that
+opens directly from disk, with a selector for several sample programs:
+
+```html
+<script src="nk.js"></script>
+<script>
+  nk.compile(src).then(function (prog) { return prog.run(); })
+    .then(function (r) { out.textContent = r.output + r.err; });
+</script>
+```
+
+The same bundle works under Node: `nk.compile(source)` resolves to a program
+handle (rejecting with `nk: <error>` on compile failure), and
+`prog.run()` — optionally passed an env object carrying `argv`, `stdin`, and
+`fs` hooks — resolves to `{output, err, error, rc}`: captured stdout, captured
+stderr, the die message (without the `nk: ` prefix), and the exit code.
+
+Boundaries:
+
+- Full op coverage: every op, including the four debug ops, works on the
+  JavaScript target. The parity suite (`bash web/tests/run_tests.sh`, 78
+  gates) compiles and runs every `comp/tests` gate, every example (including
+  the GNU transpiler outputs), and every benchmark program on both targets and
+  compares the captured streams byte for byte.
+- `--profile`, `--coverage`, and the all-thread crash dump are native target
+  only; `memstats` reads zeros on the JS target (the host manages the heap).

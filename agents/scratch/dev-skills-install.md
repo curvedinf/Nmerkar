@@ -84,6 +84,11 @@
 - Upstream declares `Self-improvement: enabled.`; not inherited. Nmerkar's
   declaration came from the user's explicit opt-in during the first install
   and is unchanged by updates.
+- Local refinement (2026-10-12, task-end self-improvement): coordinate-work
+  step 3 gained one sentence — identity-verification baselines must come from
+  a frozen source snapshot under concurrent edits. Evidence: a byte-identity
+  check was contaminated by a parallel contributor's edit to a shared
+  artifact during SPEC/compiler work. Reconcile on the next upstream sync.
 
 ## Corrections applied
 

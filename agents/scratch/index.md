@@ -2,6 +2,9 @@
 
 - [Dev Skills installation](dev-skills-install.md): source revision, destination
   mapping, adaptations, conflicts; self-improvement enabled.
+- [Emitted-C nondeterminism](codegen-nondeterminism.md): `--emit-c` output
+  varies run-to-run (HashMap-ordered init_locals/function blocks); known,
+  behavior-neutral, fix before any emitted-C hashing or reproducible builds.
 
 Durable project working notes belong here and are included in Git. Organize
 records by goal or topic and link them from this index as they are created.

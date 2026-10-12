@@ -13,7 +13,7 @@ For ongoing work, read and update [scratch records](../../passive/scratch-space/
 
 1. Establish the shared outcome, acceptance criteria, source baseline, and dependency order. Assign integration ownership.
 2. Give each assignment a bounded objective, owned files or artifacts, interface expectations, available inputs, and required return evidence. Make each handoff self-contained.
-3. Prepare authorized execution environments before dispatch. Separate writable outputs, preserve required uncommitted inputs, and allocate shared resources. Parallelize only noninterfering assignments.
+3. Prepare authorized execution environments before dispatch. Separate writable outputs, preserve required uncommitted inputs, and allocate shared resources. Parallelize only noninterfering assignments. When an assignment must verify output identity (byte-identical builds or diffs), capture its baseline from a frozen source snapshot such as a git worktree at the baseline commit — under concurrent edits a live-tree baseline silently drifts.
 4. Reconcile returned deltas against their source baseline. Check interface changes, evidence, and unresolved decisions; reassign or clarify the affected work when assumptions break.
 5. Combine authorized changes at meaningful dependency milestones and validate end-to-end interfaces. Report what is reviewed, integrated, verified, and still pending.
 

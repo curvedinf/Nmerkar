@@ -620,6 +620,15 @@ No file-handle object type; every op is self-contained.
 | 188 | 🌰 | `field_add_to` | dict field_idx amount → | dict[field] += amount; no Str alloc |
 | 189 | 😪 | `field_inc` | dict field_idx → | dict[field] += 1; no Str alloc |
 
+**Memory model of the streaming file ops** (172–175, 181): lines are read
+incrementally (`getline`) and the file is never materialized whole — but
+every line becomes a short-lived GC string, so peak RSS empirically grows
+with input size (≈ input bytes on glibc; allocator retention, independent
+of `--gc-threshold`). They are streaming in *line delivery* and *allocation
+churn*, not constant-memory primitives; a fold that keeps only a small
+accumulator still touches RSS ≈ input size on large files. Field views
+(`field_get`/`field_slice`) are zero-copy into the current line.
+
 ### JSON
 
 | idx | | mn | stack | notes |
@@ -1018,6 +1027,7 @@ yields a raw pointer (`p 8 add load` reads the next 8 bytes). Tracked handles
 | list | `"1,2,3"` style join |
 | list `[]` | `""` |
 | dict / obj | `"[object Object]"` |
+| typed array / tensor / matrix | raw handle digits (an address — unstable across runs; render containers with `print` or `to_json` instead) |
 
 ### Truthiness
 

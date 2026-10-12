@@ -124,6 +124,8 @@ const SPECS = [
   ["examples/ring.n", {}],
   ["examples/strtest.n", {}],
   ["examples/weave.n", {}],
+  ["examples/basics_stores.n", {}],
+  ["examples/basics_containers.n", {}],
   ["examples/shelltest.n", {}],
   ["examples/text/matmul.n", {}],
   ["examples/text/chat.n", { compileOnly: true }],

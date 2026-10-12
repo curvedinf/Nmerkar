@@ -129,6 +129,54 @@ binary. Eligible compute work can use a Vulkan GPU automatically when the
 toolchain and device are available, while `--device cpu` keeps it on the CPU.
 `nks` runs programs in a sandbox.
 
+## Language Basics
+
+The mental model in six rules — function-level details and the full op
+reference are in [`SPEC.md`](SPEC.md).
+
+**1. Postfix dataflow over a hidden stack.** Read left to right: literals and
+variable loads push values; each operation consumes the values above it and
+leaves its result for the next operation. You never manipulate the stack —
+values reach an operation from literals, named variables, or the previous
+operation's result. `3 4 add print` prints `7`.
+
+**2. A local store passes its value through.** `d!` stores into a local
+variable *and* leaves the value on the stack — it does not consume it. The
+classic bug is forgetting the leftover operand:
+
+```nmerkar
+5 3 sub d!      ; d = 2 — and the 2 is STILL an operand
+d d mul         ; leaves [2, 4]: the original 2 sits under the square
+add print       ; prints 6 — the leftover 2 joined the addition
+```
+
+Store-then-load is not "use the variable": after `d!`, the value is already
+there. Square with `5 3 sub d! d mul` (the pass-through *is* the operand),
+or consume it deliberately.
+
+**3. A shared store consumes.** A variable declared by a top-level
+assignment is shared (thread-safe, atomic). Inside labels, `total!` pops the
+value — it does *not* pass through — while a bare `total` loads it. The
+local/shared asymmetry is deliberate: locals chain within an expression;
+shared cells never leak operands across threads.
+
+**4. `set` returns the stored element, not the container.** `nums 1 99 set`
+mutates `nums` in place and leaves `99`, so binding its result captures the
+element — not the updated list. Read the container back by name. `get`
+likewise returns the element.
+
+**5. Render containers with `print` or `to_json`, not `%s`.** In `format`,
+`%s` applies string coercion: a list becomes `1,2,3`, a dict
+`[object Object]`, and a typed array or tensor renders as raw handle digits
+(an address). `print` gives the type-aware representation (`[10, 99, 30]`);
+`to_json` gives JSON.
+
+**6. Labels are the functions.** `name:` defines, `'name` references,
+`_call` invokes; parameters bind with `p!` directly after the definition's
+colon; every code path ends in `ret`. A callee's entire stack is drained on
+return — only the `ret` value reaches the caller, so callees cannot leak
+operands.
+
 ## Examples
 
 A shopping list stores items in order:
@@ -334,7 +382,7 @@ stderr, the die message (without the `nk: ` prefix), and the exit code.
 Boundaries:
 
 - Full op coverage: every op, including the four debug ops, works on the
-  JavaScript target. The parity suite (`bash web/tests/run_tests.sh`, 78
+  JavaScript target. The parity suite (`bash web/tests/run_tests.sh`, 80
   gates) compiles and runs every `comp/tests` gate, every example (including
   the GNU transpiler outputs), and every benchmark program on both targets and
   compares the captured streams byte for byte.

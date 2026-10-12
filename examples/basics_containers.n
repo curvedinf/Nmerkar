@@ -1,0 +1,12 @@
+; basics_containers.n — set/get return the ELEMENT; containers mutate in place.
+; Render containers with print (type-aware) or to_json (JSON);
+; %s in format string-coerces (lists join with commas, dicts become
+; "[object Object]", typed arrays/tensors render as raw handle digits).
+; Run: nk examples/basics_containers.n
+[10 20 30] nums!             ; a list, stored (top level: shared) and passed through
+nums 1 99 set print          ; 99 — set returns the STORED ELEMENT, not the list
+nums print                   ; [10,99,30] — the list itself was mutated in place
+nums 1 get print             ; 99 — get also returns the element
+nums to_json print           ; [10,99,30] — JSON rendering
+nums "a list under string coercion: %s" format print
+                             ; "a list under string coercion: 10,99,30"

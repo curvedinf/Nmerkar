@@ -71,74 +71,104 @@ fn gate_op(name: &str, caps: &Caps) {
     }
 }
 
-pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Parsed {
-    let mut macros: HashMap<String, Vec<(u32, Tok)>> = HashMap::new();
-    let imports: Vec<Import> = Vec::new();
-    // v12: destructuring bind helpers
-    fn is_multi_return(ins: Option<&Ins>, q: &VecDeque<(u32, Tok)>) -> bool {
-        match ins {
-            // v13: a bind-run of >=2 (the current bind plus at least one more
-            // in the queue) after a `_call` destructures the callee's returned
-            // list (multi-value ret); a lone trailing bind stays plain
-            Some(Ins::Call(_)) => {
-                let mut n = 0usize;
-                for t in q.iter().take(8) {
-                    if is_bind(t) {
-                        n += 1;
-                    } else {
-                        break;
-                    }
+// v12: destructuring bind helpers
+fn is_multi_return(ins: Option<&Ins>, q: &VecDeque<(u32, Tok)>) -> bool {
+    match ins {
+        // v13: a bind-run of >=2 (the current bind plus at least one more
+        // in the queue) after a `_call` destructures the callee's returned
+        // list (multi-value ret); a lone trailing bind stays plain
+        Some(Ins::Call(_)) => {
+            let mut n = 0usize;
+            for t in q.iter().take(8) {
+                if is_bind(t) {
+                    n += 1;
+                } else {
+                    break;
                 }
-                n >= 1
             }
-            _ => matches!(ins, Some(Ins::Simple(name)) if matches!(*name,
-                "op_sh" | "op_try" | "op_retry" | "op_match" | "op_scan" | "op_next")),
+            n >= 1
+        }
+        _ => matches!(ins, Some(Ins::Simple(name)) if matches!(*name,
+            "op_sh" | "op_try" | "op_retry" | "op_match" | "op_scan" | "op_next")),
+    }
+}
+fn is_bind(t: &(u32, Tok)) -> bool {
+    matches!(&t.1, Tok::LocalSet(_) | Tok::SetV(_) | Tok::Discard)
+}
+#[derive(Clone)]
+enum Bind { Local(String), Global(String), Discard }
+fn collect_destructure(first: Bind, q: &mut VecDeque<(u32, Tok)>) -> Vec<Bind> {
+    let mut pattern = vec![first];
+    while let Some(t2) = q.front() {
+        if !is_bind(t2) { break; }
+        match q.pop_front().unwrap().1 {
+            Tok::LocalSet(name) => pattern.push(Bind::Local(name)),
+            Tok::SetV(name) => pattern.push(Bind::Global(name)),
+            Tok::Discard => pattern.push(Bind::Discard),
+            _ => break,
         }
     }
-    fn is_bind(t: &(u32, Tok)) -> bool {
-        matches!(&t.1, Tok::LocalSet(_) | Tok::SetV(_) | Tok::Discard)
-    }
-    #[derive(Clone)]
-    enum Bind { Local(String), Global(String), Discard }
-    fn collect_destructure(first: Bind, q: &mut VecDeque<(u32, Tok)>) -> Vec<Bind> {
-        let mut pattern = vec![first];
-        while let Some(t2) = q.front() {
-            if !is_bind(t2) { break; }
-            match q.pop_front().unwrap().1 {
-                Tok::LocalSet(name) => pattern.push(Bind::Local(name)),
-                Tok::SetV(name) => pattern.push(Bind::Global(name)),
-                Tok::Discard => pattern.push(Bind::Discard),
-                _ => break,
-            }
-        }
-        pattern
-    }
-    fn pi(p: &mut Parsed, ins: Ins, line: u32) {
-        p.ins.push(ins);
-        p.ins_lines.push(line);
-    }
-    fn emit_destructure(pattern: Vec<Bind>, p: &mut Parsed, dtemp_ctr: &mut usize, line: u32) {
-        let temp = format!("ufdt{}", *dtemp_ctr);
-        *dtemp_ctr += 1;
-        pi(p, Ins::LocalSet(temp.clone()), line);
-        for (i, bind) in pattern.iter().enumerate() {
-            pi(p, Ins::LocalGet(temp.clone()), line);
-            pi(p, Ins::PushI(i as i64), line);
-            pi(p, Ins::Simple("op_getq"), line);
-            match bind {
-                Bind::Local(name) => pi(p, Ins::LocalSet(name.clone()), line),
-                Bind::Global(name) => {
-                    if !p.vars.contains(name) {
-                        p.vars.push(name.clone());
-                    }
-                    pi(p, Ins::SetV(name.clone()), line);
+    pattern
+}
+fn pi(p: &mut Parsed, ins: Ins, line: u32) {
+    p.ins.push(ins);
+    p.ins_lines.push(line);
+}
+fn emit_destructure(pattern: Vec<Bind>, p: &mut Parsed, dtemp_ctr: &mut usize, line: u32) {
+    let temp = format!("ufdt{}", *dtemp_ctr);
+    *dtemp_ctr += 1;
+    pi(p, Ins::LocalSet(temp.clone()), line);
+    for (i, bind) in pattern.iter().enumerate() {
+        pi(p, Ins::LocalGet(temp.clone()), line);
+        pi(p, Ins::PushI(i as i64), line);
+        pi(p, Ins::Simple("op_getq"), line);
+        match bind {
+            Bind::Local(name) => pi(p, Ins::LocalSet(name.clone()), line),
+            Bind::Global(name) => {
+                if !p.vars.contains(name) {
+                    p.vars.push(name.clone());
                 }
-                Bind::Discard => {}
+                pi(p, Ins::SetV(name.clone()), line);
             }
+            Bind::Discard => {}
         }
     }
-    let mut dtemp_ctr = 0usize;
-    let mut p = Parsed {
+}
+
+// v13: `ret` is a prefix keyword whose operand is the following expression
+// tokens (e.g. `ret 0`, `ret a@ b@ add`, `ret out@ err@ code@`). The parser
+// rewrites `ret X...` into `X... ret` by pulling the operand tokens off the
+// queue and re-pushing them ahead of the RET. The operand runs until the
+// next statement boundary (label, directive, task, another ret, or a
+// literal closer). In valid v13 code the ret is the last statement of its
+// body, so the operand is exactly the return expression.
+fn is_hard_boundary(t: &(u32, Tok)) -> bool {
+    matches!(&t.1,
+        Tok::LabelDef(_) | Tok::Task { .. } | Tok::TaskEnd(_) | Tok::Wrun(_)
+        | Tok::Entry | Tok::MacroDef(..) | Tok::StructDef(..) | Tok::Import(_)
+        | Tok::Export(_) | Tok::Use(_) | Tok::Mod(_) | Tok::Pub
+        | Tok::Extern(_) | Tok::Method(_)
+        // control flow ends the ret's operand expression: `ret` is the
+        // last statement, and `expr if_else ret` (v12 style) covers
+        // branch-returning rets via the real-stack fallback
+        | Tok::Op("RET" | "IF" | "IFELSE" | "WHILE" | "FOR")
+    ) || matches!(&t.1, Tok::Ident(n) if n.starts_with('@'))
+}
+
+fn retired_op_panic(name: &str) -> ! {
+    let retired_name = match name {
+        "~1" => "dup",
+        "~2" => "ovr",
+        "~3" => "drop",
+        "~4" => "swp",
+        "~5" => "pick",
+        _ => name,
+    };
+    panic!("'{}' is retired in v12 — use named variables instead", retired_name)
+}
+
+fn empty_parsed() -> Parsed {
+    Parsed {
         ins: Vec::new(),
         ins_lines: Vec::new(),
         labels: HashMap::new(),
@@ -161,720 +191,752 @@ pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Par
         label_names: HashMap::new(),
         ins_files: Vec::new(),
         file_names: Vec::new(),
-    };
-    let mut q: VecDeque<(u32, Tok)> = toks.into();
-    let mut pending_export: Option<String> = None;
-    let mut pending_pub = false;
-    let mut pending_method: Option<String> = None;
-    let mut weave_ctr = 0usize;
-    let mut cur_weave: Vec<(String, Vec<Param>, i64)> = Vec::new();
-    let mut expand_depth = 0usize;
-    // v13: `ret` is a prefix keyword whose operand is the following expression
-    // tokens (e.g. `ret 0`, `ret a@ b@ add`, `ret out@ err@ code@`). The parser
-    // rewrites `ret X...` into `X... ret` by pulling the operand tokens off the
-    // queue and re-pushing them ahead of the RET. The operand runs until the
-    // next statement boundary (label, directive, task, another ret, or a
-    // literal closer). In valid v13 code the ret is the last statement of its
-    // body, so the operand is exactly the return expression.
-    fn is_hard_boundary(t: &(u32, Tok)) -> bool {
-        matches!(&t.1,
-            Tok::LabelDef(_) | Tok::Task { .. } | Tok::TaskEnd(_) | Tok::Wrun(_)
-            | Tok::Entry | Tok::MacroDef(..) | Tok::StructDef(..) | Tok::Import(_)
-            | Tok::Export(_) | Tok::Use(_) | Tok::Mod(_) | Tok::Pub
-            | Tok::Extern(_) | Tok::Method(_)
-            // control flow ends the ret's operand expression: `ret` is the
-            // last statement, and `expr if_else ret` (v12 style) covers
-            // branch-returning rets via the real-stack fallback
-            | Tok::Op("RET" | "IF" | "IFELSE" | "WHILE" | "FOR")
-        ) || matches!(&t.1, Tok::Ident(n) if n.starts_with('@'))
     }
-    while let Some((line, t)) = q.pop_front() {
-        match t {
-            Tok::Op("RET") => {
-                let mut operand: Vec<(u32, Tok)> = Vec::new();
-                let mut first = true;
-                while let Some(t2) = q.front() {
-                    if is_hard_boundary(t2) || (!first && matches!(&t2.1, Tok::List(_) | Tok::Dict(_))) {
-                        break;
+}
+
+/// Single-TU parse state threaded through the token loop: the unit under
+/// construction, the token queue, and the macro/label/weave bookkeeping.
+struct ParseCtx<'a> {
+    p: Parsed,
+    q: VecDeque<(u32, Tok)>,
+    macros: HashMap<String, Vec<(u32, Tok)>>,
+    structs: &'a mut StructMap,
+    caps: &'a Caps,
+    dtemp_ctr: usize,
+    pending_export: Option<String>,
+    pending_pub: bool,
+    pending_method: Option<String>,
+    weave_ctr: usize,
+    cur_weave: Vec<(String, Vec<Param>, i64)>,
+    expand_depth: usize,
+}
+
+impl<'a> ParseCtx<'a> {
+    fn run(&mut self) {
+        while let Some((line, t)) = self.q.pop_front() {
+            match t {
+                Tok::Op("RET") => self.parse_ret(line),
+                Tok::Op("FOR") => pi(&mut self.p, Ins::For, line),
+                Tok::Op("IF") => pi(&mut self.p, Ins::If, line),
+                Tok::Op("IFELSE") => pi(&mut self.p, Ins::IfElse, line),
+                Tok::Op("WHILE") => pi(&mut self.p, Ins::While, line),
+                Tok::Op("BREAK") => pi(&mut self.p, Ins::Break, line),
+                Tok::Op("CONT") => pi(&mut self.p, Ins::Cont, line),
+                Tok::Op("STRICT") => pi(&mut self.p, Ins::Strict, line),
+                Tok::Op("LOOSE") => pi(&mut self.p, Ins::Loose, line),
+                Tok::Op("CAST") => self.parse_cast(line),
+                Tok::Op(name) if name.starts_with('~') => retired_op_panic(name),
+                Tok::Op(name) => {
+                    gate_op(name, self.caps);
+                    pi(&mut self.p, simple_ins(name), line)
+                }
+                Tok::PushI(v) => pi(&mut self.p, Ins::PushI(v), line),
+                Tok::PushBool(v) => {
+                    pi(&mut self.p, Ins::PushI(v as i64), line);
+                    pi(&mut self.p, Ins::PushI(21), line);
+                    pi(&mut self.p, simple_ins("CAST"), line);
+                }
+                Tok::PushF(v) => pi(&mut self.p, Ins::PushF(v), line),
+                Tok::PushS(s) => {
+                    let idx = self.p.strings.len();
+                    self.p.strings.push(s);
+                    pi(&mut self.p, Ins::PushS(idx), line);
+                }
+                Tok::Jump(op, label) => self.parse_jump(op, label, line),
+                Tok::SetV(n) => self.parse_set_global(n, line),
+                Tok::GetV(n) => {
+                    if !self.p.vars.contains(&n) {
+                        self.p.vars.push(n.clone());
                     }
-                    first = false;
-                    operand.push(q.pop_front().unwrap());
+                    pi(&mut self.p, Ins::GetV(n), line);
                 }
-                if operand.is_empty() {
-                    // bare ret — return null
-                    pi(&mut p, Ins::Ret, line);
-                } else {
-                    // rewrite `ret X...` into `flush X... ret`: flush the
-                    // values pushed before the operand to the real stack, so
-                    // the ret's count rule sees only the values the operand
-                    // itself leaves (strays get drained at the return)
-                    q.push_front((line, Tok::Op("RET")));
-                    for t2 in operand.into_iter().rev() {
-                        q.push_front(t2);
-                    }
-                    q.push_front((line, Tok::Ident("@flush".to_string())));
+                Tok::LocalSet(n) => self.parse_set_local(n, line),
+                Tok::LocalGet(n) => {
+                    pi(&mut self.p, Ins::LocalGet(n), line);
                 }
-            }
-            Tok::Op("FOR") => pi(&mut p, Ins::For, line),
-            Tok::Op("IF") => pi(&mut p, Ins::If, line),
-            Tok::Op("IFELSE") => pi(&mut p, Ins::IfElse, line),
-            Tok::Op("WHILE") => pi(&mut p, Ins::While, line),
-            Tok::Op("BREAK") => pi(&mut p, Ins::Break, line),
-            Tok::Op("CONT") => pi(&mut p, Ins::Cont, line),
-            Tok::Op("STRICT") => pi(&mut p, Ins::Strict, line),
-            Tok::Op("LOOSE") => pi(&mut p, Ins::Loose, line),
-            Tok::Op("CAST") => {
-                // v14.1: _cast between all static-castable types. The
-                // immediate stays prefix preprocessing: a literal operand
-                // [v, type-id, CAST] folds at parse time (int<->float);
-                // every other shape lowers to the runtime static-cast
-                // helper (scalar conversions + checked struct downcast).
-                let ty_lit = match p.ins.last() {
-                    Some(Ins::PushI(t)) => Some(*t),
-                    _ => None,
-                };
-                let val_lit = match p.ins.get(p.ins.len().wrapping_sub(2)) {
-                    Some(Ins::PushI(v)) => Some((*v as f64, true)),
-                    Some(Ins::PushF(v)) => Some((*v, false)),
-                    _ => None,
-                };
-                match (ty_lit, val_lit) {
-                    (Some(0), Some((v, true))) => {
-                        p.ins.pop(); p.ins_lines.pop();
-                        p.ins.pop(); p.ins_lines.pop();
-                        pi(&mut p, Ins::PushI(v as i64), line);
-                    }
-                    (Some(0), Some((v, false))) => {
-                        p.ins.pop(); p.ins_lines.pop();
-                        p.ins.pop(); p.ins_lines.pop();
-                        pi(&mut p, Ins::PushI(v as i64), line);
-                    }
-                    (Some(1), Some((v, true))) => {
-                        p.ins.pop(); p.ins_lines.pop();
-                        p.ins.pop(); p.ins_lines.pop();
-                        pi(&mut p, Ins::PushF(v), line);
-                    }
-                    (Some(1), Some((_, false))) => {
-                        // float -> float: the cast is the identity
-                        p.ins.pop(); p.ins_lines.pop();
-                    }
-                    _ => pi(&mut p, simple_ins("CAST"), line),
+                Tok::Discard => self.parse_discard(line),
+                Tok::IncLocal(n) => self.parse_rmw(n, false, true, line),
+                Tok::AddLocal(n) => self.parse_rmw(n, false, false, line),
+                Tok::IncGlobal(n) => self.parse_rmw(n, true, true, line),
+                Tok::AddGlobal(n) => self.parse_rmw(n, true, false, line),
+                Tok::Import(im) => self.parse_import(im),
+                Tok::ManifestImport(im) => self.parse_manifest_import(im),
+                Tok::Export(n) => self.pending_export = Some(n),
+                Tok::Use(n) => self.parse_use(n),
+                Tok::Mod(n) => self.p.modname = Some(n),
+                Tok::Pub => self.pending_pub = true,
+                Tok::Extern(n) => self.parse_extern(n, line),
+                Tok::MacroDef(n, body) => {
+                    self.macros.insert(n, body);
                 }
-            }
-            Tok::Op(name) if name.starts_with('~') => {
-                let retired_name = match name {
-                    "~1" => "dup",
-                    "~2" => "ovr",
-                    "~3" => "drop",
-                    "~4" => "swp",
-                    "~5" => "pick",
-                    _ => name,
-                };
-                panic!("'{}' is retired in v12 — use named variables instead", retired_name)
-            }
-            Tok::Op(name) => {
-                gate_op(name, caps);
-                pi(&mut p, simple_ins(name), line)
-            }
-            Tok::PushI(v) => pi(&mut p, Ins::PushI(v), line),
-            Tok::PushBool(v) => {
-                pi(&mut p, Ins::PushI(v as i64), line);
-                pi(&mut p, Ins::PushI(21), line);
-                pi(&mut p, simple_ins("CAST"), line);
-            }
-            Tok::PushF(v) => pi(&mut p, Ins::PushF(v), line),
-            Tok::PushS(s) => {
-                let idx = p.strings.len();
-                p.strings.push(s);
-                pi(&mut p, Ins::PushS(idx), line);
-            }
-            Tok::Jump(op, label) => match op {
-                "ADDR" => pi(&mut p, Ins::PushAddr(label), line),
-                "CALL" => {
-                    if let Some(ii) = p.imports.iter().position(|im| im.name == label) {
-                        pi(&mut p, Ins::CallExt(ii), line);
-                    } else {
-                        pi(&mut p, Ins::Call(label), line);
-                    }
+                Tok::StructDef(n, fields) => self.parse_struct(n, fields),
+                Tok::Method(tname) => self.pending_method = Some(tname),
+                Tok::Sys(n) => self.parse_syscall(n, line),
+                Tok::Task { name, count, body } => self.parse_task(name, count, body, line),
+                Tok::TaskEnd(skip) => {
+                    // v13: the task body ends with the user's explicit `ret`;
+                    // the skip label just marks where the next unit begins
+                    self.p.labels.insert(skip, self.p.ins.len());
+                    self.p.label_lines.insert(self.p.ins.len(), line);
                 }
-                "JMP" => panic!("jmp removed — use entry/if/while/for"),
-                "JZ" => panic!("jz removed — use if/ifelse/while"),
-                "JE" => panic!("je removed — use if/ifelse"),
-                _ => unreachable!(),
-            },
-            Tok::SetV(n) => {
-                if is_multi_return(p.ins.last(), &q) {
-                    // v12 destructuring bind: ^name! after a multi-return op
-                    let pattern = collect_destructure(Bind::Global(n), &mut q);
-                    emit_destructure(pattern, &mut p, &mut dtemp_ctr, line);
-                } else {
-                    if !p.vars.contains(&n) {
-                        p.vars.push(n.clone());
-                    }
-                    pi(&mut p, Ins::SetV(n), line);
+                Tok::List(body) => self.requeue_literal(body, "@liststart", "@listlit", line),
+                Tok::Dict(body) => self.requeue_literal(body, "@dictstart", "@dictlit", line),
+                Tok::Wrun(terminal) => self.parse_wrun(terminal, line),
+                Tok::LabelDef(n) => self.parse_label_def(n, line),
+                Tok::Entry => {
+                    self.p.labels.insert("entry".to_string(), self.p.ins.len());
+                    self.p.label_lines.insert(self.p.ins.len(), line);
+                    self.p.entry_label = Some("entry".to_string());
                 }
-            }
-            Tok::GetV(n) => {
-                if !p.vars.contains(&n) {
-                    p.vars.push(n.clone());
-                }
-                pi(&mut p, Ins::GetV(n), line);
-            }
-            Tok::LocalSet(n) => {
-                if macros.contains_key(&n) {
-                    panic!("name '{}' collides with a macro — macros take precedence over implicit loads; rename one", n);
-                }
-                if is_multi_return(p.ins.last(), &q) {
-                    // v12 destructuring bind: name! after a multi-return op
-                    let pattern = collect_destructure(Bind::Local(n), &mut q);
-                    emit_destructure(pattern, &mut p, &mut dtemp_ctr, line);
-                } else {
-                    pi(&mut p, Ins::LocalSet(n), line);
-                }
-            }
-            Tok::LocalGet(n) => {
-                pi(&mut p, Ins::LocalGet(n), line);
-            }
-            Tok::Discard => {
-                if is_multi_return(p.ins.last(), &q) {
-                    // v12 destructuring bind: leading _! after a multi-return op
-                    let pattern = collect_destructure(Bind::Discard, &mut q);
-                    emit_destructure(pattern, &mut p, &mut dtemp_ctr, line);
-                } else {
-                    panic!("_! is only valid inside a destructuring bind");
-                }
-            }
-            Tok::IncLocal(n) => {
-                pi(&mut p, Ins::PushI(1), line);
-                pi(&mut p, Ins::LocalGet(n.clone()), line);
-                pi(&mut p, simple_ins("ADD"), line);
-                pi(&mut p, Ins::LocalSet(n), line);
-            }
-            Tok::AddLocal(n) => {
-                pi(&mut p, Ins::LocalGet(n.clone()), line);
-                pi(&mut p, simple_ins("ADD"), line);
-                pi(&mut p, Ins::LocalSet(n), line);
-            }
-            Tok::IncGlobal(n) => {
-                pi(&mut p, Ins::PushI(1), line);
-                pi(&mut p, Ins::GetV(n.clone()), line);
-                pi(&mut p, simple_ins("ADD"), line);
-                pi(&mut p, Ins::SetV(n), line);
-            }
-            Tok::AddGlobal(n) => {
-                pi(&mut p, Ins::GetV(n.clone()), line);
-                pi(&mut p, simple_ins("ADD"), line);
-                pi(&mut p, Ins::SetV(n), line);
-            }
-            Tok::Import(im) => {
-                if !caps.cap("ffi.import") {
-                    panic!(
-                        "sandbox: `import c\"{}\"(...)` is disabled — capability `ffi.import` is denied by policy '{}' ({}); raw FFI declarations are only available under a policy that allows them",
-                        im.name, caps.policy_name, caps.origin
-                    );
-                }
-                if !p.imports.iter().any(|x| x.name == im.name) {
-                    p.imports.push(im);
-                }
-            }
-            Tok::ManifestImport(im) => {
-                // imports inside an allowed module's .ufm manifest: loading the
-                // module was already gated by the ffi.use module policy
-                if !p.imports.iter().any(|x| x.name == im.name) {
-                    p.imports.push(im);
-                }
-            }
-            Tok::Export(n) => pending_export = Some(n),
-            Tok::Use(n) => {
-                if !caps.module_allowed(&n) {
-                    let list = match &caps.module_allow {
-                        Some(l) if !l.is_empty() => format!("; allowed modules: {}", l.join(", ")),
-                        _ => String::new(),
-                    };
-                    panic!(
-                        "sandbox: module `use \"{}\"` is denied by policy '{}' ({}){} — add it with `allow-module {}` in an allowed sandbox config, or run under a policy that permits it",
-                        n, caps.policy_name, caps.origin, list, n
-                    );
-                }
-                if !p.uses.contains(&n) {
-                    p.uses.push(n);
-                }
-            }
-            Tok::Mod(n) => p.modname = Some(n),
-            Tok::Pub => pending_pub = true,
-            Tok::Extern(n) => {
-                if !caps.cap("ffi.import") {
-                    panic!(
-                        "sandbox: `extern \"{}\"` is disabled — capability `ffi.import` is denied by policy '{}' ({}); extern symbols are only available under a policy that allows them",
-                        n, caps.policy_name, caps.origin
-                    );
-                }
-                if !p.externs.contains(&n) {
-                    p.externs.push(n.clone());
-                }
-                pi(&mut p, Ins::Extern(n), line);
-            }
-            Tok::MacroDef(n, body) => {
-                macros.insert(n, body);
-            }
-            Tok::StructDef(n, fields) => {
-                // v13: obj fields are stored as full Cells (16 bytes: tag +
-                // int64 payload), so the layout strides by sizeof(Cell) —
-                // 8-byte strides made adjacent fields overlap.
-                let mut off = 0i64;
-                let mut fs = Vec::new();
-                for (fname, fty) in &fields {
-                    let sz = match type_id(fty) {
-                        Some(_) => 16,
-                        None => match structs.get(fty) {
-                            Some((_, tsz, _)) => *tsz,
-                            None => panic!("STRUCT {}: unknown field type {}", n, fty),
-                        },
-                    };
-                    let align = sz.min(16);
-                    off = (off + align - 1) / align * align;
-                    fs.push((fname.clone(), off));
-                    off += sz;
-                }
-                let sid = structs.len() as i64;
-                structs.insert(n, (fs, off, sid));
-            }
-            Tok::Method(tname) => pending_method = Some(tname),
-            Tok::Sys(n) => {
-                if !caps.cap("raw.syscall") {
-                    panic!(
-                        "sandbox: `_syscall {}` is disabled — capability `raw.syscall` is denied by policy '{}' ({}); syscalls are never available in sandboxed policies",
-                        n, caps.policy_name, caps.origin
-                    );
-                }
-                pi(&mut p, Ins::Sys(n), line)
-            }
-            Tok::Task { name, count, body } => {
-                // v10 fanout: count literal 1..64; count > 1 requires exactly
-                // one input (checked at RUN where the input is resolved)
-                if let Some(c) = count {
-                    if !(1..=64).contains(&c) {
-                        panic!("WEAVE: task {} worker count {} out of range 1..64", name, c);
-                    }
-                }
-                // v13: leading binding tokens in the body are the task's input
-                // bindings (task name! makes that task's result a parameter)
-                let mut inputs: Vec<Param> = Vec::new();
-                let mut body: Vec<(u32, Tok)> = body;
-                loop {
-                    match body.first() {
-                        Some((_, Tok::LocalSet(nm))) => {
-                            inputs.push(Param::Local(nm.clone()));
-                            body.remove(0);
-                        }
-                        Some((_, Tok::SetV(nm))) => {
-                            inputs.push(Param::Global(nm.clone()));
-                            body.remove(0);
-                        }
-                        Some((_, Tok::Discard)) => panic!("WEAVE: task {} input `_!` needs a task name", name),
-                        _ => break,
-                    }
-                }
-                let skip = format!("__wskip{}", weave_ctr);
-                weave_ctr += 1;
-                pi(&mut p, Ins::Goto(skip.clone()), line);
-                p.labels.insert(name.clone(), p.ins.len());
-                p.label_lines.insert(p.ins.len(), line);
-                // task bodies are self-contained: their labels are task-local,
-                // so two tasks may reuse the same v-names
-                let prefix = format!("{}/", name);
-                let body = prefix_task_labels(body, &prefix);
-                // input bindings are emitted reversed (guarded param pops)
-                for (k, par) in inputs.iter().rev().enumerate() {
-                    let pc = p.ins.len();
-                    match par {
-                        Param::Local(nm) => pi(&mut p, Ins::LocalSet(nm.clone()), line),
-                        Param::Global(nm) => {
-                            if !p.vars.contains(nm) {
-                                p.vars.push(nm.clone());
-                            }
-                            pi(&mut p, Ins::SetV(nm.clone()), line);
-                        }
-                        Param::Discard => unreachable!(),
-                    }
-                    p.param_pcs.insert(pc, inputs.len() - 1 - k);
-                }
-                q.push_front((line, Tok::TaskEnd(skip)));
-                for t in body.into_iter().rev() {
-                    q.push_front(t);
-                }
-                cur_weave.push((name, inputs, count.unwrap_or(1)));
-            }
-            Tok::TaskEnd(skip) => {
-                // v13: the task body ends with the user's explicit `ret`;
-                // the skip label just marks where the next unit begins
-                p.labels.insert(skip, p.ins.len());
-                p.label_lines.insert(p.ins.len(), line);
-            }
-            Tok::List(body) => {
-                let mut lbody = body;
-                lbody.push((line, Tok::Ident("@listlit".to_string())));
-                lbody.insert(0, (line, Tok::Ident("@liststart".to_string())));
-                for t in lbody.into_iter().rev() {
-                    q.push_front(t);
-                }
-            }
-            Tok::Dict(body) => {
-                let mut dbody = body;
-                dbody.push((line, Tok::Ident("@dictlit".to_string())));
-                dbody.insert(0, (line, Tok::Ident("@dictstart".to_string())));
-                for t in dbody.into_iter().rev() {
-                    q.push_front(t);
-                }
-            }
-            Tok::Wrun(terminal) => {
-                // static DAG checks: inputs must name tasks in this weave; acyclic
-                let names: Vec<&String> = cur_weave.iter().map(|(n, _, _)| n).collect();
-                let mut metas: Vec<WeaveMeta> = Vec::new();
-                for (n, ins, count) in &cur_weave {
-                    let mut idxs = Vec::new();
-                    for inp in ins {
-                        let inp_name = match inp {
-                            Param::Local(x) | Param::Global(x) => x,
-                            Param::Discard => unreachable!(),
-                        };
-                        match names.iter().position(|x| *x == inp_name) {
-                            Some(i) => idxs.push(i),
-                            None => panic!("WEAVE: task {} has unknown input {}", n, inp_name),
-                        }
-                    }
-                    if *count > 1 && idxs.is_empty() {
-                        panic!("WEAVE: fanout task {} ({} workers) must have at least one input", n, count);
-                    }
-                    metas.push(WeaveMeta { name: n.clone(), pc: *p.labels.get(n).unwrap_or(&0), inputs: idxs, count: *count });
-                }
-                // Kahn topo: cycle check (execution order is the scheduler's job)
-                let mut done = vec![false; metas.len()];
-                for _ in 0..metas.len() {
-                    let mut progressed = false;
-                    for (i, m) in metas.iter().enumerate() {
-                        if !done[i] && m.inputs.iter().all(|&j| done[j]) {
-                            done[i] = true;
-                            progressed = true;
-                        }
-                    }
-                    if !progressed {
-                        break;
-                    }
-                }
-                if done.iter().any(|d| !d) {
-                    panic!("WEAVE: cycle in task DAG");
-                }
-                // v13: `run <name>` names a terminal task. Tasks not reachable
-                // from the terminal become orphans: they stay in scope (their
-                // labels remain callable) but are dropped from the auto-run
-                // DAG. The terminal's result is left on the stack after run.
-                let mut terminal_idx: Option<usize> = None;
-                if let Some(t) = &terminal {
-                    match names.iter().position(|x| *x == t) {
-                        Some(i) => terminal_idx = Some(i),
-                        None => panic!("WEAVE: run names unknown task {}", t),
-                    }
-                }
-                if let Some(ti) = terminal_idx {
-                    // reverse BFS from the terminal over input edges
-                    let mut reachable = vec![false; metas.len()];
-                    reachable[ti] = true;
-                    let mut changed = true;
-                    while changed {
-                        changed = false;
-                        for (i, m) in metas.iter().enumerate() {
-                            if !reachable[i] {
-                                continue;
-                            }
-                            for &j in &m.inputs {
-                                if !reachable[j] {
-                                    reachable[j] = true;
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                    let mut kept: Vec<usize> = (0..metas.len()).filter(|&i| reachable[i]).collect();
-                    // move the terminal last so the codegen pushes its result
-                    kept.retain(|&i| i != ti);
-                    kept.push(ti);
-                    let mut remap = vec![0usize; metas.len()];
-                    for (k, &i) in kept.iter().enumerate() {
-                        remap[i] = k;
-                    }
-                    let mut metas2: Vec<WeaveMeta> = Vec::new();
-                    for &i in &kept {
-                        let m = &metas[i];
-                        metas2.push(WeaveMeta {
-                            name: m.name.clone(),
-                            pc: m.pc.clone(),
-                            inputs: m.inputs.iter().map(|&j| remap[j]).collect(),
-                            count: m.count,
-                        });
-                    }
-                    metas = metas2;
-                }
-                if !metas.is_empty() {
-                    for m in &metas {
-                        if !p.vars.contains(&m.name) {
-                            p.vars.push(m.name.clone());
-                        }
-                    }
-                    pi(&mut p, Ins::Weave(metas), line);
-                }
-                cur_weave.clear();
-            }
-            Tok::LabelDef(n) => {
-                p.labels.insert(n.clone(), p.ins.len());
-                p.label_lines.insert(p.ins.len(), line);
-                if pending_pub {
-                    p.pubs.push(n.clone());
-                    pending_pub = false;
-                }
-                if let Some(tname) = pending_method.take() {
-                    let tk = method_typekey(&tname, structs)
-                        .unwrap_or_else(|| panic!("METHOD: unknown type {}", tname));
-                    p.methods.push((tk, fnv64(&n), n.clone()));
-                }
-                if let Some(x) = pending_export.take() {
-                    p.exports.push((x, n));
-                }
-                // v13: consume a leading run of binding tokens as parameter
-                // declarations (name! / ^name! / _!). Bindings are emitted as
-                // instructions in REVERSE order so the first declared binding
-                // pops the first cell the caller pushed (the caller's stack
-                // holds the args in push order, last on top).
-                let mut params: Vec<Param> = Vec::new();
-                while let Some(t2) = q.front() {
-                    match &t2.1 {
-                        Tok::LocalSet(name) => {
-                            params.push(Param::Local(name.clone()));
-                            q.pop_front();
-                        }
-                        Tok::SetV(name) => {
-                            params.push(Param::Global(name.clone()));
-                            q.pop_front();
-                        }
-                        Tok::Discard => {
-                            params.push(Param::Discard);
-                            q.pop_front();
-                        }
-                        _ => break,
-                    }
-                }
-                if !params.is_empty() {
-                    p.label_params.insert(p.ins.len(), params.clone());
-                }
-                for (k, par) in params.iter().rev().enumerate() {
-                    let pc = p.ins.len();
-                    match par {
-                        Param::Local(name) => pi(&mut p, Ins::LocalSet(name.clone()), line),
-                        Param::Global(name) => {
-                            if !p.vars.contains(name) {
-                                p.vars.push(name.clone());
-                            }
-                            pi(&mut p, Ins::SetV(name.clone()), line);
-                        }
-                        Param::Discard => pi(&mut p, Ins::Simple("op_drop"), line),
-                    }
-                    // guard offset: the k-th pop (0-based, reversed emission)
-                    // pops only when the caller left (arity - k) cells; see
-                    // the guard in gen.rs
-                    p.param_pcs.insert(pc, params.len() - 1 - k);
-                }
-            }
-            Tok::Entry => {
-                p.labels.insert("entry".to_string(), p.ins.len());
-                p.label_lines.insert(p.ins.len(), line);
-                p.entry_label = Some("entry".to_string());
-            }
-            Tok::Ident(n) => {
-                if n == "@flush" {
-                    pi(&mut p, Ins::Flush, line);
-                } else if n == "@liststart" {
-                    pi(&mut p, Ins::ListStart, line);
-                } else if n == "@dictstart" {
-                    pi(&mut p, Ins::DictStart, line);
-                } else if n == "@listlit" {
-                    pi(&mut p, Ins::ListLit, line);
-                } else if n == "@dictlit" {
-                    pi(&mut p, Ins::DictLit, line);
-                } else if let Some(rest) = n.strip_prefix("@sizeof:") {
-                    if let Some(id) = type_id(rest) {
-                        pi(&mut p, Ins::PushI(if id == 3 || id == 21 { 1 } else { 8 }), line);
-                    } else if let Some((_, tsz, _)) = structs.get(rest) {
-                        pi(&mut p, Ins::PushI(*tsz), line);
-                    } else {
-                        panic!("SIZEOF: unknown type {}", rest);
-                    }
-                } else if let Some(rest) = n.strip_prefix("@offset:") {
-                    let parts: Vec<&str> = rest.splitn(2, '.').collect();
-                    if parts.len() != 2 {
-                        panic!("OFFSET needs Struct.field, got {}", rest);
-                    }
-                    let (fs, _, _) = structs
-                        .get(parts[0])
-                        .unwrap_or_else(|| panic!("OFFSET: unknown struct {}", parts[0]));
-                    let off = fs
-                        .iter()
-                        .find(|(f, _)| f == parts[1])
-                        .unwrap_or_else(|| panic!("OFFSET: no field {} in {}", parts[1], parts[0]));
-                    pi(&mut p, Ins::PushI(off.1), line);
-                } else if let Some(rest) = n.strip_prefix("@objsize:") {
-                    let (_, tsz, sid) = structs
-                        .get(rest)
-                        .unwrap_or_else(|| panic!("OBJ: unknown struct {}", rest));
-                    // size in low 32 bits, struct id above (op_obj splits them)
-                    pi(&mut p, Ins::PushI(tsz | (sid << 32)), line);
-                } else if let Some(rest) = n.strip_prefix("@cast:") {
-                    let (_, _, sid) = structs
-                        .get(rest)
-                        .unwrap_or_else(|| panic!("CAST: unknown struct {}", rest));
-                    pi(&mut p, Ins::PushI(1000 + sid), line);
-                } else if let Some(body) = macros.get(&n).cloned() {
-                    expand_depth += 1;
-                    if expand_depth > 1024 {
-                        panic!("macro expansion too deep (recursive macro?)");
-                    }
-                    for t2 in body.into_iter().rev() {
-                        q.push_front(t2);
-                    }
-                } else if is_reserved(&n) {
-                    panic!("'{}' is a reserved word (opcode mnemonic)", n);
-                } else {
-                    // v15: a bare name is an implicit variable load
-                    pi(&mut p, Ins::LocalGet(n), line);
-                }
+                Tok::Ident(n) => self.parse_ident(n, line),
             }
         }
     }
+    fn parse_ret(&mut self, line: u32) {
+        let mut operand: Vec<(u32, Tok)> = Vec::new();
+        let mut first = true;
+        while let Some(t2) = self.q.front() {
+            if is_hard_boundary(t2) || (!first && matches!(&t2.1, Tok::List(_) | Tok::Dict(_))) {
+                break;
+            }
+            first = false;
+            operand.push(self.q.pop_front().unwrap());
+        }
+        if operand.is_empty() {
+            // bare ret — return null
+            pi(&mut self.p, Ins::Ret, line);
+        } else {
+            // rewrite `ret X...` into `flush X... ret`: flush the
+            // values pushed before the operand to the real stack, so
+            // the ret's count rule sees only the values the operand
+            // itself leaves (strays get drained at the return)
+            self.q.push_front((line, Tok::Op("RET")));
+            for t2 in operand.into_iter().rev() {
+                self.q.push_front(t2);
+            }
+            self.q.push_front((line, Tok::Ident("@flush".to_string())));
+        }
+    }
+
+    fn parse_cast(&mut self, line: u32) {
+        // v14.1: _cast between all static-castable types. The
+        // immediate stays prefix preprocessing: a literal operand
+        // [v, type-id, CAST] folds at parse time (int<->float);
+        // every other shape lowers to the runtime static-cast
+        // helper (scalar conversions + checked struct downcast).
+        let ty_lit = match self.p.ins.last() {
+            Some(Ins::PushI(t)) => Some(*t),
+            _ => None,
+        };
+        let val_lit = match self.p.ins.get(self.p.ins.len().wrapping_sub(2)) {
+            Some(Ins::PushI(v)) => Some((*v as f64, true)),
+            Some(Ins::PushF(v)) => Some((*v, false)),
+            _ => None,
+        };
+        match (ty_lit, val_lit) {
+            (Some(0), Some((v, true))) => {
+                self.p.ins.pop(); self.p.ins_lines.pop();
+                self.p.ins.pop(); self.p.ins_lines.pop();
+                pi(&mut self.p, Ins::PushI(v as i64), line);
+            }
+            (Some(0), Some((v, false))) => {
+                self.p.ins.pop(); self.p.ins_lines.pop();
+                self.p.ins.pop(); self.p.ins_lines.pop();
+                pi(&mut self.p, Ins::PushI(v as i64), line);
+            }
+            (Some(1), Some((v, true))) => {
+                self.p.ins.pop(); self.p.ins_lines.pop();
+                self.p.ins.pop(); self.p.ins_lines.pop();
+                pi(&mut self.p, Ins::PushF(v), line);
+            }
+            (Some(1), Some((_, false))) => {
+                // float -> float: the cast is the identity
+                self.p.ins.pop(); self.p.ins_lines.pop();
+            }
+            _ => pi(&mut self.p, simple_ins("CAST"), line),
+        }
+    }
+
+    fn parse_jump(&mut self, op: &'static str, label: String, line: u32) {
+        match op {
+            "ADDR" => pi(&mut self.p, Ins::PushAddr(label), line),
+            "CALL" => {
+                if let Some(ii) = self.p.imports.iter().position(|im| im.name == label) {
+                    pi(&mut self.p, Ins::CallExt(ii), line);
+                } else {
+                    pi(&mut self.p, Ins::Call(label), line);
+                }
+            }
+            "JMP" => panic!("jmp removed — use entry/if/while/for"),
+            "JZ" => panic!("jz removed — use if/ifelse/while"),
+            "JE" => panic!("je removed — use if/ifelse"),
+            _ => unreachable!(),
+        }
+    }
+    fn parse_set_global(&mut self, n: String, line: u32) {
+        if is_multi_return(self.p.ins.last(), &self.q) {
+            // v12 destructuring bind: ^name! after a multi-return op
+            let pattern = collect_destructure(Bind::Global(n), &mut self.q);
+            emit_destructure(pattern, &mut self.p, &mut self.dtemp_ctr, line);
+        } else {
+            if !self.p.vars.contains(&n) {
+                self.p.vars.push(n.clone());
+            }
+            pi(&mut self.p, Ins::SetV(n), line);
+        }
+    }
+
+    fn parse_set_local(&mut self, n: String, line: u32) {
+        if self.macros.contains_key(&n) {
+            panic!("name '{}' collides with a macro — macros take precedence over implicit loads; rename one", n);
+        }
+        if is_multi_return(self.p.ins.last(), &self.q) {
+            // v12 destructuring bind: name! after a multi-return op
+            let pattern = collect_destructure(Bind::Local(n), &mut self.q);
+            emit_destructure(pattern, &mut self.p, &mut self.dtemp_ctr, line);
+        } else {
+            pi(&mut self.p, Ins::LocalSet(n), line);
+        }
+    }
+
+    fn parse_discard(&mut self, line: u32) {
+        if is_multi_return(self.p.ins.last(), &self.q) {
+            // v12 destructuring bind: leading _! after a multi-return op
+            let pattern = collect_destructure(Bind::Discard, &mut self.q);
+            emit_destructure(pattern, &mut self.p, &mut self.dtemp_ctr, line);
+        } else {
+            panic!("_! is only valid inside a destructuring bind");
+        }
+    }
+
+    // x++ / x+= expand to an explicit load-add-store run; the scope pass
+    // folds the shared forms into AtomicAdd
+    fn parse_rmw(&mut self, n: String, global: bool, inc: bool, line: u32) {
+        if inc {
+            pi(&mut self.p, Ins::PushI(1), line);
+        }
+        if global {
+            pi(&mut self.p, Ins::GetV(n.clone()), line);
+        } else {
+            pi(&mut self.p, Ins::LocalGet(n.clone()), line);
+        }
+        pi(&mut self.p, simple_ins("ADD"), line);
+        if global {
+            pi(&mut self.p, Ins::SetV(n), line);
+        } else {
+            pi(&mut self.p, Ins::LocalSet(n), line);
+        }
+    }
+
+    fn parse_import(&mut self, im: Import) {
+        if !self.caps.cap("ffi.import") {
+            panic!(
+                "sandbox: `import c\"{}\"(...)` is disabled — capability `ffi.import` is denied by policy '{}' ({}); raw FFI declarations are only available under a policy that allows them",
+                im.name, self.caps.policy_name, self.caps.origin
+            );
+        }
+        if !self.p.imports.iter().any(|x| x.name == im.name) {
+            self.p.imports.push(im);
+        }
+    }
+
+    fn parse_manifest_import(&mut self, im: Import) {
+        // imports inside an allowed module's .ufm manifest: loading the
+        // module was already gated by the ffi.use module policy
+        if !self.p.imports.iter().any(|x| x.name == im.name) {
+            self.p.imports.push(im);
+        }
+    }
+
+    fn parse_use(&mut self, n: String) {
+        if !self.caps.module_allowed(&n) {
+            let list = match &self.caps.module_allow {
+                Some(l) if !l.is_empty() => format!("; allowed modules: {}", l.join(", ")),
+                _ => String::new(),
+            };
+            panic!(
+                "sandbox: module `use \"{}\"` is denied by policy '{}' ({}){} — add it with `allow-module {}` in an allowed sandbox config, or run under a policy that permits it",
+                n, self.caps.policy_name, self.caps.origin, list, n
+            );
+        }
+        if !self.p.uses.contains(&n) {
+            self.p.uses.push(n);
+        }
+    }
+    fn parse_extern(&mut self, n: String, line: u32) {
+        if !self.caps.cap("ffi.import") {
+            panic!(
+                "sandbox: `extern \"{}\"` is disabled — capability `ffi.import` is denied by policy '{}' ({}); extern symbols are only available under a policy that allows them",
+                n, self.caps.policy_name, self.caps.origin
+            );
+        }
+        if !self.p.externs.contains(&n) {
+            self.p.externs.push(n.clone());
+        }
+        pi(&mut self.p, Ins::Extern(n), line);
+    }
+
+    fn parse_struct(&mut self, n: String, fields: Vec<(String, String)>) {
+        // v13: obj fields are stored as full Cells (16 bytes: tag +
+        // int64 payload), so the layout strides by sizeof(Cell) —
+        // 8-byte strides made adjacent fields overlap.
+        let mut off = 0i64;
+        let mut fs = Vec::new();
+        for (fname, fty) in &fields {
+            let sz = match type_id(fty) {
+                Some(_) => 16,
+                None => match self.structs.get(fty) {
+                    Some((_, tsz, _)) => *tsz,
+                    None => panic!("STRUCT {}: unknown field type {}", n, fty),
+                },
+            };
+            let align = sz.min(16);
+            off = (off + align - 1) / align * align;
+            fs.push((fname.clone(), off));
+            off += sz;
+        }
+        let sid = self.structs.len() as i64;
+        self.structs.insert(n, (fs, off, sid));
+    }
+
+    fn parse_syscall(&mut self, n: usize, line: u32) {
+        if !self.caps.cap("raw.syscall") {
+            panic!(
+                "sandbox: `_syscall {}` is disabled — capability `raw.syscall` is denied by policy '{}' ({}); syscalls are never available in sandboxed policies",
+                n, self.caps.policy_name, self.caps.origin
+            );
+        }
+        pi(&mut self.p, Ins::Sys(n), line)
+    }
+    fn parse_task(&mut self, name: String, count: Option<i64>, body: Vec<(u32, Tok)>, line: u32) {
+        // v10 fanout: count literal 1..64; count > 1 requires exactly
+        // one input (checked at RUN where the input is resolved)
+        if let Some(c) = count {
+            if !(1..=64).contains(&c) {
+                panic!("WEAVE: task {} worker count {} out of range 1..64", name, c);
+            }
+        }
+        // v13: leading binding tokens in the body are the task's input
+        // bindings (task name! makes that task's result a parameter)
+        let mut inputs: Vec<Param> = Vec::new();
+        let mut body: Vec<(u32, Tok)> = body;
+        loop {
+            match body.first() {
+                Some((_, Tok::LocalSet(nm))) => {
+                    inputs.push(Param::Local(nm.clone()));
+                    body.remove(0);
+                }
+                Some((_, Tok::SetV(nm))) => {
+                    inputs.push(Param::Global(nm.clone()));
+                    body.remove(0);
+                }
+                Some((_, Tok::Discard)) => panic!("WEAVE: task {} input `_!` needs a task name", name),
+                _ => break,
+            }
+        }
+        let skip = format!("__wskip{}", self.weave_ctr);
+        self.weave_ctr += 1;
+        pi(&mut self.p, Ins::Goto(skip.clone()), line);
+        self.p.labels.insert(name.clone(), self.p.ins.len());
+        self.p.label_lines.insert(self.p.ins.len(), line);
+        // task bodies are self-contained: their labels are task-local,
+        // so two tasks may reuse the same v-names
+        let prefix = format!("{}/", name);
+        let body = prefix_task_labels(body, &prefix);
+        // input bindings are emitted reversed (guarded param pops)
+        for (k, par) in inputs.iter().rev().enumerate() {
+            let pc = self.p.ins.len();
+            match par {
+                Param::Local(nm) => pi(&mut self.p, Ins::LocalSet(nm.clone()), line),
+                Param::Global(nm) => {
+                    if !self.p.vars.contains(nm) {
+                        self.p.vars.push(nm.clone());
+                    }
+                    pi(&mut self.p, Ins::SetV(nm.clone()), line);
+                }
+                Param::Discard => unreachable!(),
+            }
+            self.p.param_pcs.insert(pc, inputs.len() - 1 - k);
+        }
+        self.q.push_front((line, Tok::TaskEnd(skip)));
+        for t in body.into_iter().rev() {
+            self.q.push_front(t);
+        }
+        self.cur_weave.push((name, inputs, count.unwrap_or(1)));
+    }
+
+    fn requeue_literal(&mut self, body: Vec<(u32, Tok)>, start: &str, lit: &str, line: u32) {
+        let mut lbody = body;
+        lbody.push((line, Tok::Ident(lit.to_string())));
+        lbody.insert(0, (line, Tok::Ident(start.to_string())));
+        for t in lbody.into_iter().rev() {
+            self.q.push_front(t);
+        }
+    }
+    fn parse_wrun(&mut self, terminal: Option<String>, line: u32) {
+        // static DAG checks: inputs must name tasks in this weave; acyclic
+        let names: Vec<&String> = self.cur_weave.iter().map(|(n, _, _)| n).collect();
+        let mut metas: Vec<WeaveMeta> = Vec::new();
+        for (n, ins, count) in &self.cur_weave {
+            let mut idxs = Vec::new();
+            for inp in ins {
+                let inp_name = match inp {
+                    Param::Local(x) | Param::Global(x) => x,
+                    Param::Discard => unreachable!(),
+                };
+                match names.iter().position(|x| *x == inp_name) {
+                    Some(i) => idxs.push(i),
+                    None => panic!("WEAVE: task {} has unknown input {}", n, inp_name),
+                }
+            }
+            if *count > 1 && idxs.is_empty() {
+                panic!("WEAVE: fanout task {} ({} workers) must have at least one input", n, count);
+            }
+            metas.push(WeaveMeta { name: n.clone(), pc: *self.p.labels.get(n).unwrap_or(&0), inputs: idxs, count: *count });
+        }
+        // Kahn topo: cycle check (execution order is the scheduler's job)
+        let mut done = vec![false; metas.len()];
+        for _ in 0..metas.len() {
+            let mut progressed = false;
+            for (i, m) in metas.iter().enumerate() {
+                if !done[i] && m.inputs.iter().all(|&j| done[j]) {
+                    done[i] = true;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        if done.iter().any(|d| !d) {
+            panic!("WEAVE: cycle in task DAG");
+        }
+        // v13: `run <name>` names a terminal task. Tasks not reachable
+        // from the terminal become orphans: they stay in scope (their
+        // labels remain callable) but are dropped from the auto-run
+        // DAG. The terminal's result is left on the stack after run.
+        let mut terminal_idx: Option<usize> = None;
+        if let Some(t) = &terminal {
+            match names.iter().position(|x| *x == t) {
+                Some(i) => terminal_idx = Some(i),
+                None => panic!("WEAVE: run names unknown task {}", t),
+            }
+        }
+        if let Some(ti) = terminal_idx {
+            // reverse BFS from the terminal over input edges
+            let mut reachable = vec![false; metas.len()];
+            reachable[ti] = true;
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for (i, m) in metas.iter().enumerate() {
+                    if !reachable[i] {
+                        continue;
+                    }
+                    for &j in &m.inputs {
+                        if !reachable[j] {
+                            reachable[j] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            let mut kept: Vec<usize> = (0..metas.len()).filter(|&i| reachable[i]).collect();
+            // move the terminal last so the codegen pushes its result
+            kept.retain(|&i| i != ti);
+            kept.push(ti);
+            let mut remap = vec![0usize; metas.len()];
+            for (k, &i) in kept.iter().enumerate() {
+                remap[i] = k;
+            }
+            let mut metas2: Vec<WeaveMeta> = Vec::new();
+            for &i in &kept {
+                let m = &metas[i];
+                metas2.push(WeaveMeta {
+                    name: m.name.clone(),
+                    pc: m.pc.clone(),
+                    inputs: m.inputs.iter().map(|&j| remap[j]).collect(),
+                    count: m.count,
+                });
+            }
+            metas = metas2;
+        }
+        if !metas.is_empty() {
+            for m in &metas {
+                if !self.p.vars.contains(&m.name) {
+                    self.p.vars.push(m.name.clone());
+                }
+            }
+            pi(&mut self.p, Ins::Weave(metas), line);
+        }
+        self.cur_weave.clear();
+    }
+
+    fn parse_label_def(&mut self, n: String, line: u32) {
+        self.p.labels.insert(n.clone(), self.p.ins.len());
+        self.p.label_lines.insert(self.p.ins.len(), line);
+        if self.pending_pub {
+            self.p.pubs.push(n.clone());
+            self.pending_pub = false;
+        }
+        if let Some(tname) = self.pending_method.take() {
+            let tk = method_typekey(&tname, self.structs)
+                .unwrap_or_else(|| panic!("METHOD: unknown type {}", tname));
+            self.p.methods.push((tk, fnv64(&n), n.clone()));
+        }
+        if let Some(x) = self.pending_export.take() {
+            self.p.exports.push((x, n));
+        }
+        // v13: consume a leading run of binding tokens as parameter
+        // declarations (name! / ^name! / _!). Bindings are emitted as
+        // instructions in REVERSE order so the first declared binding
+        // pops the first cell the caller pushed (the caller's stack
+        // holds the args in push order, last on top).
+        let mut params: Vec<Param> = Vec::new();
+        while let Some(t2) = self.q.front() {
+            match &t2.1 {
+                Tok::LocalSet(name) => {
+                    params.push(Param::Local(name.clone()));
+                    self.q.pop_front();
+                }
+                Tok::SetV(name) => {
+                    params.push(Param::Global(name.clone()));
+                    self.q.pop_front();
+                }
+                Tok::Discard => {
+                    params.push(Param::Discard);
+                    self.q.pop_front();
+                }
+                _ => break,
+            }
+        }
+        if !params.is_empty() {
+            self.p.label_params.insert(self.p.ins.len(), params.clone());
+        }
+        for (k, par) in params.iter().rev().enumerate() {
+            let pc = self.p.ins.len();
+            match par {
+                Param::Local(name) => pi(&mut self.p, Ins::LocalSet(name.clone()), line),
+                Param::Global(name) => {
+                    if !self.p.vars.contains(name) {
+                        self.p.vars.push(name.clone());
+                    }
+                    pi(&mut self.p, Ins::SetV(name.clone()), line);
+                }
+                Param::Discard => pi(&mut self.p, Ins::Simple("op_drop"), line),
+            }
+            // guard offset: the k-th pop (0-based, reversed emission)
+            // pops only when the caller left (arity - k) cells; see
+            // the guard in gen.rs
+            self.p.param_pcs.insert(pc, params.len() - 1 - k);
+        }
+    }
+    fn parse_ident(&mut self, n: String, line: u32) {
+        if n == "@flush" {
+            pi(&mut self.p, Ins::Flush, line);
+        } else if n == "@liststart" {
+            pi(&mut self.p, Ins::ListStart, line);
+        } else if n == "@dictstart" {
+            pi(&mut self.p, Ins::DictStart, line);
+        } else if n == "@listlit" {
+            pi(&mut self.p, Ins::ListLit, line);
+        } else if n == "@dictlit" {
+            pi(&mut self.p, Ins::DictLit, line);
+        } else if let Some(rest) = n.strip_prefix("@sizeof:") {
+            if let Some(id) = type_id(rest) {
+                pi(&mut self.p, Ins::PushI(if id == 3 || id == 21 { 1 } else { 8 }), line);
+            } else if let Some((_, tsz, _)) = self.structs.get(rest) {
+                pi(&mut self.p, Ins::PushI(*tsz), line);
+            } else {
+                panic!("SIZEOF: unknown type {}", rest);
+            }
+        } else if let Some(rest) = n.strip_prefix("@offset:") {
+            let parts: Vec<&str> = rest.splitn(2, '.').collect();
+            if parts.len() != 2 {
+                panic!("OFFSET needs Struct.field, got {}", rest);
+            }
+            let (fs, _, _) = self.structs
+                .get(parts[0])
+                .unwrap_or_else(|| panic!("OFFSET: unknown struct {}", parts[0]));
+            let off = fs
+                .iter()
+                .find(|(f, _)| f == parts[1])
+                .unwrap_or_else(|| panic!("OFFSET: no field {} in {}", parts[1], parts[0]));
+            pi(&mut self.p, Ins::PushI(off.1), line);
+        } else if let Some(rest) = n.strip_prefix("@objsize:") {
+            let (_, tsz, sid) = self.structs
+                .get(rest)
+                .unwrap_or_else(|| panic!("OBJ: unknown struct {}", rest));
+            // size in low 32 bits, struct id above (op_obj splits them)
+            pi(&mut self.p, Ins::PushI(tsz | (sid << 32)), line);
+        } else if let Some(rest) = n.strip_prefix("@cast:") {
+            let (_, _, sid) = self.structs
+                .get(rest)
+                .unwrap_or_else(|| panic!("CAST: unknown struct {}", rest));
+            pi(&mut self.p, Ins::PushI(1000 + sid), line);
+        } else if let Some(body) = self.macros.get(&n).cloned() {
+            self.expand_depth += 1;
+            if self.expand_depth > 1024 {
+                panic!("macro expansion too deep (recursive macro?)");
+            }
+            for t2 in body.into_iter().rev() {
+                self.q.push_front(t2);
+            }
+        } else if is_reserved(&n) {
+            panic!("'{}' is a reserved word (opcode mnemonic)", n);
+        } else {
+            // v15: a bare name is an implicit variable load
+            pi(&mut self.p, Ins::LocalGet(n), line);
+        }
+    }
+}
+
+// v13: every label body must end with `ret` (a path that falls off the end
+// of a label is a compile error). Bodies consisting only of break/cont are
+// loop-exit continuations and are exempt; internal weave-skip regions end
+// with a Goto and are exempt (no user code may end a body with a jump).
+fn check_label_bodies_end_with_ret(p: &Parsed) {
+    let mut pcs: Vec<(String, usize)> = p.labels.iter().map(|(n, &pc)| (n.clone(), pc)).collect();
+    pcs.sort_by_key(|(_, pc)| *pc);
+    for (i, (name, pc)) in pcs.iter().enumerate() {
+        // internal weave-skip labels are not user bodies
+        if name.starts_with("__wskip") {
+            continue;
+        }
+        let end = pcs.get(i + 1).map(|(_, e)| *e).unwrap_or(p.ins.len());
+        if end <= *pc {
+            continue; // empty label (alias)
+        }
+        let last = end - 1;
+        if std::env::var("UF_DEBUG_PARSE").is_ok() {
+            eprintln!("retcheck label={} pc={} end={} lastins={:?}", name, pc, end, p.ins.get(last));
+        }
+        // Terminating instructions never fall off the end: ret returns,
+        // break/cont unwind a loop, Goto jumps, and if_else transfers to
+        // one of two bodies. if/while/for fall through on some path, so a
+        // body may not end with them.
+        match &p.ins[last] {
+            Ins::Ret | Ins::Break | Ins::Cont | Ins::Goto(_) | Ins::IfElse => {}
+            _ => panic!(
+                "label '{}': body must end with `ret` — falling off the end of a label is a v13 compile error",
+                name
+            ),
+        }
+    }
+}
+
+// v10: break/cont outside a loop are compile errors. A "function" here is
+// the instruction region starting at a label used as a code address
+// (CALL/ADDR/weave task entry); a loop is a FOR/WHILE whose body address
+// is a compile-time-known PushAddr. break/cont must textually appear in a
+// loop body (nested quotation bodies have their own labels, so nested
+// loops resolve to the innermost body as required).
+fn check_loop_exits_in_loop(p: &Parsed) {
+    let mut entries: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut loop_bodies: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let resolve = |l: &String| -> Option<usize> { p.labels.get(l).copied() };
+    for (i, ins) in p.ins.iter().enumerate() {
+        match ins {
+            Ins::Call(l) => {
+                if let Some(t) = resolve(l) {
+                    entries.insert(t);
+                }
+            }
+            Ins::PushAddr(l) => {
+                // A PushAddr that directly feeds a control-flow op
+                // (if/ifelse/while/for) is a continuation of the current
+                // body, not a new function entry: it runs in the caller's
+                // frame, so break/cont inside it bind to the caller's
+                // loop. Everything else (stored/computed addresses)
+                // starts a new entry.
+                let feeds_cf = match p.ins.get(i + 1) {
+                    Some(Ins::If) | Some(Ins::IfElse) | Some(Ins::For) | Some(Ins::While) => true,
+                    Some(Ins::PushAddr(_)) => {
+                        matches!(p.ins.get(i + 2), Some(Ins::While) | Some(Ins::IfElse))
+                    }
+                    _ => false,
+                };
+                if !feeds_cf {
+                    if let Some(t) = resolve(l) {
+                        entries.insert(t);
+                    }
+                }
+            }
+            Ins::Weave(ms) => {
+                for m in ms {
+                    entries.insert(m.pc);
+                }
+            }
+            Ins::For => {
+                if i > 0 {
+                    if let Ins::PushAddr(l) = &p.ins[i - 1] {
+                        if let Some(t) = resolve(l) {
+                            loop_bodies.insert(t);
+                        }
+                    }
+                }
+            }
+            Ins::While => {
+                if i > 0 {
+                    if let Ins::PushAddr(l) = &p.ins[i - 1] {
+                        if let Some(t) = resolve(l) {
+                            loop_bodies.insert(t);
+                        }
+                    }
+                }
+                if i > 1 {
+                    if let Ins::PushAddr(l) = &p.ins[i - 2] {
+                        if let Some(t) = resolve(l) {
+                            loop_bodies.insert(t);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut cur_fn: Option<usize> = None;
+    for (i, ins) in p.ins.iter().enumerate() {
+        if entries.contains(&i) || loop_bodies.contains(&i) {
+            cur_fn = Some(i);
+        }
+        if matches!(ins, Ins::Break | Ins::Cont) {
+            let ok = match cur_fn {
+                Some(f) => loop_bodies.contains(&f),
+                None => false,
+            };
+            if !ok {
+                panic!("{} outside a loop (compile error)",
+                    if matches!(ins, Ins::Break) { "break" } else { "cont" });
+            }
+        }
+    }
+}
+
+pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Parsed {
+    let mut ctx = ParseCtx {
+        p: empty_parsed(),
+        q: toks.into(),
+        macros: HashMap::new(),
+        structs,
+        caps,
+        dtemp_ctr: 0,
+        pending_export: None,
+        pending_pub: false,
+        pending_method: None,
+        weave_ctr: 0,
+        cur_weave: Vec::new(),
+        expand_depth: 0,
+    };
+    ctx.run();
+    let mut p = ctx.p;
     p.ins_files = vec![0; p.ins.len()];
     p.file_names = vec![p.modname.clone().unwrap_or_else(|| "main".to_string())];
     for (n, &pc) in &p.labels {
         p.label_names.entry(pc).or_insert_with(|| n.clone());
     }
-    let _ = imports;
-    // v13: every label body must end with `ret` (a path that falls off the end
-    // of a label is a compile error). Bodies consisting only of break/cont are
-    // loop-exit continuations and are exempt; internal weave-skip regions end
-    // with a Goto and are exempt (no user code may end a body with a jump).
-    {
-        let mut pcs: Vec<(String, usize)> = p.labels.iter().map(|(n, &pc)| (n.clone(), pc)).collect();
-        pcs.sort_by_key(|(_, pc)| *pc);
-        for (i, (name, pc)) in pcs.iter().enumerate() {
-            // internal weave-skip labels are not user bodies
-            if name.starts_with("__wskip") {
-                continue;
-            }
-            let end = pcs.get(i + 1).map(|(_, e)| *e).unwrap_or(p.ins.len());
-            if end <= *pc {
-                continue; // empty label (alias)
-            }
-            let last = end - 1;
-            if std::env::var("UF_DEBUG_PARSE").is_ok() {
-                eprintln!("retcheck label={} pc={} end={} lastins={:?}", name, pc, end, p.ins.get(last));
-            }
-            // Terminating instructions never fall off the end: ret returns,
-            // break/cont unwind a loop, Goto jumps, and if_else transfers to
-            // one of two bodies. if/while/for fall through on some path, so a
-            // body may not end with them.
-            match &p.ins[last] {
-                Ins::Ret | Ins::Break | Ins::Cont | Ins::Goto(_) | Ins::IfElse => {}
-                _ => panic!(
-                    "label '{}': body must end with `ret` — falling off the end of a label is a v13 compile error",
-                    name
-                ),
-            }
-        }
-    }
-    // v10: break/cont outside a loop are compile errors. A "function" here is
-    // the instruction region starting at a label used as a code address
-    // (CALL/ADDR/weave task entry); a loop is a FOR/WHILE whose body address
-    // is a compile-time-known PushAddr. break/cont must textually appear in a
-    // loop body (nested quotation bodies have their own labels, so nested
-    // loops resolve to the innermost body as required).
-    {
-        let mut entries: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut loop_bodies: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let resolve = |l: &String| -> Option<usize> { p.labels.get(l).copied() };
-        for (i, ins) in p.ins.iter().enumerate() {
-            match ins {
-                Ins::Call(l) => {
-                    if let Some(t) = resolve(l) {
-                        entries.insert(t);
-                    }
-                }
-                Ins::PushAddr(l) => {
-                    // A PushAddr that directly feeds a control-flow op
-                    // (if/ifelse/while/for) is a continuation of the current
-                    // body, not a new function entry: it runs in the caller's
-                    // frame, so break/cont inside it bind to the caller's
-                    // loop. Everything else (stored/computed addresses)
-                    // starts a new entry.
-                    let feeds_cf = match p.ins.get(i + 1) {
-                        Some(Ins::If) | Some(Ins::IfElse) | Some(Ins::For) | Some(Ins::While) => true,
-                        Some(Ins::PushAddr(_)) => {
-                            matches!(p.ins.get(i + 2), Some(Ins::While) | Some(Ins::IfElse))
-                        }
-                        _ => false,
-                    };
-                    if !feeds_cf {
-                        if let Some(t) = resolve(l) {
-                            entries.insert(t);
-                        }
-                    }
-                }
-                Ins::Weave(ms) => {
-                    for m in ms {
-                        entries.insert(m.pc);
-                    }
-                }
-                Ins::For => {
-                    if i > 0 {
-                        if let Ins::PushAddr(l) = &p.ins[i - 1] {
-                            if let Some(t) = resolve(l) {
-                                loop_bodies.insert(t);
-                            }
-                        }
-                    }
-                }
-                Ins::While => {
-                    if i > 0 {
-                        if let Ins::PushAddr(l) = &p.ins[i - 1] {
-                            if let Some(t) = resolve(l) {
-                                loop_bodies.insert(t);
-                            }
-                        }
-                    }
-                    if i > 1 {
-                        if let Ins::PushAddr(l) = &p.ins[i - 2] {
-                            if let Some(t) = resolve(l) {
-                                loop_bodies.insert(t);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut cur_fn: Option<usize> = None;
-        for (i, ins) in p.ins.iter().enumerate() {
-            if entries.contains(&i) || loop_bodies.contains(&i) {
-                cur_fn = Some(i);
-            }
-            if matches!(ins, Ins::Break | Ins::Cont) {
-                let ok = match cur_fn {
-                    Some(f) => loop_bodies.contains(&f),
-                    None => false,
-                };
-                if !ok {
-                    panic!("{} outside a loop (compile error)",
-                        if matches!(ins, Ins::Break) { "break" } else { "cont" });
-                }
-            }
-        }
-    }
+    check_label_bodies_end_with_ret(&p);
+    check_loop_exits_in_loop(&p);
     // Note: resolve_locals is deferred to merge_tus, where all TU offsets
     // are finalized. Calling it here would produce per-TU slot IDs and frame
     // sizes that are invalidated when instructions are offset during merge.

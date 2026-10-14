@@ -40,7 +40,7 @@ v2!
 0 v9!
 'c4 'b5 while
 v3 0 eq not v2 0 eq not mul not not 'i19 if
-0 rv! 1 fr!
+0 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 c4:
 fr not 1 and ret
@@ -63,7 +63,7 @@ v6 -1 eq 'i8 if
 v4 0 eq 'i9 if
 v4 1 eq 'i10 if
 v4 2 eq 'i11 if
-v4 pt! v4 1 add v4! frv! pt 
+v4 v4 1 add v4! consume 
 0 ret
 i8:
 break
@@ -127,7 +127,7 @@ i23:
 continue
 0 ret
 i24:
-v15 pt! v15 1 add v15! frv! pt 
+v15 v15 1 add v15! consume 
 0 v12! 
 0 ret
 e25:
@@ -161,7 +161,7 @@ c41:
 0 ret
 b33:
 v14 6 shl v12 or v14! 
-v13 pt! v13 1 add v13! frv! pt 
+v13 v13 1 add v13! consume 
 v13 4 eq 'i34 if
 fr 'c41 'b42 if_else
 0 ret
@@ -215,19 +215,19 @@ fr 'c51 'b52 if_else
 0 ret
 i47:
 1 v16! 
-v18 pt! v18 1 add v18! frv! pt 
+v18 v18 1 add v18! consume 
 continue
 0 ret
 i48:
 2 v19 "" _call strstr add load 255 and 0 eq not 'i49 if
-v18 pt! v18 1 add v18! frv! pt 
+v18 v18 1 add v18! consume 
 v18 8 mul extern "nk_argv" load add load _call b64_num v17! 
-v18 pt! v18 1 add v18! frv! pt 
+v18 v18 1 add v18! consume 
 continue
 0 ret
 i49:
 v19 2 add _call b64_num v17! 
-v18 pt! v18 1 add v18! frv! pt 
+v18 v18 1 add v18! consume 
 continue
 0 ret
 i50:
@@ -235,7 +235,7 @@ extern "stderr" load "base64: %s: No such file or directory\n" v19 1 _call fprin
 1 _call exit
 0 ret
 b52:
-v18 pt! v18 1 add v18! frv! pt 
+v18 v18 1 add v18! consume 
 break
 0 ret
 c51:
@@ -255,7 +255,7 @@ v20 _call b64_decode _call exit
 c53:
 0 ret
 b64_table:
-"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" rv! 1 fr!
+"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 b64_index:
 v21!
@@ -273,7 +273,7 @@ fr 'c61 'b62 if_else
 i60:
 v23 rv! 1 fr! 0 ret
 b62:
-v23 pt! v23 1 add v23! frv! pt 
+v23 v23 1 add v23! consume 
 0 ret
 c61:
 0 ret
@@ -306,7 +306,7 @@ v27!
 v28!
 v29!
 _call b64_table v30!
-v27 v30 "" _call strstr add load 255 and v28 v29 _call b64_out rv! 1 fr!
+v27 v30 "" _call strstr add load 255 and v28 v29 _call b64_out rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 b64_num:
 v31!
@@ -315,7 +315,7 @@ v31!
 0 v31 "" _call strstr add load 255 and 45 eq 0 v31 "" _call strstr add load 255 and 43 eq or not not 'i69 if
 v32 v31 "" _call strstr add load 255 and v34! 
 'c70 'b71 while
-v33 rv! 1 fr!
+v33 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 i69:
 1 v32! 
@@ -324,6 +324,6 @@ c70:
 fr not v34 48 lt not v34 57 gt not mul not not and ret
 b71:
 v33 10 mul v34 48 sub add v33! 
-v32 pt! v32 1 add v32! frv! pt 
+v32 v32 1 add v32! consume 
 v32 v31 "" _call strstr add load 255 and v34! 
 0 ret

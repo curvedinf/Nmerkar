@@ -10,6 +10,9 @@
 4 "3" add print                     ; 7 — either operand order
 "3" 4 add type_of print             ; 1 — float: a string operand coerces via f64, as with mul/div
 "hello" 1 add print                 ; NaN — no numeric form propagates
+"" 5 add print                      ; 5 — empty string coerces to 0 (SPEC table)
+"  " 5 add print                    ; 5 — whitespace-only coerces to 0
+"" 0 eq print                       ; 1 — loose eq sees the 0 form
 "0x1A" 1 add print                  ; 27 — hex strings parse
 "abc" s!
 s 0 get print                       ; 97 — byte read via the container protocol

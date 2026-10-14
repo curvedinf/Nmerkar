@@ -27,13 +27,13 @@ v1!
 v0 v1 255 and 24 shl xor v0! 
 v0 4294967295 and v0! 
 'c1 'b2 while
-v0 rv! 1 fr!
+v0 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 c1:
 fr not v2 8 lt and ret
 b2:
 v0 2147483648 and 0 eq not 'i3 'e4 if_else
-v2 pt! v2 1 add v2! frv! pt 
+v2 v2 1 add v2! consume 
 0 ret
 i3:
 v0 1 shl 79764919 xor 4294967295 and v0! 
@@ -47,13 +47,13 @@ v4!
 v5!
 0 v6!
 'c5 'b6 while
-v3 rv! 1 fr!
+v3 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 c5:
 fr not v6 v5 lt and ret
 b6:
 v3 v6 v4 "" _call strstr add load 255 and _call cksum_byte v3! 
-v6 pt! v6 1 add v6! frv! pt 
+v6 v6 1 add v6! consume 
 0 ret
 cksum_length:
 v7!
@@ -63,7 +63,7 @@ v8 255 gt 'i8 if
 v8 65535 gt 'i9 if
 v8 16777215 gt 'i10 if
 v8 4294967295 gt 'i11 if
-v7 rv! 1 fr!
+v7 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 i7:
 v7 v8 255 and _call cksum_byte v7! 
@@ -91,7 +91,7 @@ v11!
 v12 v13 _call cksum_length v12! 
 v12 4294967295 xor v12! 
 v10 0 eq not 'i15 'e16 if_else
-0 rv! 1 fr!
+0 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 c12:
 fr not 1 and ret
@@ -130,7 +130,7 @@ extern "stderr" load "cksum: %s: No such file or directory\n" v16 8 mul extern "
 b21:
 v17 1 v16 8 mul extern "nk_argv" load add load _call cksum_stream 
 v17 _call fclose 
-v16 pt! v16 1 add v16! frv! pt 
+v16 v16 1 add v16! consume 
 0 ret
 c20:
 0 ret

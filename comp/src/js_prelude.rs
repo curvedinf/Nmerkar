@@ -273,7 +273,11 @@ var RT = (function () {
       case "f": return x.v;
       case "y": return x.v;
       case "b": return x.v;
-      case "s": return strictDouble(x.v);
+      case "s": {
+        // empty / whitespace-only -> 0 (SPEC numeric-context table; C isspace)
+        if (x.v.replace(/[ \t\n\v\f\r]+$/, "").length === 0) return 0;
+        return strictDouble(x.v);
+      }
       case "l": {
         if (x.v.length === 0) return 0;
         if (x.v.length === 1) return toNumber(x.v[0]);

@@ -5,8 +5,6 @@
 - [Emitted-C nondeterminism](codegen-nondeterminism.md): `--emit-c` output
   varies run-to-run (HashMap-ordered init_locals/function blocks); known,
   behavior-neutral, fix before any emitted-C hashing or reproducible builds.
-- [Pre-existing drift](preexisting-drift.md): gnu gate failures (cat/base64)
-  + stale `examples/gnu` exports, and `""`→NaN vs SPEC's `""`→0 coercion row.
 - [Security disclosure policy](security-policy.md): standing permissions for
   the pre-commit security gate (currently none approved — every finding needs
   an explicit disposition).

@@ -31,7 +31,7 @@ v1 4 and v7!
 v1 1 and v8!
 v1 8 and v9!
 'c1 'b2 while
-0 rv! 1 fr!
+0 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 c1:
 fr not 1 and ret
@@ -99,7 +99,7 @@ fr 'c15 'b16 if_else
 0 ret
 i13:
 1 v13! 
-v11 pt! v11 1 add v11! frv! pt 
+v11 v11 1 add v11! consume 
 continue
 0 ret
 i14:
@@ -107,7 +107,7 @@ extern "stderr" load "cat: invalid option -- %s\n" v14 1 add 1 _call fprintf
 1 _call exit
 0 ret
 b16:
-v11 pt! v11 1 add v11! frv! pt 
+v11 v11 1 add v11! consume 
 continue
 0 ret
 c15:
@@ -119,7 +119,7 @@ v15 _call fclose
 c22:
 0 ret
 b25:
-v11 pt! v11 1 add v11! frv! pt 
+v11 v11 1 add v11! consume 
 0 ret
 c24:
 0 ret
@@ -154,7 +154,7 @@ c26:
 cat_set_flag:
 v16!
 v17!
-v16 v17 or rv! 1 fr!
+v16 v17 or rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 cat_parse_short:
 v18!
@@ -257,7 +257,7 @@ fr 'c62 'b63 if_else
 i61:
 0 1 sub rv! 1 fr! 0 ret
 b63:
-v22 pt! v22 1 add v22! frv! pt 
+v22 v22 1 add v22! consume 
 0 ret
 c62:
 0 ret

@@ -266,6 +266,17 @@ pub fn plab(prefix: &str, i: usize) -> String {
     }
 }
 
+// The C label a PushAddr of target pc `t` would emit in the current emission
+// window — in-window targets of a nested copy get the copy's prefix, all
+// others the standalone depth-0 label (same rule as the Ins::PushAddr arm).
+fn addr_lab(start: usize, end: usize, prefix: &str, t: usize) -> String {
+    if t >= start && t < end && !prefix.is_empty() {
+        plab(prefix, t)
+    } else {
+        plab("", t)
+    }
+}
+
 // v13: the data-stack pointer a body's guarded param pops compare against —
 // the caller's saved sp (the just-pushed cs entry), or the outline's own
 // pre-arg pointer, or 0 at the top level.
@@ -1227,6 +1238,13 @@ pub fn emit_range(
                                     }
                                 }
                                 vflush(&mut e, &mut vstack, &mut vcache);
+                                // Suppressed callback PushAddr (inlining
+                                // analysis): the generic op pops it.
+                                if depth >= 8 && inline_ffolds.contains_key(&i) {
+                                    if let Some((bs, _)) = inline_ffolds.get(&i).copied() {
+                                        e.push_str(&format!("pushp(cx,(void*)&&{});", addr_lab(start, end, prefix, bs)));
+                                    }
+                                }
                                 e.push_str(&format!("uf_cur_op=\"{}\";{}(cx);\n", h, h));
                             }
                         }
@@ -1359,6 +1377,12 @@ pub fn emit_range(
                         e.push_str("cx->lsp=fr;}}\n");
                     }
                     None => {
+                        // The suppressed PushAddr (inlining analysis) must be
+                        // re-materialized: the generic path pops the body
+                        // address from the stack.
+                        if let Some((bs, _)) = inline_fors.get(&i).copied() {
+                            e.push_str(&format!("pushp(cx,(void*)&&{});", addr_lab(start, end, prefix, bs)));
+                        }
                         e.push_str(&format!(
                         "{{const void* t=((void*)pop(cx).i);int64_t cnt=pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};for(int64_t k=0;k<cnt;k++){{pushi(cx,k);uf_cspush(cx,&&K_{}{},cx->sp-1);goto *t;K_{}{}:;if(cx->sp>0)pop(cx);K_FC_{}{}:;}}K_FE_{}{}:;cx->lsp=fr;}}\n",
                         prefix, i, prefix, i, prefix, i, prefix, i, prefix, i, prefix, i
@@ -1517,6 +1541,14 @@ pub fn emit_range(
                     }
                 }
                 vflush(&mut e, &mut vstack, &mut vcache);
+                // The analysis suppressed this if's PushAddr (it marked the
+                // construct inlinable), but depth >= 8 declined the inline —
+                // the generic path below pops the address, so re-push it.
+                if depth >= 8 {
+                    if let Some((tbs, _, _, _)) = inline_ifs.get(&i).copied() {
+                        e.push_str(&format!("pushp(cx,(void*)&&{});", addr_lab(start, end, prefix, tbs)));
+                    }
+                }
                 // v13: the body's declared arity sets the drain point (the
                 // caller's cells below the branch's arguments stay put)
                 let if_arity = if i > start {
@@ -1579,6 +1611,18 @@ pub fn emit_range(
                     }
                 }
                 vflush(&mut e, &mut vstack, &mut vcache);
+                // Both branch PushAddrs were suppressed by the inlining
+                // analysis; at depth >= 8 the generic path pops them, so
+                // re-push then/else in the order it expects (else on top).
+                if depth >= 8 {
+                    if let Some((tbs, _, ebs, _)) = inline_ifs.get(&i).copied() {
+                        e.push_str(&format!(
+                            "pushp(cx,(void*)&&{});pushp(cx,(void*)&&{});",
+                            addr_lab(start, end, prefix, tbs),
+                            addr_lab(start, end, prefix, ebs)
+                        ));
+                    }
+                }
                 // v13: each branch may declare its own arity; the drain point
                 // is saved per branch before jumping
                 let (th_ar, el_ar) = if i > start {
@@ -1627,6 +1671,18 @@ pub fn emit_range(
                     vdiscard(&mut e, &mut vstack, &mut vcache);
                 } else {
                     vflush(&mut e, &mut vstack, &mut vcache);
+                    // Suppressed cond/body PushAddrs (inlining analysis) must
+                    // be re-materialized for the generic path (cond then
+                    // body, body on top).
+                    if depth >= 8 {
+                        if let Some((bbs, _, cbs, _)) = inline_whiles.get(&i).copied() {
+                            e.push_str(&format!(
+                                "pushp(cx,(void*)&&{});pushp(cx,(void*)&&{});",
+                                addr_lab(start, end, prefix, cbs),
+                                addr_lab(start, end, prefix, bbs)
+                            ));
+                        }
+                    }
                 }
                 // v13: cond/body declared arities set the per-call drain points
                 let (cond_arity, body_arity) = if i >= 2 {
@@ -2562,7 +2618,19 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                 }
                 Ins::GetV(name) => {
                     if let Some(&t) = shared_types.get(name) {
-                        type_stack.push((t, false));
+                        if t == VType::Unknown {
+                            // Committed-Unknown (conflicted): the runtime value
+                            // is dynamic — reads are opaque so consumers cannot
+                            // commit partial evidence and mis-specialize.
+                            type_stack.push((VType::Unknown, true));
+                        } else {
+                            type_stack.push((t, false));
+                        }
+                    } else if shared_poison.contains(name) || shared_conflicted.contains(name) {
+                        // Poisoned vars never commit (opaque stores, e.g. a
+                        // string into an int-initialized shared); every read
+                        // must carry the poison downstream.
+                        type_stack.push((VType::Unknown, true));
                     } else {
                         type_stack.push((VType::Unknown, false));
                     }

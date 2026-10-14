@@ -8,6 +8,30 @@ new semantics or performance) are listed under the commit that made them.
 
 ## v15.1 — 2026-10-14 (uniform pass-through stores, `#` destructuring, vector coercion, alias retirement)
 
+- Deep-branch inline-cap fallback — fixed (compiler bug, no language
+  change): constructs the inlining analysis marks inlinable (suppressing
+  their `PushAddr` operands) but emitted at inline depth ≥ 8 fell back to
+  the generic call path without re-materializing the branch addresses —
+  the interpreter popped garbage as a code address (SIGSEGV; `cat -t` in
+  the GNU gates once transpiled elif chains grew past depth 8). The
+  if/if_else/while/for/fold fallbacks now push the suppressed addresses
+  so declining to inline preserves the stack contract. Gate:
+  `comp/tests/t22_deepbranch.n`.
+- Shared-var type inference — fixed (compiler bug, no language change): a
+  shared var int-initialized at top level and later assigned a string
+  (the C transpiler's `fr`/`rv` early-return protocol) committed as Int;
+  reads cached through `uf_i` then parsed the string content instead of
+  the value (`"A"` → 0), and downstream pointer arithmetic crashed (all
+  six base64 gates). Poison (an opaque store into an evidenced shared)
+  now propagates through reads — GetV of a poisoned or conflicted shared
+  is opaque, so consumers stay Unknown and emit the generic Cell path.
+  Gate: `comp/tests/t23_sharedpoly.n`.
+- Empty-string numeric coercion — fixed (behavior, same opcodes): `""` and
+  whitespace-only strings now coerce to 0 in numeric context (SPEC's
+  numeric-context table has always said `0`; both runtimes returned NaN —
+  parity could not see it since both agreed). Loose `eq` sees the 0 form
+  (`"" 0 eq` → 1). Gate: `comp/tests/t21_strarith.n` (rows restored).
+
 - String arithmetic coercion — changed (behavior, same opcodes): `add`/`sub`
   no longer run "char*" byte-offset pointer arithmetic on a tracked string
   operand (the undocumented prelude `uf_stradd` path); a string now coerces

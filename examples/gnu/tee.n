@@ -47,22 +47,22 @@ extern "stderr" load "tee: invalid option -- %s\n" v8 1 add 1 _call fprintf
 0 ret
 i4:
 1 v2! 
-v1 pt! v1 1 add v1! frv! pt 
+v1 v1 1 add v1! consume 
 continue
 0 ret
 i5:
 1 v0! 
-v1 pt! v1 1 add v1! frv! pt 
+v1 v1 1 add v1! consume 
 continue
 0 ret
 i6:
-v1 pt! v1 1 add v1! frv! pt 
+v1 v1 1 add v1! consume 
 continue
 0 ret
 b8:
 v4 v3 lt 'i9 if
 v1 v4! 
-v1 pt! v1 1 add v1! frv! pt 
+v1 v1 1 add v1! consume 
 0 ret
 i9:
 v1 v3! 
@@ -137,7 +137,7 @@ extern "stderr" load "tee: %s: cannot open\n" v14 8 mul extern "nk_argv" load ad
 b28:
 v11 1 v12 v15 _call fwrite 
 v15 _call fclose 
-v14 pt! v14 1 add v14! frv! pt 
+v14 v14 1 add v14! consume 
 0 ret
 c27:
 0 ret

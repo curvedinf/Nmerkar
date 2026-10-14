@@ -68,11 +68,11 @@ c12:
 0 ret
 b18:
 v4 _call putchar 
-v6 pt! v6 1 add v6! frv! pt 
+v6 v6 1 add v6! consume 
 v4 10 eq 'i19 if
 0 ret
 i19:
-v5 pt! v5 1 add v5! frv! pt 
+v5 v5 1 add v5! consume 
 0 ret
 c17:
 0 ret
@@ -121,7 +121,7 @@ extern "stderr" load "head: invalid option -- %s\n" v15 1 add 1 _call fprintf
 i25:
 1 v15 "" _call strstr add load 255 and 99 eq 'i26 if
 2 v15 "" _call strstr add load 255 and 0 eq not 'i27 'e28 if_else
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 continue
 0 ret
 i26:
@@ -131,32 +131,32 @@ i27:
 v15 2 add _call head_num v7! 
 0 ret
 e28:
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 v12 8 mul extern "nk_argv" load add load _call head_num v7! 
 0 ret
 i29:
 1 v9! 
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 continue
 0 ret
 i30:
 1 v10! 
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 continue
 0 ret
 i31:
 1 v11! 
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 continue
 0 ret
 i32:
 v15 1 add _call head_num v7! 
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 continue
 0 ret
 b34:
-v13 pt! v13 1 add v13! frv! pt 
-v12 pt! v12 1 add v12! frv! pt 
+v13 v13 1 add v13! consume 
+v12 v12 1 add v12! consume 
 0 ret
 c33:
 0 ret
@@ -167,7 +167,7 @@ v16 _call fclose
 c48:
 0 ret
 b51:
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 0 ret
 c50:
 0 ret
@@ -203,19 +203,19 @@ fr 'c50 'b51 if_else
 i39:
 1 v15 "" _call strstr add load 255 and 45 eq 2 v15 "" _call strstr add load 255 and 0 eq mul not not 'i40 if
 1 v15 "" _call strstr add load 255 and 110 eq 1 v15 "" _call strstr add load 255 and 99 eq or not not 'i41 if
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 continue
 0 ret
 i40:
 1 v11! 
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 continue
 0 ret
 i41:
 2 v15 "" _call strstr add load 255 and 0 eq 'i42 if
 0 ret
 i42:
-v12 pt! v12 1 add v12! frv! pt 
+v12 v12 1 add v12! consume 
 0 ret
 i43:
 v14 0 eq not 'i44 if
@@ -251,7 +251,7 @@ v22 98 eq 'i61 if
 v22 75 eq v22 107 eq or not not 'i62 if
 v22 77 eq 'i63 if
 v22 71 eq 'i64 if
-v18 v20 mul v21 mul rv! 1 fr!
+v18 v20 mul v21 mul rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
 i56:
 0 1 sub v18! 
@@ -267,7 +267,7 @@ c59:
 fr not v22 48 lt not v22 57 gt not mul not not and ret
 b60:
 v20 10 mul v22 48 sub add v20! 
-v19 pt! v19 1 add v19! frv! pt 
+v19 v19 1 add v19! consume 
 v19 v17 "" _call strstr add load 255 and v22! 
 0 ret
 i61:

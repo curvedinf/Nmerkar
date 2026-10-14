@@ -378,7 +378,7 @@ stderr, the die message (without the `nk: ` prefix), and the exit code.
 Boundaries:
 
 - Full op coverage: every op, including the four debug ops, works on the
-  JavaScript target. The parity suite (`bash web/tests/run_tests.sh`, 82
+  JavaScript target. The parity suite (`bash web/tests/run_tests.sh`, 84
   gates) compiles and runs every `comp/tests` gate, every example (including
   the GNU transpiler outputs), and every benchmark program on both targets and
   compares the captured streams byte for byte.

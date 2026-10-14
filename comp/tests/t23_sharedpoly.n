@@ -1,0 +1,16 @@
+; t23_sharedpoly.n — a shared var initialized as int and later assigned a
+; string (the C transpiler's fr/rv early-return protocol) must not be
+; Int-specialized at reads: the string round-trips intact and byte reads
+; through the container protocol see its content. Run:
+; nk comp/tests/t23_sharedpoly.n
+0 rv! 0 fr! 0 frv!
+ret
+entry:
+_call f s!
+s print
+s 0 get print
+s "ABC" structural_equal print
+ret
+f:
+"ABC" rv! 1 fr! consume consume
+fr rv mul frv! 0 fr! ret frv

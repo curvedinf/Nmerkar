@@ -732,7 +732,11 @@ static inline double uf_to_number(Cell c){
         return NAN;
       }
       if(h->tag==HT_STR){
-        const char*s=uf_sptr(c); char*end; double v=strtod(s,&end);
+        const char*s=uf_sptr(c);
+        /* empty / whitespace-only -> 0 (SPEC numeric-context table) */
+        const char*q=s; while(isspace((unsigned char)*q))q++;
+        if(!*q)return 0.0;
+        char*end; double v=strtod(s,&end);
         if(end==s)return NAN;
         while(isspace((unsigned char)*end))end++;
         if(*end)return NAN;

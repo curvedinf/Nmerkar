@@ -100,38 +100,9 @@ token-optimized encoding.
 JSON booleans through lists and dicts, and `to_json` writes them back as
 `true`/`false`. Use `bool cast` to convert a value explicitly.
 
-## Key Concepts
-
-**Read left to right.** Nmerkar uses postfix operations: `3 4 add print`
-adds two values, then prints `7`. Each operation consumes its inputs and passes
-its result to the next one. The compiler manages the underlying stack; `total!`
-stores a value and `total` reads it. A `;` starts a comment.
-
-**Work with data.** Integers, floats, and strings can live in lists, dictionaries,
-objects, or typed arrays and tensors. The same `get`, `set`, and `length`
-operations work across several containers. Managed values are garbage collected,
-and built-ins handle JSON, text, files, and regular expressions.
-
-**Compose behavior.** `if`, `while`, and `for` call labeled blocks such as
-`'step`; the block is defined with `step:` and can bind inputs to named variables.
-Blocks also serve as callbacks for operations such as `filter`, and `ret` returns
-a value.
-
-**Parallel pipelines with `weave`.** Process files and large datasets without
-managing threads or passing results between them by hand. Define steps as
-`task` blocks; `run` executes independent steps in parallel and passes their
-results to dependent steps. Add a worker count to spread collection items
-across cores; eligible tensor work can use a fused Vulkan GPU kernel.
-
-**Compile and run.** `nk` translates a program to C, compiles it with the system
-C compiler, and runs the native result; it can also emit C or a standalone
-binary. Eligible compute work can use a Vulkan GPU automatically when the
-toolchain and device are available, while `--device cpu` keeps it on the CPU.
-`nks` runs programs in a sandbox.
-
 ## Language Basics
 
-The mental model in six rules — function-level details and the full op
+The mental model in eleven rules — function-level details and the full op
 reference are in [`SPEC.md`](SPEC.md).
 
 **1. Postfix dataflow over a hidden stack.** Read left to right: literals and
@@ -172,6 +143,32 @@ likewise returns the element.
 colon; every code path ends in `ret`. A callee's entire stack is drained on
 return — only the `ret` value reaches the caller, so callees cannot leak
 operands.
+
+**7. Named variables and comments.** `total!` stores a value and `total`
+reads it back. A `;` starts a comment.
+
+**8. Built-in containers and utilities.** Integers, floats, and strings can
+live in lists, dictionaries, objects, or typed arrays and tensors. The same
+`get`, `set`, and `length` operations work across several containers.
+Managed values are garbage collected, and built-ins handle JSON, text,
+files, and regular expressions.
+
+**9. Blocks drive control flow and callbacks.** `if`, `while`, and `for`
+call labeled blocks such as `'step`, and blocks also serve as callbacks for
+operations such as `filter`.
+
+**10. Parallel pipelines with `weave`.** Process files and large datasets
+without managing threads or passing results between them by hand. Define
+steps as `task` blocks; `run` executes independent steps in parallel and
+passes their results to dependent steps. Add a worker count to spread
+collection items across cores; eligible tensor work can use a fused Vulkan
+GPU kernel.
+
+**11. Compile and run.** `nk` translates a program to C, compiles it with
+the system C compiler, and runs the native result; it can also emit C or a
+standalone binary. Eligible compute work can use a Vulkan GPU automatically
+when the toolchain and device are available, while `--device cpu` keeps it
+on the CPU. `nks` runs programs in a sandbox.
 
 ## Examples
 

@@ -111,7 +111,10 @@ leaves its result for the next operation. You never manipulate the stack —
 values reach an operation from literals, named variables, or the previous
 operation's result. `3 4 add print` prints `7`.
 
-**2. Every store passes its value through.** `d!` stores into the variable
+**2. Named variables and comments.** `total!` stores a value and `total`
+reads it back. A `;` starts a comment.
+
+**3. Every store passes its value through.** `d!` stores into the variable
 *and* leaves the value on the stack — local or shared alike, one token, one
 effect. The value flows on; a leftover below never disturbs later lines
 (operations read from the top, and bodies drain at `ret`). Square with
@@ -120,38 +123,35 @@ place a store *between* pushing a call's arguments — the leftover splices
 into the argument window (`100 3 x! 5 _call add2` passes 3 and 5, not 100
 and 5). Keep side effects on their own lines, or `consume` the leftover.
 
-**3. Destructuring is explicit `#`.** `result out# err# code#` binds the
+**4. Built-in containers and utilities.** Integers, floats, and strings can
+live in lists, dictionaries, objects, or typed arrays and tensors. The same
+`get`, `set`, and `length` operations work across several containers.
+Managed values are garbage collected, and built-ins handle JSON, text,
+files, and regular expressions.
+
+**5. `set` returns the stored element, not the container.** `nums 1 99 set`
+mutates `nums` in place and leaves `99`, so binding its result captures the
+element — not the updated list. Read the container back by name. `get`
+likewise returns the element.
+
+**6. Render containers with `print` or `to_json`, not `%s`.** In `format`,
+`%s` applies string coercion: a list becomes `1,2,3`, a dict
+`[object Object]`, and a typed array or tensor renders as raw handle digits
+(an address). `print` gives the type-aware representation (`[10, 99, 30]`);
+`to_json` gives JSON.
+
+**7. Destructuring is explicit `#`.** `result out# err# code#` binds the
 parts of the structure on the stack; the structure itself stays there.
 `x#` takes the next positional slot, `x#key` takes a dict key or object
 field, `_#` skips a slot. A plain `x!` always stores the *whole* value —
 `!` never reaches inside. A bind that cannot resolve (non-container,
 out-of-bounds slot, missing key) dies at its source line.
 
-**4. `set` returns the stored element, not the container.** `nums 1 99 set`
-mutates `nums` in place and leaves `99`, so binding its result captures the
-element — not the updated list. Read the container back by name. `get`
-likewise returns the element.
-
-**5. Render containers with `print` or `to_json`, not `%s`.** In `format`,
-`%s` applies string coercion: a list becomes `1,2,3`, a dict
-`[object Object]`, and a typed array or tensor renders as raw handle digits
-(an address). `print` gives the type-aware representation (`[10, 99, 30]`);
-`to_json` gives JSON.
-
-**6. Labels are the functions.** `name:` defines, `'name` references,
+**8. Labels are the functions.** `name:` defines, `'name` references,
 `_call` invokes; parameters bind with `p!` directly after the definition's
 colon; every code path ends in `ret`. A callee's entire stack is drained on
 return — only the `ret` value reaches the caller, so callees cannot leak
 operands.
-
-**7. Named variables and comments.** `total!` stores a value and `total`
-reads it back. A `;` starts a comment.
-
-**8. Built-in containers and utilities.** Integers, floats, and strings can
-live in lists, dictionaries, objects, or typed arrays and tensors. The same
-`get`, `set`, and `length` operations work across several containers.
-Managed values are garbage collected, and built-ins handle JSON, text,
-files, and regular expressions.
 
 **9. Blocks drive control flow and callbacks.** `if`, `while`, and `for`
 call labeled blocks such as `'step`, and blocks also serve as callbacks for

@@ -514,18 +514,14 @@ var RT = (function () {
     var p = pop2(rt, op); var a = p[0], b = p[1];
     var add = op === "add";
     if (vecCand(a) || vecCand(b)) { polyArith(rt, a, b, add ? 0 : 1, add ? "add" : "sub"); return; }
-    // C (uf_cadd/uf_csub): pointer ± int is raw byte-offset arithmetic; a
-    // string plus an integer shifts the string pointer (the C flip path is
-    // add-only). string - int and string + string fall through to the
-    // numeric path below, as in C.
+    // C (uf_cadd/uf_csub): pointer ± int is raw byte-offset arithmetic.
+    // Tracked strings never enter it — they coerce by content below, as in C.
     if (a.t === "p" || b.t === "p") {
       var pv = a.t === "p" ? a : b, iv = a.t === "p" ? b : a;
       if (!isTInt(iv)) die(rt, "pointer arithmetic: non-integer operand");
       ptrShift(rt, pv, iv, op);
       return;
     }
-    if (a.t === "s" && isTInt(b)) { ptrShift(rt, a, b, op); return; }
-    if (add && b.t === "s" && isTInt(a)) { ptrShift(rt, b, a, "add"); return; }
     if (add) { var r = cadd2(a, b); rt.st.push(r); }
     else {
       var x = toNumber(a), y = toNumber(b);
@@ -2443,7 +2439,7 @@ var RT = (function () {
     strstr: function (rt, A) {
       var a = cstrBytes(rt, A[0], "strstr"), b = cstrBytes(rt, A[1], "strstr");
       var base = A[0];
-      if (b.length === 0) return base;
+      if (b.length === 0) return base.t === "s" ? PS(base.v, 0) : base;
       var idx = -1;
       outer: for (var i = 0; i + b.length <= a.length; i++) {
         for (var j = 0; j < b.length; j++) if (a[i + j] !== b[j]) continue outer;

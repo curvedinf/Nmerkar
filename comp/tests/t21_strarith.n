@@ -1,0 +1,16 @@
+; t21_strarith.n — string operands coerce by content in numeric context (SPEC
+; "Universal coercion"): add/sub never do pointer arithmetic on a tracked
+; string; byte reads go through the container protocol (s i get). Run:
+; nk comp/tests/t21_strarith.n
+"3" 4 add print                     ; 7
+"3" 4 sub print                     ; -1
+"3" 4 mul print                     ; 12
+"3" 4 div print                     ; 0.75
+"3" 4 rem print                     ; 3
+4 "3" add print                     ; 7 — either operand order
+"3" 4 add type_of print             ; 1 — float: a string operand coerces via f64, as with mul/div
+"hello" 1 add print                 ; NaN — no numeric form propagates
+"0x1A" 1 add print                  ; 27 — hex strings parse
+"abc" s!
+s 0 get print                       ; 97 — byte read via the container protocol
+ret

@@ -1048,7 +1048,9 @@ to numbers. Exception: a **raw pointer** (an untracked ptr — from `malloc`,
 `buffer` data, FFI returns, or `strstr`-style interior pointers into string
 data) combined with an int under `add`/`sub` performs pointer arithmetic and
 yields a raw pointer (`p 8 add load` reads the next 8 bytes). Tracked handles
-(strings, lists, dicts) are unaffected: they coerce by content as before:
+(strings, lists, dicts) are unaffected: they coerce by content as before — a
+tracked string never enters pointer arithmetic; read its bytes with `get`
+(`s i get`):
 
 | Input | Result |
 |-------|--------|

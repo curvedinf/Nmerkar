@@ -8,6 +8,20 @@ new semantics or performance) are listed under the commit that made them.
 
 ## v15.1 — 2026-10-14 (uniform pass-through stores, `#` destructuring, vector coercion, alias retirement)
 
+- String arithmetic coercion — changed (behavior, same opcodes): `add`/`sub`
+  no longer run "char*" byte-offset pointer arithmetic on a tracked string
+  operand (the undocumented prelude `uf_stradd` path); a string now coerces
+  by content in numeric context exactly like `mul`/`div`/`rem` (`"3" 4 add`
+  is 7; it previously returned a raw interior pointer). Pointer arithmetic
+  is raw-pointer only (`malloc`/`buffer` data, FFI returns, `strstr`
+  interiors), matching this spec's normative text. Read a tracked string's
+  bytes with `get` (`s i get`). The JS target's string `ptrShift` emulation
+  — and its shifted-string `type_of` crash — is removed with it; the JS
+  libc `strstr` emulation's empty-needle fast path now returns a pointer
+  view (`PS(base,0)`) like C's `char*` return instead of the bare string
+  (the removed branch had been masking that gap). Gate:
+  `comp/tests/t21_strarith.n`.
+
 - `setv` (33, 🌆) — changed: stores pass through **everywhere** — a shared
   store now leaves its value on the hidden stack exactly like a local store
   (the v14/v15 shared-stores-consume asymmetry is removed; `x!` has one

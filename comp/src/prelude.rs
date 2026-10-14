@@ -799,18 +799,9 @@ static int uf_spv_index(const char*name);
 static int uf_vk_run(int k,uint64_t n,const void*A,size_t asz,const void*B,size_t bsz,void*R,size_t rsz,struct UFPC pc);
 #endif
 static inline int uf_rawptr(Cell c){ return c.tag==T_PTR&&c.i&&!uf_gc_find((void*)c.i); }
-/* char* semantics: string + int / int + string is data-pointer arithmetic */
-static inline Cell uf_stradd(Cell a,Cell b,int sub){
-  Cell s=a; Cell n=b; int flip=0;
-  if(b.tag==T_PTR&&b.i&&uf_is_str(b)&&a.tag==T_INT){ s=b; n=a; flip=1; }
-  if(!(s.tag==T_PTR&&s.i&&uf_is_str(s)&&n.tag==T_INT)) return uf_mki(-4200000001LL);
-  const char* p=uf_sptr(s);
-  int64_t off=sub? -n.i : n.i;
-  if(flip&&sub) return uf_mki(-4200000001LL);
-  return uf_mkp((void*)(p+off));
-}
-static inline Cell uf_cadd(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_veccand(a)||uf_veccand(b))return uf_poly_arith(a,b,0,"add"); if(a.tag==T_INT&&uf_rawptr(b))return uf_mkp((void*)(a.i+b.i)); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i+b.i)); Cell s=uf_stradd(a,b,0); if(s.i!=-4200000001LL)return s; } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i+b.i); return uf_mkf(x+y); }
-static inline Cell uf_csub(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_veccand(a)||uf_veccand(b))return uf_poly_arith(a,b,1,"sub"); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i-b.i)); Cell s=uf_stradd(a,b,1); if(s.i!=-4200000001LL)return s; } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i-b.i); return uf_mkf(x-y); }
+/* pointer arithmetic is raw-pointer only; tracked strings coerce by content */
+static inline Cell uf_cadd(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_veccand(a)||uf_veccand(b))return uf_poly_arith(a,b,0,"add"); if(a.tag==T_INT&&uf_rawptr(b))return uf_mkp((void*)(a.i+b.i)); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i+b.i)); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i+b.i); return uf_mkf(x+y); }
+static inline Cell uf_csub(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_veccand(a)||uf_veccand(b))return uf_poly_arith(a,b,1,"sub"); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i-b.i)); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i-b.i); return uf_mkf(x-y); }
 static inline Cell uf_cmul(Cell a,Cell b){ if(a.tag==T_INT&&a.i==1&&b.tag!=T_FLOAT&&!uf_veccand(b))return b; if(b.tag==T_INT&&b.i==1&&a.tag!=T_FLOAT&&!uf_veccand(a))return a; if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_veccand(a)||uf_veccand(b))return uf_poly_arith(a,b,2,"mul"); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i*b.i); return uf_mkf(x*y); }
 static inline Cell uf_cand(Cell a,Cell b){ return uf_mki(uf_i(a)&uf_i(b)); }
 static inline Cell uf_cshr(Cell a,Cell b){ if(a.tag==T_FLOAT||b.tag==T_FLOAT||a.tag==T_PTR||b.tag==T_PTR)die("SHR: ints only"); if(b.i<0||b.i>=64)die("SHR: shift out of range"); return uf_mki((int64_t)((uint64_t)a.i>>b.i)); }

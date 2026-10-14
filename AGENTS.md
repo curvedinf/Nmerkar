@@ -75,11 +75,15 @@ Key gotchas not to re-derive: string escapes limited to `\n \t \r \0 \\ \"`. Lin
 
 Process skills from [curvedinf/dev-skills](https://github.com/curvedinf/dev-skills)
 (MIT, `agents/skills/LICENSE`), installed at commit
-[eec75da](https://github.com/curvedinf/dev-skills/tree/eec75da909fc954cd970cc3921859f9884a66a84);
+[d175452](https://github.com/curvedinf/dev-skills/tree/d1754529343d4c7bc8fb6de40565e80757f0dbaa);
 install record: `agents/scratch/dev-skills-install.md`. Passive skills are
 persistent conventions that apply within their routed scope; activated skills
 are explicitly requested workflows; triggered skills are workflows initiated
-by a non-user event when their conditions hold. Skill bodies live at
+by a non-user event when their conditions hold. A triggered skill's
+`description` states its trigger conditions so agents can fire it without
+reading the body; when too complex to state fully, it gives encompassing
+initial conditions plus " and extra conditions." and specifies the full
+condition list inside the skill. Skill bodies live at
 `agents/skills/<passive|activated|triggered>/<name>/SKILL.md`; a keyword is a routing
 hint, not permission to start another task. Load the workflow matching the
 requested outcome and only the passive conventions routed for that work.
@@ -122,47 +126,66 @@ maintenance.
 
 - Specify outcomes and consequential decision criteria; delegate execution
   mechanics. Prefer precise verbs and established terms over explanatory
-  padding.
-- Remove tutorials, micromanagement, repeated policy, and speculative edge
-  cases. Every sentence costs attention.
+  padding; preserve scope and qualifiers.
+- Remove tutorials, micromanagement, repeated policy, obvious advice, and
+  speculative edge cases. Every sentence costs attention.
+- Prefer consolidation over rule accumulation; do not hide verbosity in
+  references.
 - Keep skills portable and self-contained; add supporting files only for
-  necessary task-specific material. Check format and links after edits.
+  necessary task-specific material. Check format and links after edits; use
+  behavioral evaluation when a consequential uncertainty warrants it.
 - `README.md` is for humans (value, proof, adoption path); `AGENTS.md` is
   for computers (routing, constraints, commands, decision rules). Keep agent
   operating instructions out of README and promotional prose out of AGENTS.
 
 ### Scratch space
 
+**Fresh-session startup:** on the first project-context load after the
+initial user prompt, read triggered
+[maintain-scratch](agents/skills/triggered/maintain-scratch/SKILL.md) and
+check its entry in `agents/scratch/timers.json`; run it if the shared
+seven-day timer is due. Check once per project per fresh session, not per
+task or context-window compaction.
+
 Use [scratch-space](agents/skills/passive/scratch-space/SKILL.md) for durable,
 Git-versioned task notes in `agents/scratch/` with a small `index.md` linking
 active goals; one record per goal, never ignore the directory, and include
-relevant note updates when committing authorized work. Disposable files go
-in the ignored `agents/tmp/`; retain reusable evidence in durable storage.
+relevant note updates when committing authorized work. Scratch is not a
+changelog: no routine edit summaries, completion receipts, or duplicate skill
+lessons; delete obsolete records rather than archiving them. Disposable
+files go in the ignored `agents/tmp/`; retain reusable evidence in durable
+storage.
 
 ### Self-improvement
 
 Always read and consider [refine-skill](agents/skills/triggered/refine-skill/SKILL.md)
-— a cross-cutting metaskill, not an optional route. At the end of each task,
+— a cross-cutting metaskill, not an optional route. When skill use ends,
 before the final response, evaluate user corrections, recurring friction,
 workflow gaps, and verified reusable lessons; when self-improvement is
-enabled, apply one evidence-backed refinement pass within the task's write
-scope, validate any edits, and include them in the authorized task commit.
-No evidence means no edit; refinement does not recursively trigger itself.
+enabled, coalesce skills used for the same activity into one evidence-backed
+refinement pass within the task's write scope, validate any edits, and
+include them in the authorized task commit. Include blocked or interrupted
+skill use; rereading a skill does not retrigger the check. No evidence means
+no edit; refinement does not recursively trigger itself. Setting
+`Self-improvement: disabled.` disables automatic edits, not the requirement
+to read and consider the metaskill.
 
 Self-improvement: enabled.
 
 ### Reference skill libraries
 
 Use as inspiration, not requirements; check licenses before copying
-material.
+material. Favor this collection's minimalism over a reference library's
+complexity.
 
 | Library | Useful ideas to examine |
 | --- | --- |
 | [Anthropic skills](https://github.com/anthropics/skills) | Self-contained packaging, concise entrypoints, supporting resources. |
 | [Obra Superpowers](https://github.com/obra/superpowers) | Composable processes, explicit workflow transitions, skill validation. Adapt ideas without importing the methodology. |
 | [Vercel agent-skills](https://github.com/vercel-labs/agent-skills) | Clear use conditions, impact-based prioritization, focused skill separation. |
-| [Hermes bundled skills](https://github.com/NousResearch/hermes-agent/tree/main/skills) | Default skill architecture, capability-focused discovery, evidence-driven refinement. |
+| [Hermes bundled skills](https://github.com/NousResearch/hermes-agent/tree/main/skills) | Default skill architecture, capability-focused discovery, evidence-driven refinement. Inspect its [skill authoring procedure](https://github.com/NousResearch/hermes-agent/blob/main/skills/software-development/hermes-agent-skill-authoring/SKILL.md) and distinguish portable principles from Hermes-specific runtime policies. |
 
 The [Agent Skills specification](https://agentskills.io/specification) is a
 format reference for portable packaging, not a library. Verify current
-external content when relying on it.
+external content when relying on external conventions; avoid preserving star
+counts or treating popularity as evidence of effectiveness.

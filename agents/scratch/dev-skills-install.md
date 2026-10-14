@@ -1,8 +1,8 @@
 # Dev Skills installation record
 
 - **Source:** https://github.com/curvedinf/dev-skills, revision `main`,
-  commit `eec75da909fc954cd970cc3921859f9884a66a84` (updated 2026-10-12;
-  prior install: `f2f50ba49e47d201711cca17b4737e1339407f40`).
+  commit `d1754529343d4c7bc8fb6de40565e80757f0dbaa` (updated 2026-10-14;
+  prior install: `eec75da909fc954cd970cc3921859f9884a66a84`).
 - **Scope:** project-wide (user option 1), destination
   `agents/skills/<passive|activated|triggered>/<name>/` at the Nmerkar root,
   branch `probe`.
@@ -58,6 +58,54 @@
   sections outside "Dev Skills" (Scratch space / a new gate section). The
   routing table exposes both skills by request terms; adopting the wiring is
   a separate decision for the repo owner. `timers.json` was not created.
+
+## Update 2026-10-14: eec75da → d175452
+
+- Scope: project-wide (user: "reinstall dev-skills to this project" —
+  explicit option 1). Upstream `main` resolved to
+  `d1754529343d4c7bc8fb6de40565e80757f0dbaa` (2026-10-14).
+- Upstream theme: trigger conditions move into triggered skills'
+  `description` frontmatter (fire without reading the body); complex
+  conditions use "encompassing initial conditions + ' and extra
+  conditions.'" with the full list inside the skill.
+- Updated from upstream (complete folders): design-skill,
+  design-time-triggered-skill, maintain-scratch, refine-skill,
+  security-hygiene-check (the last three gained full trigger-condition
+  descriptions; refine-skill's Event section became an explicit condition
+  list; the two authoring skills gained the description-state rule).
+- Preserved local customization: coordinate-work keeps the local
+  baseline-freeze sentence (see Conflicts, 2026-10-12 entry) — upstream
+  d175452's copy is unchanged from eec75da, so no merge was needed;
+  divergence remains exactly that one sentence. All other 14 skills are
+  byte-identical to upstream.
+- AGENTS.md "Dev Skills" section merged: pinned commit updated; the
+  triggered-description rule added to the category definitions; authoring
+  conventions gained the consolidation bullet, "obvious advice," and the
+  behavioral-evaluation clause; Scratch space gained the fresh-session
+  startup paragraph and the no-changelog retention rule; Self-improvement
+  reworded to the coalesced per-activity pass (blocked/interrupted uses
+  included; rereading is not a new event; `disabled.` disables edits, not
+  the read requirement); Reference libraries gained the Hermes
+  authoring-procedure link and the no-star-counts sentence. Routing table
+  unchanged (same 20 rows). "Self-improvement: enabled." preserved (user's
+  explicit first-install opt-in; upstream's declaration not inherited).
+- Wiring completed this install (the 2026-10-12 install deferred it as a
+  repo-owner decision; the current installer skill mandates it, and the
+  user's reinstall request executes that skill): `agents/scratch/timers.json`
+  initialized per the shared timer contract (maintain-scratch, 7-day
+  default, null completion — due at the next fresh-session context load);
+  `agents/scratch/security-policy.md` created as a strict baseline (no
+  standing disclosures approved; every finding requires explicit
+  disposition). No upstream disclosure permissions imported.
+- Verification: 20 skills, frontmatter intact (name/description/category
+  match directories), all AGENTS.md routing links resolve, updated skills'
+  cross-links resolve (`../../activated/design-time-triggered-skill/
+  references/timer-contract.md`, `../../passive/scratch-space/SKILL.md`).
+  Host does not auto-register `agents/skills/`; guidance loads via AGENTS.md
+  in a fresh session — this session's context still shows the pre-update
+  section.
+- Upstream clone fetched to the ignored `agents/tmp/` and removed after
+  copy.
 
 ## Adaptations
 

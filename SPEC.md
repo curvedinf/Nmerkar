@@ -125,7 +125,10 @@ than one label body is an error — the bodies are distinct frames, so the
 writes would not alias; declare it shared or rename. Reading a name that is
 never assigned anywhere is an error, and using a body's local from another
 body is an error. Label parameter binds shadow a shared name within their
-own body only.
+own body only; a param bind satisfies reads inside its own body (it binds a
+frame slot), two bodies each binding the same name as a param is legal
+(per-invocation slots), and reading another body's param from outside is the
+cross-body error above.
 
 ## Label parameters
 
@@ -152,13 +155,19 @@ the first non-binding token ends the parameter list.
 
 - **Arity** = the number of declared bindings. Labels with no bindings have
   arity 0 — all caller cells are discarded on entry.
-- **Strict binding**: too few arguments at a call site → **compile error** when the
+- **Strict binding**: too few arguments at an invoke site → **compile error** when the
   stack depth is statically known (`label 'x' declares N parameter(s) but the call site
-  leaves only M value(s)`), and a descriptive runtime error otherwise. The
-  compiler tracks a static stack depth per label body (an effects table over
-  all ops; dynamic regions are poisoned conservatively); dynamically-shaped
-  sites fall back to a runtime check that dies naming the label, parameter,
-  and declared arity. Excess cells are
+  leaves only M value(s)`), and a descriptive runtime error otherwise. Body entry
+  depths are computed from actual invoke sites — call sites and structured-op
+  callback sites alike, independent of label definition order; dynamic regions are
+  poisoned conservatively and fall back to a runtime check that dies naming the
+  label, parameter, and declared arity. Structured-op callbacks receive the same
+  static check: a body that declares more bindings than the callback provides is a
+  compile error (message: … but the `filter` callback provides only M value(s)…), covering
+  `'body for`'s pushed index, `filter`/`any`/`all`/`array_map`'s element,
+  `array_reduce`/`file_fold_lines`/`file_split_lines`/`range_reduce`'s accumulator
+  pair, `bfs`/`dfs`/`find_first`'s node, `try`'s continuation, and `spawn`'s fresh
+  frame (0 cells). Excess cells are
   silently discarded after the bindings are satisfied.
 - Structured ops pass values implicitly: `5 'body for` pushes the loop index,
   and a `body: i!` binding consumes it.

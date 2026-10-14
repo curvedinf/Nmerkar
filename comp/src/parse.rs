@@ -1122,6 +1122,18 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
                 assigned_in.entry(n.as_str()).or_default().push(ins_body[i]);
             }
         }
+        // bound_in: assignments PLUS param binds. A param binds a frame slot,
+        // so reads inside its own body resolve to it; a name bound only as
+        // another body's param is that body's local (two bodies each binding
+        // the same name as a param stays legal — per-invocation slots, not a
+        // collision). Feeds the never-assigned and cross-body checks below.
+        let mut bound_in: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, ins) in p.ins.iter().enumerate() {
+            if let Ins::LocalSet(n) = ins {
+                bound_in.entry(n.as_str()).or_default().push(ins_body[i]);
+            }
+        }
+        if std::env::var("NK_DEBUG_SCOPE").is_ok() { eprintln!("[scope] bound_in={:?}", bound_in); }
         // v14: a plain name assigned (non-param) in MORE THAN ONE body is
         // ambiguous — the bodies are distinct frames at runtime (separate
         // spawn/call contexts), so the writes do not alias. Declare it shared
@@ -1151,12 +1163,11 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
         let label_of = |body: usize| -> String {
             p.local_names.get(&body).map(|_| format!("body@{}", body)).unwrap_or_else(|| format!("body@{}", body))
         };
-        // collision + unresolved checks (label-body names only)
+        // collision + unresolved checks (every region: the main straight-line
+        // and each label body — the shared-set test above is what exempts
+        // declared shared vars, not a region skip)
         for (i, ins) in p.ins.iter().enumerate() {
             let b = ins_body[i];
-            if i >= first_label_pc {
-                continue; // main straight-line: shared-set already covers it
-            }
             let n = match ins {
                 Ins::LocalSet(n) | Ins::LocalGet(n) | Ins::IncLocal(n) | Ins::AddLocal(n) => n,
                 _ => continue,
@@ -1164,7 +1175,7 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
             if shared.contains(n) {
                 continue; // resolves to the shared var everywhere
             }
-            let owners = assigned_in.get(n.as_str()).cloned().unwrap_or_default();
+            let owners = bound_in.get(n.as_str()).cloned().unwrap_or_default();
             if owners.is_empty() {
                 user_err!("parse", Some(p.ins_lines[i]), "name '{}' is read but never assigned anywhere — assign it (top level declares a shared var) before use", n);
             }
@@ -1716,7 +1727,9 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         "op_vand" | "op_vor" => (2, 1),
         "op_vnot" | "op_vcount" | "op_vsum" | "op_vmean" | "op_vmin" | "op_vmax" | "op_vargsort" => (1, 1),
         "op_vgather" | "op_vwhere" | "op_vsearchsorted" => (2, 1),
-        "op_vmap" | "op_vfold" => (3, 1),
+        "op_vmap" => (2, 1),
+        "op_vfold" => (3, 1),
+        "op_try" => (1, 1),
         "op_vget" => (2, 1),
         "op_vset" => (3, 0),
         // strings
@@ -1769,48 +1782,338 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         "op_shutdown" => (0, 0),
         "op_drop" => (1, 0),
         "op_sortkeys" | "op_topn" => return None,
-        "op_wfind" | "op_bfs" | "op_dfs" => (2, 1),
+        "op_wfind" => (3, 1),
+        "op_bfs" | "op_dfs" => (2, 1),
         "op_rangefold" => (3, 1),
         _ => return None,
     })
 }
 
-/// Post-merge pass: at every `_call`, verify the statically-known stack depth
-/// covers the callee's declared arity. Unknown (poisoned) depths defer to the
-/// runtime backstop. Missing arguments are a compile error (null-fill removed).
-pub fn check_label_arity(p: &Parsed) {
-    let arity_at = |pc: usize| -> usize {
-        // nearest label at or before pc that declares params
-        let mut best: Option<(usize, usize)> = None;
-        for (&lpc, params) in &p.label_params {
-            if lpc <= pc && best.map_or(true, |(b, _)| lpc > b) {
-                best = Some((lpc, params.len()));
+/// Callback convention for a quoting op: `(total operand pops, addr slots)`.
+/// Each slot is `(index from stack top at the op, cells pushed on the
+/// callback's entry)`; index 0 is the topmost operand. Conventions are
+/// verified against the runtime helpers (`uf_call_addr(..., nargs)` sites in
+/// the C prelude) and the structured-control codegen. `op_spawn` runs its
+/// body on a fresh Ctx (empty stack): its slot entry is 0 regardless of the
+/// caller's depth, encoded here as pushes `-1`.
+fn callback_slots(h: &str) -> Option<(i64, &'static [(usize, i64)])> {
+    Some(match h {
+        // (list/arr/etc., fn) — callback receives one element
+        "op_filter" | "op_some" | "op_every" | "op_group" | "op_agg"
+        | "op_imap" | "op_ifilter" | "op_bfs" | "op_dfs" | "op_feach"
+        | "op_vmap" => (2, &[(0, 1)]),
+        // (coll, init, fn) — callback receives (acc, elem)
+        "op_vfold" | "op_ffold" | "op_rangefold" => (3, &[(0, 2)]),
+        // (path, sep, init, fn) — callback receives (acc, field-list)
+        "op_fsplit" => (4, &[(0, 2)]),
+        // (start, fn, pred) — two callbacks, one node each
+        "op_wfind" => (3, &[(0, 1), (1, 1)]),
+        // (body_addr) — continuation on the caller's stack
+        "op_try" => (1, &[(0, 0)]),
+        // (body_addr) — fresh Ctx, empty stack
+        "op_spawn" => (1, &[(0, -1)]),
+        _ => return None,
+    })
+}
+
+fn callback_mnem(h: &str) -> &str {
+    match h {
+        "op_filter" => "filter",
+        "op_some" => "any",
+        "op_every" => "all",
+        "op_group" => "group_by",
+        "op_agg" => "aggregate",
+        "op_imap" => "iter_map",
+        "op_ifilter" => "iter_filter",
+        "op_bfs" => "bfs",
+        "op_dfs" => "dfs",
+        "op_feach" => "file_each_line",
+        "op_ffold" => "file_fold_lines",
+        "op_fsplit" => "file_split_lines",
+        "op_vmap" => "array_map",
+        "op_vfold" => "array_reduce",
+        "op_rangefold" => "range_reduce",
+        "op_wfind" => "find_first",
+        "op_try" => "try",
+        "op_spawn" => "spawn",
+        _ => h,
+    }
+}
+
+/// Static entry depth of a label body: the number of cells above the frame
+/// base when the body starts, when statically knowable.
+///
+/// Computed from actual invoke sites (call sites, structured-op callback
+/// sites), not from label position — a body entered from two sites with
+/// different depths poisons (the checks defer to the runtime backstop).
+/// `Known(arity)` remains the fallback for never-referenced call-entry
+/// labels (dead code, weave tasks, exports: their entry is the declared
+/// parameter window by construction).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EDepth {
+    Unknown,
+    Known(i64),
+    Poison,
+}
+
+fn join_depth(a: EDepth, b: EDepth) -> EDepth {
+    match (a, b) {
+        (EDepth::Poison, _) | (_, EDepth::Poison) => EDepth::Poison,
+        (EDepth::Unknown, x) | (x, EDepth::Unknown) => x,
+        (EDepth::Known(x), EDepth::Known(y)) => {
+            if x == y { EDepth::Known(x) } else { EDepth::Poison }
+        }
+    }
+}
+
+/// Entry depth per body-entry pc (label entries plus pc 0). `None` = not
+/// statically known (poisoned); the arity checks defer to the runtime
+/// backstop there.
+pub fn label_entry_depths(p: &Parsed) -> HashMap<usize, Option<i64>> {
+    // frame-entry labels: the same classification resolve_locals and codegen
+    // use — pc 0, the entry label, CALL targets, weave tasks, exports.
+    // Everything else referenced by PushAddr is a continuation sharing its
+    // invoker's frame.
+    let mut call_entries: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    call_entries.insert(0);
+    if let Some(el) = &p.entry_label {
+        if let Some(&pc) = p.labels.get(el) {
+            call_entries.insert(pc);
+        }
+    }
+    for ins in &p.ins {
+        if let Ins::Call(l) = ins {
+            if let Some(&pc) = p.labels.get(l) {
+                call_entries.insert(pc);
             }
         }
-        best.map(|(_, n)| n).unwrap_or(0)
+    }
+    for ins in &p.ins {
+        if let Ins::Weave(tasks) = ins {
+            for t in tasks {
+                call_entries.insert(t.pc);
+            }
+        }
+    }
+    for (_, l) in &p.exports {
+        if let Some(&pc) = p.labels.get(l) {
+            call_entries.insert(pc);
+        }
+    }
+    let push_targets: std::collections::HashSet<usize> = p
+        .ins
+        .iter()
+        .filter_map(|i| match i {
+            Ins::PushAddr(t) => p.labels.get(t.as_str()).copied(),
+            _ => None,
+        })
+        .collect();
+    let arity = |pc: usize| -> i64 {
+        p.label_params.get(&pc).map(|v| v.len()).unwrap_or(0) as i64
     };
+
+    let mut st: HashMap<usize, EDepth> = HashMap::new();
+    for &pc in p.labels.values() {
+        st.insert(pc, EDepth::Unknown);
+    }
+    // The runtime jumps from pc 0 to the entry label before executing
+    // anything (gen: `if(pc==0) goto L_entry`), so the entry body starts on
+    // an empty stack and a top-level prefix before a non-pc-0 entry label is
+    // never executed.
+    if let Some(el) = &p.entry_label {
+        if let Some(&pc) = p.labels.get(el) {
+            st.insert(pc, EDepth::Known(0));
+        }
+    }
+    if !p.labels.values().any(|&l| l == 0) {
+        let dead_prefix = p
+            .entry_label
+            .as_deref()
+            .and_then(|el| p.labels.get(el))
+            .map(|&pc| pc != 0)
+            .unwrap_or(false);
+        st.insert(
+            0,
+            if dead_prefix { EDepth::Poison } else { EDepth::Known(0) },
+        );
+    }
+
+    let max_rounds = (p.labels.len() + 2).min(256);
+    for _ in 0..max_rounds {
+        let mut cands: HashMap<usize, EDepth> = HashMap::new();
+        arity_walk(
+            p,
+            &|pc| match st.get(&pc) {
+                Some(EDepth::Known(d)) => Some(*d),
+                _ => None,
+            },
+            Some(&mut cands),
+        );
+        let mut changed = false;
+        for (pc, cand) in cands {
+            let e = st.entry(pc).or_insert(EDepth::Unknown);
+            let joined = join_depth(*e, cand);
+            if joined != *e {
+                *e = joined;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (&pc, e) in st.iter_mut() {
+        if *e == EDepth::Unknown {
+            // Never resolved from a walkable invoke site. A PushAddr-only
+            // target consumed by an unclassified op cannot be guessed; other
+            // call-entry labels enter exactly their parameter window.
+            *e = if push_targets.contains(&pc) && !call_entries.contains(&pc) {
+                EDepth::Poison
+            } else {
+                EDepth::Known(arity(pc))
+            };
+        }
+    }
+    st.into_iter()
+        .map(|(pc, e)| {
+            let v = match e {
+                EDepth::Known(d) => Some(d),
+                _ => None,
+            };
+            (pc, v)
+        })
+        .collect()
+}
+
+fn param_names(p: &Parsed, tp: usize) -> String {
+    p.label_params
+        .get(&tp)
+        .map(|params| {
+            params
+                .iter()
+                .map(|pr| match pr {
+                    Param::Local(n) | Param::Global(n) => n.clone(),
+                    Param::Discard => "_!".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+fn join_into(sink: &mut Option<&mut HashMap<usize, EDepth>>, pc: usize, v: i64) {
+    if let Some(s) = sink.as_deref_mut() {
+        let e = s.entry(pc).or_insert(EDepth::Unknown);
+        *e = join_depth(*e, EDepth::Known(v));
+    }
+}
+
+/// Statically-known invoke of a quoted label (a structured op or a callback
+/// op): record the callback's entry depth, and in emit mode reject a body
+/// that declares more parameters than the callback provides.
+#[allow(clippy::too_many_arguments)]
+fn process_slots(
+    p: &Parsed,
+    shadow: &[Option<String>],
+    i: usize,
+    d: i64,
+    pops: i64,
+    slots: &[(usize, i64)],
+    what: &str,
+    sink: &mut Option<&mut HashMap<usize, EDepth>>,
+) {
+    for &(slot, pushes) in slots {
+        let cell = shadow.get(shadow.len().saturating_sub(1 + slot));
+        if let Some(Some(t)) = cell {
+            if let Some(&tp) = p.labels.get(t.as_str()) {
+                let arity = p.label_params.get(&tp).map(|v| v.len()).unwrap_or(0) as i64;
+                let entry = if pushes < 0 { 0 } else { d - pops + pushes };
+                join_into(sink, tp, entry);
+                if sink.is_none() && entry < arity {
+                    user_err!(
+                        "parse",
+                        Some(p.ins_lines[i]),
+                        "label '{}' declares {} parameter(s) ({}) but the `{}` callback provides only {} value(s) (missing {}) — structured ops pass their values implicitly; provide all arguments or declare fewer bindings",
+                        t, arity, param_names(p, tp), what, entry, arity - entry
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The shared static-stack walk over all instruction bodies. In collect mode
+/// (`sink` Some) it records entry-depth candidates for invoked labels and
+/// emits no diagnostics; in emit mode (`sink` None) entry depths are final
+/// and every statically known under-supplied invoke site (call or callback)
+/// is a compile error. `shadow` tracks PushAddr provenance per stack cell so
+/// quoting ops can be associated with the labels they invoke.
+fn arity_walk(
+    p: &Parsed,
+    entry_of: &dyn Fn(usize) -> Option<i64>,
+    mut sink: Option<&mut HashMap<usize, EDepth>>,
+) {
     let mut depth: Option<i64> = Some(0);
-    let mut list_marks: Vec<i64> = Vec::new();
+    let mut shadow: Vec<Option<String>> = Vec::new();
+    let mut list_marks: Vec<(i64, usize)> = Vec::new(); // (depth, shadow len)
     for (i, ins) in p.ins.iter().enumerate() {
         // label boundary: a new body begins (params are the incoming cells)
         let is_label_entry = p.labels.values().any(|&lpc| lpc == i) || i == 0;
         if is_label_entry {
-            depth = Some(arity_at(i) as i64);
+            depth = entry_of(i);
+            shadow.clear();
             list_marks.clear();
         }
         match ins {
-            Ins::PushI(_) | Ins::PushF(_) | Ins::PushS(_) | Ins::PushAddr(_) => {
+            Ins::PushI(_) | Ins::PushF(_) | Ins::PushS(_) => {
                 depth = depth.map(|d| d + 1);
+                shadow.push(None);
+            }
+            Ins::PushAddr(t) => {
+                depth = depth.map(|d| d + 1);
+                shadow.push(Some(t.clone()));
             }
             Ins::Simple(h) => {
                 if p.param_pcs.contains_key(&i) {
                     // guarded param pop at body start: consumes one arg cell
                     depth = depth.map(|d| d - 1);
+                    shadow.pop();
+                } else if let Some((pops, slots)) = callback_slots(h) {
+                    if let Some(d) = depth {
+                        process_slots(p, &shadow, i, d, pops, slots, callback_mnem(h), &mut sink);
+                    }
+                    match helper_effect(h) {
+                        Some((po, pu)) => {
+                            depth = depth.map(|d| d - po + pu);
+                            for _ in 0..po.max(0) as usize {
+                                shadow.pop();
+                            }
+                            for _ in 0..pu.max(0) as usize {
+                                shadow.push(None);
+                            }
+                        }
+                        None => {
+                            depth = None;
+                            shadow.clear();
+                        }
+                    }
                 } else {
-                    depth = match (depth, helper_effect(h)) {
+                    let eff = helper_effect(h);
+                    depth = match (depth, eff) {
                         (Some(d), Some((pops, pushes))) => Some(d - pops + pushes),
                         _ => None,
                     };
+                    match (eff, depth) {
+                        (Some((pops, pushes)), Some(_)) => {
+                            for _ in 0..pops.max(0) as usize {
+                                shadow.pop();
+                            }
+                            for _ in 0..pushes.max(0) as usize {
+                                shadow.push(None);
+                            }
+                        }
+                        _ => shadow.clear(),
+                    }
                 }
             }
             Ins::Call(l) => {
@@ -1818,67 +2121,111 @@ pub fn check_label_arity(p: &Parsed) {
                     Some(tp) => {
                         let arity = p.label_params.get(&tp).map(|v| v.len()).unwrap_or(0);
                         if let Some(d) = depth {
-                            if d < arity as i64 {
-                                let params = p.label_params.get(&tp).cloned().unwrap_or_default();
-                                let pnames: Vec<String> = params
-                                    .iter()
-                                    .map(|pr| match pr {
-                                        Param::Local(n) | Param::Global(n) => n.clone(),
-                                        Param::Discard => "_!".to_string(),
-                                    })
-                                    .collect();
+                            if sink.is_none() && d < arity as i64 {
                                 let missing = arity as i64 - if d > 0 { d } else { 0 };
                                 user_err!(
                                     "parse",
                                     Some(p.ins_lines[i]),
                                     "label '{}' declares {} parameter(s) ({}) but the call site leaves only {} value(s) on the stack (missing {}) — missing arguments are no longer filled with null; provide all arguments or declare fewer bindings",
-                                    l, arity, pnames.join(" "), d, missing
+                                    l, arity, param_names(p, tp), d, missing
                                 );
                             }
+                            join_into(&mut sink, tp, d);
                             depth = Some(d - arity as i64 + 1);
+                            for _ in 0..(arity as i64).clamp(0, shadow.len() as i64) as usize {
+                                shadow.pop();
+                            }
+                            shadow.push(None);
                         } else {
                             depth = None;
                         }
                     }
-                    None => depth = None,
+                    None => {
+                        depth = None;
+                        shadow.clear();
+                    }
                 }
             }
             Ins::CallExt(ii) => {
                 let im = &p.imports[*ii];
                 if im.params.iter().any(|x| x == "...") || im.ret == "..." {
                     depth = None;
+                    shadow.clear();
                 } else {
                     let n = im.params.len() as i64;
                     depth = depth.map(|d| d - n + if im.ret == "void" { 0 } else { 1 });
+                    for _ in 0..n.max(0) as usize {
+                        shadow.pop();
+                    }
+                    if im.ret != "void" {
+                        shadow.push(None);
+                    }
                 }
             }
-            Ins::For | Ins::While => {
+            Ins::For => {
+                if let Some(d) = depth {
+                    process_slots(p, &shadow, i, d, 2, &[(0, 1)], "for", &mut sink);
+                }
                 depth = depth.map(|d| d - 2);
+                shadow.pop();
+                shadow.pop();
+            }
+            Ins::While => {
+                if let Some(d) = depth {
+                    process_slots(p, &shadow, i, d, 2, &[(0, 0), (1, 0)], "while", &mut sink);
+                }
+                depth = depth.map(|d| d - 2);
+                shadow.pop();
+                shadow.pop();
             }
             Ins::If => {
+                if let Some(d) = depth {
+                    process_slots(p, &shadow, i, d, 2, &[(0, 0)], "if", &mut sink);
+                }
                 depth = depth.map(|d| d - 2);
+                shadow.pop();
+                shadow.pop();
             }
             Ins::IfElse => {
+                if let Some(d) = depth {
+                    process_slots(p, &shadow, i, d, 3, &[(0, 0), (1, 0)], "if_else", &mut sink);
+                }
                 depth = depth.map(|d| d - 3);
+                shadow.pop();
+                shadow.pop();
+                shadow.pop();
             }
             Ins::Sys(n) => {
                 depth = depth.map(|d| d - *n as i64 - 1 + 1);
+                for _ in 0..(*n as usize).saturating_add(1) {
+                    shadow.pop();
+                }
+                shadow.push(None);
             }
             Ins::Send => {
                 depth = depth.map(|d| d - 2);
+                shadow.pop();
+                shadow.pop();
             }
             Ins::ListStart | Ins::DictStart => {
                 if let Some(d) = depth {
-                    list_marks.push(d);
+                    list_marks.push((d, shadow.len()));
                 } else {
-                    list_marks.push(-1);
+                    list_marks.push((-1, 0));
                 }
             }
             Ins::ListLit | Ins::DictLit => {
-                depth = match (list_marks.pop(), depth) {
-                    (Some(-1), _) => None,
-                    (Some(m), _) => Some(m + 1),
-                    (None, d) => d, // malformed; leave as-is
+                match (list_marks.pop(), depth) {
+                    (Some((-1, _)), _) => {
+                        depth = None;
+                        shadow.clear();
+                    }
+                    (Some((m, sl)), _) => {
+                        depth = Some(m + 1);
+                        shadow.truncate(sl);
+                        shadow.push(None);
+                    }
+                    (None, _) => {} // malformed; leave as-is
                 };
             }
             Ins::Strict | Ins::Loose => {
@@ -1887,25 +2234,47 @@ pub fn check_label_arity(p: &Parsed) {
             Ins::Ret => {
                 // body ends; the next label entry resets depth
                 depth = None;
+                shadow.clear();
             }
-            Ins::Break | Ins::Cont | Ins::Goto(_) | Ins::Weave(_) | Ins::Extern(_) | Ins::Flush => {
+            Ins::Break | Ins::Cont | Ins::Weave(_) | Ins::Extern(_) | Ins::Flush => {
                 depth = None;
+                shadow.clear();
+            }
+            Ins::Goto(l) => {
+                if let (Some(d), Some(&tp)) = (depth, p.labels.get(l.as_str())) {
+                    join_into(&mut sink, tp, d);
+                }
+                depth = None;
+                shadow.clear();
             }
             Ins::SetV(_) | Ins::GetV(_) | Ins::LocalSet(_) | Ins::LocalGet(_) | Ins::AtomicAdd(_, _) | Ins::Nop
             | Ins::IncLocal(_) | Ins::AddLocal(_) | Ins::IncGlobal(_) | Ins::AddGlobal(_)
             | Ins::LocalSetI(_) | Ins::LocalGetI(_) => {
                 if p.param_pcs.contains_key(&i) {
                     depth = depth.map(|d| d - 1);
+                    shadow.pop();
                 } else {
                     let net = match ins {
                         Ins::SetV(_) | Ins::LocalSet(_) | Ins::LocalSetI(_) => 0, // pass-through
                         _ => 1,
                     };
                     depth = depth.map(|d| d + net);
+                    if net == 1 {
+                        shadow.push(None);
+                    }
                 }
             }
         }
     }
+}
+
+/// Post-merge pass: at every statically known invoke site (`_call` and
+/// structured-op callbacks), verify the stack depth covers the callee's
+/// declared arity. Unknown (poisoned) depths defer to the runtime backstop.
+/// Missing arguments are a compile error (null-fill removed).
+pub fn check_label_arity(p: &Parsed) {
+    let entries = label_entry_depths(p);
+    arity_walk(p, &|pc| entries.get(&pc).copied().flatten(), None);
 }
 
 // ---------------- strictness: strict / loose (v14.1) ----------------
@@ -1920,10 +2289,14 @@ pub fn check_label_arity(p: &Parsed) {
 // strict (contagion). `loose` (🔓, v → v) removes the property; contagion
 // overrides prior looseness — only an explicit `loose` clears it.
 //
-// The pass is an abstract interpretation over the same static stack model the
-// arity checker uses (helper_effect + poisoning). Opaque regions (syscalls,
-// FFI, weave scheduling, statically unknown stack shapes) poison the taint:
-// no error, no propagation there — the same conservative fallback as arity.
+// The pass is an abstract interpretation over a static stack model close to
+// the arity checker's (helper_effect + poisoning), except that a body's
+// incoming cells are still seeded from the positional arity heuristic
+// (`arity_at` below) rather than invoke-site entry depths
+// (`label_entry_depths`) — continuation caller cells are not seeded. Opaque
+// regions (syscalls, FFI, weave scheduling, statically unknown stack shapes)
+// poison the taint: no error, no propagation there — the same conservative
+// fallback as arity.
 
 // Ops whose runtime semantics perform implicit universal coercion on a value
 // operand. Keyed by the C helper name (Ins::Simple payload).
@@ -2574,6 +2947,217 @@ mod tests {
     fn label_arity_accepts_a_satisfied_call() {
         let p = parse_src("entry:\n  5 _call dbl ret\ndbl: n!\n  ret n n add\n");
         check_label_arity(&p); // must not panic
+    }
+
+    // ---- static scope guarantees (SPEC "Names, labels, and variables") ----
+    // Reading a name that is never assigned anywhere is a compile error —
+    // in a label body and in the main straight-line alike.
+
+    #[test]
+    fn scope_rejects_never_assigned_read_in_label_body() {
+        let d = crate::diag::catch_diag(|| {
+            parse_src("entry:\n  x print\n  ret\n");
+        });
+        assert_eq!(d.stage, "parse");
+        assert!(d.message.contains("'x' is read but never assigned anywhere"), "{}", d.message);
+    }
+
+    #[test]
+    fn scope_rejects_never_assigned_read_at_top_level() {
+        let d = crate::diag::catch_diag(|| {
+            parse_src("x print\nentry:\n  ret\n");
+        });
+        assert_eq!(d.stage, "parse");
+        assert!(d.message.contains("'x' is read but never assigned anywhere"), "{}", d.message);
+    }
+
+    // Using a body's local from another body is a compile error (the bodies
+    // are distinct frames; the write would not alias).
+    #[test]
+    fn scope_rejects_cross_body_local_read() {
+        let d = crate::diag::catch_diag(|| {
+            parse_src("entry:\n  1 y!\n  _call other\n  ret\nother:\n  y print\n  ret\n");
+        });
+        assert_eq!(d.stage, "parse");
+        assert!(d.message.contains("name collision: 'y'"), "{}", d.message);
+    }
+
+    // Params bind frame slots: reads inside the owning body resolve; the
+    // same name bound as a param in two bodies is legal (per-invocation
+    // slots); continuation chains share their invoker's frame.
+    #[test]
+    fn scope_accepts_param_binds_and_continuation_chains() {
+        parse_src(
+            "entry:\n  5 'fbody for\n  0 'c 'b while\n  ret\n\
+             fbody: k!\n  k 1 eq 'p 'q if_else\n  ret 0\n\
+             p:\n  k print\n  ret 0\n\
+             q: ret 1\n\
+             c: ret 1\n\
+             b: ret 0\n",
+        ); // must not panic
+    }
+
+    // ---- static arity guarantees (SPEC "Label parameters") ----
+    // The check must fire in BOTH label orders: a caller body that follows
+    // a parameter-declaring label must not inherit its arity.
+
+    #[test]
+    fn label_arity_error_fires_with_callee_defined_first() {
+        let d = crate::diag::catch_diag(|| {
+            let p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 _call add2\n  print\n  ret\n");
+            check_label_arity(&p);
+        });
+        assert_eq!(d.stage, "parse");
+        assert_eq!(
+            d.message,
+            "label 'main:add2' declares 2 parameter(s) (a b) but the call site leaves only 1 value(s) on the stack (missing 1) — missing arguments are no longer filled with null; provide all arguments or declare fewer bindings"
+        );
+    }
+
+    #[test]
+    fn label_arity_error_fires_with_callee_defined_first_zero_args() {
+        let d = crate::diag::catch_diag(|| {
+            let p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  _call add2\n  ret\n");
+            check_label_arity(&p);
+        });
+        assert_eq!(d.stage, "parse");
+        assert!(
+            d.message.contains("declares 2 parameter(s) (a b) but the call site leaves only 0 value(s)"),
+            "{}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn label_arity_accepts_satisfied_call_with_callee_first() {
+        let p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 4 _call add2\n  print\n  ret\n");
+        check_label_arity(&p); // must not panic
+    }
+
+    // Structured ops pass their values implicitly: a callback body may not
+    // declare more bindings than the callback provides.
+    #[test]
+    fn label_arity_rejects_underbound_filter_callback() {
+        let d = crate::diag::catch_diag(|| {
+            let p = parse_src("[1 2 3] 'big filter\nret\nbig: a! b!\n  ret 1\n");
+            check_label_arity(&p);
+        });
+        assert_eq!(d.stage, "parse");
+        assert!(
+            d.message.contains("declares 2 parameter(s) (a b) but the `filter` callback provides only 1 value(s)"),
+            "{}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn label_arity_rejects_underbound_spawn_body() {
+        let d = crate::diag::catch_diag(|| {
+            let p = parse_src("entry:\n  'w spawn\n  ret\nw: x!\n  ret x\n");
+            check_label_arity(&p);
+        });
+        assert_eq!(d.stage, "parse");
+        assert!(
+            d.message.contains("declares 1 parameter(s) (x) but the `spawn` callback provides only 0 value(s)"),
+            "{}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn label_arity_accepts_for_body_binding() {
+        let p = parse_src("entry:\n  5 'fbody for\n  ret\nfbody: k!\n  k print\n  ret 0\n");
+        check_label_arity(&p); // must not panic
+    }
+
+    // ---- SPEC guarantee fixtures: every normative "is a compile error"
+    // sentence about scope and arity, as an executable table so spec and
+    // implementation cannot drift apart silently. (name, source, expected
+    // message substring, expect_error)
+    #[test]
+    fn spec_scope_and_arity_guarantee_fixtures() {
+        let fixtures: &[(&str, &str, &str, bool)] = &[
+            (
+                "never-assigned read in a label body",
+                "entry:\n  x print\n  ret\n",
+                "is read but never assigned anywhere",
+                true,
+            ),
+            (
+                "never-assigned read in the main straight-line",
+                "x print\nentry:\n  ret\n",
+                "is read but never assigned anywhere",
+                true,
+            ),
+            (
+                "using a body's local from another body",
+                "entry:\n  1 y!\n  _call other\n  ret\nother:\n  y print\n  ret\n",
+                "name collision: 'y'",
+                true,
+            ),
+            (
+                "name assigned in two distinct bodies",
+                "entry:\n  1 v!\n  _call other\n  ret\nother:\n  2 v!\n  ret\n",
+                "is assigned in 2 distinct bodies",
+                true,
+            ),
+            (
+                "call site leaves fewer values than declared arity (callee first)",
+                "add2: a! b!\n  ret a b add\nentry:\n  3 _call add2\n  ret\n",
+                "but the call site leaves only 1 value(s)",
+                true,
+            ),
+            (
+                "call site leaves fewer values than declared arity (caller first)",
+                "entry:\n  _call big\n  ret\nbig: n!\n  ret n\n",
+                "but the call site leaves only 0 value(s)",
+                true,
+            ),
+            (
+                "callback declares more bindings than the op provides",
+                "[1 2 3] 'big filter\nret\nbig: a! b!\n  ret 1\n",
+                "but the `filter` callback provides only 1 value(s)",
+                true,
+            ),
+            (
+                "satisfied call, callee first (no error)",
+                "add2: a! b!\n  ret a b add\nentry:\n  3 4 _call add2\n  print\n  ret\n",
+                "",
+                false,
+            ),
+            (
+                "for-body index binding (no error)",
+                "entry:\n  5 'fbody for\n  ret\nfbody: k!\n  k print\n  ret 0\n",
+                "",
+                false,
+            ),
+            (
+                "param reads inside the owning body (no error)",
+                "entry:\n  7 _call big\n  print\n  ret\nbig: n!\n  ret n\n",
+                "",
+                false,
+            ),
+        ];
+        for (name, src, needle, expect_err) in fixtures {
+            if *expect_err {
+                let d = crate::diag::catch_diag(|| {
+                    let p = parse_src(src);
+                    check_label_arity(&p);
+                });
+                assert_eq!(d.stage, "parse", "fixture {:?}: wrong stage", name);
+                assert!(
+                    d.message.contains(needle),
+                    "fixture {:?}: message {:?} lacks {:?}",
+                    name,
+                    d.message,
+                    needle
+                );
+            } else {
+                // no diagnostic expected: a user_err panic fails the test
+                let p = parse_src(src);
+                check_label_arity(&p);
+            }
+        }
     }
 
     #[test]

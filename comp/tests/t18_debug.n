@@ -16,4 +16,4 @@ memstats z!
 100 print
 ret
 spin:
-1 1 add drop ret
+1 1 add consume ret

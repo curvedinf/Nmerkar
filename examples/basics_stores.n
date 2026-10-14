@@ -1,6 +1,6 @@
-; basics_stores.n — local stores pass their value through; shared stores consume.
-; A local `x!` stores its value AND leaves it as an operand for the next op.
-; A shared variable (declared by a top-level assignment) pops its value instead.
+; basics_stores.n — every store passes its value through (v15.1: local and
+; shared alike, one token, one stack effect). A `x!` stores its value AND
+; leaves it as an operand for the next op.
 ; Run: nk examples/basics_stores.n   → prints 6 4 5 9 (one per line)
 0 total!                     ; top-level assignment declares the SHARED total
 entry:
@@ -8,8 +8,9 @@ entry:
   d d mul                    ; leaves [2, 4]: the original 2 is still there
   add print                  ; 6 — the leftover 2 joined the addition
   5 3 sub d! d mul print     ; 4 — the correct square: the pass-through is the operand
-  5 total!                   ; shared store CONSUMES the 5
+  5 total!                   ; shared store — the 5 passes through here too
   total print                ; 5
-  total 4 add total!         ; 5 + 4 = 9, stored (consumed)
+  total 4 add total!         ; 5 + 4 = 9, stored (the 9 passes through)
   total print                ; 9
+  consume                    ; drop the passed-through leftovers
   ret

@@ -4,7 +4,7 @@ list 1 append 2 append 3 append 0 array a!
 "map sq: " print a _addr sq array_map print
 "reduce +: " print a 0 _addr addb array_reduce print
 ;float reduce
-list 1.5 append 2.5 append 0 float tensor ft!
+list 1.5 append 2.5 append 0.5 append float tensor ft!
 "reduce float: " print ft 0.5 _addr addb array_reduce print
 ;fold over a list (C converts list -> float tensor)
 list 1 append 2 append 3 append 1 _addr addb array_reduce print
@@ -57,7 +57,7 @@ list 1 append 3 append 2 append 0 array mi!
 "mean int: " print mi mean print
 "min int: " print mi min print
 "max int: " print mi max print
-list 1.5 append 2.5 append 0.5 append 0 float tensor mf!
+list 1.5 append 2.5 append 0.5 append float tensor mf!
 "mean f: " print mf mean print
 "min f: " print mf min print
 "max f: " print mf max print
@@ -72,9 +72,8 @@ trb:
   3 sub
   ret
 sq:
-  dup
-  mul
-  ret
+  x!
+  ret x x mul
 mm2:
   1.0 add
   ret

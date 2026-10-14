@@ -1599,15 +1599,8 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "FILTER" => "op_filter",
         "SOME" => "op_some",
         "EVERY" => "op_every",
-        // v10: vector ops
-        "VADD" => "op_add",
-        "VSUB" => "op_sub",
-        "VMUL" => "op_mul",
-        "VDIV" => "op_div",
-        "VEADD" => "op_add",
-        "VESUB" => "op_sub",
-        "VEMUL" => "op_mul",
-        "VEDIV" => "op_div",
+        // v10: vector ops (v15.1: VADD/VSUB/VMUL/VDIV/VEADD/VESUB/VEMUL/VEDIV retired —
+        // their scalar_*/array_* mnemonics were parser aliases of the core ops)
         "VEMAX" => "op_vemax",
         "VEMIN" => "op_vemin",
         "VEQ" => "op_veq",
@@ -1718,8 +1711,7 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         "op_dcast" => (2, 1),
         "op_dbg" => (0, 0), "op_check" => (1, 0), "op_timer" => (0, 1), "op_memstats" => (0, 1),
         // vector
-        "op_vadd" | "op_vsub" | "op_vmul" | "op_vdiv" => (2, 1),
-        "op_veadd" | "op_vesub" | "op_vemul" | "op_vediv" | "op_vemax" | "op_vemin" => (2, 1),
+        "op_vemax" | "op_vemin" => (2, 1),
         "op_veq" | "op_vlt" | "op_vgt" | "op_vge" | "op_vle" => (2, 1),
         "op_vand" | "op_vor" => (2, 1),
         "op_vnot" | "op_vcount" | "op_vsum" | "op_vmean" | "op_vmin" | "op_vmax" | "op_vargsort" => (1, 1),

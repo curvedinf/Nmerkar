@@ -513,7 +513,7 @@ var RT = (function () {
   function arith2(rt, op) {
     var p = pop2(rt, op); var a = p[0], b = p[1];
     var add = op === "add";
-    if (a.t === "v" || b.t === "v") { polyArith(rt, a, b, add ? 0 : 1, add ? "add" : "sub"); return; }
+    if (vecCand(a) || vecCand(b)) { polyArith(rt, a, b, add ? 0 : 1, add ? "add" : "sub"); return; }
     // C (uf_cadd/uf_csub): pointer ± int is raw byte-offset arithmetic; a
     // string plus an integer shifts the string pointer (the C flip path is
     // add-only). string - int and string + string fall through to the
@@ -546,7 +546,7 @@ var RT = (function () {
   function op_sub(rt) { arith2(rt, "sub"); }
   function op_mul(rt) {
     var p = pop2(rt, "mul"); var a = p[0], b = p[1];
-    if (a.t === "v" || b.t === "v") { polyArith(rt, a, b, 2, "mul"); return; }
+    if (vecCand(a) || vecCand(b)) { polyArith(rt, a, b, 2, "mul"); return; }
     if (a.t === "i" && a.v === 1n && b.t !== "f") { rt.st.push(b); return; }
     if (b.t === "i" && b.v === 1n && a.t !== "f") { rt.st.push(a); return; }
     var x = toNumber(a), y = toNumber(b);
@@ -599,10 +599,20 @@ var RT = (function () {
     else rt.st.push(F(x - 1));
   }
   function op_pow(rt) { var p = pop2(rt, "pow"); rt.st.push(F(Math.pow(toNumber(p[0]), toNumber(p[1])))); }
-  function op_sqrt(rt) { var a = pop(rt, "sqrt"); rt.st.push(F(Math.sqrt(toNumber(a)))); }
+  function op_sqrt(rt) {
+    var a = pop(rt, "sqrt");
+    if (vecCand(a)) {
+      var h = vecNormV(rt, a, "sqrt");
+      var n = h.v.len, r = vArrLike(h, n);
+      for (var i = 0; i < n; i++) putEl(r, i, Math.sqrt(elD(h, i)));
+      rt.st.push(r);
+      return;
+    }
+    rt.st.push(F(Math.sqrt(toNumber(a))));
+  }
   function op_div(rt) {
     var p = pop2(rt, "div"); var a = p[0], b = p[1];
-    if (a.t === "v" || b.t === "v") { polyArith(rt, a, b, 3, "div"); return; }
+    if (vecCand(a) || vecCand(b)) { polyArith(rt, a, b, 3, "div"); return; }
     var x = toNumber(a), y = toNumber(b);
     if (isNaN(x) || isNaN(y)) { rt.st.push(F(NaN)); return; }
     if (y === 0) die(rt, "DIV: division by zero");
@@ -930,20 +940,11 @@ var RT = (function () {
   }
   function op_vget(rt) { var ix = iOf(pop(rt, "vget")); var h = vcheckV(rt, pop(rt, "vget")); if (ix < 0n || ix >= BigInt(h.v.len)) die(rt, "VGET: index out of bounds"); rt.st.push(vread(h, Number(ix))); }
   function op_vset(rt) { var val = pop(rt, "vset"); var ix = iOf(pop(rt, "vset")); var h = vcheckV(rt, pop(rt, "vset")); if (ix < 0n || ix >= BigInt(h.v.len)) die(rt, "VSET: index out of bounds"); vwrite(h, Number(ix), val); }
-  function op_vsum(rt) { var h = vcheckV(rt, pop(rt, "vsum")); var s = 0; for (var i = 0; i < h.v.len; i++) s += elD(h, i); if (h.v.ety === 1) rt.st.push(F(s)); else rt.st.push(I(i64OfDouble(s))); }
+  function op_vsum(rt) { var h = vecNormV(rt, pop(rt, "vsum"), "vsum"); var s = 0; for (var i = 0; i < h.v.len; i++) s += elD(h, i); if (h.v.ety === 1) rt.st.push(F(s)); else rt.st.push(I(i64OfDouble(s))); }
   async function op_vfold(rt) {
     var f = pop(rt, "vfold");
     var acc = pop(rt, "vfold");
-    var h = pop(rt, "vfold");
-    // C: uf_handle dies "handle is null" on non-pointers; lists (HT_DYN)
-    // are allowed and converted below, any other non-arr pointer dies
-    if (h.t !== "l" && h.t !== "v" && h.t !== "m" && h.t !== "d" && h.t !== "s" && h.t !== "t") die(rt, "handle is null");
-    if (h.t === "l") {
-      var lv = h.v, nd = new Array(lv.length);
-      for (var i = 0; i < lv.length; i++) nd[i] = fOf(lv[i]);
-      h = V("arr", 1, lv.length, nd, 0);
-    }
-    if (h.t !== "v") die(rt, "vector op: not an arr");
+    var h = vecNormV(rt, pop(rt, "vfold"), "vfold");
     var fr = rt.lsp++;
     if (rt.lsp >= 64) die(rt, "loops nested too deep");
     for (var q = 0; q < h.v.len; q++) {
@@ -964,11 +965,6 @@ var RT = (function () {
     if (h.t !== "v") die(rt, "vector op: not an arr");
     return h;
   }
-  function bmCheckV(rt, h) {
-    if (h.t === "i" || h.t === "f" || h.t === "y" || h.t === "b" || h.t === "n" || h.t === "a") die(rt, "handle is null");
-    if (h.t !== "m") die(rt, "bitmap op: not a bitmap");
-    return h.v;
-  }
   // ---------- bitmap (C HT_BITMAP=14): { t:"m", v:{ len, words } } ----------
   // words are 64-bit BigInts; len is the bit count.
   var BMASK64 = (1n << 64n) - 1n;
@@ -978,10 +974,80 @@ var RT = (function () {
     return { t: "m", v: { len: n, words: ws } };
   }
   function bmBit(b, i) { return (b.words[i >> 6] >> BigInt(i & 63)) & 1n; }
+  // ============ v15.1: uniform vector-op operand normalization ============
+  // (C uf_vec_norm): a list becomes a typed array — int elements stay int
+  // unless one forces float — a bitmap becomes the int array of its set-bit
+  // indices, and a scalar/string operand becomes a one-element array by the
+  // scalar numeric-coercion table. Elements with no numeric form die.
+  function strNumClass(s) {
+    var t = s.replace(/^\s+|\s+$/g, "");
+    if (t === "") return { fl: 0, d: 0 };
+    if (/^[+-]?[0-9]+$/.test(t)) {
+      var b = BigInt(t);
+      if (b <= 9223372036854775807n && b >= -9223372036854775808n) return { fl: 0, d: Number(b) };
+    }
+    return { fl: 1, d: strictDouble(t) };
+  }
+  function vecClassV(rt, x, idx) {
+    for (var k = 0; k < 8; k++) {
+      if (x.t === "f") return { fl: 1, d: x.v };
+      if (x.t === "i" || x.t === "y" || x.t === "b" || x.t === "tm") return { fl: 0, d: Number(x.v) };
+      if (x.t === "n") return { fl: 0, d: 0 };
+      if (x.t === "s") return strNumClass(x.v);
+      if (x.t === "l") {
+        if (x.v.length === 0) return { fl: 0, d: 0 };
+        if (x.v.length === 1) { x = x.v[0]; continue; }
+      }
+      break;
+    }
+    die(rt, "vector op: element " + idx + " of the list has no numeric form (convert explicitly, e.g. `list type array`)");
+  }
+  function vecNormV(rt, h, name) {
+    if (h.t === "v") return h;
+    if (h.t === "l") {
+      var n = h.v.length, fl = 0, cl = new Array(n), i;
+      for (i = 0; i < n; i++) { cl[i] = vecClassV(rt, h.v[i], i); if (cl[i].fl) fl = 1; }
+      var d = new Array(n);
+      if (fl) for (i = 0; i < n; i++) d[i] = cl[i].d;
+      else for (i = 0; i < n; i++) d[i] = BigInt(Math.trunc(cl[i].d));
+      return V("arr", fl ? 1 : 0, n, d, 0);
+    }
+    if (h.t === "m") {
+      var ix = [];
+      for (var q = 0; q < h.v.len; q++) if (bmBit(h.v, q)) ix.push(BigInt(q));
+      return V("arr", 0, ix.length, ix, 0);
+    }
+    if (h.t === "f") return V("arr", 1, 1, [h.v], 0);
+    if (h.t === "i" || h.t === "y" || h.t === "b" || h.t === "tm") return V("arr", 0, 1, [iOf(h)], 0);
+    if (h.t === "n") return V("arr", 0, 1, [0n], 0);
+    if (h.t === "s") {
+      var c = strNumClass(h.v);
+      return V("arr", c.fl, 1, [c.fl ? c.d : BigInt(Math.trunc(c.d))], 0);
+    }
+    if (h.t === "p" || h.t === "a") die(rt, "vector op: not an arr");
+    die(rt, "vector op: not an arr (operand has no numeric form; convert explicitly, e.g. `x float array`)");
+  }
+  function vecCand(x) { return x.t === "v" || x.t === "l" || x.t === "m"; }
+  // (C uf_bm_norm): bitmap ops coerce list/arr/tensor operands to bitmaps
+  // via element truthiness
+  function bmNormV(rt, h, name) {
+    if (h.t === "m") return h.v;
+    if (h.t === "l") {
+      var b = bmNew(h.v.length);
+      for (var i = 0; i < h.v.length; i++) if (truthy(h.v[i])) b.v.words[i >> 6] |= 1n << BigInt(i & 63);
+      return b.v;
+    }
+    if (h.t === "v") {
+      var b2 = bmNew(h.v.len);
+      for (var j = 0; j < h.v.len; j++) { var e = elD(h, j); if (e !== 0 && !isNaN(e)) b2.v.words[j >> 6] |= 1n << BigInt(j & 63); }
+      return b2.v;
+    }
+    die(rt, "bitmap op: not a bitmap");
+  }
   // elementwise max/min (C UF_VEOP): both arrs, length mismatch dies
   function veMinMax(rt, isMax, name) {
     var h2 = pop(rt, name), h1 = pop(rt, name);
-    var a = vcheckV(rt, h1), b = vcheckV(rt, h2);
+    var a = vecNormV(rt, h1, name), b = vecNormV(rt, h2, name);
     if (a.v.len !== b.v.len) die(rt, name + ": length mismatch");
     var n = a.v.len, r = vArrLike(a, n);
     if (a.v.ety === 1 && b.v.ety === 1 && a.v.kind !== "mat" && b.v.kind !== "mat") {
@@ -1000,7 +1066,7 @@ var RT = (function () {
   // comparisons (C UF_VCOP): arr scalar -> bitmap, scalar coerced to double
   function vcCmp(rt, fn, name) {
     var s = pop(rt, name), h = pop(rt, name);
-    var a = vcheckV(rt, h);
+    var a = vecNormV(rt, h, name);
     var n = a.v.len, r = bmNew(n), d = fOf(s);
     for (var i = 0; i < n; i++) if (fn(elD(a, i), d)) r.v.words[i >> 6] |= 1n << BigInt(i & 63);
     rt.st.push(r);
@@ -1012,7 +1078,7 @@ var RT = (function () {
   function op_vle(rt) { vcCmp(rt, function (x, d) { return x <= d; }, "op_vle"); }
   function bmBinOp(rt, isAnd, op, tag) {
     var h2 = pop(rt, op), h1 = pop(rt, op);
-    var a = bmCheckV(rt, h1), b = bmCheckV(rt, h2);
+    var a = bmNormV(rt, h1, op), b = bmNormV(rt, h2, op);
     if (a.len !== b.len) die(rt, tag + ": length mismatch");
     var w = (a.len + 63) / 64 | 0, r = bmNew(a.len);
     for (var i = 0; i < w; i++) r.v.words[i] = isAnd ? (a.words[i] & b.words[i]) : (a.words[i] | b.words[i]);
@@ -1022,7 +1088,7 @@ var RT = (function () {
   function op_vor(rt) { bmBinOp(rt, 0, "op_vor", "VOR"); }
   function op_vnot(rt) {
     var h = pop(rt, "op_vnot");
-    var a = bmCheckV(rt, h);
+    var a = bmNormV(rt, h, "op_vnot");
     var w = (a.len + 63) / 64 | 0, r = bmNew(a.len);
     for (var i = 0; i < w; i++) r.v.words[i] = ~a.words[i] & BMASK64;
     if (a.len % 64) r.v.words[w - 1] &= (1n << BigInt(a.len % 64)) - 1n;
@@ -1030,7 +1096,7 @@ var RT = (function () {
   }
   function op_vcount(rt) {
     var h = pop(rt, "op_vcount");
-    var a = bmCheckV(rt, h);
+    var a = bmNormV(rt, h, "op_vcount");
     var n = 0n;
     for (var i = 0; i < a.words.length; i++) {
       var w = a.words[i];
@@ -1041,7 +1107,7 @@ var RT = (function () {
   // VGATHER: arr bitmap -> arr' (keep the set-bit elements)
   function op_vgather(rt) {
     var h2 = pop(rt, "VGATHER"), h1 = pop(rt, "VGATHER");
-    var a = vcheckV(rt, h1), b = bmCheckV(rt, h2);
+    var a = vecNormV(rt, h1, "VGATHER"), b = bmNormV(rt, h2, "VGATHER");
     if (a.v.len !== b.len) die(rt, "VGATHER: length mismatch");
     var n = 0n;
     for (var i = 0; i < a.v.len; i++) if (bmBit(b, i)) n++;
@@ -1052,7 +1118,7 @@ var RT = (function () {
   // reductions (C op_vmean / op_vmin / op_vmax)
   function op_vmean(rt) {
     var h = pop(rt, "VMEAN");
-    var a = vcheckV(rt, h);
+    var a = vecNormV(rt, h, "VMEAN");
     if (!a.v.len) die(rt, "VMEAN: empty arr");
     var s = 0;
     for (var i = 0; i < a.v.len; i++) s += elD(a, i);
@@ -1060,7 +1126,7 @@ var RT = (function () {
   }
   function vMinMaxRed(rt, isMax, name) {
     var h = pop(rt, name);
-    var a = vcheckV(rt, h);
+    var a = vecNormV(rt, h, name);
     if (!a.v.len) die(rt, name + ": empty arr");
     var s = elD(a, 0);
     for (var i = 1; i < a.v.len; i++) { var d = elD(a, i); if (isMax ? d > s : d < s) s = d; }
@@ -1072,7 +1138,7 @@ var RT = (function () {
   // element is the double of the return, stored through put_el)
   async function op_vmap(rt) {
     var f = pop(rt, "VMAP"), h = pop(rt, "VMAP");
-    var a = vcheckV(rt, h);
+    var a = vecNormV(rt, h, "VMAP");
     var r = vArrLike(a, a.v.len);
     var fr = rt.lsp++;
     if (rt.lsp >= 64) die(rt, "loops nested too deep");
@@ -1089,7 +1155,7 @@ var RT = (function () {
   // NaN on the right pulls the right index forward — same as C)
   function op_vargsort(rt) {
     var h = pop(rt, "VARGSORT");
-    var a = vcheckV(rt, h);
+    var a = vecNormV(rt, h, "VARGSORT");
     var n = a.v.len, idx = new Array(n), tmp = new Array(n);
     for (var i = 0; i < n; i++) idx[i] = i;
     for (var w = 1; w < n; w <<= 1) {
@@ -1112,7 +1178,7 @@ var RT = (function () {
   // VSEARCHSORTED: sorted_arr val -> insertion index (first pos with el >= val)
   function op_vsearchsorted(rt) {
     var v = pop(rt, "VSEARCHSORTED"), h = pop(rt, "VSEARCHSORTED");
-    var a = vcheckV(rt, h);
+    var a = vecNormV(rt, h, "VSEARCHSORTED");
     var d = fOf(v), lo = 0, hi = a.v.len;
     while (lo < hi) { var mid = (lo + hi) >> 1; if (elD(a, mid) < d) lo = mid + 1; else hi = mid; }
     rt.st.push(I(BigInt(lo)));
@@ -1120,7 +1186,7 @@ var RT = (function () {
   // VWHERE: arr arr bitmap -> arr' (bit set -> first arr, else the second)
   function op_vwhere(rt) {
     var h3 = pop(rt, "VWHERE"), h2 = pop(rt, "VWHERE"), h1 = pop(rt, "VWHERE");
-    var a = vcheckV(rt, h1), b = vcheckV(rt, h2), m = bmCheckV(rt, h3);
+    var a = vecNormV(rt, h1, "VWHERE"), b = vecNormV(rt, h2, "VWHERE"), m = bmNormV(rt, h3, "VWHERE");
     if (a.v.len !== b.v.len || a.v.len !== m.len) die(rt, "VWHERE: length mismatch");
     var r = vArrLike(a, a.v.len);
     for (var i = 0; i < a.v.len; i++) putEl(r, i, bmBit(m, i) ? elD(a, i) : elD(b, i));
@@ -1183,6 +1249,9 @@ var RT = (function () {
     return res;
   }
   function polyArith(rt, a, b, op, opn) {
+    // v15.1: list/bitmap operands normalize to typed arrays at the boundary
+    if (vecCand(a) && a.t !== "v") a = vecNormV(rt, a, opn);
+    if (vecCand(b) && b.t !== "v") b = vecNormV(rt, b, opn);
     var ha = a.t === "v" ? a : null, hb = b.t === "v" ? b : null;
     if ((ha && ha.v.ety === 21) || (hb && hb.v.ety === 21)) die(rt, "arithmetic on bool arrays requires numeric elements");
     if (ha && hb) {

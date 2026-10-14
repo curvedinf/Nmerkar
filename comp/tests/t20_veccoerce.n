@@ -1,0 +1,27 @@
+; t20_veccoerce.n — v15.1 uniform vector-op operand coercion (SPEC "Collection
+; coercion"): list/bitmap/scalar/string operands normalize to typed arrays at
+; the vector-op boundary; int elements stay int unless one forces float; bitmap
+; ops coerce collections via truthiness. Run: nk comp/tests/t20_veccoerce.n
+[1 2 3] sum print                       ; 6
+[1 2 3] sum type_of print               ; 0 — int preserved
+[1.5 2.5] sum print                     ; 4
+[1.5 2.5] sum type_of print             ; 1 — any float element forces float
+[1 2 3] [4 5 6] add print               ; [5,7,9] — elementwise via core add
+[1 2 3] 2 mul print                     ; [2,4,6] — broadcast
+3 [1 2 3] add print                     ; [4,5,6] — scalar on the left
+[10 20 30] 5 div print                  ; [2,4,6]
+[1 2 3] [4 5 6] array_max print         ; [4,5,6]
+[1 2 3] [4 5 6] array_min print         ; [1,2,3]
+[1 2 3] 2 scalar_gt bitmap_count print  ; 1
+[1 2 3] [1 2 3] 2 scalar_gt array_gather sum print ; 3
+[1 2 3] [10 20 30] [1 2 3] 2 scalar_gt array_where sum print ; 33
+[1 0 1] bitmap_count print              ; 2 — list -> bitmap via truthiness
+[true false true] bitmap_count print    ; 2
+[100 50] 0 'acc array_reduce print      ; 150 — int list stays int in the fold
+[1.0 4.0 9.0] sqrt sum print            ; 6 — sqrt is elementwise on arrays
+[1 "2" 3] sum print                     ; 6 — numeric strings coerce per element
+"123" sum print                         ; 123 — string operand: one-element array
+[] sum print                            ; 0 — empty list
+ret
+acc: a! b!
+  ret a b add

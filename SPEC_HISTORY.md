@@ -6,7 +6,7 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
-## v15.1 — 2026-10-14 (uniform pass-through stores + `#` destructuring)
+## v15.1 — 2026-10-14 (uniform pass-through stores, `#` destructuring, vector coercion, alias retirement)
 
 - `setv` (33, 🌆) — changed: stores pass through **everywhere** — a shared
   store now leaves its value on the hidden stack exactly like a local store
@@ -37,6 +37,39 @@ new semantics or performance) are listed under the commit that made them.
   consuming a prior op's residue) now sees the value remain; t06_vec's
   elementwise sums become the mathematically correct values (the old
   outputs consumed a stale for-loop count cell).
+- Vector-op operand coercion — changed (behavior, same opcodes): a
+  collection operand now **normalizes to a typed array at the op boundary**,
+  restoring the "rules are the same for every op" invariant of universal
+  coercion for the vector family. A list becomes a typed array (int
+  elements stay int unless one forces float — float tag, non-integral
+  numeric form, or no numeric form → NaN, mirroring scalar arithmetic; an
+  element with no numeric form at all — dict/obj/chan/multi-element
+  list/raw pointer — dies naming the index); a bitmap becomes the int array
+  of its set-bit indices; a scalar or string operand becomes a one-element
+  array by the scalar numeric table (`[1 2 3] sum` → `6` int, `[1 2 3]
+  2 mul` → `[2,4,6]`, `"123" sum` → `123`). Affected: the reductions
+  (`sum`/`mean`/`min`/`max`), `array_max`/`array_min`, the `scalar_*`
+  comparison family, `array_map`/`array_reduce` (its float-only list
+  special case is replaced — int lists now fold as int, matching arrays),
+  `array_gather`/`array_where`, `array_argsort`/`array_search_sorted`,
+  `sqrt` (elementwise on any collection operand), and the core
+  `add`/`sub`/`mul`/`div` in all polymorphic forms. `array_get`/`array_set`
+  stay raw (no validation, no coercion). Bitmap ops
+  (`bitmap_and`/`bitmap_or`/`bitmap_not`/`bitmap_count`, and the mask slot
+  of gather/where) coerce list/arr/tensor operands to bitmaps via element
+  truthiness. Previously a list operand either died (`sum` etc.) or
+  silently coerced to scalar `NaN` (core arithmetic) — the silent path is
+  gone. Both targets byte-identical (die messages included); gate:
+  `comp/tests/t20_veccoerce.n`. JS-target fix included: `sqrt` gained the
+  elementwise array path it was missing (a latent native/JS divergence).
+- `scalar_add` (128), `scalar_sub` (129), `scalar_mul` (130), `scalar_div`
+  (131), `array_add` (132), `array_sub` (133), `array_mul` (134),
+  `array_div` (135) — **retired**: they were parser aliases of the core
+  `add`/`sub`/`mul`/`div` (identical handlers, identical semantics, no
+  token saving), and the core ops' new operand normalization makes the
+  distinction meaningless. Slots are `~128`..`~135`; their glyphs
+  (😛 🚧 🤪 🌟 😜 🚨 🤫 🌠) are freed. Live count 204 → 196; glyphed
+  count 201 → 193.
 
 ## 2026-09-20 (post-v15) — binary right shift
 

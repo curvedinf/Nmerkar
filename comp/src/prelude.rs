@@ -787,6 +787,7 @@ static inline int uf_strict_eq(Cell a,Cell b){
 /* ---- arithmetic primitives: scalar, ptr/str, array dispatch ---- */
 static int uf_numarr(Cell c);
 static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn);
+static int uf_veccand(Cell c);
 static Hdr* uf_arr_like(Hdr*a,uint64_t n);
 static double uf_el(Hdr*a,uint64_t i);
 static void uf_put_el(Hdr*a,uint64_t i,double d);
@@ -808,9 +809,9 @@ static inline Cell uf_stradd(Cell a,Cell b,int sub){
   if(flip&&sub) return uf_mki(-4200000001LL);
   return uf_mkp((void*)(p+off));
 }
-static inline Cell uf_cadd(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,0,"add"); if(a.tag==T_INT&&uf_rawptr(b))return uf_mkp((void*)(a.i+b.i)); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i+b.i)); Cell s=uf_stradd(a,b,0); if(s.i!=-4200000001LL)return s; } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i+b.i); return uf_mkf(x+y); }
-static inline Cell uf_csub(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,1,"sub"); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i-b.i)); Cell s=uf_stradd(a,b,1); if(s.i!=-4200000001LL)return s; } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i-b.i); return uf_mkf(x-y); }
-static inline Cell uf_cmul(Cell a,Cell b){ if(a.tag==T_INT&&a.i==1&&b.tag!=T_FLOAT&&!uf_numarr(b))return b; if(b.tag==T_INT&&b.i==1&&a.tag!=T_FLOAT&&!uf_numarr(a))return a; if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,2,"mul"); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i*b.i); return uf_mkf(x*y); }
+static inline Cell uf_cadd(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_veccand(a)||uf_veccand(b))return uf_poly_arith(a,b,0,"add"); if(a.tag==T_INT&&uf_rawptr(b))return uf_mkp((void*)(a.i+b.i)); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i+b.i)); Cell s=uf_stradd(a,b,0); if(s.i!=-4200000001LL)return s; } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i+b.i); return uf_mkf(x+y); }
+static inline Cell uf_csub(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_veccand(a)||uf_veccand(b))return uf_poly_arith(a,b,1,"sub"); if(uf_rawptr(a)&&b.tag==T_INT)return uf_mkp((void*)(a.i-b.i)); Cell s=uf_stradd(a,b,1); if(s.i!=-4200000001LL)return s; } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i-b.i); return uf_mkf(x-y); }
+static inline Cell uf_cmul(Cell a,Cell b){ if(a.tag==T_INT&&a.i==1&&b.tag!=T_FLOAT&&!uf_veccand(b))return b; if(b.tag==T_INT&&b.i==1&&a.tag!=T_FLOAT&&!uf_veccand(a))return a; if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_veccand(a)||uf_veccand(b))return uf_poly_arith(a,b,2,"mul"); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i*b.i); return uf_mkf(x*y); }
 static inline Cell uf_cand(Cell a,Cell b){ return uf_mki(uf_i(a)&uf_i(b)); }
 static inline Cell uf_cshr(Cell a,Cell b){ if(a.tag==T_FLOAT||b.tag==T_FLOAT||a.tag==T_PTR||b.tag==T_PTR)die("SHR: ints only"); if(b.i<0||b.i>=64)die("SHR: shift out of range"); return uf_mki((int64_t)((uint64_t)a.i>>b.i)); }
 static inline Cell uf_cinc(Cell a){ double x=uf_to_number(a); if(isnan(x))return uf_mkf(NAN); if(a.tag==T_INT)return uf_mki(a.i+1); return uf_mkf(x+1.0); }
@@ -823,7 +824,7 @@ static inline Cell uf_cdec(Cell a){ double x=uf_to_number(a); if(isnan(x))return
 #else
 #define UF_NOINLINE
 #endif
-static Cell UF_NOINLINE uf_cdiv(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_numarr(a)||uf_numarr(b))return uf_poly_arith(a,b,3,"div"); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(y==0.0)die("DIV: division by zero"); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i/b.i); return uf_mkf(x/y); }
+static Cell UF_NOINLINE uf_cdiv(Cell a,Cell b){ if(a.tag==T_PTR||b.tag==T_PTR){ if(uf_veccand(a)||uf_veccand(b))return uf_poly_arith(a,b,3,"div"); } double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(y==0.0)die("DIV: division by zero"); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i/b.i); return uf_mkf(x/y); }
 static Cell UF_NOINLINE uf_crem(Cell a,Cell b){ double x=uf_to_number(a),y=uf_to_number(b); if(isnan(x)||isnan(y))return uf_mkf(NAN); if(y==0.0)die("REM: division by zero"); if(a.tag==T_INT&&b.tag==T_INT)return uf_mki(a.i%b.i); return uf_mkf(fmod(x,y)); }
 static inline Cell uf_clt(Cell a,Cell b){ double x=uf_to_number(a),y=uf_to_number(b); return uf_mki(isnan(x)||isnan(y)?0:(x<y?1:0)); }
 static inline Cell uf_cgt(Cell a,Cell b){ double x=uf_to_number(a),y=uf_to_number(b); return uf_mki(isnan(x)||isnan(y)?0:(x>y?1:0)); }
@@ -889,9 +890,11 @@ static void op_nop(Ctx*cx){ (void)cx; }
 
 static int uf_numarr(Cell c);
 static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn);
-static void op_add(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_numarr(a)||uf_numarr(b))pushc(cx,uf_poly_arith(a,b,0,"add")); else pushc(cx,uf_cadd(a,b)); }
-static void op_sub(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_numarr(a)||uf_numarr(b))pushc(cx,uf_poly_arith(a,b,1,"sub")); else pushc(cx,uf_csub(a,b)); }
-static void op_mul(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_numarr(a)||uf_numarr(b))pushc(cx,uf_poly_arith(a,b,2,"mul")); else pushc(cx,uf_cmul(a,b)); }
+static int uf_veccand(Cell c);
+static Hdr* uf_vec_norm(Cell*ph,const char*op);
+static void op_add(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_veccand(a)||uf_veccand(b))pushc(cx,uf_poly_arith(a,b,0,"add")); else pushc(cx,uf_cadd(a,b)); }
+static void op_sub(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_veccand(a)||uf_veccand(b))pushc(cx,uf_poly_arith(a,b,1,"sub")); else pushc(cx,uf_csub(a,b)); }
+static void op_mul(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_veccand(a)||uf_veccand(b))pushc(cx,uf_poly_arith(a,b,2,"mul")); else pushc(cx,uf_cmul(a,b)); }
 static void op_and(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_cand(a,b)); }
 static void op_pow(Ctx*cx){ Cell b=pop(cx),a=pop(cx); double x=uf_to_number(a),y=uf_to_number(b); pushc(cx,uf_mkf(pow(x,y))); }
 static void op_sqrt(Ctx*cx){ Cell a=pop(cx);
@@ -907,7 +910,7 @@ static void op_sqrt(Ctx*cx){ Cell a=pop(cx);
       if(ok){ UF_UNPROTECT(); pushp(cx,r); return; }
     } }
 #endif
-  if(uf_numarr(a)){ Hdr*h=(Hdr*)(void*)a.i; uint64_t n=h->len; Hdr*r=uf_arr_like(h,n); UF_PROTECT(&r);
+  if(uf_veccand(a)){ Hdr*h=uf_vec_norm(&a,"SQRT"); uint64_t n=h->len; Hdr*r=uf_arr_like(h,n); UF_PROTECT(&r);
     if(h->ety==1){ const double*A=(const double*)uf_data(h); double*R=(double*)uf_data(r); for(uint64_t i=0;i<n;i++)R[i]=sqrt(A[i]); }
     else for(uint64_t i=0;i<n;i++) uf_put_el(r,i,sqrt(uf_el(h,i)));
     UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); return; }
@@ -921,7 +924,7 @@ static void op_inc(Ctx*cx){ pushc(cx,uf_cinc(pop(cx))); }
 static void op_dec(Ctx*cx){ pushc(cx,uf_cdec(pop(cx))); }
 
 /* v10 arithmetic & logic */
-static void op_div(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_numarr(a)||uf_numarr(b))pushc(cx,uf_poly_arith(a,b,3,"div")); else pushc(cx,uf_cdiv(a,b)); }
+static void op_div(Ctx*cx){ Cell b=pop(cx),a=pop(cx); if(uf_veccand(a)||uf_veccand(b))pushc(cx,uf_poly_arith(a,b,3,"div")); else pushc(cx,uf_cdiv(a,b)); }
 static void op_rem(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushc(cx,uf_crem(a,b)); }
 static void op_eq(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushi(cx,uf_loose_eq(a,b)?1:0); }
 static void op_seq(Ctx*cx){ Cell b=pop(cx),a=pop(cx); pushi(cx,uf_strict_eq(a,b)?1:0); }
@@ -3094,6 +3097,11 @@ static Hdr* uf_vecmat(Hdr*v,Hdr*m){
 }
 /* polymorphic + - * / for array/matrix/scalar operand mixes */
 static Cell uf_poly_arith(Cell a,Cell b,int op,const char*opn){
+  /* v15.1: a list or bitmap operand normalizes to a typed array at the
+     boundary, so the core arithmetic ops coerce collections exactly like the
+     rest of the vector family */
+  if(uf_veccand(a)&&!uf_numarr(a)){ uf_vec_norm(&a,opn); if(uf_veccand(b)&&!uf_numarr(b)){ UF_PROTECT((void**)(void*)&a.i); uf_vec_norm(&b,opn); UF_UNPROTECT(); } }
+  else if(uf_veccand(b)&&!uf_numarr(b))uf_vec_norm(&b,opn);
   Hdr*ha=uf_numarr(a)?(Hdr*)(void*)a.i:0;
   Hdr*hb=uf_numarr(b)?(Hdr*)(void*)b.i:0;
   if((ha&&ha->ety==T_BOOL)||(hb&&hb->ety==T_BOOL))die("arithmetic on bool arrays requires numeric elements");
@@ -3214,41 +3222,138 @@ static void op_transpose(Ctx*cx){
   for(uint64_t i=0;i<r;i++) for(uint64_t j=0;j<c;j++) uf_put_el(t,j*r+i,uf_el(a,i*c+j));
   UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,t);
 }
-static Hdr* uf_vcheck(Cell h,const char*op){ Hdr*a=uf_handle(h,op); if(a->tag!=HT_ARR&&a->tag!=HT_TENSOR&&a->tag!=HT_MAT)die("vector op: not an arr"); return a; }
-/* scalar arr ops: arr scalar -> arr' */
-#define UF_VSOP(NAME,EXPR,RAWEXPR,ZERO_DIE) \
-static void NAME(Ctx*cx){ Cell s=pop(cx),h=pop(cx); Hdr*a=uf_vcheck(h,#NAME); \
-  UF_PROTECT((void**)(void*)&h.i); \
-  uint64_t n=a->len; Hdr*r=uf_arr_like(a,n); UF_PROTECT(&r); \
-  if(a->ety==1&&a->tag!=HT_MAT){ const double*A=(const double*)uf_data(a); double*R=(double*)uf_data(r); double d=uf_f(s); if(ZERO_DIE&&d==0.0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)R[i]=(RAWEXPR); } \
-  else if(s.tag==T_FLOAT){ double d=uf_f(s); if(ZERO_DIE&&d==0.0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); } \
-  else { int64_t d=s.i; if(ZERO_DIE&&d==0)die(#NAME ": zero scalar"); for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); } \
-  UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); }
-UF_VSOP(op_vadd, uf_el(a,i)+d, A[i]+d, 0)
-UF_VSOP(op_vsub, uf_el(a,i)-d, A[i]-d, 0)
-UF_VSOP(op_vmul, uf_el(a,i)*d, A[i]*d, 0)
-UF_VSOP(op_vdiv, uf_el(a,i)/d, A[i]/d, 1)
+static Hdr* uf_vec_norm(Cell*ph,const char*op);
+/* (v15.1: the scalar- and array-prefixed arithmetic aliases were retired:
+   they were parser aliases of the core add/sub/mul/div, which are
+   themselves polymorphic over scalar, broadcast, and elementwise forms.) */
 /* elementwise arr arr ops: length mismatch dies */
 #define UF_VEOP(NAME,EXPR,RAWEXPR,ZERO_DIE) \
-static void NAME(Ctx*cx){ Cell h2=pop(cx),h1=pop(cx); Hdr*a=uf_vcheck(h1,#NAME); Hdr*b=uf_vcheck(h2,#NAME); \
+static void NAME(Ctx*cx){ Cell h2=pop(cx),h1=pop(cx); Hdr*a=uf_vec_norm(&h1,#NAME); UF_PROTECT((void**)(void*)&h1.i); Hdr*b=uf_vec_norm(&h2,#NAME); \
   if(a->len!=b->len)die(#NAME ": length mismatch"); \
-  UF_PROTECT((void**)(void*)&h1.i); UF_PROTECT((void**)(void*)&h2.i); \
+  UF_PROTECT((void**)(void*)&h2.i); \
   uint64_t n=a->len; Hdr*r=uf_arr_like(a,n); UF_PROTECT(&r); \
   if(a->ety==1&&b->ety==1&&a->tag!=HT_MAT&&b->tag!=HT_MAT){ const double*A=(const double*)uf_data(a); const double*B=(const double*)uf_data(b); double*R=(double*)uf_data(r); for(uint64_t i=0;i<n;i++)R[i]=(RAWEXPR); } \
   else { \
   if(ZERO_DIE) for(uint64_t i=0;i<n;i++) if(uf_el(b,i)==0.0)die(#NAME ": zero divisor"); \
   for(uint64_t i=0;i<n;i++)uf_put_el(r,i,(EXPR)); } \
   UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r); }
-UF_VEOP(op_veadd, uf_el(a,i)+uf_el(b,i), A[i]+B[i], 0)
-UF_VEOP(op_vesub, uf_el(a,i)-uf_el(b,i), A[i]-B[i], 0)
-UF_VEOP(op_vemul, uf_el(a,i)*uf_el(b,i), A[i]*B[i], 0)
-UF_VEOP(op_vediv, uf_el(a,i)/uf_el(b,i), A[i]/B[i], 1)
 UF_VEOP(op_vemax, uf_el(a,i)>uf_el(b,i)?uf_el(a,i):uf_el(b,i), A[i]>B[i]?A[i]:B[i], 0)
 UF_VEOP(op_vemin, uf_el(a,i)<uf_el(b,i)?uf_el(a,i):uf_el(b,i), A[i]<B[i]?A[i]:B[i], 0)
 /* comparisons: arr scalar -> bitmap */
 static Bitmap* uf_bm_new(uint64_t nbits){ Bitmap*b=(Bitmap*)uf_gc_alloc(sizeof(Bitmap)+((nbits+63)/64)*8,0); b->tag=HT_BITMAP; b->len=nbits; b->esz=8; memset(b->words,0,((nbits+63)/64)*8); return b; }
+/* ============ v15.1: uniform vector-op operand normalization ============
+   The universal-coercion contract ("the rules are the same for every op")
+   now holds for the vector family: a vector op's collection operand is
+   normalized to a typed array at the op boundary. A list becomes a typed
+   array — int elements stay int unless some element forces float (float
+   tag, non-integral numeric form, or no numeric form, which coerces to NaN
+   exactly as in scalar arithmetic) — a bitmap becomes the int array of its
+   set-bit indices, and a scalar or string operand becomes a one-element
+   array by the scalar numeric-coercion table. An element that is a dict,
+   obj, chan, multi-element list, or raw pointer dies naming the index: a
+   silent NaN from a whole-operand coercion is the failure mode this
+   boundary exists to prevent. ARR/TENSOR/MAT pass through unchanged. The
+   converted handle is written back into the caller's cell so the op's own
+   UF_PROTECT — which registers the cell's address — roots it afterwards. */
+static Hdr* uf_one_vec(int fl,double d){ Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+8,0); h->tag=HT_ARR; h->len=1; h->esz=8; h->ety=fl?1:0; if(fl)((double*)h->data)[0]=d; else ((int64_t*)h->data)[0]=(int64_t)d; return h; }
+/* numeric class of string content: 0 = int (full base-10 parse), 1 = float
+   (any other numeric form, or NaN when there is none); empty or
+   whitespace-only content is int 0, mirroring the scalar coercion table */
+static int uf_str_class(const char*s,double*out){
+  const char*p=s; while(isspace((unsigned char)*p))p++;
+  if(!*p){ *out=0; return 0; }
+  errno=0; char*end; long long v=strtoll(p,&end,10);
+  if(end!=p&&errno!=ERANGE){ const char*q=end; while(isspace((unsigned char)*q))q++; if(!*q){ *out=(double)v; return 0; } }
+  double d=strtod(p,&end);
+  const char*q=end; while(isspace((unsigned char)*q))q++;
+  if(end==p||*q){ *out=NAN; return 1; }
+  *out=d; return 1;
+}
+/* classify one element: 1 = float context, 0 = int context; dies when the
+   element has no numeric form at all (mirrors uf_to_number, except that
+   structural non-numbers die instead of coercing to NaN) */
+static int uf_vecclass(Cell c,double*out,uint64_t idx){
+  for(;;){
+    if(c.tag==T_FLOAT){ *out=uf_fbits(c.i); return 1; }
+    if(c.tag==T_INT||c.tag==T_BYTE||c.tag==T_BOOL||c.tag==T_TIME||c.tag==T_DUR){ *out=(double)c.i; return 0; }
+    if(c.tag==T_PTR){
+      if(!c.i){ *out=0; return 0; }
+      Hdr*h=uf_gc_find((void*)c.i);
+      if(h){
+        if(h->tag==HT_STR)return uf_str_class(uf_sptr(c),out);
+        if(h->tag==HT_DYN){ Dyn*d=(Dyn*)h; if(d->len==0){ *out=0; return 0; } if(d->len==1){ c=d->data[0]; continue; } }
+      }
+    }
+    break;
+  }
+  { char m[128]; snprintf(m,sizeof m,"vector op: element %llu of the list has no numeric form (convert explicitly, e.g. `list type array`)",(unsigned long long)idx); die(m); }
+  return 0;
+}
+static Hdr* uf_dyn_to_vec(Cell*ph){
+  Dyn*d=(Dyn*)(void*)ph->i; uint64_t n=d->len; int fl=0; double dv;
+  for(uint64_t i=0;i<n;i++){ if(uf_vecclass(d->data[i],&dv,i))fl=1; }
+  UF_PROTECT((void**)(void*)&ph->i);
+  Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)n*8,0);
+  h->tag=HT_ARR; h->len=n; h->esz=8; h->ety=fl?1:0;
+  if(fl){ double*A=(double*)h->data; for(uint64_t i=0;i<n;i++){ uf_vecclass(d->data[i],&dv,i); A[i]=dv; } }
+  else { int64_t*A=(int64_t*)h->data; for(uint64_t i=0;i<n;i++){ uf_vecclass(d->data[i],&dv,i); A[i]=(int64_t)dv; } }
+  *ph=uf_mkp(h);
+  UF_UNPROTECT();
+  return h;
+}
+static Hdr* uf_bm_to_vec(Bitmap*b){
+  uint64_t n=0; for(uint64_t i=0;i<b->len;i++) if((b->words[i>>6]>>(i&63))&1)n++;
+  Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)n*8,0);
+  h->tag=HT_ARR; h->len=n; h->esz=8; h->ety=0;
+  uint64_t k=0; int64_t*A=(int64_t*)h->data;
+  for(uint64_t i=0;i<b->len;i++) if((b->words[i>>6]>>(i&63))&1)A[k++]=(int64_t)i;
+  return h;
+}
+static int uf_veccand(Cell c){ if(uf_numarr(c))return 1; if(c.tag!=T_PTR||!c.i)return 0; Hdr*h=uf_gc_find((void*)c.i); return h&&(h->tag==HT_DYN||h->tag==HT_BITMAP); }
+static Hdr* uf_vec_norm(Cell*ph,const char*op){
+  (void)op;
+  Cell c=*ph;
+  if(c.tag==T_PTR&&c.i){
+    Hdr*h=uf_gc_find((void*)c.i);
+    if(h){
+      if(h->tag==HT_ARR||h->tag==HT_TENSOR||h->tag==HT_MAT)return h;
+      if(h->tag==HT_DYN)return uf_dyn_to_vec(ph);
+      if(h->tag==HT_BITMAP){ UF_PROTECT((void**)(void*)&ph->i); Hdr*r=uf_bm_to_vec((Bitmap*)h); *ph=uf_mkp(r); UF_UNPROTECT(); return r; }
+      if(h->tag==HT_STR){ double d; int fl=uf_str_class(uf_sptr(c),&d); Hdr*r=uf_one_vec(fl,d); *ph=uf_mkp(r); return r; }
+      die("vector op: not an arr (operand has no numeric form; convert explicitly, e.g. `x float array`)");
+    }
+  }
+  if(c.tag==T_FLOAT){ Hdr*r=uf_one_vec(1,uf_fbits(c.i)); *ph=uf_mkp(r); return r; }
+  if(c.tag==T_INT||c.tag==T_BYTE||c.tag==T_BOOL||c.tag==T_TIME||c.tag==T_DUR){ Hdr*r=uf_one_vec(0,(double)c.i); *ph=uf_mkp(r); return r; }
+  if(c.tag==T_PTR&&!c.i){ Hdr*r=uf_one_vec(0,0); *ph=uf_mkp(r); return r; }
+  die("vector op: not an arr");
+  return 0;
+}
+/* v15.1: bitmap ops coerce list/arr/tensor operands to bitmaps via element
+   truthiness; anything else still dies */
+static Bitmap* uf_bm_norm(Cell*ph,const char*op){
+  (void)op;
+  Cell c=*ph;
+  if(c.tag==T_PTR&&c.i){
+    Hdr*h=uf_gc_find((void*)c.i);
+    if(h){
+      if(h->tag==HT_BITMAP)return (Bitmap*)h;
+      if(h->tag==HT_DYN||h->tag==HT_ARR||h->tag==HT_TENSOR){
+        UF_PROTECT((void**)(void*)&ph->i);
+        uint64_t n=h->len; Bitmap*b=uf_bm_new(n);
+        if(h->tag==HT_DYN){ Dyn*d=(Dyn*)h; for(uint64_t i=0;i<n;i++) if(uf_truthy(d->data[i])) b->words[i>>6]|=(1ULL<<(i&63)); }
+        else { for(uint64_t i=0;i<n;i++){ double e=uf_el(h,i); if(e!=0.0&&!isnan(e)) b->words[i>>6]|=(1ULL<<(i&63)); } }
+        *ph=uf_mkp(b);
+        UF_UNPROTECT();
+        return b;
+      }
+    }
+  }
+  die("bitmap op: not a bitmap");
+  return 0;
+}
 #define UF_VCOP(NAME,EXPR) \
-static void NAME(Ctx*cx){ Cell s=pop(cx),h=pop(cx); Hdr*a=uf_vcheck(h,#NAME); \
+static void NAME(Ctx*cx){ Cell s=pop(cx),h=pop(cx); Hdr*a=uf_vec_norm(&h,#NAME); \
   UF_PROTECT((void**)(void*)&h.i); \
   uint64_t n=a->len; Bitmap*r=uf_bm_new(n); UF_PROTECT(&r); \
   double d=uf_f(s); \
@@ -3260,23 +3365,21 @@ UF_VCOP(op_vgt, uf_el(a,i)>d)
 UF_VCOP(op_vge, uf_el(a,i)>=d)
 UF_VCOP(op_vle, uf_el(a,i)<=d)
 /* bitmap logic */
-static Bitmap* uf_bm_check(Cell h){ Hdr*a=uf_handle(h,"bitmap op"); if(a->tag!=HT_BITMAP)die("bitmap op: not a bitmap"); return (Bitmap*)a; }
-static void op_vand(Ctx*cx){ Cell h2=pop(cx),h1=pop(cx); Bitmap*a=uf_bm_check(h1),*b=uf_bm_check(h2); if(a->len!=b->len)die("VAND: length mismatch"); uint64_t w=(a->len+63)/64; Bitmap*r=uf_bm_new(a->len); UF_PROTECT(&r); for(uint64_t i=0;i<w;i++)r->words[i]=a->words[i]&b->words[i]; UF_UNPROTECT(); pushp(cx,r); }
-static void op_vor(Ctx*cx){ Cell h2=pop(cx),h1=pop(cx); Bitmap*a=uf_bm_check(h1),*b=uf_bm_check(h2); if(a->len!=b->len)die("VOR: length mismatch"); uint64_t w=(a->len+63)/64; Bitmap*r=uf_bm_new(a->len); UF_PROTECT(&r); for(uint64_t i=0;i<w;i++)r->words[i]=a->words[i]|b->words[i]; UF_UNPROTECT(); pushp(cx,r); }
-static void op_vnot(Ctx*cx){ Cell h=pop(cx); Bitmap*a=uf_bm_check(h); uint64_t w=(a->len+63)/64; Bitmap*r=uf_bm_new(a->len); UF_PROTECT(&r); for(uint64_t i=0;i<w;i++)r->words[i]=~a->words[i]; if(a->len&63)r->words[w-1]&=(1ULL<<(a->len&63))-1; UF_UNPROTECT(); pushp(cx,r); }
-static void op_vcount(Ctx*cx){ Cell h=pop(cx); Bitmap*a=uf_bm_check(h); uint64_t w=(a->len+63)/64,n=0; for(uint64_t i=0;i<w;i++)n+=(uint64_t)__builtin_popcountll(a->words[i]); pushi(cx,(int64_t)n); }
+static void op_vand(Ctx*cx){ Cell h2=pop(cx),h1=pop(cx); Bitmap*a=uf_bm_norm(&h1,"VAND"); Bitmap*b=uf_bm_norm(&h2,"VAND"); if(a->len!=b->len)die("VAND: length mismatch"); uint64_t w=(a->len+63)/64; Bitmap*r=uf_bm_new(a->len); UF_PROTECT(&r); for(uint64_t i=0;i<w;i++)r->words[i]=a->words[i]&b->words[i]; UF_UNPROTECT(); pushp(cx,r); }
+static void op_vor(Ctx*cx){ Cell h2=pop(cx),h1=pop(cx); Bitmap*a=uf_bm_norm(&h1,"VOR"); Bitmap*b=uf_bm_norm(&h2,"VOR"); if(a->len!=b->len)die("VOR: length mismatch"); uint64_t w=(a->len+63)/64; Bitmap*r=uf_bm_new(a->len); UF_PROTECT(&r); for(uint64_t i=0;i<w;i++)r->words[i]=a->words[i]|b->words[i]; UF_UNPROTECT(); pushp(cx,r); }
+static void op_vnot(Ctx*cx){ Cell h=pop(cx); Bitmap*a=uf_bm_norm(&h,"VNOT"); uint64_t w=(a->len+63)/64; Bitmap*r=uf_bm_new(a->len); UF_PROTECT(&r); for(uint64_t i=0;i<w;i++)r->words[i]=~a->words[i]; if(a->len&63)r->words[w-1]&=(1ULL<<(a->len&63))-1; UF_UNPROTECT(); pushp(cx,r); }
+static void op_vcount(Ctx*cx){ Cell h=pop(cx); Bitmap*a=uf_bm_norm(&h,"VCOUNT"); uint64_t w=(a->len+63)/64,n=0; for(uint64_t i=0;i<w;i++)n+=(uint64_t)__builtin_popcountll(a->words[i]); pushi(cx,(int64_t)n); }
 /* VGATHER: arr bm -> arr' (keep set-bit elements) */
 static void op_vgather(Ctx*cx){
-  Cell h2=pop(cx),h1=pop(cx); Hdr*a=uf_vcheck(h1,"VGATHER"); Bitmap*b=uf_bm_check(h2);
+  Cell h2=pop(cx),h1=pop(cx); Hdr*a=uf_vec_norm(&h1,"VGATHER"); UF_PROTECT((void**)(void*)&h1.i); Bitmap*b=uf_bm_norm(&h2,"VGATHER"); UF_PROTECT((void**)(void*)&h2.i);
   if(a->len!=b->len)die("VGATHER: length mismatch");
-  UF_PROTECT((void**)(void*)&h1.i);
   uint64_t n=0; for(uint64_t i=0;i<a->len;i++) if((b->words[i>>6]>>(i&63))&1)n++;
   Hdr*r=uf_arr_like(a,n); UF_PROTECT(&r);
   uint64_t k=0; for(uint64_t i=0;i<a->len;i++) if((b->words[i>>6]>>(i&63))&1)uf_put_el(r,k++,uf_el(a,i));
-  UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r);
+  UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r);
 }
 /* reductions */
-static void op_vsum(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VSUM");
+static void op_vsum(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vec_norm(&h,"VSUM");
 #ifdef NK_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
      &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
@@ -3284,21 +3387,21 @@ static void op_vsum(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VSUM");
 #endif
  if(a->ety==1){ const double*A=(const double*)uf_data(a); double s=0; for(uint64_t i=0;i<a->len;i++)s+=A[i]; pushf(cx,s); return; }
  double s=0; for(uint64_t i=0;i<a->len;i++)s+=uf_el(a,i); if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
-static void op_vmean(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMEAN"); if(!a->len)die("VMEAN: empty arr");
+static void op_vmean(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vec_norm(&h,"VMEAN"); if(!a->len)die("VMEAN: empty arr");
 #ifdef NK_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
      &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
     double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rsum",&_r)){ pushf(cx,_r/(double)a->len); return; } }
 #endif
  double s=0; for(uint64_t i=0;i<a->len;i++)s+=uf_el(a,i); pushf(cx,s/(double)a->len); }
-static void op_vmin(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMIN"); if(!a->len)die("VMIN: empty arr");
+static void op_vmin(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vec_norm(&h,"VMIN"); if(!a->len)die("VMIN: empty arr");
 #ifdef NK_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
      &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
     double _r; if(uf_gpu_reduce((const double*)uf_data(a),a->len,"rmin",&_r)){ pushf(cx,_r); return; } }
 #endif
  double s=uf_el(a,0); for(uint64_t i=1;i<a->len;i++){double d=uf_el(a,i);if(d<s)s=d;} if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
-static void op_vmax(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMAX"); if(!a->len)die("VMAX: empty arr");
+static void op_vmax(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vec_norm(&h,"VMAX"); if(!a->len)die("VMAX: empty arr");
 #ifdef NK_GPU
   if(a->ety==1&&a->len>=(uint64_t)uf_gpu_min()
      &&!(uf_dev_is_auto()&&!uf_vk_ready&&a->len<(uint64_t)uf_gpu_arith_min())){
@@ -3307,31 +3410,32 @@ static void op_vmax(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VMAX"); if(!a->l
  double s=uf_el(a,0); for(uint64_t i=1;i<a->len;i++){double d=uf_el(a,i);if(d>s)s=d;} if(a->ety==1)pushf(cx,s); else pushi(cx,(int64_t)s); }
 /* VMAP: arr fn_addr -> arr' ; VFOLD: arr init fn_addr -> acc */
 static void op_vmap(Ctx*cx){
-  Cell f=pop(cx),h=pop(cx); Hdr*a=uf_vcheck(h,"VMAP");
+  Cell f=pop(cx),h=pop(cx); Hdr*a=uf_vec_norm(&h,"VMAP");
+  UF_PROTECT((void**)(void*)&h.i);
   Hdr*r=uf_arr_like(a,a->len); UF_PROTECT(&r);
   for(uint64_t i=0;i<a->len;i++){
     if(a->ety==1)pushf(cx,uf_el(a,i)); else pushi(cx,(int64_t)uf_el(a,i));
     uf_call_addr(cx,(const void*)f.i,0,-1,1);
     uf_put_el(r,i,uf_f(pop(cx)));
   }
-  UF_UNPROTECT(); pushp(cx,r);
+  UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r);
 }
 static void op_vfold(Ctx*cx){
   Cell f=pop(cx),acc=pop(cx),h=pop(cx);
-  Hdr*a=uf_handle(h,"VFOLD");
-  if(a->tag==HT_DYN){ /* list input: convert to a float tensor once */ Dyn*d=(Dyn*)a; Hdr*t=(Hdr*)uf_gc_alloc(sizeof(Hdr)+d->len*8,0); t->tag=HT_TENSOR; t->len=d->len; t->esz=8; t->ety=1; UF_PROTECT((void**)(void*)&t); for(uint64_t q=0;q<d->len;q++){ ((double*)t->data)[q]=uf_f(d->data[q]); } UF_UNPROTECT(); a=t; }
-  else if(a->tag!=HT_ARR&&a->tag!=HT_TENSOR&&a->tag!=HT_MAT)die("vector op: not an arr");
+  Hdr*a=uf_vec_norm(&h,"VFOLD");
+  UF_PROTECT((void**)(void*)&h.i);
   for(uint64_t i=0;i<a->len;i++){
     pushc(cx,acc);
     if(a->ety==1)pushf(cx,uf_el(a,i)); else pushi(cx,(int64_t)uf_el(a,i));
     uf_call_addr(cx,(const void*)f.i,0,-1,2);
     acc=pop(cx);
   }
+  UF_UNPROTECT();
   pushc(cx,acc);
 }
 /* VARGSORT: arr -> idx_arr (stable) */
 static void op_vargsort(Ctx*cx){
-  Cell h=pop(cx); Hdr*a=uf_vcheck(h,"VARGSORT");
+  Cell h=pop(cx); Hdr*a=uf_vec_norm(&h,"VARGSORT");
   uint64_t n=a->len;
   int64_t* idx=(int64_t*)uf_alloc((n?n:1)*8,0); int64_t* tmp=(int64_t*)uf_alloc((n?n:1)*8,0);
   for(uint64_t i=0;i<n;i++)idx[i]=(int64_t)i;
@@ -3352,7 +3456,7 @@ static void op_vargsort(Ctx*cx){
 }
 /* VSEARCHSORTED: sorted_arr val -> idx (insertion point) */
 static void op_vsearchsorted(Ctx*cx){
-  Cell v=pop(cx),h=pop(cx); Hdr*a=uf_vcheck(h,"VSEARCHSORTED");
+  Cell v=pop(cx),h=pop(cx); Hdr*a=uf_vec_norm(&h,"VSEARCHSORTED");
   double d=uf_f(v); uint64_t lo=0,hi=a->len;
   while(lo<hi){ uint64_t mid=(lo+hi)/2; if(uf_el(a,mid)<d)lo=mid+1; else hi=mid; }
   pushi(cx,(int64_t)lo);
@@ -3360,11 +3464,13 @@ static void op_vsearchsorted(Ctx*cx){
 /* VWHERE: arr arr bm -> arr' (bit set -> first arr, else second) */
 static void op_vwhere(Ctx*cx){
   Cell h3=pop(cx),h2=pop(cx),h1=pop(cx);
-  Hdr*a=uf_vcheck(h1,"VWHERE"); Hdr*b=uf_vcheck(h2,"VWHERE"); Bitmap*m=uf_bm_check(h3);
+  Hdr*a=uf_vec_norm(&h1,"VWHERE"); UF_PROTECT((void**)(void*)&h1.i);
+  Hdr*b=uf_vec_norm(&h2,"VWHERE"); UF_PROTECT((void**)(void*)&h2.i);
+  Bitmap*m=uf_bm_norm(&h3,"VWHERE"); UF_PROTECT((void**)(void*)&h3.i);
   if(a->len!=b->len||a->len!=m->len)die("VWHERE: length mismatch");
   Hdr*r=uf_arr_like(a,a->len); UF_PROTECT(&r);
   for(uint64_t i=0;i<a->len;i++) uf_put_el(r,i, ((m->words[i>>6]>>(i&63))&1)?uf_el(a,i):uf_el(b,i));
-  UF_UNPROTECT(); pushp(cx,r);
+  UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT(); pushp(cx,r);
 }
 
 /* ================= data ops: group/agg/unique/flat/chunk ================= */

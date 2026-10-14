@@ -20,6 +20,12 @@ Current revision: **v15.1**. Not backward compatible with v15 (stores pass
 through everywhere — a shared store no longer consumes its value, removing
 the local/shared stack-effect asymmetry; destructuring is explicit `#` — a
 bind run after a multi-return op is now a plain store of the whole value).
+v15.1 also uniformizes **vector-op operand coercion** (a collection operand
+normalizes to a typed array at the op boundary — see "Collection coercion")
+and **retires the eight arithmetic alias opcodes** `scalar_add`/`scalar_sub`/
+`scalar_mul`/`scalar_div` and `array_add`/`array_sub`/`array_mul`/
+`array_div` (slots 128–135), which were parser aliases of the core
+`add`/`sub`/`mul`/`div`.
 Per-operation history is in `SPEC_HISTORY.md`; this document is the current
 specification only. Opcode totals are kept in lockstep with
 `comp/src/lex.rs` by a compiler unit test (`comp/src/spec_contract.rs`), so
@@ -45,7 +51,7 @@ auto-detection).
 
 | space | range | contents |
 |-------|-------|----------|
-| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 204 live (201 with dense glyphs; `cap`/`caps`/`consume` are text-only) |
+| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 196 live (193 with dense glyphs; `cap`/`caps`/`consume` are text-only) |
 | v-space | U+1F941+ interleaved with other emoji | variable/label name atoms, runs fold |
 | l-space | U+1F130+ (enclosed alphanumerics) | base-64 digit atoms (self-evaluating numbers) |
 | delimiters | U+13100..U+13108 | chat-template delimiters, stripped pre-compilation |
@@ -396,7 +402,7 @@ The same applies to `tensor`. Elements are coerced to the element type
 
 ## Opcode reference
 
-222 slots (0..221); **204 live opcodes**. Each live opcode except the
+222 slots (0..221); **196 live opcodes**. Each live opcode except the
 text-only `cap`/`caps`/`consume` (no dense glyph — they cannot be written in
 dense source) has a unique dense glyph; the text mnemonics are the
 full-word/`snake_case` names listed below. Glyph assignments are 1:1 and
@@ -531,23 +537,26 @@ outside a loop are compile errors.
 | 167 | 🤳 | `flatten` | list → list' | flatten one level |
 | 168 | 🌪 | `chunk` | seq size → list | split into size-element pieces (last may be short); size<1: dies |
 
-### Vector ops (128–154, plus 169–171, 185–186, 201, 214)
+### Vector ops (136–154, plus 169–171, 185–186, 201, 214)
 
-Operate on arr/tensor of numeric element type; autovectorized C loops; results
-freshly allocated; die on non-arr input. A **bitmap** (tag 14) is a dense
-LSB-first u64-word array — the mask currency of the `scalar_*`/`array_*`
-family.
+Operate on typed arrays of numeric element type; autovectorized C loops;
+results freshly allocated. **Operand normalization (v15.1)**: a collection
+operand is normalized to a typed array at the op boundary — a list becomes a
+typed array (int elements stay int unless one forces float: float tag,
+non-integral numeric form, or no numeric form, which coerces to NaN as in
+scalar arithmetic), a bitmap becomes the int array of its set-bit indices,
+and a scalar or string operand becomes a one-element array by the scalar
+numeric-coercion table. An element with no numeric form (dict, obj, chan,
+multi-element list, raw pointer) dies naming the index; a non-collection
+operand without a numeric form dies. `array_get`/`array_set` are exempt —
+they are the raw, validation-free accessors. Bitmap ops (`bitmap_and/or/
+not/count`, and the mask slot of `array_gather`/`array_where`) coerce
+list/arr/tensor operands to bitmaps via element truthiness. A **bitmap**
+(tag 14) is a dense LSB-first u64-word array — the mask currency of the
+`scalar_*`/`array_*` family.
 
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
-| 128 | 😛 | `scalar_add` | arr scalar → arr' | |
-| 129 | 🚧 | `scalar_sub` | arr scalar → arr' | |
-| 130 | 🤪 | `scalar_mul` | arr scalar → arr' | |
-| 131 | 🌟 | `scalar_div` | arr scalar → arr' | scalar 0: dies |
-| 132 | 😜 | `array_add` | arr arr → arr' | length mismatch: dies |
-| 133 | 🚨 | `array_sub` | arr arr → arr' | |
-| 134 | 🤫 | `array_mul` | arr arr → arr' | |
-| 135 | 🌠 | `array_div` | arr arr → arr' | any 0 divisor: dies |
 | 136 | 😝 | `array_max` | arr arr → arr' | elementwise max |
 | 201 | 😭 | `array_min` | arr arr → arr' | elementwise min |
 | 137 | 🚩 | `scalar_eq` | arr scalar → bitmap | |
@@ -1112,9 +1121,17 @@ a fresh `Ctx` and are unaffected.
 
 ### Collection coercion
 
-Vector ops expecting `arr` coerce lists, dict values, strings (char codes),
-bitmaps (set-bit indices), and scalars (single-element array). Bitmap ops coerce
-collection elements to bits via truthiness.
+Vector ops and the polymorphic core arithmetic (`add`/`sub`/`mul`/`div`, in
+every elementwise/broadcast form) normalize a collection operand to a typed
+array at the op boundary: a **list** becomes a typed array — int elements
+stay int unless some element forces float (float tag, non-integral numeric
+form, or no numeric form, which coerces to NaN exactly as in scalar
+arithmetic) — a **bitmap** becomes the int array of its set-bit indices, and
+a **scalar or string** operand becomes a one-element array by the scalar
+numeric-coercion table (`"123" sum` → `123`). `array_get`/`array_set` are
+exempt (raw, validation-free access). Bitmap ops coerce list/arr/tensor
+operands to bitmaps via element truthiness. Conversion is one O(n) copy per
+op — for hot chains convert once explicitly with `list type array`.
 
 ### When coercion dies
 
@@ -1122,7 +1139,14 @@ Only when the result is genuinely undefined, never on input type:
 
 - Integer truncation of `NaN` or `Infinity` (`div`, `rem`).
 - `mean` / `min` / `max` on empty collection.
-- Length mismatch in elementwise ops (`array_add`, etc.).
+- Length mismatch in elementwise ops (core `add`/`sub`/`mul`/`div`,
+  `array_max`/`array_min`, `array_where`).
+- A vector-op **element** that is a dict, obj, chan, multi-element list, or
+  raw pointer (no numeric form at all) — the die names the index and the
+  remedy; a non-numeric **string** element instead coerces to a NaN float
+  element, mirroring scalar arithmetic.
+- A vector-op **operand** with no numeric form (dict, obj, chan, bloom,
+  iterator, raw pointer).
 
 ## Strictness
 
@@ -1471,7 +1495,7 @@ environment.
 
 ## Totals
 
-222 opcode slots (0..221); **204 live opcodes**. 201 of them have unique
+222 opcode slots (0..221); **196 live opcodes**. 193 of them have unique
 dense glyph codepoints (`cap`/`caps`/`consume` are text-only).
 
 ## Non-goals
@@ -1668,9 +1692,11 @@ The core arithmetic ops are polymorphic by operand type:
 Shape/dim mismatches die with the dims in the message. `sum`/`mean`/`min`/
 `max` reduce matrices flat; `sqrt` applies elementwise to arrays/tensors.
 `transpose` (214): `mat → mat'` (swaps rows/cols; dies on non-matrix).
-`scalar_add/sub/mul/div` and `array_add/sub/mul/div` are aliases of
-the core ops. `mul` on two equal-length 1-D arrays is
-elementwise, **not** a dot product (use `mul` then `sum`).
+(v15.1 retired the `scalar_add/sub/mul/div` and `array_add/sub/mul/div`
+aliases of the core ops — slots 128–135 — the core ops are themselves
+polymorphic over scalar, broadcast, and elementwise forms, and list/bitmap
+operands now normalize through the same boundary.) `mul` on two equal-length
+1-D arrays is elementwise, **not** a dot product (use `mul` then `sum`).
 
 ## GPU compute offloading (Vulkan)
 

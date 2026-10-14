@@ -114,6 +114,7 @@ const SPECS = [
   ["comp/tests/t17_strict.n", {}],
   ["comp/tests/t18_debug.n", {}],
   ["comp/tests/t19_checkfail.n", {}],
+  ["comp/tests/t20_veccoerce.n", {}],
   // examples: repo example programs
   ["examples/hello.n", {}],
   ["examples/fib.n", {}],

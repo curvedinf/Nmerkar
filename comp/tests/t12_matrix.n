@@ -43,11 +43,10 @@ x 1 1.0 set
 x 2 1.0 set
 "m*x: " print m x mul print
 
-; --- elementwise + broadcast (aliases still work) ---
+; --- elementwise + broadcast (v15.1: the scalar-/array-prefixed aliases are retired; core ops coerce) ---
 "m+m: " print m m add print
 "m*2: " print m 2.0 mul print
-"scalar_mul alias: " print m 2.0 scalar_mul print
-"array_add alias: " print
+"elementwise u+v: " print
 4 float tensor u!
 u 0 9.0 set
 u 1 9.0 set
@@ -58,8 +57,7 @@ v 0 1.0 set
 v 1 1.0 set
 v 2 1.0 set
 v 3 1.0 set
-"u+v: " print u v array_add print
-"u+v (core add): " print u v add print
+"u+v: " print u v add print
 
 ; --- reductions over matrices ---
 "sum(m): " print m sum print

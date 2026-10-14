@@ -74,68 +74,9 @@ fn gate_op(name: &str, caps: &Caps, line: u32) {
     }
 }
 
-// v12: destructuring bind helpers
-fn is_multi_return(ins: Option<&Ins>, q: &VecDeque<(u32, Tok)>) -> bool {
-    match ins {
-        // v13: a bind-run of >=2 (the current bind plus at least one more
-        // in the queue) after a `_call` destructures the callee's returned
-        // list (multi-value ret); a lone trailing bind stays plain
-        Some(Ins::Call(_)) => {
-            let mut n = 0usize;
-            for t in q.iter().take(8) {
-                if is_bind(t) {
-                    n += 1;
-                } else {
-                    break;
-                }
-            }
-            n >= 1
-        }
-        _ => matches!(ins, Some(Ins::Simple(name)) if matches!(*name,
-            "op_sh" | "op_try" | "op_retry" | "op_match" | "op_scan" | "op_next")),
-    }
-}
-fn is_bind(t: &(u32, Tok)) -> bool {
-    matches!(&t.1, Tok::LocalSet(_) | Tok::SetV(_) | Tok::Discard)
-}
-#[derive(Clone)]
-enum Bind { Local(String), Global(String), Discard }
-fn collect_destructure(first: Bind, q: &mut VecDeque<(u32, Tok)>) -> Vec<Bind> {
-    let mut pattern = vec![first];
-    while let Some(t2) = q.front() {
-        if !is_bind(t2) { break; }
-        match q.pop_front().unwrap().1 {
-            Tok::LocalSet(name) => pattern.push(Bind::Local(name)),
-            Tok::SetV(name) => pattern.push(Bind::Global(name)),
-            Tok::Discard => pattern.push(Bind::Discard),
-            _ => break,
-        }
-    }
-    pattern
-}
 fn pi(p: &mut Parsed, ins: Ins, line: u32) {
     p.ins.push(ins);
     p.ins_lines.push(line);
-}
-fn emit_destructure(pattern: Vec<Bind>, p: &mut Parsed, dtemp_ctr: &mut usize, line: u32) {
-    let temp = format!("ufdt{}", *dtemp_ctr);
-    *dtemp_ctr += 1;
-    pi(p, Ins::LocalSet(temp.clone()), line);
-    for (i, bind) in pattern.iter().enumerate() {
-        pi(p, Ins::LocalGet(temp.clone()), line);
-        pi(p, Ins::PushI(i as i64), line);
-        pi(p, Ins::Simple("op_getq"), line);
-        match bind {
-            Bind::Local(name) => pi(p, Ins::LocalSet(name.clone()), line),
-            Bind::Global(name) => {
-                if !p.vars.contains(name) {
-                    p.vars.push(name.clone());
-                }
-                pi(p, Ins::SetV(name.clone()), line);
-            }
-            Bind::Discard => {}
-        }
-    }
 }
 
 // v13: `ret` is a prefix keyword whose operand is the following expression
@@ -258,6 +199,8 @@ impl<'a> ParseCtx<'a> {
                     pi(&mut self.p, Ins::LocalGet(n), line);
                 }
                 Tok::Discard => self.parse_discard(line),
+                Tok::Destr(n, k) => self.parse_destructure(Some((n, k)), line),
+                Tok::DestrDiscard => self.parse_destructure(None, line),
                 Tok::IncLocal(n) => self.parse_rmw(n, false, true, line),
                 Tok::AddLocal(n) => self.parse_rmw(n, false, false, line),
                 Tok::IncGlobal(n) => self.parse_rmw(n, true, true, line),
@@ -377,38 +320,72 @@ impl<'a> ParseCtx<'a> {
         }
     }
     fn parse_set_global(&mut self, n: String, line: u32) {
-        if is_multi_return(self.p.ins.last(), &self.q) {
-            // v12 destructuring bind: ^name! after a multi-return op
-            let pattern = collect_destructure(Bind::Global(n), &mut self.q);
-            emit_destructure(pattern, &mut self.p, &mut self.dtemp_ctr, line);
-        } else {
-            if !self.p.vars.contains(&n) {
-                self.p.vars.push(n.clone());
-            }
-            pi(&mut self.p, Ins::SetV(n), line);
+        if !self.p.vars.contains(&n) {
+            self.p.vars.push(n.clone());
         }
+        pi(&mut self.p, Ins::SetV(n), line);
     }
 
     fn parse_set_local(&mut self, n: String, line: u32) {
         if self.macros.contains_key(&n) {
             user_err!("parse", Some(line), "name '{}' collides with a macro — macros take precedence over implicit loads; rename one", n);
         }
-        if is_multi_return(self.p.ins.last(), &self.q) {
-            // v12 destructuring bind: name! after a multi-return op
-            let pattern = collect_destructure(Bind::Local(n), &mut self.q);
-            emit_destructure(pattern, &mut self.p, &mut self.dtemp_ctr, line);
-        } else {
-            pi(&mut self.p, Ins::LocalSet(n), line);
-        }
+        pi(&mut self.p, Ins::LocalSet(n), line);
     }
 
     fn parse_discard(&mut self, line: u32) {
-        if is_multi_return(self.p.ins.last(), &self.q) {
-            // v12 destructuring bind: leading _! after a multi-return op
-            let pattern = collect_destructure(Bind::Discard, &mut self.q);
-            emit_destructure(pattern, &mut self.p, &mut self.dtemp_ctr, line);
-        } else {
-            user_err!("parse", Some(line), "_! is only valid inside a destructuring bind");
+        user_err!("parse", Some(line), "_! is only valid as a label or task parameter bind (a destructuring discard is _#)");
+    }
+
+    // v15.1: explicit destructure bind run (`x# y#key _#`). The run peeks
+    // the structure on the stack into a hidden temp — the store is
+    // pass-through, so the structure stays on the stack — then each bind
+    // fetches (positional slot i, or a dict key / obj field via GET — a loud
+    // die on non-container, out-of-bounds slot, or missing key/field), binds
+    // it with a pass-through store, and drops the element. Binds consume
+    // what they fetched; the original structure remains. The positional
+    // counter advances only on keyless binds.
+    fn parse_destructure(&mut self, first: Option<(String, Option<String>)>, line: u32) {
+        let mut run: Vec<(String, Option<String>)> = Vec::new();
+        if let Some(b) = first {
+            run.push(b);
+        }
+        while let Some(t2) = self.q.front() {
+            match &t2.1 {
+                Tok::Destr(n, k) => run.push((n.clone(), k.clone())),
+                Tok::DestrDiscard => run.push(("_".to_string(), None)),
+                _ => break,
+            }
+            self.q.pop_front();
+        }
+        let temp = format!("ufdt{}", self.dtemp_ctr);
+        self.dtemp_ctr += 1;
+        pi(&mut self.p, Ins::LocalSet(temp.clone()), line);
+        let mut slot: i64 = 0;
+        for (name, key) in run {
+            if name == "_" {
+                slot += 1;
+                continue;
+            }
+            if self.macros.contains_key(&name) {
+                user_err!("parse", Some(line), "name '{}' collides with a macro — macros take precedence over implicit loads; rename one", name);
+            }
+            pi(&mut self.p, Ins::LocalGet(temp.clone()), line);
+            let keyed = key.is_some();
+            match key {
+                Some(k) => {
+                    let idx = self.p.strings.len();
+                    self.p.strings.push(k);
+                    pi(&mut self.p, Ins::PushS(idx), line);
+                }
+                None => pi(&mut self.p, Ins::PushI(slot), line),
+            }
+            pi(&mut self.p, simple_ins("GET"), line);
+            pi(&mut self.p, Ins::LocalSet(name), line);
+            pi(&mut self.p, simple_ins("CONSUME"), line);
+            if !keyed {
+                slot += 1;
+            }
         }
     }
 
@@ -1541,7 +1518,7 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "LTE" => "op_lte",
         "GTE" => "op_gte",
         "SHUTDOWN" => "op_shutdown",
-        "DROP" => "op_drop",
+        "CONSUME" => "op_drop",
         "SHR" => "op_shr",
         "INC" => "op_inc",
         "DEC" => "op_dec",
@@ -2415,18 +2392,34 @@ pub fn check_strictness(p: &mut Parsed) {
                 }
                 Ins::SetV(n) => {
                     let key = format!("S:{}", n);
-                    match stack.as_mut() {
-                        Some(s) => match s.pop() {
-                            Some(e) => {
-                                if e.strict {
-                                    vars.insert(key, true);
-                                } else {
-                                    vars.remove(&key);
+                    if p.param_pcs.contains_key(&i) {
+                        // guarded param pop: consumes one incoming cell
+                        match stack.as_mut() {
+                            Some(s) => match s.pop() {
+                                Some(e) => {
+                                    if e.strict {
+                                        vars.insert(key, true);
+                                    } else {
+                                        vars.remove(&key);
+                                    }
                                 }
+                                None => stack = None,
+                            },
+                            None => {}
+                        }
+                    } else if let Some(s) = stack.as_mut() {
+                        // v15.1: shared stores pass through — the value stays
+                        // on the abstract stack (peek, taint, leave)
+                        if let Some(top) = s.last_mut() {
+                            if top.strict {
+                                vars.insert(key.clone(), true);
+                            } else {
+                                vars.remove(&key);
                             }
-                            None => stack = None,
-                        },
-                        None => {}
+                            if !top.prov.contains(&key) {
+                                top.prov.push(key);
+                            }
+                        }
                     }
                 }
                 Ins::GetV(n) => {

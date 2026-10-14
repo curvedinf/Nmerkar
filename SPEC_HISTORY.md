@@ -6,6 +6,38 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## v15.1 — 2026-10-14 (uniform pass-through stores + `#` destructuring)
+
+- `setv` (33, 🌆) — changed: stores pass through **everywhere** — a shared
+  store now leaves its value on the hidden stack exactly like a local store
+  (the v14/v15 shared-stores-consume asymmetry is removed; `x!` has one
+  stack effect in every scope). Shared RMW (`x++`/`x+=`) already pushed its
+  result and is unchanged.
+- Destructuring — changed: bind runs after multi-return ops are **plain
+  stores** (the v12 adjacency heuristic — `shell`/`try`/`retry`/
+  `regex_match`/`scan`/`next` + any bind, `_call` + ≥2 binds — is removed).
+  Destructuring is now the explicit `x#` (positional slot), `x#key`
+  (dict key / obj field, identifier keys only, attached, ASCII `#` in both
+  encodings), `_#` (discard slot). The run peeks the structure into a temp
+  (the store passes through, so the structure **stays on the stack**),
+  fetches each part via GET (dies loudly on non-container, OOB slot, or
+  missing key/field — the old getq 0-fill of excess binds is gone), binds
+  it, and drops the element; the run is depth-neutral. No new opcodes —
+  the expansion is parser-synthesized from existing instructions.
+- `_!` — changed: only a label/task parameter bind; a destructuring
+  discard is `_#` (a stray `_!` is a compile error with the remedy).
+- `consume` (83) — added (text-only, no dense glyph): consumes the top
+  value. Slot 83 was retired in place as `ENDT` since v10; its reserved
+  glyph is freed. Uniform pass-through stores need an explicit way to
+  consume a leftover mid-expression (a store between argument pushes
+  splices into the argument window) — the shared store's consume was the
+  language's only sink. Named `consume` (not Forth's `drop`) to keep the
+  ops-consume-their-inputs model.
+- Known-output effects: code that relied on shared-store consume (e.g.
+  consuming a prior op's residue) now sees the value remain; t06_vec's
+  elementwise sums become the mathematically correct values (the old
+  outputs consumed a stale for-loop count cell).
+
 ## 2026-09-20 (post-v15) — binary right shift
 
 - `shr` (10, 🚃) — changed from unary shift-by-one to binary logical

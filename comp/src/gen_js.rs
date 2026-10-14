@@ -374,10 +374,12 @@ fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
                     Some(&format!("rt.G[\"{}\"]", v)),
                 );
             } else {
+                // v15.1: pass-through, mirroring LocalSetI — pop, store the
+                // shared cell, push the value back onto the inline buffer
                 o.push_str("if(iv.length)st.push.apply(st,iv.splice(0));\n");
                 o.push_str(&format!(
-                    "var _s{}=RT.pop(rt,\"\");rt.G[\"{}\"]=_s{};\n",
-                    i, v, i
+                    "var _s{}=RT.pop(rt,\"\");rt.G[\"{}\"]=_s{};iv.push(_s{});\n",
+                    i, v, i, i
                 ));
             }
         }

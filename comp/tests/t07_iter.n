@@ -4,14 +4,14 @@
 0 10 range iter 'ev iter_filter collect length print
 ; next
 0 3 range iter it!
-it next v! m!
+it next v# m#
 v print
 m print
-it next v! m!
+it next v# m#
 v print
 m print
-it next _! _!
-it next v! m!
+it next _# _#
+it next v# m#
 v print
 m print
 ; dict iter yields keys
@@ -27,14 +27,14 @@ j "s" get print
 j to_json print
 "[1.5, 2]" parse_json 0 get print
 ; try / retry
-'good try r! ok!
+'good try r# ok#
 r print
 ok print
-'bad try r! ok!
+'bad try r# ok#
 r print
 ok print
 0 cnt!
-2 'flaky retry r! ok!
+2 'flaky retry r# ok#
 r print
 ok print
 cnt print

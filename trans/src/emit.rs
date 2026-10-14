@@ -234,7 +234,9 @@ impl Emitter {
             buf.code.push_str("rv! 1 fr! 0 ret\n");
             Ok(true)
         } else {
-            buf.code.push_str("rv! 1 fr!\n");
+            // v15.1: stores pass through — the value and the flag stay on the
+            // stack; consume both (they live on in rv/fr).
+            buf.code.push_str("rv! 1 fr! consume consume\n");
             Ok(false)
         }
     }
@@ -462,10 +464,10 @@ impl Emitter {
             ExprKind::Post { name, delta } => {
                 let slot = self.slot_of(ctx, name, e.line, e.col)?;
                 let op = if *delta > 0 { "add" } else { "sub" };
-                // Net one cell (the old value): local stores pass through, so
-                // the increment's store would leak a second cell under the
-                // result — sink it into frv (free outside the epilogue).
-                buf.code.push_str(&format!("{slot} pt! {slot} 1 {op} {slot}! frv! pt "));
+                // Net one cell (the old value). v15.1: stores pass through
+                // (local and shared alike), so the increment's store leaves
+                // the new value on the stack — discard it explicitly.
+                buf.code.push_str(&format!("{slot} {slot} 1 {op} {slot}! consume "));
             }
             ExprKind::Call { name, args } => {
                 // malloc/free are Nmerkar opcodes (reserved words), not

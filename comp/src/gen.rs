@@ -1857,13 +1857,15 @@ pub fn emit_range(
                         VType::Int => {
                             let rhs = if t.ty == VType::Int { t.expr.clone() } else { format!("uf_i({})", cell_of(&t)) };
                             e.push_str(&format!("{}={};", expr, rhs));
-                            let _ = is_param_bind;
+                            // v16: pass-through — the stored value stays live
+                            vpush(&mut e, &mut vstack, &mut vtmp, expr, VType::Int);
                             o.push_str(&e);
                             continue;
                         }
                         VType::Float => {
                             e.push_str(&format!("{}={};", expr, f64_expr(&t)));
-                            let _ = is_param_bind;
+                            // v16: pass-through — the stored value stays live
+                            vpush(&mut e, &mut vstack, &mut vtmp, expr, VType::Float);
                             o.push_str(&e);
                             continue;
                         }
@@ -1883,12 +1885,12 @@ pub fn emit_range(
                     "Cell {}={};uf_sh_set(&var_{},{});",
                     tmp, cell_expr, v, tmp
                 ));
-                // v14: shared stores CONSUME their value (not pass-through).
-                // Atomic-cell writes are not free-floating stack values:
-                // leaving them on the vstack let the next op (notably
-                // AtomicAdd's delta pop) consume a stale cell, corrupting
-                // RMW chains. Param binds also consume.
-                let _ = is_param_bind;
+                // v15.1: stores pass through everywhere (local and shared
+                // alike). The stored value stays live as the operand; param
+                // binds (param_pcs) still consume.
+                if !is_param_bind {
+                    vstack.push(t);
+                }
             }
             Ins::GetV(v) => {
                 // Loop-hoisted snapshot: the enclosing non-escapable while/for

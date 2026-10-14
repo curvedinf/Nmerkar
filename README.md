@@ -140,25 +140,21 @@ leaves its result for the next operation. You never manipulate the stack —
 values reach an operation from literals, named variables, or the previous
 operation's result. `3 4 add print` prints `7`.
 
-**2. A local store passes its value through.** `d!` stores into a local
-variable *and* leaves the value on the stack — it does not consume it. The
-classic bug is forgetting the leftover operand:
+**2. Every store passes its value through.** `d!` stores into the variable
+*and* leaves the value on the stack — local or shared alike, one token, one
+effect. The value flows on; a leftover below never disturbs later lines
+(operations read from the top, and bodies drain at `ret`). Square with
+`5 3 sub d! d mul` — the pass-through *is* the operand. One caution: don't
+place a store *between* pushing a call's arguments — the leftover splices
+into the argument window (`100 3 x! 5 _call add2` passes 3 and 5, not 100
+and 5). Keep side effects on their own lines, or `consume` the leftover.
 
-```nmerkar
-5 3 sub d!      ; d = 2 — and the 2 is STILL an operand
-d d mul         ; leaves [2, 4]: the original 2 sits under the square
-add print       ; prints 6 — the leftover 2 joined the addition
-```
-
-Store-then-load is not "use the variable": after `d!`, the value is already
-there. Square with `5 3 sub d! d mul` (the pass-through *is* the operand),
-or consume it deliberately.
-
-**3. A shared store consumes.** A variable declared by a top-level
-assignment is shared (thread-safe, atomic). Inside labels, `total!` pops the
-value — it does *not* pass through — while a bare `total` loads it. The
-local/shared asymmetry is deliberate: locals chain within an expression;
-shared cells never leak operands across threads.
+**3. Destructuring is explicit `#`.** `result out# err# code#` binds the
+parts of the structure on the stack; the structure itself stays there.
+`x#` takes the next positional slot, `x#key` takes a dict key or object
+field, `_#` skips a slot. A plain `x!` always stores the *whole* value —
+`!` never reaches inside. A bind that cannot resolve (non-container,
+out-of-bounds slot, missing key) dies at its source line.
 
 **4. `set` returns the stored element, not the container.** `nums 1 99 set`
 mutates `nums` in place and leaves `99`, so binding its result captures the

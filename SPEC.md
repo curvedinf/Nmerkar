@@ -16,13 +16,14 @@ garbage-collected (scripts never `free` managed objects).
 
 ## Revision status
 
-Current revision: **v15**. Not backward compatible with v14.1 (bare names are
-implicit loads — the `@` varget suffix is gone; dense label defs need the 🏷
-marker; dense struct immediates use the 📏 📍 📦 🎭 tag glyphs). Per-operation
-history is in `SPEC_HISTORY.md`; this document is the current specification
-only. Opcode totals are kept in lockstep with `comp/src/lex.rs` by a compiler
-unit test (`comp/src/spec_contract.rs`), so the counts in this file cannot
-drift from the implementation silently.
+Current revision: **v15.1**. Not backward compatible with v15 (stores pass
+through everywhere — a shared store no longer consumes its value, removing
+the local/shared stack-effect asymmetry; destructuring is explicit `#` — a
+bind run after a multi-return op is now a plain store of the whole value).
+Per-operation history is in `SPEC_HISTORY.md`; this document is the current
+specification only. Opcode totals are kept in lockstep with
+`comp/src/lex.rs` by a compiler unit test (`comp/src/spec_contract.rs`), so
+the counts in this file cannot drift from the implementation silently.
 
 ## Source encodings
 
@@ -44,7 +45,7 @@ auto-detection).
 
 | space | range | contents |
 |-------|-------|----------|
-| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 203 live (201 with dense glyphs; `cap`/`caps` are text-only) |
+| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 204 live (201 with dense glyphs; `cap`/`caps`/`consume` are text-only) |
 | v-space | U+1F941+ interleaved with other emoji | variable/label name atoms, runs fold |
 | l-space | U+1F130+ (enclosed alphanumerics) | base-64 digit atoms (self-evaluating numbers) |
 | delimiters | U+13100..U+13108 | chat-template delimiters, stripped pre-compilation |
@@ -92,9 +93,11 @@ l-run; elsewhere it begins an ASCII identifier.
 A run of v-space atoms folds into one name. Whitespace must separate two
 adjacent v-runs meant to be distinct.
 
-Variable semantics (v15 — implicit loads):
-- `<name>!` — store into **local** variable (call-scoped, fresh frame per CALL)
-  and leave the value on the hidden stack for chaining.
+Variable semantics (v15.1 — uniform pass-through):
+- `<name>!` — store into a **local** (call-scoped, fresh frame per CALL) or
+  **shared** variable and leave the value on the hidden stack for chaining.
+  The store passes through in both scopes (v15.1 removed the shared-consume
+  asymmetry of v14/v15).
 - A bare `<name>` — **implicit load**: pushes the local (or shared) variable.
   The v14 `<name>@` varget suffix is removed; writing it is a lex error.
 - A name assigned in a TU's straight-line top level (before its first label)
@@ -150,8 +153,7 @@ the first non-binding token ends the parameter list.
   all ops; dynamic regions are poisoned conservatively); dynamically-shaped
   sites fall back to a runtime check that dies naming the label, parameter,
   and declared arity. Excess cells are
-  silently discarded after the bindings are satisfied. Destructuring binds after
-  multi-value returns may still receive `null` for excess slots (a different mechanism).
+  silently discarded after the bindings are satisfied.
 - Structured ops pass values implicitly: `5 'body for` pushes the loop index,
   and a `body: i!` binding consumes it.
 
@@ -173,8 +175,8 @@ exempt.
 
 - `ret expr` — return the single value the operand expression leaves.
 - `ret a b c` — the operand nets three values; they are combined into a list
-  and that list is returned. The caller destructures it with a bind list:
-  `"cmd" _call run_cmd out! err! code!`.
+  and that list is returned. The caller destructures it with a `#` bind run:
+  `"cmd" _call run_cmd out# err# code#`.
 - Bare `ret` — return `null`; if the body pushed onto the real
   stack (a value sits above the frame base), that top cell is returned instead.
 
@@ -204,6 +206,44 @@ foo:
 
 Recursion uses the same call stack as structured control flow; a label calls
 itself the same way it calls any other label.
+
+## Destructuring (`#`)
+
+`name#` is an explicit destructure bind. A run of consecutive `#` tokens
+peeks the structure on top of the hidden stack, binds its parts, and leaves
+the structure itself on the stack:
+
+- `x#` — **positional**: binds the next unfetched slot (a per-run counter
+  advances on each keyless bind, `_#` included).
+- `x#key` — **keyed**: binds the dict key / obj field `key` through the
+  uniform container protocol (`get`). The key is an identifier, attached
+  directly after the `#`, written the same way (ASCII) in both encodings —
+  like the literal brackets.
+- `_#` — discards one positional slot.
+
+Semantics:
+
+- **The structure stays on the stack**; each bind consumes only the value it
+  fetched. The run is depth-neutral: `[1 2 3] a# b# _#` leaves the list
+  itself on the stack with `a`=1, `b`=2. Consume it with `consume` when the
+  structure is not wanted.
+- **Every bind must resolve**: destructuring a non-container, an
+  out-of-bounds slot, or a missing dict key / obj field dies at the source
+  site. Nothing 0-fills or silently misses.
+- **`!` never destructures** (v15.1; the v12 adjacency heuristic — bind runs
+  after `shell`/`try`/`retry`/`regex_match`/`scan`/`next`/`_call` reaching
+  inside — is removed). A bind after any op is a plain pass-through store of
+  the whole value; bind the parts you want with `#`.
+- Positional and keyed binds may mix in one run; keyed binds do not advance
+  the positional counter.
+- Numeric slot selection (`x#2`) and quoted keys are not supported — use
+  `get`.
+
+```
+"cmd" _call run_cmd out# err# code#   ; multi-value ret: [out, err, code]
+d a#bob b#jim c#tom                    ; dict fields (obj fields equally); d stays
+it next v# m#                          ; iterator step: [value, more]
+```
 
 ## Shared variables
 
@@ -238,8 +278,10 @@ body:
   `x += k` compile to a single atomic read-modify-write, so racing increments
   from multiple threads serialize with **no lost updates** — `n` threads doing
   `x++` `k` times each yield exactly `n*k`.
-- **Stores consume.** A shared store (`count!`) pops its value off the hidden
-  stack (it does not pass through like a local store).
+- **Stores pass through.** A shared store (`count!`) leaves its value on the
+  hidden stack exactly like a local store (v15.1 — the v14/v15
+  shared-stores-consume asymmetry is removed; one token, one stack effect,
+  in every scope).
 - **Spawn transparency.** Spawned bodies get a fresh frame; shared vars are the
   way to publish results or counters across threads. They are GC roots and are
   scanned by the collector.
@@ -354,12 +396,13 @@ The same applies to `tensor`. Elements are coerced to the element type
 
 ## Opcode reference
 
-222 slots (0..221); **203 live opcodes**. Each live opcode except the
-text-only `cap`/`caps` (no dense glyph — they cannot be written in dense
-source) has a unique dense glyph; the text mnemonics are the full-word/
-`snake_case` names listed below. Glyph assignments are 1:1 and final in
-`comp/src/lex.rs`. Retired slots are not listed; slot 83 (`ENDT`) is retired
-in place — its glyph is reserved but its mnemonic resolves to nothing.
+222 slots (0..221); **204 live opcodes**. Each live opcode except the
+text-only `cap`/`caps`/`consume` (no dense glyph — they cannot be written in
+dense source) has a unique dense glyph; the text mnemonics are the
+full-word/`snake_case` names listed below. Glyph assignments are 1:1 and
+final in `comp/src/lex.rs`. Retired slots are not listed. (Slot 83, retired
+in place as `ENDT` since v10, is revived as the text-only `consume` in
+v15.1; its formerly reserved glyph is freed.)
 
 ### Core stack, memory, and I/O
 
@@ -389,7 +432,7 @@ in place — its glyph is reserved but its mnemonic resolves to nothing.
 | 27 | 😅 | `_cast` | v type → v' | static cast (immediate type): int/float/ptr/byte/bool, struct id = checked downcast; dies on mismatch |
 | 28 | 🚆 | `macro` | (directive) | `macro name { body }` |
 | 29 | 🤔 | `tensor` | len_or_list type → h | as `array`; 64-aligned |
-| 33 | 🌆 | `setv` | value → value | `<v>!` local (pass-through); shared store consumes |
+| 33 | 🌆 | `setv` | value → value | `<v>!` store, local or shared (pass-through, v15.1) |
 | 34 | 😆 | `getv` | → value | bare `name` — local / shared read (snapshot for shared); v15 removed the `@` suffix spelling |
 | 35 | 🚇 | `_str` | → h | bare `"…"` preferred |
 | 36 | 🤕 | `concat` | a b → h | tag-dispatched: str/arr/list concat |
@@ -411,6 +454,7 @@ in place — its glyph is reserved but its mnemonic resolves to nothing.
 | 53 | 🤙 | `extern` | → address | `extern "symbol"` — global C symbol via `__asm__` |
 | 54 | 🌋 | `print` | v → | type-aware recursive representation; top-level strings print raw |
 | 55 | 😋 | `scan` | fmt → list | fscanf semantics; list holds values followed by count |
+| 83 | | `consume` | v → | consume the top value (text-only — no dense glyph; the v15.1 companion to pass-through stores) |
 | 206 | 🛎 | `entry` | → | marks program entry; implicit jump from pc 0 |
 
 ### Containers
@@ -1159,8 +1203,11 @@ string       := '"' ... '"'
 literal      := '[' token* ']' [<type> ('array' | 'tensor')]
              | '{' token* '}'           ; dict literal; element count must be even
 name         := [a-zA-Z][a-zA-Z0-9_]*    ; must NOT start with '_' (reserved for _-prefixed ops)
-varset       := name ('!' | setv-glyph)       ; local: store and pass through;
-             ; shared (name declared at top level): store and consume
+varset       := name ('!' | setv-glyph)       ; store and pass through
+             ; (local and shared alike — v15.1)
+destructure  := name '#' [key] | '_' '#'      ; v15.1: bind parts of the structure
+             ; on the stack (positional slot, or dict key / obj field);
+             ; the structure itself stays on the stack
 varget       := name                          ; v15: bare name = implicit load
 labeldef     := name ':' [param]*             ; params: name! | _!
              | name labeldef-glyph            ; dense: v-run + 🏷 marker
@@ -1178,10 +1225,12 @@ task         := [<count>] task name ':' token*   ; body must end with ret
 the next statement boundary (label, directive, task, another `ret`, or a
 literal closer). `ret a b c` builds a list from the operand's values.
 
-A sequence of consecutive `varset` tokens after a multi-return op is a
-**destructuring bind**: each `name!` binds the next slot of the returned tuple,
-and `_!` discards a slot. Bind arity need not match tuple length; excess binds
-receive `null` and unbound trailing slots are auto-discarded.
+A run of consecutive `destructure` tokens is a **destructuring bind run**
+(see "Destructuring (`#`)"): each `name#` binds the next positional slot of
+the structure on the stack (or the named dict key / obj field), `_#`
+discards a slot, and the structure itself remains on the stack. Every bind
+must resolve or the program dies at the site. `_!` is only a label or task
+parameter bind.
 
 Quotation-taking ops (if/if_else/while/for, try/retry, filter/any/all,
 array_map/array_reduce, iter_map/iter_filter, file_each_line/file_fold_lines,
@@ -1349,8 +1398,8 @@ match the concurrent C execution for the corpus.
 partial output preserved alongside the error message. i64 arithmetic wraps
 (BigInt masked to 64 bits); floats are IEEE-754 doubles. `type_of` tag
 ids: i:0 f:1 null/addr:2 byte:3 list:7 dict:8 str:9 iter:18 bool:21.
-Reading an unassigned shared/local slot yields 0; a local `x!` store
-passes the value through, a shared store consumes it (as in C). Loop
+Reading an unassigned shared/local slot yields 0; an `x!` store passes the
+value through (local and shared alike, v15.1). Loop
 nesting is capped at 64. `for` leaves the first iteration's count-slot
 cell (the stale count, or what the first iteration last wrote into it),
 as in the inlined C. A while loop leaves the stack as it found it: the
@@ -1422,8 +1471,8 @@ environment.
 
 ## Totals
 
-222 opcode slots (0..221); **203 live opcodes**. 201 of them have unique
-dense glyph codepoints (`cap`/`caps` are text-only).
+222 opcode slots (0..221); **204 live opcodes**. 201 of them have unique
+dense glyph codepoints (`cap`/`caps`/`consume` are text-only).
 
 ## Non-goals
 

@@ -27,30 +27,30 @@ fn live_indices() -> Vec<usize> {
 fn table_shape_and_retirement() {
     assert_eq!(OP_NAMES.len(), 222);
     assert_eq!(OP_GLYPHS.len(), OP_NAMES.len());
-    // exactly one slot is retired in place: 83 (ENDT) — name kept, mnemonic dead
+    // v15.1: no slot is retired in place (83 was ENDT; now the text-only `consume`)
     let retired_in_place: Vec<usize> = (0..OP_NAMES.len())
         .filter(|&i| !OP_NAMES[i].starts_with('~') && text_mnemonic(i) == "~retired")
         .collect();
-    assert_eq!(retired_in_place, vec![83], "exactly slot 83 must be retired in place");
-    assert_eq!(OP_NAMES[83], "ENDT");
+    assert_eq!(retired_in_place, Vec::<usize>::new(), "no op may be retired in place");
     let live = live_indices();
-    assert_eq!(live.len(), 203, "live-op count");
+    assert_eq!(live.len(), 204, "live-op count");
     // 18 "~NN" retired slots, all glyph-less
     let retired: Vec<usize> = (0..OP_NAMES.len()).filter(|&i| OP_NAMES[i].starts_with('~')).collect();
     assert_eq!(retired.len(), 18, "retired ~NN slot count");
     for &i in &retired {
         assert_eq!(OP_GLYPHS[i], 0, "retired slot {} ({}) must have no glyph", i, OP_NAMES[i]);
     }
-    // the only live ops without a dense glyph are cap (86) / caps (87)
+    // the only live ops without a dense glyph are consume (83) / cap (86) / caps (87)
     let glyphless: Vec<usize> = live.iter().copied().filter(|&i| OP_GLYPHS[i] == 0).collect();
-    assert_eq!(glyphless, vec![86, 87], "cap/caps are the only text-only live ops");
+    assert_eq!(glyphless, vec![83, 86, 87], "consume/cap/caps are the only text-only live ops");
+    assert_eq!(OP_NAMES[83], "CONSUME");
     assert_eq!(OP_NAMES[86], "CAP");
     assert_eq!(OP_NAMES[87], "CAPS");
 }
 
 #[test]
 fn glyph_spaces_unique_disjoint_roundtrip() {
-    // every nonzero opcode glyph is unique (201 live + ENDT's reserved one)
+    // every nonzero opcode glyph is unique (v15.1: 201 live glyphed ops)
     let mut seen: Vec<(u32, usize)> = Vec::new(); // (glyph, first slot)
     for (i, &g) in OP_GLYPHS.iter().enumerate() {
         if g != 0 {
@@ -60,7 +60,7 @@ fn glyph_spaces_unique_disjoint_roundtrip() {
             seen.push((g, i));
         }
     }
-    assert_eq!(seen.len(), 202, "nonzero opcode glyph count");
+    assert_eq!(seen.len(), 201, "nonzero opcode glyph count");
     // v-space / l-space: 64 unique codepoints each
     for (name, space) in [("V_SPACE", &V_SPACE), ("L_SPACE", &L_SPACE)] {
         assert_eq!(space.len(), 64);

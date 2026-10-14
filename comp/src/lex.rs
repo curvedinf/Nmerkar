@@ -7,43 +7,10 @@ use crate::ast::*;
 pub const DELIM_BASE: u32 = 0x13100;
 pub const TYPE_BASE: u32 = 0x13110;
 
-// Opcode glyphs (203 live ops; 201 glyphed — `cap`/`caps` are text-only,
+// Opcode glyphs (204 live ops; 201 glyphed — `cap`/`caps`/`consume` are text-only,
 // slot 0 means no glyph). Index = OP_NAMES array position.
 // All colored emoji (U+1F300+), each exactly one Qwen3 token.
-pub const OP_GLYPHS: [u32; 222] = [
-    0x1F300, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1F682, 0x1F910,
-    0x1F302, 0x1F602, 0x1F683, 0x1F911, 0x1F303, 0x1FA94, 0x1FA91, 0x1FA92,
-    0x1F603, 0x1F684, 0x1F912, 0x1F304, 0x1F604, 0x1F685, 0x1FA90, 0x1F913,
-    0x1FAAB, 0x0, 0x1F305, 0x1F605, 0x1F686, 0x1F914, 0x0, 0x0,
-    0x0, 0x1F306, 0x1F606, 0x1F687, 0x1F915, 0x1F307, 0x1F607, 0x0,
-    0x1F689, 0x1F916, 0x1F308, 0x1F608, 0x1F68A, 0x1F917, 0x1F309, 0x1F609,
-    0x1F68C, 0x1F918, 0x1F30A, 0x1F60A, 0x1F68D, 0x1F919, 0x1F30B, 0x1F60B,
-    0x1F690, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1F91A, 0x1F30C,
-    0x1F60C, 0x1F691, 0x1F91B, 0x1F30D, 0x1F60D, 0x1F692, 0x1F91C, 0x1F30E,
-    0x1F60E, 0x1F693, 0x1F91D, 0x1F30F, 0x0, 0x0, 0x1F60F, 0x1F694,
-    0x1F91E, 0x1F310, 0x1F610, 0x1F695, 0x1F91F, 0x1F311, 0x0, 0x0,
-    0x1F611, 0x1F696, 0x1F920, 0x1F313, 0x1F612, 0x1F697, 0x1F921, 0x1F314,
-    0x1F613, 0x1F698, 0x1F922, 0x1F315, 0x1F614, 0x1F699, 0x1F923, 0x1F318,
-    0x1F615, 0x1F69A, 0x1F924, 0x1F319, 0x1F616, 0x1F69B, 0x1F925, 0x1F31A,
-    0x1F617, 0x1F69C, 0x1F926, 0x1F31B, 0x1F618, 0x1F6A2, 0x1F927, 0x1F31C,
-    0x1F619, 0x1F6A3, 0x1F928, 0x1F31D, 0x1F61A, 0x1F6A6, 0x1F929, 0x1F31E,
-    0x1F61B, 0x1F6A7, 0x1F92A, 0x1F31F, 0x1F61C, 0x1F6A8, 0x1F92B, 0x1F320,
-    0x1F61D, 0x1F6A9, 0x1F92C, 0x1F321, 0x1F61E, 0x1F6AA, 0x1F92D, 0x1F324,
-    0x1F61F, 0x1F6AB, 0x1F92E, 0x1F325, 0x1F620, 0x1F6AC, 0x1F92F, 0x0,
-    0x1F326, 0x1F621, 0x1F6B2, 0x1F930, 0x1F327, 0x1F622, 0x1F6B4, 0x1F931,
-    0x1F328, 0x1F623, 0x1F6B5, 0x1F932, 0x1F329, 0x1F624, 0x1F6B6, 0x1F933,
-    0x1F32A, 0x1F625, 0x1F6B9, 0x1F934, 0x1F32B, 0x1F626, 0x1F6BC, 0x1F935,
-    0x1F32C, 0x1F627, 0x1F6BE, 0x1F936, 0x1F32E, 0x1F628, 0x1F6BF, 0x1F937,
-    0x1F32F, 0x1F629, 0x1F6C0, 0x1F938, 0x1F330, 0x1F62A, 0x1F6C1, 0x1F939,
-    0x1F331, 0x1F62B, 0x1F6CB, 0x1F93D, 0x1F332, 0x1F62C, 0x1F6CC, 0x1F93E,
-    0x1F333, 0x1F62D, 0x1F6CD, 0x1F940, 0x1F334, 0x1F62E, 0x1F6CE,
-    0x1F95B, 0x1F95C, 0x1F95D, 0x1F95E,
-    0x1F958, 0x1F959, 0x1F95A,
-    0x1F500,
-    0x1F512, 0x1F513,
-    0x1F501,
-    0x1F50D, 0x1F3AF, 0x1F552, 0x1F4CA,
-];
+pub const OP_GLYPHS: [u32; 222] = [0x1F300,0x0,0x0,0x0,0x0,0x0,0x1F682,0x1F910,0x1F302,0x1F602,0x1F683,0x1F911,0x1F303,0x1FA94,0x1FA91,0x1FA92,0x1F603,0x1F684,0x1F912,0x1F304,0x1F604,0x1F685,0x1FA90,0x1F913,0x1FAAB,0x0,0x1F305,0x1F605,0x1F686,0x1F914,0x0,0x0,0x0,0x1F306,0x1F606,0x1F687,0x1F915,0x1F307,0x1F607,0x0,0x1F689,0x1F916,0x1F308,0x1F608,0x1F68A,0x1F917,0x1F309,0x1F609,0x1F68C,0x1F918,0x1F30A,0x1F60A,0x1F68D,0x1F919,0x1F30B,0x1F60B,0x1F690,0x0,0x0,0x0,0x0,0x0,0x1F91A,0x1F30C,0x1F60C,0x1F691,0x1F91B,0x1F30D,0x1F60D,0x1F692,0x1F91C,0x1F30E,0x1F60E,0x1F693,0x1F91D,0x1F30F,0x0,0x0,0x1F60F,0x1F694,0x1F91E,0x1F310,0x1F610,0x0,0x1F91F,0x1F311,0x0,0x0,0x1F611,0x1F696,0x1F920,0x1F313,0x1F612,0x1F697,0x1F921,0x1F314,0x1F613,0x1F698,0x1F922,0x1F315,0x1F614,0x1F699,0x1F923,0x1F318,0x1F615,0x1F69A,0x1F924,0x1F319,0x1F616,0x1F69B,0x1F925,0x1F31A,0x1F617,0x1F69C,0x1F926,0x1F31B,0x1F618,0x1F6A2,0x1F927,0x1F31C,0x1F619,0x1F6A3,0x1F928,0x1F31D,0x1F61A,0x1F6A6,0x1F929,0x1F31E,0x1F61B,0x1F6A7,0x1F92A,0x1F31F,0x1F61C,0x1F6A8,0x1F92B,0x1F320,0x1F61D,0x1F6A9,0x1F92C,0x1F321,0x1F61E,0x1F6AA,0x1F92D,0x1F324,0x1F61F,0x1F6AB,0x1F92E,0x1F325,0x1F620,0x1F6AC,0x1F92F,0x0,0x1F326,0x1F621,0x1F6B2,0x1F930,0x1F327,0x1F622,0x1F6B4,0x1F931,0x1F328,0x1F623,0x1F6B5,0x1F932,0x1F329,0x1F624,0x1F6B6,0x1F933,0x1F32A,0x1F625,0x1F6B9,0x1F934,0x1F32B,0x1F626,0x1F6BC,0x1F935,0x1F32C,0x1F627,0x1F6BE,0x1F936,0x1F32E,0x1F628,0x1F6BF,0x1F937,0x1F32F,0x1F629,0x1F6C0,0x1F938,0x1F330,0x1F62A,0x1F6C1,0x1F939,0x1F331,0x1F62B,0x1F6CB,0x1F93D,0x1F332,0x1F62C,0x1F6CC,0x1F93E,0x1F333,0x1F62D,0x1F6CD,0x1F940,0x1F334,0x1F62E,0x1F6CE,0x1F95B,0x1F95C,0x1F95D,0x1F95E,0x1F958,0x1F959,0x1F95A,0x1F500,0x1F512,0x1F513,0x1F501,0x1F50D,0x1F3AF,0x1F552,0x1F4CA,];
 
 // v-space: base-64 digits for variable/label name atoms (colored emoji).
 pub const V_SPACE: [u32; 64] = [
@@ -135,7 +102,7 @@ pub const OP_NAMES: [&str; 222] = [
     // v9 kept
     "DICT", "~57", "~58", "~59", "~60", "~61", "LIST", "PUSH", "POP", "CHAN",
     "ENQ", "DEQ", "CLOSE", "ATOM", "AGET", "ASET", "AADD", "CAS", "TYPEOF", "LEN", "~76",
-    "~77", "USE", "MOD", "PUB", "WEAVE", "TASK", "ENDT", "WRUN",
+    "~77", "USE", "MOD", "PUB", "WEAVE", "TASK", "CONSUME", "WRUN",
     // shell + strings
     "SH", "CAP", "CAPS", "SHP", "EXEC",
     "MATCH", "REPLACE", "RSPLIT", "GLOB", "SPLIT", "JOIN", "SLICE", "FIND", "REPL",
@@ -246,7 +213,7 @@ pub fn op_usage(name: &str) -> &'static str {
         "PUB" => "(directive) | export next label globally",
         "WEAVE" => "(directive) | begin task scope",
         "TASK" => "(directive) | begin task body",
-        "ENDT" => "(directive) | end task body",
+        "CONSUME" => "v → | consume the top value (text-only, v15.1)",
         "WRUN" => "(directive) | schedule DAG, wait, publish",
         "SH" => "cmd → stdout stderr status | /bin/sh -c",
         "SHP" => "cmd → chan | stream stdout line-by-line",
@@ -467,6 +434,24 @@ impl Lexer {
         }
         s
     }
+    // v15.1: attached key after '#' — identifier-shaped only; a digit is
+    // rejected (no numeric slot selection), anything else ends the token
+    // (positional bind). Quoted keys are not supported (use `get`).
+    fn lex_destr_key(&mut self) -> Option<String> {
+        match self.peek() {
+            Some(c) if c.is_ascii_digit() => {
+                self.err("numeric slot selection is not supported — use `get` with an index")
+            }
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                let k = self.lex_ident();
+                if k.starts_with('_') {
+                    self.err("destructure key may not start with '_' — use `get` with the key");
+                }
+                Some(k)
+            }
+            _ => None,
+        }
+    }
     // v15 immediate-tag operand: ASCII struct/type name
     fn tag_name(&mut self, what: &str) -> String {
         match self.peek() {
@@ -676,6 +661,11 @@ impl Lexer {
                 if g == Some('!') || g.map_or(false, |c| opcode_index(c) == Some(33)) {
                     self.bump();
                     out.push((self.line, Tok::LocalSet(name)));
+                } else if g == Some('#') {
+                    // v15.1 destructure bind: v-run + '#' (+ attached ASCII key)
+                    self.bump();
+                    let key = self.lex_destr_key();
+                    out.push((self.line, Tok::Destr(name, key)));
                 } else if g == Some('+') && self.at(1) == Some('+') {
                     // v15: dense name++ / name+= round-trip (emit writes them)
                     self.pos += 2;
@@ -798,6 +788,20 @@ impl Lexer {
                 if name == "_" && (self.peek() == Some('!') || self.peek().map_or(false, |c| opcode_index(c) == Some(33))) {
                     self.bump();
                     out.push((self.line, Tok::Discard));
+                    continue;
+                }
+                if self.peek() == Some('#') {
+                    // v15.1 destructure bind on an ASCII name (round-trip from text)
+                    self.bump();
+                    if name == "_" {
+                        if self.lex_destr_key().is_some() {
+                            self.err("discard bind _# takes no key — omit the binding entirely");
+                        }
+                        out.push((self.line, Tok::DestrDiscard));
+                    } else {
+                        let key = self.lex_destr_key();
+                        out.push((self.line, Tok::Destr(name, key)));
+                    }
                     continue;
                 }
                 if name == "true" || name == "false" {
@@ -1022,7 +1026,7 @@ impl Lexer {
                     }
                 }
             }
-            "TASK" | "ENDT" | "WRUN" => self.err("TASK/ENDT/WRUN are only valid inside WEAVE..WRUN"),
+            "TASK" | "WRUN" => self.err("TASK/WRUN are only valid inside WEAVE..WRUN"),
             "EXTERN" => {
                 self.skip_ws();
                 if self.peek() != Some('"') {
@@ -1201,7 +1205,7 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "ENQ" => "enqueue", "DEQ" => "dequeue", "CLOSE" => "close", "ATOM" => "atomic", "AGET" => "atomic_get",
         "ASET" => "atomic_set", "AADD" => "atomic_add", "CAS" => "cas", "TYPEOF" => "type_of", "LEN" => "length",
         "USE" => "use", "MOD" => "mod", "PUB" => "pub", "WEAVE" => "weave", "TASK" => "task",
-        "ENDT" => "~retired", "WRUN" => "run",
+        "CONSUME" => "consume", "WRUN" => "run",
         "SH" => "shell", "SHP" => "shell_stream", "EXEC" => "execute",
         "CAP" => "cap", "CAPS" => "caps",
         "MATCH" => "regex_match", "REPLACE" => "regex_replace", "RSPLIT" => "regex_split", "GLOB" => "glob_match",
@@ -1496,6 +1500,30 @@ impl TextLexer {
                     out.push((l, Tok::LabelDef(name.to_string())));
                     continue;
                 }
+            }
+            if let Some(hp) = tok.find('#') {
+                self.pos += 1;
+                let (name, rest) = tok.split_at(hp);
+                let key = &rest[1..];
+                if name.is_empty() {
+                    self.err("'#' must directly follow a name (x# / x#key / _#)");
+                }
+                if let Some(fc) = key.chars().next() {
+                    if fc.is_ascii_digit() {
+                        self.err("numeric slot selection is not supported — use `get` with an index");
+                    }
+                    check_ident(l, key, "destructure key");
+                }
+                if name == "_" {
+                    if !key.is_empty() {
+                        self.err("discard bind _# takes no key — omit the binding entirely");
+                    }
+                    out.push((l, Tok::DestrDiscard));
+                } else {
+                    check_ident(l, name, "variable");
+                    out.push((l, Tok::Destr(name.to_string(), if key.is_empty() { None } else { Some(key.to_string()) })));
+                }
+                continue;
             }
             if let Some(name) = tok.strip_suffix('!') {
                 if !name.is_empty() && !tok.starts_with('!') {
@@ -1831,7 +1859,7 @@ mod tests {
             );
             seen.push(m);
         }
-        assert_eq!(seen.len(), 203);
+        assert_eq!(seen.len(), 204);
     }
 
     #[test]

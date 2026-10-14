@@ -32,7 +32,9 @@ pub enum Tok {
     AddLocal(String),             // x+= — local accumulate from stack
     IncGlobal(String),            // shared x++ — atomic increment by 1
     AddGlobal(String),            // shared x+= — atomic accumulate from stack
-    Discard,                      // _! — discard one slot in destructuring bind
+    Discard,                      // _! — discard one param slot (label/task bindings only)
+    Destr(String, Option<String>),// x# / x#key — destructure bind: positional slot or dict/obj key (v15.1)
+    DestrDiscard,                 // _# — discard one slot in a destructure run (v15.1)
     Import(Import),
     ManifestImport(Import), // import from a loaded .ufm manifest (exempt from ffi.import gating)
     Export(String),

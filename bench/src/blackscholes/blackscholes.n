@@ -4,7 +4,7 @@
 ; once over the concatenated [d1 d2] vector (compiler unrolls the constant
 ; list into one fused pass); discount D = e^(-rT) pinned (r=0.02, T=0.75).
 2000000 n!
-has_args 'setn if
+has_args setn if
 0 n range float tensor kk!
 kk 0.000001 mul 100.0 add ss!     ; S = 100 + 1e-6 k
 kk 0.0000005 mul 95.0 add ks!     ; K = 95 + 5e-7 k
@@ -22,7 +22,7 @@ dw dw mul w!
   6.1709290701241611e-07 -9.2236015244880478e-06 0.00011477352256159136
   -0.0011861254737728477 0.009972402563565597 -0.066489940262615232
   0.39894225252808718 ] coefs!
-coefs 0.0 'horner array_reduce ph!
+coefs 0.0 horner array_reduce ph!
 0.5 dw ph mul add nc!            ; N(d) over [d1 d2]
 nc 0 n slice nc1!                ; N(d1)
 nc n n 2 mul slice nc2!         ; N(d2)

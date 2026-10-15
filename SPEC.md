@@ -19,8 +19,8 @@ garbage-collected (scripts never `free` managed objects).
 Current revision: **v15.2**. Adds **@Type methods with `send` dispatch**
 (SPEC "Methods"): data-owned processes — `@Type label:` declares a method
 in the type's namespace (send-only, one implementation per (type, name),
-any TU can extend any type including built-in tags), `recv 'name send`
-dispatches on the receiver's type, `'recv.method send` is sugar. Also adds
+any TU can extend any type including built-in tags), `'recv.method send`
+dispatches on the receiver's type (the dotted form is the one call form). Also adds
 packages: schemed `use` sources (`gh:` / `https:` / `path:`) with `:`
 namespacing under use aliases, per-use-site capability grants (zero by
 default, compile-gated) plus the `NK_CAP_CEILING` runtime ceiling,
@@ -39,6 +39,15 @@ and **retires the eight arithmetic alias opcodes** `scalar_add`/`scalar_sub`/
 `scalar_mul`/`scalar_div` and `array_add`/`array_sub`/`array_mul`/
 `array_div` (slots 128–135), which were parser aliases of the core
 `add`/`sub`/`mul`/`div`.
+The v16 migration campaign (in progress) makes **78 built-in ops automatic
+methods** (SPEC "Built-in methods") and turns **code into a value**: `'name`
+is the call form (retiring the `_call` spelling), a bare label name is an
+implicit **fn** reference (tag 22, retiring `_addr`), every callback-taking
+op accepts a fn cell from the stack, and **anonymous functions** — `:` body
+`ret` defines one inline, `':` body `ret` applies it to a list argument
+vector via the revived `apply` op (slot 41) — see "Label parameters" and
+"Anonymous functions". Not backward compatible with v15.2 source using
+`_call`/`_addr` or quoted callback references.
 Per-operation history is in `SPEC_HISTORY.md`; this document is the current
 specification only. Opcode totals are kept in lockstep with
 `comp/src/lex.rs` by a compiler unit test (`comp/src/spec_contract.rs`), so
@@ -122,14 +131,17 @@ Variable semantics (v15.1 — uniform pass-through):
 - A name assigned in a TU's straight-line top level (before its first label)
   declares a **shared** variable; inside label bodies the plain name then
   reads/writes that shared var. See "Shared variables" below.
-- A v-run after CALL/ADDR/`'` is a label **reference**.
+- A v-run after CALL/`'` is a label **reference**.
 - A label **definition** is `name:` (text) or `name` + 🏷 (dense); the v14
   colon-less dense label definition is removed — a bare v-run now loads a
   variable. ASCII `name:` works in both encodings.
 - IMPORT/EXPORT/EXTERN/MACRO/STRUCT names remain ASCII.
 - Bare-name resolution order at parse time: internal `@`-sentinel, then macro
-  expansion, then implicit load. Storing into a macro's name is a compile
-  error (macros take precedence over loads; rename one of the two).
+  expansion, then implicit load — and, since v16, an unassigned read whose
+  name is a **label** resolves to that label's fn cell (see "Label
+  parameters"). Storing into a macro's name is a compile error (macros take
+  precedence over loads; rename one of the two). Storing into a label's
+  name is a compile error (one name, one meaning).
 
 Local variables exist from first assignment until the nearest enclosing RET.
 if/while/for body labels are continuations that share the caller's frame.
@@ -151,7 +163,7 @@ the same postfix calling convention as built-ins: arguments first, then the
 operation.
 
 ```
-3 4 _call add2        ; 7
+3 4 'add2             ; 7 — the call form
 add2: a! b!
   ret a b add
 ```
@@ -177,20 +189,82 @@ the first non-binding token ends the parameter list.
   label, parameter, and declared arity. Structured-op callbacks receive the same
   static check: a body that declares more bindings than the callback provides is a
   compile error (message: … but the `filter` callback provides only M value(s)…), covering
-  `'body for`'s pushed index, `filter`/`any`/`all`/`array_map`'s element,
+  `body for`'s pushed index, `filter`/`any`/`all`/`array_map`'s element,
   `array_reduce`/`file_fold_lines`/`file_split_lines`/`range_reduce`'s accumulator
   pair, `bfs`/`dfs`/`find_first`'s node, `try`'s continuation, and `spawn`'s fresh
   frame (0 cells). Excess cells are
   silently discarded after the bindings are satisfied.
-- Structured ops pass values implicitly: `5 'body for` pushes the loop index,
+- Structured ops pass values implicitly: `5 body for` pushes the loop index,
   and a `body: i!` binding consumes it.
 
 ```
-5 'body for
+5 body for              ; body is a bare fn reference
 body: i!
   i print
   ret
 ```
+
+**Fn cells (v16)** — a bare label name in expression position is its
+callable: it pushes a **fn cell** (tag 22) carrying the label's code address,
+declared arity, and name. `body`, `sq`, `worker` are values like any other —
+store them, pass them through vars, hand them to any callback-taking op. The
+consumer ops above (and `if`/`while`/`for`/`try`/`spawn`/…) accept a fn cell
+from the stack; when the parser can see the label statically (the common
+`5 body for` shape) the callback is inlined exactly as before, and the static
+arity checks above apply. When a fn cell arrives dynamically (out of a var or
+container), the runtime enforces the same contract: providing fewer values
+than the label declares dies at the site naming the label. `print` renders a
+fn cell as `<fn name/arity>`; `type_of` reports tag 22.
+
+**One name, one meaning** — a name that is a label may not also be a
+variable: assigning to a label name (including a shared declaration) is a
+compile error (`name collision: 'x' is both a label and a variable — rename
+one`). Label *parameter* binds are exempt where they must be: a weave task's
+input binds name the tasks whose results it consumes (`task c: a! b!` with
+tasks `a` and `b`), so a param bind may shadow a same-named label inside its
+own body.
+
+### Anonymous functions (`:` and `':`)
+
+`:` is a label definition without a name — the fn-cell form of an inline
+function. The body is the tokens that follow, through a **load-bearing
+`ret`** that closes the body and must sit on the **same line**; the value
+the body leaves on the stack is its result (the closing `ret` is bare —
+write the body so the result is on top). Leading param binds are legal,
+exactly like a named label's:
+
+```nmerkar
+xs : 2 mul ret array_map           ; callback fn cell, adjacent -> inlined
+xs : x! x x mul ret array_map      ; binds when a name earns its tokens
+0 n!
+3 : n 3 lt ret : n 1 add n! ret while   ; two anon bodies, shared frame
+: 42 ret spawn ch!
+: x! x x mul ret sq!               ; store it — a fn cell like any other
+```
+
+`':` is the same definition followed by an immediate **apply**: the list
+pushed below it is the argument vector — `apply` spreads its elements onto
+the stack and calls the body (declared arity is enforced at runtime by the
+fn cell, same as any dynamic callback):
+
+```nmerkar
+[3 4] ': add ret print             ; 7
+[3 4] ': a! b! a b add ret print   ; 7, named
+```
+
+Lowering: `:` collects the body, pushes the fn cell at the collection site
+(`PushAddr` of an unspellable `__qN` label), and hoists the body's
+instructions after the main flow — so a callback consumer written right
+after stays **adjacent** to the fn reference and keeps the inline fast
+path, the static arity check, and continuation frame-sharing for
+`while`/`for`/`if` bodies. `':` appends one `apply` op (`list fn → r`,
+opcode 41 — slot retired with ADDR, revived here). Restrictions: the body
+may not contain a label definition or a nested line break (an inner `:`/`':`
+is legal and nests by `ret`-matching); a stored quote applies later through
+`apply` on any fn cell (`[7] sqf apply`).
+
+Dense: `:` is 🔖 (a v-run + 🏷 is a named definition, so the anonymous
+form has its own marker); `':` is the CALL glyph + 🔖.
 
 ## Return values and stack draining
 
@@ -204,7 +278,7 @@ exempt.
 - `ret expr` — return the single value the operand expression leaves.
 - `ret a b c` — the operand nets three values; they are combined into a list
   and that list is returned. The caller destructures it with a `#` bind run:
-  `"cmd" _call run_cmd out# err# code#`.
+  `"cmd" 'run_cmd out# err# code#`.
 - Bare `ret` — return `null`; if the body pushed onto the real
   stack (a value sits above the frame base), that top cell is returned instead.
 
@@ -220,12 +294,12 @@ run_cmd: c!
 On return, the callee's **entire data stack is drained** back to the caller's
 saved pointer and the single return value is pushed on top of it. The caller's
 stack pointer is saved just below the arguments at every call boundary —
-`_call`, structured-op callbacks, weave tasks, `spawn` bodies, `try`/`retry`
+`'label` calls, structured-op callbacks, weave tasks, `spawn` bodies, `try`/`retry`
 bodies, and `filter`/`array_reduce`/etc. callbacks. Callees can therefore never
 leak transient values into the caller's stack.
 
 ```
-0 _call foo
+0 'foo
 add             ; 0 + 0 -> 0, not 0 + 42
 foo:
   42            ; pushed but never named in ret
@@ -259,7 +333,7 @@ Semantics:
   out-of-bounds slot, or a missing dict key / obj field dies at the source
   site. Nothing 0-fills or silently misses.
 - **`!` never destructures** (v15.1; the v12 adjacency heuristic — bind runs
-  after `shell`/`try`/`retry`/`regex_match`/`scan`/`next`/`_call` reaching
+  after `shell`/`try`/`retry`/`regex_match`/`scan`/`next`/`'label` calls reaching
   inside — is removed). A bind after any op is a plain pass-through store of
   the whole value; bind the parts you want with `#`.
 - Positional and keyed binds may mix in one run; keyed binds do not advance
@@ -268,7 +342,7 @@ Semantics:
   `get`.
 
 ```
-"cmd" _call run_cmd out# err# code#   ; multi-value ret: [out, err, code]
+"cmd" 'run_cmd out# err# code#   ; multi-value ret: [out, err, code]
 d a#bob b#jim c#tom                    ; dict fields (obj fields equally); d stays
 it next v# m#                          ; iterator step: [value, more]
 ```
@@ -285,7 +359,7 @@ main:
   4 spawn-workers
   ...
 worker: n!
-  25000 'loop 'body while
+  25000 loop body while
   ret
 loop: n count lt ret
 body:
@@ -342,7 +416,7 @@ str(6→2) bool(7→21) — handle/str are ptr aliases; bool is a distinct scala
 
 0 int, 1 float, 2 ptr, 3 byte, 4 void, 5 arr, 6 tensor, 7 list, 8 dict,
 9 str, 10 chan, 11 atom, 12 buf, 13 obj, 14 bitmap, 15 time, 16 dur,
-17 bloom, 18 iter, 19 set, 20 matrix, 21 bool. JSON null is
+17 bloom, 18 iter, 19 set, 20 matrix, 21 bool, 22 fn. JSON null is
 a null pointer (tag 2, payload 0). Booleans are distinct from integers and
 bytes. `true` and `false` are literals in text mode; the bool type glyph
 and `bool` keyword push type id 21. Dense emission encodes a boolean literal
@@ -380,7 +454,7 @@ the type name is ASCII in both encodings):
   `int`, … — any tag `type_of` reports). Unknown type = compile error.
 - The label mangles to `Type.name` internally: dots cannot appear in
   identifiers, so methods never collide with ordinary labels, and the
-  name is unspellable in source — **methods are send-only** (`_call`
+  name is unspellable in source — **methods are send-only** (the call form
   cannot reach them). One implementation per `(type, name)`; duplicates
   are compile errors. `pub` on a method is an error (send-only).
 - Methods are linkable across TUs by nature (dispatch goes through a
@@ -537,7 +611,7 @@ v15.1; its formerly reserved glyph is freed.)
 | 14 | 🪑 | `sqrt` | a → √a | coerces, returns float |
 | 15 | 🪒 | `lte` | a b → 0/1 | a≤b; coerces both sides to Number, NaN → 0 |
 | 16 | 😃 | `for` | count addr → | pushes k per iteration |
-| 17 | 🚄 | `_call` | (label operand) | |
+| 17 | 🚄 | `'` | `'label` | call subroutine; the `_call` spelling was removed in v16 |
 | 18 | 🤒 | `ret` | → | explicit return, operand expression (see Return values) |
 | 19 | 🌄 | `_obj` | → h | type immediate (struct id) |
 | 20 | 😄 | `get` | h k → v | polymorphic (protocol above) |
@@ -556,7 +630,7 @@ v15.1; its formerly reserved glyph is freed.)
 | 37 | 🌇 | `format` | args… fmt → h | |
 | 38 | 😇 | `buffer` | size → ptr | raw (untracked) buffer |
 | 40 | 🚉 | `copy_memory` | dst src n → | |
-| 41 | 🤖 | `_addr` | → code address | `'label` |
+| 41 | 🤖 | `apply` | list fn → r | spread the list as args and call the fn cell (the `':` form) |
 | 42 | 🌈 | `load` | addr → value | raw memory read; a string operand reads its first byte (unsigned) |
 | 43 | 😈 | `store` | value addr → | raw memory write |
 | 44 | 🚊 | `_size_of` | type → n | |
@@ -627,9 +701,9 @@ outside a loop are compile errors.
 
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
-| 114 | 🤦 | `if` | cond body_addr → | CALL body if cond nonzero |
-| 115 | 🌛 | `if_else` | cond then_addr else_addr → | transfers control — a body may end with it |
-| 116 | 😘 | `while` | cond_addr body_addr → | exit on 0, else CALL body, repeat |
+| 114 | 🤦 | `if` | cond body → | CALL body if cond nonzero |
+| 115 | 🌛 | `if_else` | cond then else → | transfers control — a body may end with it |
+| 116 | 😘 | `while` | cond body → | exit on 0, else CALL body, repeat |
 | 117 | 🚢 | `break` | → | to end of nearest enclosing while/for |
 | 118 | 🤧 | `continue` | → | next iteration of nearest enclosing loop |
 | 128 | 📡 | `send` | args… recv 'name → r | method dispatch on the receiver's type (see "Methods") |
@@ -640,11 +714,11 @@ outside a loop are compile errors.
 |----|---|----|----|-------|
 | 123 | 🌝 | `range` | start stop → list | ints [start, stop) |
 | 124 | 😚 | `sort` | seq → seq' | Timsort (stable); list and arr |
-| 125 | 🚦 | `filter` | list pred_addr → list' | keep elems where pred truthy |
-| 126 | 🤩 | `any` | list pred_addr → 0/1 | short-circuits; empty → 0 |
-| 127 | 🌞 | `all` | list pred_addr → 0/1 | short-circuits; empty → 1 |
-| 164 | 🌩 | `group_by` | list fn_addr → dict | fn (elem → key); dict maps key → list |
-| 165 | 😤 | `aggregate` | dict fn_addr → dict' | map each group's value-list through fn |
+| 125 | 🚦 | `filter` | list fn → list' | keep elems where pred truthy |
+| 126 | 🤩 | `any` | list fn → 0/1 | short-circuits; empty → 0 |
+| 127 | 🌞 | `all` | list fn → 0/1 | short-circuits; empty → 1 |
+| 164 | 🌩 | `group_by` | list fn → dict | fn (elem → key); dict maps key → list |
+| 165 | 😤 | `aggregate` | dict fn → dict' | map each group's value-list through fn |
 | 166 | 🚶 | `unique` | list → list' | dedup, first-occurrence order, O(n) via dict |
 | 167 | 🤳 | `flatten` | list → list' | flatten one level |
 | 168 | 🌪 | `chunk` | seq size → list | split into size-element pieces (last may be short); size<1: dies |
@@ -685,8 +759,8 @@ list/arr/tensor operands to bitmaps via element truthiness. A **bitmap**
 | 148 | 😠 | `mean` | arr → f64 | empty: dies |
 | 149 | 🚬 | `min` | arr → scalar | empty: dies |
 | 150 | 🤯 | `max` | arr → scalar | empty: dies |
-| 153 | 😡 | `array_map` | arr fn_addr → arr' | elementwise fn (elem → elem) |
-| 154 | 🚲 | `array_reduce` | arr init fn_addr → acc | generic reduction fn (acc elem → acc) |
+| 153 | 😡 | `array_map` | arr fn → arr' | elementwise fn (elem → elem) |
+| 154 | 🚲 | `array_reduce` | arr init fn → acc | generic reduction fn (acc elem → acc) |
 | 169 | 😥 | `array_argsort` | arr → idx_arr | indices that would stably sort |
 | 170 | 🚹 | `array_search_sorted` | sorted_arr val → idx | binary-search insertion point |
 | 171 | 🤴 | `array_where` | arr arr bm → arr' | blend: bit set → first arr, else second |
@@ -769,18 +843,18 @@ No file-handle object type; every op is self-contained.
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
 | 172 | 🌫 | `mmap` | path → str | read-only zero-copy string; GC-unmapped on sweep. All string ops work |
-| 173 | 😦 | `file_each_line` | path fn_addr → | call fn (line → flag) per line; stops early when fn returns 0 |
-| 174 | 🚼 | `file_fold_lines` | path init fn_addr → acc | streaming reduce; fn (acc line → acc) |
-| 175 | 🤵 | `file_split_lines` | path sep init fn_addr → acc | streaming split of a regular file or pipe/stdin (`/dev/stdin`); fields via `field_get`/`field_int`/`field_float`/`field_slice`/`field_byte` |
+| 173 | 😦 | `file_each_line` | path fn → | call fn (line → flag) per line; stops early when fn returns 0 |
+| 174 | 🚼 | `file_fold_lines` | path init fn → acc | streaming reduce; fn (acc line → acc) |
+| 175 | 🤵 | `file_split_lines` | path sep init fn → acc | streaming split of a regular file or pipe/stdin (`/dev/stdin`); fields via `field_get`/`field_int`/`field_float`/`field_slice`/`field_byte` |
 | 176 | 🌬 | `field_get` | field_idx → str | zero-copy field view (current file_split_lines line) |
 | 177 | 😧 | `field_int` | field_idx → int | parse field directly, no alloc |
 | 178 | 🚾 | `field_float` | field_idx → float | parse field directly, no alloc |
 | 179 | 🤶 | `field_slice` | field_idx off len → str | zero-alloc field substring |
 | 180 | 🌮 | `field_byte` | field_idx off → int | single byte from field, no alloc |
 | 181 | 😨 | `file_match_lines` | path pat → chan | spawn producer streaming regex-matching lines (cap 64); closed at EOF |
-| 182 | 🚿 | `bfs` | start fn_addr → list | breadth-first visit-order; fn (node → neighbors) |
-| 183 | 🤷 | `dfs` | start fn_addr → list | depth-first pre-order; same fn contract |
-| 184 | 🌯 | `find_first` | start fn_addr pred_addr → v_or_0 | BFS with early exit: first match or 0 |
+| 182 | 🚿 | `bfs` | start fn → list | breadth-first visit-order; fn (node → neighbors) |
+| 183 | 🤷 | `dfs` | start fn → list | depth-first pre-order; same fn contract |
+| 184 | 🌯 | `find_first` | start fn pred → v_or_0 | BFS with early exit: first match or 0 |
 | 187 | 🤸 | `add_to` | dict key amount → | dict[key] += amount; missing starts at 0 |
 | 188 | 🌰 | `field_add_to` | dict field_idx amount → | dict[field] += amount; no Str alloc |
 | 189 | 😪 | `field_inc` | dict field_idx → | dict[field] += 1; no Str alloc |
@@ -819,17 +893,17 @@ Single-use, mutable cursors. Every collection is iterable.
 | 192 | 🌱 | `iter` | h → it | list/arr/tensor (elems), dict (keys), str (bytes), chan (until close), bitmap (set-bit indices) |
 | 193 | 😫 | `next` | it → list | returns `[value, more]`; exhausted → `[0, 0]`; non-iter: dies |
 | 194 | 🛋 | `collect` | it → list | drain into fresh list |
-| 195 | 🤽 | `iter_map` | it fn_addr → it' | lazy map; fn (v → v') |
-| 196 | 🌲 | `iter_filter` | it pred_addr → it' | lazy filter; pred (v → 0/1) |
+| 195 | 🤽 | `iter_map` | it fn → it' | lazy map; fn (v → v') |
+| 196 | 🌲 | `iter_filter` | it pred → it' | lazy filter; pred (v → 0/1) |
 | 197 | 😬 | `file_emit` | path it → n | stream any iterable to file, one item per line; returns count |
 
 ### Error containment & threads
 
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
-| 198 | 🛌 | `try` | body_addr → list | returns `[result, ok]`; success → `[value, 1]`, die → `[0, 0]` |
-| 199 | 🤾 | `retry` | n body_addr → list | same as `try`; try up to n+1 times |
-| 200 | 🌳 | `spawn` | body_addr → chan | detached thread; body must end with `ret`, whose value is enqueued + chan closed at body end; `dequeue` = join |
+| 198 | 🛌 | `try` | body → list | returns `[result, ok]`; success → `[value, 1]`, die → `[0, 0]` |
+| 199 | 🤾 | `retry` | n body → list | same as `try`; try up to n+1 times |
+| 200 | 🌳 | `spawn` | body → chan | detached thread; body must end with `ret`, whose value is enqueued + chan closed at body end; `dequeue` = join |
 
 `die` unwinds to the nearest `setjmp` checkpoint pushed by `try`/`retry` (they
 nest); with no checkpoint, `die` is fatal. No backoff, jitter, or exception
@@ -944,7 +1018,7 @@ USEing TU. Ships: `m.ufm`, `c.ufm`, `pthread.ufm`, `curl.ufm`, `sdl2.ufm`,
   already prototyped by the prelude are safe to import. Varargs: declare fixed
   params then `...` (e.g. `import c"printf"(ptr,...)->int`); at the call site
   push [fixed params..., varargs..., vararg-count] — the count of variadic
-  arguments as the topmost int cell, e.g. `"x=%d" 7 1 _call printf`. The
+  arguments as the topmost int cell, e.g. `"x=%d" 7 1 'printf`. The
   runtime pops the count first, so it never scans the stack for the format
   string (unrelated pointer cells deeper on the stack could otherwise be
   misread as the format). A missing/malformed count cell fails at runtime with
@@ -1015,7 +1089,7 @@ Grant clauses are text-mode spellings; dense supports the plain
 The optional leading name is the package's **alias** — its namespace
 everywhere:
 
-- **Labels** are addressable as `alias:name` (`_call libdemo:double`,
+- **Labels** are addressable as `alias:name` (`'libdemo:double` calls,
   `'lib1:helper`). Package labels register under the alias via the standard
   per-TU mangling; `pub` marks the API contract (all labels are addressable;
   pub-ness is convention). Cross-package references always qualify — a
@@ -1065,7 +1139,7 @@ Enforcement is two-layered:
   checks the effective mask and dies loudly
   (`cap denied: X (runtime ceiling) in op_sh`) with its source site;
   `cap`/`caps` report `min(baked, ceiling)` so packages can degrade
-  deliberately (`"proc" cap 'spawn 'fallback if_else`). A package's
+  deliberately (`"proc" cap spawn fallback if_else`). A package's
   **required** caps are validated against the ceiling at startup — a run
   that starves them dies before any work happens
   (`package X requires capability Y — denied by the runtime ceiling`),
@@ -1309,13 +1383,13 @@ run
   weave
     task serve:
       0 n!
-      'more 'step while
+      more step while
       ret
     more:
       ret n 100 lt
     step:
       n 1 add n!
-      n 100 gte 'shut if
+      n 100 gte shut if
       ret
     shut:
       shutdown
@@ -1433,18 +1507,18 @@ label** instead of resuming after the `if`:
 
 ```
 solve: r! cols!
-  r cols r n lt 'rec if       ; tail position: only `1 ret` follows
+  r cols r n lt rec if       ; tail position: only `1 ret` follows
   1 ret                             ; not taken: return 1
 rec: r! cols! ... ret               ; taken: rec's ret returns from solve
 ```
 
-This is the early-return idiom for `_call`ed labels. The rule applies only in
+This is the early-return idiom for called labels. The rule applies only in
 real bodies (top level and outlined functions); inside inlined loop bodies a
 target's `ret` still means "continue the loop", and `if`/`if_else` elsewhere
 keep resume-after-branch semantics (the target's `ret` value is discarded).
-A limitation to know about: `_call`ed-label recursion that passes frames
+A limitation to know about: called-label recursion that passes frames
 through branch parameters can still mis-bind when a pass-through assignment
-(`x!`) precedes the call (vstack pass-through leak). A `_call` pushes the
+(`x!`) precedes the call (vstack pass-through leak). A call pushes the
 callee's local frame past the caller's live slots (the caller body's slot
 count), so nested calls cannot alias the caller's locals; spawned bodies get
 a fresh `Ctx` and are unaffected.
@@ -1511,8 +1585,8 @@ Semantics:
   makes every variable that supplied a value operand to that op strict, and
   the op's outputs strict. Strictness overrides looseness: a `loose` result
   becomes strict again the moment it flows into an op with a strict operand —
-  only an explicit `loose` clears the property. Code addresses (`'label`
-  operands) are not values and never taint or get tainted.
+  only an explicit `loose` clears the property. Fn cells (bare label-name
+  references) are opaque values and never taint or get tainted.
 - **Compile errors.** An op that performs implicit coercion — numeric context
   (`add sub mul div rem pow sqrt inc dec lt gt lte gte eq`), string context
   (`concat join split format find replace_all regex_* trim uppercase
@@ -1525,7 +1599,7 @@ Semantics:
   container protocol, `print`, `length`, `type_of`, `copy`, channel and
   atomic ops, the explicit converters, `cast`, `structural_equal`, …) accept
   strict values and propagate strictness.
-- **Interprocedural.** A `_call` argument's strictness flows into the
+- **Interprocedural.** A call argument's strictness flows into the
   callee's parameter bindings; a callee's return value is strict if any of
   its `ret` operands is strict. Elements of a strict collection are strict
   inside callback labels (`filter`, `array_map`, `file_fold_lines`, …).
@@ -1572,7 +1646,7 @@ destructure  := name '#' [key] | '_' '#'      ; v15.1: bind parts of the structu
 varget       := name                          ; v15: bare name = implicit load
 labeldef     := name ':' [param]*             ; params: name! | _!
              | name labeldef-glyph            ; dense: v-run + 🏷 marker
-jump         := (_call | "'") name
+jump         := "'" name
 op           := opcode-glyph | text-mnemonic
              ; text mode: immediate-operand ops are _-prefixed — see section below
 directive    := import c"name"(params)->ret | export "name" | extern "sym"
@@ -1611,7 +1685,7 @@ compiler.
 
 Syntax categories (three, not two): **stack ops** (`add`, `print`) read
 operands from the hidden stack at runtime; **immediate ops** (`_lit`,
-`_call`, `_str`) are *runtime instructions* whose operand is a compile-time
+`_str`) are *runtime instructions* whose operand is a compile-time
 immediate — the `_` prefix marks exactly this; and **directives** (`use`,
 `import`, `extern`, `export`, `mod`, `pub`, `macro`, `struct`) are
 compile-time only, with no machine existence — they never emit an
@@ -1625,9 +1699,10 @@ keyword and string) is a lex error with the remedy
 
 All other opcodes operate purely on the runtime stack.
 
-This makes the distinction visible at a glance: `_call foo` consumes the
-token `foo` as a label reference, whereas `add` reads its inputs from the
-hidden stack at run time.
+This makes the distinction visible at a glance: `_lit 3` consumes the
+token `3` at compile time, whereas `add` reads its inputs from the
+hidden stack at run time. The call form `'foo` is the v16 replacement for
+the retired `_call foo` — a prefixed label operand with no `_`.
 
 User-defined identifiers (variables, labels) may **not** start with `_` —
 the prefix is reserved for these opcodes.
@@ -1638,8 +1713,7 @@ so no prefix is needed (or possible) there.
 | mnemonic | opcode | immediate operand | stack effect |
 |----------|--------|-------------------|--------------|
 | `_lit` | LIT | number / type glyph / type keyword | → v |
-| `_call` | CALL | label name | call (see notes) |
-| `_addr` | ADDR | label name (`'label`) | → code address |
+| `'label` | CALL | label name | call (see notes; text spelling is the `'` prefix) |
 | `_syscall` | SYS | syscall number | args… num → ret |
 | `_str` | STR | string literal | → h |
 | `_size_of` | SIZEOF | type name / Struct name | type → n |
@@ -1723,7 +1797,7 @@ instead of C (no cc step). Single input only — no MTU, no directory mode.
 exported as `RT`), the program's string table (`__STRS`), the machine state
 (`rt`, `st`, `iv`), the code-address table (`__NKAD`), one `F_<pc>` function per
 dynamic code segment (a segment is the instruction range until the next pc
-execution can re-enter: 0, any `_addr`/`_call`/goto target, any weave task, or
+execution can re-enter: 0, any `'label`-call/goto/fn-reference target, any weave task, or
 the entry label), and finally the `__NK_API` handle:
 
 ```

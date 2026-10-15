@@ -1,14 +1,14 @@
 ; spectralnorm variant: eval_A computed inline, no A matrix (matches C++ memory pattern)
 5500 n!
-has_args 'argn if
+has_args argn if
 n float array v!
 n float array u!
 n float array tmp!
 0 i!
-'ic 'ib while
-10 'power for
+ic ib while
+10 power for
 0 uvt! 0 vvt!
-n 'dots for
+n dots for
 uvt vvt div sqrt "%.9f" format print
 ret
 argn:
@@ -21,21 +21,21 @@ ib:
   v i 0.0 array_set
   i++ ret
 power: k!
-  tmp u n _call mv
-  v tmp n _call tm
-  tmp v n _call mv
-  u tmp n _call tm
+  tmp u n 'mv
+  v tmp n 'tm
+  tmp v n 'mv
+  u tmp n 'tm
   ret
 ; mv(dst,src,n): dst[i] = sum_j src[j] * eval_A(i,j)
 mv: dst! src! nn!
   0 mi!
-  'mc 'mb while
+  mc mb while
   ret 0
 mc:
   ret mi nn lt
 mb:
   0 ms! 0 mj!
-  'jc 'jb while
+  jc jb while
   dst mi ms array_set
   mi++ ret
 jc:
@@ -48,13 +48,13 @@ jb:
 ; tm(dst,src,n): dst[i] = sum_j src[j] * eval_A(j,i)
 tm: dst! src! nn!
   0 ti!
-  'tc 'tb while
+  tc tb while
   ret 0
 tc:
   ret ti nn lt
 tb:
   0 ts! 0 tj!
-  'dc 'db while
+  dc db while
   dst ti ts array_set
   ti++ ret
 dc:

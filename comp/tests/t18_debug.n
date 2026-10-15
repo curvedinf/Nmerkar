@@ -9,7 +9,7 @@ entry:
 42 dbg
 3 check
 timer x!
-30 'spin for
+30 spin for
 timer y!
 y x sub 0 gt check
 memstats z!

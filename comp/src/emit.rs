@@ -75,7 +75,15 @@ pub fn emit_text(toks: &[(u32, Tok)]) -> String {
             Tok::PushBool(v) => o.push_str(if *v { "true " } else { "false " }),
             Tok::PushF(v) => o.push_str(&format!("{:?} ", v)),
             Tok::PushS(s) => o.push_str(&format!("\"{}\" ", escape_str(s))),
-            Tok::Jump(op, l) => o.push_str(&format!("{} {} ", text_mnemonic(op_index(op).expect("jump")), l)),
+            Tok::Jump(op, l) => match op.as_ref() {
+                // v16: 'name is the call form; 'recv.method is the send-only
+                // method reference; a bare ADDR jump (no producer since v16)
+                // degrades to the implicit-load spelling
+                "CALL" => o.push_str(&format!("'{} ", l)),
+                "ADDR" if l.contains('.') => o.push_str(&format!("'{} ", l)),
+                "ADDR" => o.push_str(&format!("{} ", l)),
+                _ => o.push_str(&format!("{} {} ", text_mnemonic(op_index(op).expect("jump")), l)),
+            },
             Tok::SetV(n) => o.push_str(&format!("^{}! ", n)),
             Tok::GetV(n) => o.push_str(&format!("^{}@ ", n)),
             Tok::LocalSet(n) => o.push_str(&format!("{}! ", n)),
@@ -141,6 +149,8 @@ pub fn emit_text(toks: &[(u32, Tok)]) -> String {
                 }
             }
             Tok::LabelDef(n) => o.push_str(&format!("{}: ", n)),
+            Tok::AnonDef => o.push_str(": "),
+            Tok::AnonCall => o.push_str("': "),
             Tok::Entry => o.push_str("entry: "),
             Tok::Task { name, count, body } => {
                 if !in_weave {
@@ -313,20 +323,24 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
                 }
                 Tok::PushS(s) => o.push_str(&format!("\"{}\"", escape_str(s))),
                 Tok::Jump(op, l) => {
-                    let idx = op_index(op).expect("jump");
                     if *op == "ADDR" {
-                        o.push('\'');
                         if l.contains('.') {
                             // method reference (recv.method): ASCII, the same
                             // spelling as the struct immediates
+                            o.push('\'');
                             o.push_str(l);
                         } else {
+                            // v16: a bare label reference is an implicit fn
+                            // load — the same v-run spelling as a var load
+                            // (the parser resolves it)
+                            sep_v(o);
                             o.push_str(&nm(l, names, next));
                         }
                     } else if *op == "JE" {
                         o.push_str("=");
                         o.push_str(&nm(l, names, next));
                     } else {
+                        let idx = op_index(op).expect("jump");
                         o.push(glyph_of(idx));
                         o.push_str(&nm(l, names, next));
                     }
@@ -397,6 +411,8 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
                 // v15: dense label definitions carry the 🏷 marker (bare
                 // v-runs are implicit loads now)
                 Tok::LabelDef(n) => { sep_v(o); o.push_str(&format!("{}{}\n", nm(n, names, next), GLYPH_LABEL_DEF)); }
+                Tok::AnonDef => { sep_v(o); o.push(GLYPH_ANON_DEF); o.push(' '); }
+                Tok::AnonCall => { o.push(glyph_of(17)); o.push_str(&format!("{}", GLYPH_ANON_DEF)); }
                 Tok::Entry => o.push_str(&format!("{}\n", glyph_of(206))),
                 Tok::Task { name, count, body } => {
                     if !*weave {
@@ -465,5 +481,42 @@ mod tests {
         assert_eq!(emit_text(&toks2), text, "text -> dense -> text must reproduce the canonical text");
         let dense2 = emit_dense(&resolve_implicit_loads(&lex_source(&emit_text(&toks2))));
         assert_eq!(dense2, dense, "dense must be a fixed point of the round trip");
+    }
+
+    // v16: 'name is the call form; a bare label name is its callable
+    // (implicit fn load). Both spellings must survive the round trip (names
+    // must be vN-shaped — dense canonicalizes other names to slots).
+    #[test]
+    fn call_and_fn_ref_round_trip() {
+        let src = "3 v0 'v1 print\n4 v0 v1 filter\n5 v2 v3 while\n'v0.area send print\nret\nv1: v4! v5!\n  ret v4 v5 add\n";
+        let toks = resolve_implicit_loads(&lex_source(src));
+        assert!(toks.iter().any(|(_, t)| matches!(t, Tok::Jump("CALL", l) if l == "v1")));
+        assert!(toks.iter().any(|(_, t)| matches!(t, Tok::LocalGet(n) if n == "v1" || n == "v2" || n == "v3")));
+        let text = emit_text(&toks);
+        assert!(text.contains("'v1 "), "call form must re-emit as 'label: {}", text);
+        assert!(text.contains(" v1 "), "fn ref must re-emit bare: {}", text);
+        let dense = emit_dense(&toks);
+        let toks2 = resolve_implicit_loads(&lex_source(&dense));
+        assert_eq!(emit_text(&toks2), text, "call/fn-ref round trip must be stable");
+        let dense2 = emit_dense(&resolve_implicit_loads(&lex_source(&text)));
+        assert_eq!(dense2, dense, "dense must be a fixed point");
+    }
+
+    // v16: ':' / '': anonymous functions round-trip through dense (🔖;
+    // CALL glyph + 🔖 for the apply form)
+    #[test]
+    fn anon_round_trip() {
+        let src = "v0 : v1 2 mul ret filter\n[v1] ': v2! v2 v2 mul ret print\nret\n";
+        let toks = resolve_implicit_loads(&lex_source(src));
+        assert!(toks.iter().any(|(_, t)| matches!(t, Tok::AnonDef)));
+        assert!(toks.iter().any(|(_, t)| matches!(t, Tok::AnonCall)));
+        let text = emit_text(&toks);
+        assert!(text.contains(": "), "anon def must re-emit as ':': {}", text);
+        assert!(text.contains("': "), "anon call must re-emit as ':'': {}", text);
+        let dense = emit_dense(&toks);
+        let toks2 = resolve_implicit_loads(&lex_source(&dense));
+        assert_eq!(emit_text(&toks2), text, "anon round trip must be stable");
+        let dense2 = emit_dense(&resolve_implicit_loads(&lex_source(&text)));
+        assert_eq!(dense2, dense, "dense must be a fixed point");
     }
 }

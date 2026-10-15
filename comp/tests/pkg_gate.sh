@@ -36,9 +36,9 @@ use demo "path:$FIX/libdemo"
 use files "path:$FIX/filelib" allow fs.read
 use needy "path:$FIX/needy" allow proc
 entry:
-  21 _call demo:double print
-  "$PROJ/main.n" _call files:slurp length 0 gt check
-  "true" _call needy:shcmd 2 get 0 structural_equal check
+  21 'demo:double print
+  "$PROJ/main.n" 'files:slurp length 0 gt check
+  "true" 'needy:shcmd 2 get 0 structural_equal check
   "pkg gate ok" print
   ret
 EOF
@@ -100,10 +100,10 @@ cat > "$PROJ/main.n" <<EOF
 use lib1 "path:$FIX/structlib"
 use lib2 "path:$FIX/structlib"
 entry:
-  _call lib1:ptsize print
-  _call lib2:ptsize print
+  'lib1:ptsize print
+  'lib2:ptsize print
   _offset lib1:Pt.y print
-  _call lib1:ptyoff print
+  'lib1:ptyoff print
   ret
 EOF
 out=$("$NK" install "$PROJ" --yes 2>&1); rc=$?
@@ -115,11 +115,11 @@ echo "$out" | tr '\n' ' ' | expect_out "caller-side _offset + package-internal o
 
 # ---- phase 2: deps of deps install and resolve transitively ----
 mkdir -p "$WORK/pkgdep"
-printf 'use "path:%s/libdemo"\npub\nquad: n!\n  ret n _call libdemo:double\n' "$FIX" > "$WORK/pkgdep/main.n"
+printf 'use "path:%s/libdemo"\npub\nquad: n!\n  ret n '\''libdemo:double\n' "$FIX" > "$WORK/pkgdep/main.n"
 cat > "$PROJ/main.n" <<EOF
 use "path:$WORK/pkgdep"
 entry:
-  5 _call pkgdep:quad print
+  5 'pkgdep:quad print
   ret
 EOF
 rm -rf "$PROJ/.nk"
@@ -148,8 +148,8 @@ cat > "$PROJ/main.n" <<EOF
 use v1 "path:$WORK/libv@v1"
 use v2 "path:$WORK/libv@v2"
 entry:
-  4 _call v1:double print
-  4 _call v2:double print
+  4 'v1:double print
+  4 'v2:double print
   ret
 EOF
 out=$("$NK" "$PROJ/main.n" 2>&1); rc=$?
@@ -189,7 +189,7 @@ use files "path:$FIX/filelib" allow fs.read
 use needy "path:$FIX/needy" allow proc
 entry:
   "proc" cap print
-  "$FIX/libdemo/main.n" _call files:slurp length 0 gt check
+  "$FIX/libdemo/main.n" 'files:slurp length 0 gt check
   "ceiling ok" print
   ret
 EOF
@@ -206,7 +206,7 @@ cat > "$PROJ/main.n" <<EOF
 use files "path:$FIX/filelib" allow fs.read
 entry:
   "fs.read" cap print
-  "$FIX/libdemo/main.n" _call files:slurp length print
+  "$FIX/libdemo/main.n" 'files:slurp length print
   ret
 EOF
 "$NK" install "$PROJ" --yes >/dev/null 2>&1
@@ -259,7 +259,7 @@ expect_rc "tools rm" 0 "$rc"
 SIGNLIB="$WORK/siglib"
 mkdir -p "$SIGNLIB"
 printf 'pub\nval:\n  ret 7\n' > "$SIGNLIB/main.n"
-printf 'use "path:%s"\nentry:\n  _call siglib:val print\n  ret\n' "$SIGNLIB" > "$PROJ/main.n"
+printf 'use "path:%s"\nentry:\n  '\''siglib:val print\n  ret\n' "$SIGNLIB" > "$PROJ/main.n"
 rm -rf "$PROJ/.nk"
 "$NK" install "$PROJ" --yes >/dev/null 2>&1
 SROOT=$(grep '/siglib' "$PROJ/.nk/lock" | sed 's/.*root=//' | cut -d' ' -f1)

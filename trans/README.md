@@ -100,7 +100,7 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
   `write_file` are whole-file and die on error, which would change tool
   behavior (exact "No such file" diagnostics, streaming of unseekable
   input), so those remain FFI.
-- `return expr;` in `main` becomes the process exit code (`_call exit`).
+- `return expr;` in `main` becomes the process exit code (`'exit`).
 
 ## Deliberate omissions (parse-time or run-time errors)
 
@@ -117,7 +117,7 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
 - `&&`/`||` do not short-circuit: both sides are evaluated (normalized via
   `not not` then combined). Guard out-of-bounds dereferences with nested
   `if`s.
-- Recursion works: every `_call` entry gets a fresh local frame, so a
+- Recursion works: every `'label` call entry gets a fresh local frame, so a
   callee (recursive or not) cannot clobber the caller's slots.
 
 ## Emission model
@@ -135,12 +135,12 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
   follow their enclosing body's `ret`.
 - Early `return` inside control flow binds `rv`, sets `fr`, and the
   remaining statements of the enclosing list are wrapped behind
-  `fr@ 'c 'b if_else` (guard labels hoisted to function end); loop
+  `fr c b if_else` (guard labels hoisted to function end); loop
   conditions are `fr@`-guarded so loops exit; each function epilogue
   returns `fr@ rv@ mul` (the early value when flagged, else 0) and
   resets the flag. Dead code after a top-level `return` is dropped.
 - Calls are direct: arguments evaluate inline in the caller's body, then
-  `_call name`. The callee's parameter binds pop the arguments, its `ret`
+  `'name`. The callee's parameter binds pop the arguments, its `ret`
   drains the data stack and leaves the single return value — vararg
   counts (`printf`/`fprintf`) are pushed after the arguments. No
   save/restore wrapper is needed: callee frames are fresh (v14), and
@@ -148,9 +148,9 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
   stores' pass-through cells stay under the argument values.
 - A `for` post-expression becomes an `nN` label invoked by the loop body
   tail and by `continue` (`1 'nN if continue` — a quotation jump, same
-  frame, so the post's slot writes land in the loop's locals; a `_call`
+  frame, so the post's slot writes land in the loop's locals; a call
   would push a fresh frame and lose them). `do-while` uses a `dfN`
-  first-pass flag because `'c 'b while` tests before the first body run.
+  first-pass flag because `c b while` tests before the first body run.
 - Post-`++`/`--` emits `x@ pt! x@ 1 add x! frv! pt@` — net exactly one
   cell (the old value): the increment's pass-through residue is sunk into
   `frv` (free outside the epilogue) so it cannot leak between a vararg

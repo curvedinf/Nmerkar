@@ -63,6 +63,8 @@ pub enum Tok {
     Sys(usize),                // arity immediate (default 0)
     Ident(String),             // macro invocation site
     LabelDef(String),
+    AnonDef,                   // v16: `:` — anonymous label; body = following tokens until its depth-0 ret
+    AnonCall,                  // v16: `':` — anonymous label + immediate apply (spread the list below)
     Entry,                     // ENTRY — marks the program entry point (replaces jmp main)
 }
 
@@ -72,7 +74,7 @@ pub enum Ins {
     PushI(i64),
     PushF(f64),
     PushS(usize),
-    PushAddr(String),
+    PushAddr(String),             // v16: bare label name — pushes the label's fn cell (arity + name carried at runtime)
     Simple(&'static str), // maps to a C helper op_*
     For,
     Call(String),

@@ -21,9 +21,9 @@ m type_of print
 m "ERROR" find 0 gt print
 m length print
 ; feach / ffold
-"tests/log.txt" 'pl file_each_line
+"tests/log.txt" pl file_each_line
 0 c!
-"tests/log.txt" 0 'countf file_fold_lines print
+"tests/log.txt" 0 countf file_fold_lines print
 ; fmatch
 "tests/log.txt" "ERROR.*timeout" file_match_lines fc!
 fc dequeue print
@@ -34,11 +34,11 @@ g 1 list 2 append 3 append set
 g 2 list 4 append set
 g 3 list 4 append set
 g 4 list set
-1 'nb bfs length print
-1 'nb dfs length print
-1 'nb 'is4 find_first print
+1 nb bfs length print
+1 nb dfs length print
+1 nb is4 find_first print
 ; femit
-0 3 range iter 'strf iter_map "tests/fem.txt" file_emit print
+0 3 range iter strf iter_map "tests/fem.txt" file_emit print
 "tests/fem.txt" read_file print
 ret
 ; --- quotation bodies ---

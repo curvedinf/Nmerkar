@@ -1,7 +1,7 @@
 ; build int array [0..9]
 0 10 range lst!
 lst length int array a!
-lst length 'cp for
+lst length cp for
 a 2 add sum print
 a sum print
 a mean print
@@ -20,17 +20,17 @@ a 4 scalar_gt a 7 scalar_lt bitmap_or bitmap_count print
 a a4!
 a4 a4 4 scalar_gt array_gather sum print
 a 5 scalar_gte bitmap_not bitmap_count print
-a 'sq array_map sum print
-a 0 'acc array_reduce print
+a sq array_map sum print
+a 0 acc array_reduce print
 ; float arr
 lst length float array f!
-lst length 'cp2 for
+lst length cp2 for
 f 0.5 add sum print
 f mean print
 ; vargsort / vsearchsorted / vwhere
 list 30 append 10 append 20 append s3!
 s3 length int array b!
-s3 length 'cp3 for
+s3 length cp3 for
 b array_argsort idx!
 idx 0 get print
 b 15 array_search_sorted print

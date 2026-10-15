@@ -2,21 +2,21 @@
 import c"usleep"(int)->int
 
 ; use a shared helper from util.n
-42 _call double "%d" format print
+42 'double "%d" format print
 
 ; get the background service's channel (retry until bg thread has created it)
-'wcond 'wbody while
+wcond wbody while
 
 ch "hello from main" enqueue
 
 ; give bg thread time to receive and print
-100000 _call usleep
+100000 'usleep
 
 "main done" print
 0 ret
 wcond:
-  _call bg_chan ch! ch
+  'bg_chan ch! ch
   0 eq ret
 wbody:
-  1000 _call usleep
+  1000 'usleep
   0 ret

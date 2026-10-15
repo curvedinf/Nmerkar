@@ -1,8 +1,8 @@
 ; gate t05: iterators + json (mirrors comp/tests/t07_iter.n minus try/retry/spawn)
 ; iterators
-0 5 range iter 'dbl iter_map collect length print
-0 5 range iter 'dbl iter_map collect 3 get print
-0 10 range iter 'ev iter_filter collect length print
+0 5 range iter dbl iter_map collect length print
+0 5 range iter dbl iter_map collect 3 get print
+0 10 range iter ev iter_filter collect length print
 ; next
 0 3 range iter it!
 it next v# m#

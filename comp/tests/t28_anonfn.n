@@ -1,0 +1,43 @@
+; t28_anonfn.n — v16 anonymous functions: `:` defines an inline fn cell,
+; `':` applies one immediately against the list below (spread as args).
+; The closing `ret` is load-bearing and must sit on the same line.
+; Run: nk comp/tests/t28_anonfn.n
+
+; 1. anon callback at a consumer (adjacent -> inlined)
+[1 2 3] xs!
+xs : 2 mul ret array_map dup!
+dup to_json "[2,4,6]" eq check
+xs : 2 gt ret filter to_json "[3]" eq check
+
+; 2. binds inside an anon body (vars reload, so reuse needs no dup)
+xs : x! x x mul ret array_map to_json "[1,4,9]" eq check
+
+; 3. while with two anon bodies sharing the caller's frame
+0 i2!
+3 : i2 3 lt ret : i2 1 add i2! ret while
+i2 3 eq check
+
+; 4. try / spawn with anon bodies
+: 1 0 div ret try ok# _#
+ok 0 eq check
+: 42 ret spawn ch!
+ch dequeue 42 eq check
+
+; 5. ': apply — list is the arg vector, spread onto the stack
+[3 4] ': add ret 7 eq check
+[5] ': 2 mul ret 10 eq check
+[3 4] ': a! b! a b add ret 7 eq check
+
+; 6. the value form stores like any fn cell; apply works on it
+: x! x x mul ret sqf!
+[7] sqf apply 49 eq check
+sqf type_of 22 eq check
+
+; 7. a nested anon callback inside an apply body
+[[1 2 3]] ': l! l : 2 mul ret array_map ret to_json "[2,4,6]" eq check
+
+; 8. named labels still work alongside anons
+xs pred filter to_json "[3]" eq check
+ret
+pred: v!
+  ret v 2 gt

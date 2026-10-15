@@ -11,7 +11,7 @@
 ; allocate large tensors. Concurrent mark/sweep used to crash in uf_gc_alloc.
 ; An explicit collection after the join checks that p remains rooted.
 2000000 n!
-has_args 'setn if
+has_args setn if
 0 n range lst!
 lst lst!
 weave

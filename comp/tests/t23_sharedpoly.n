@@ -6,7 +6,7 @@
 0 rv! 0 fr! 0 frv!
 ret
 entry:
-_call f s!
+'f s!
 s print
 s 0 get print
 s "ABC" structural_equal print

@@ -6,6 +6,46 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-15 — anonymous functions (`:` / `':`) + `apply`
+
+- `FNAPPLY` (41, 🤖, `apply` — `list fn → r`) — added (slot retired with
+  ADDR earlier in v16, revived): spreads the list argument vector onto the
+  stack and calls the fn cell; the cell's declared arity is the runtime
+  contract. Powers the `':` form and applies var-held fn cells directly.
+- New syntax `:` / `'`: — anonymous labels. `:` collects the one-line body
+  through its load-bearing `ret`, pushes an anonymous fn cell at the site
+  (`__qN` is unspellable), and hoists the body after the main flow so an
+  adjacent callback consumer keeps the inline fast path, static arity
+  check, and continuation frame-sharing. `':` appends `apply`. Dense: 🔖
+  for `:`, CALL glyph + 🔖 for `':`. Leading param binds legal (they
+  reload, so reuse needs no dup). Gates: `comp/tests/t28_anonfn.n`.
+
+## 2026-10-15 — fn cells: code is a value (CALL re-spelled, ADDR retired)
+
+- `CALL` (17, 🚄) — the text spelling is now `'label` (the `_call` keyword
+  is a lex error with a remedy); dense is unchanged (glyph + label).
+- `ADDR` (41) — retired (slot now `~41`, glyph removed): the quoted-address
+  form was the only producer of raw code addresses. A bare label name is an
+  implicit **fn** reference instead — `5 body for`, `xs pred filter`,
+  `c b while` — pushing a fn cell (tag 22: code address, declared arity,
+  name; static interning, GC-free, thread-safe). `--to-text` renders a
+  legacy dense addr push as the bare label name.
+- Consumer ops accepting a fn cell from the stack (was `*_addr` raw
+  address): `if` (114), `if_else` (115), `while` (116), `for` (117),
+  `filter` (125), `any` (126), `all` (127), `group_by` (164),
+  `aggregate` (165), `array_map` (153), `array_reduce` (154),
+  `file_each_line` (173), `file_fold_lines` (174), `file_split_lines`
+  (175), `bfs` (182), `dfs` (183), `find_first` (184), `iter_map` (195),
+  `iter_filter` (196), `try` (198), `retry` (199), `spawn` (200). The
+  statically-seen callback keeps the inline fast path and static arity
+  check; a dynamic fn cell (out of a var/container) gets the same arity
+  contract enforced at runtime, dying at the site naming the label.
+  `print` renders a fn as `<fn name/arity>`; `type_of` reports 22; fn
+  cells are truthy and `to_json` rejects them.
+- Scope rule: a label name may not also be a variable (assigning to one is
+  a compile error); label param binds may shadow (weave task inputs name
+  their dependency tasks). Gate: `comp/tests/t27_callable.n`.
+
 ## 2026-10-15 — built-in methods campaign (78 ops; behavior-preserving)
 
 - 78 type-targeting built-ins are now automatic methods: their selectors

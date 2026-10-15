@@ -2,21 +2,21 @@
 ; n from argv[1] (default 1000000). Edges: u -> (7u+3) mod n and
 ; u -> (13u+11) mod n for every u, plus u -> (u+1) mod n when u mod 3 = 0.
 1000000 n!
-has_args 'setn if
+has_args setn if
 n 1 add int array offsets!
 n 2 mul n 2 add 3 div add int array edges!
 n int array dist!
 n int array q!
 0 ep! 0 r! 0 s! 0 m!
-0 n 'bld for
+0 n bld for
 offsets n ep set
-0 n 'negf for
+0 n negf for
 dist 0 0 set
 q 0 0 set
 1 tail!
 0 head!
-'more 'step while
-0 n 'tally for
+more step while
+0 n tally for
 "reached: " print r print
 "unreached: " print n r sub print
 "sum_dist: " print s print
@@ -29,7 +29,7 @@ bld: u!
   ep++
   edges ep u 13 mul 11 add n rem set
   ep++
-  u 3 rem 0 eq 'third 'put if_else
+  u 3 rem 0 eq third put if_else
   ret
 third:
   edges ep u 1 add n rem set
@@ -44,12 +44,12 @@ step:
   head++
   offsets u get j!
   offsets u 1 add get end!
-  'vis_c 'vis while
+  vis_c vis while
   ret
 vis_c: j end lt ret
 vis:
   edges j get v!
-  dist v get 0 lt 'visit if
+  dist v get 0 lt visit if
   j++
   ret
 visit:
@@ -59,11 +59,11 @@ visit:
   ret
 tally: i!
   dist i get d!
-  d 0 gte 'tc if
+  d 0 gte tc if
   ret
 tc:
   r++
   d s+=
-  d m gt 'tmax if
+  d m gt tmax if
   ret
 tmax: d m! ret

@@ -456,6 +456,8 @@ var RT = (function () {
   // in a torn state for the caller's post-call pop.
   async function preludeCall(rt, fn, nargs) {
     if (typeof fn !== "function") die(rt, "JavaScript target: cannot call a non-function cell");
+    if (typeof fn.ar === "number" && fn.ar > nargs)
+      die(rt, "label '" + (fn.nm || "?") + "' declares " + fn.ar + " parameter(s) but the callback provides only " + nargs + " value(s) — provide all arguments or declare fewer bindings");
     var _lb = rt.lb;
     rt.lb += (rt.curN || 0);
     await fn(rt, { drain: rt.st.length > nargs ? rt.st.length - nargs : 0, base: rt.lb });
@@ -732,7 +734,7 @@ var RT = (function () {
       case "i": tag = 0; break;
       case "f": tag = 1; break;
       case "n": tag = 2; break;
-      case "a": tag = 2; break;
+      case "a": tag = 22; break;
       case "y": tag = 3; break;
       case "l": tag = 7; break;
       case "d": tag = 8; break;
@@ -754,7 +756,8 @@ var RT = (function () {
     switch (c.t) {
       case "i": return 0;
       case "f": return 1;
-      case "n": case "a": return 2;
+      case "n": return 2;
+      case "a": return 22;
       case "y": return 3;
       case "l": return 7;
       case "d": return 8;
@@ -3043,7 +3046,7 @@ var RT = (function () {
       case "bl": return "<bloom>";
       case "c": return "<chan>";
       case "o": return "<atom>";
-      case "a": return "<code>";
+      case "a": return "<fn " + (x.v.nm || "?") + "/" + (typeof x.v.ar === "number" ? x.v.ar : 0) + ">";
       case "t": return "<iter>";
       case "p": {
         var pv = x.v;
@@ -3691,6 +3694,17 @@ var RT = (function () {
     rt.st.length = base;
     return [r, I(1n)];
   }
+  // FNAPPLY (v16): list fn -> r — spread the list as args and call the fn
+  // cell (the ': form; also applies var-held cells). preludeCall enforces
+  // the carried arity.
+  async function op_apply(rt) {
+    var c = pop(rt, "apply");
+    var l = pop(rt, "apply");
+    if (l.t !== "l") die(rt, "APPLY: the argument vector must be a list");
+    if (c.t !== "a") die(rt, "APPLY: expected a fn cell");
+    for (var i = 0; i < l.v.length; i++) rt.st.push(l.v[i]);
+    await preludeCall(rt, c.v, l.v.length);
+  }
   async function op_try(rt) {
     var body = pop(rt, "try");
     var sp0 = rt.st.length;
@@ -3821,7 +3835,7 @@ var RT = (function () {
     op_bufcopy: op_bufcopy, op_loadx: op_loadx, op_storex: op_storex,
     op_chan: op_chan, op_enq: op_enq, op_deq: op_deq, op_close: op_close,
     op_atom: op_atom, op_aget: op_aget, op_aset: op_aset, op_aadd: op_aadd,
-    op_cas: op_cas, op_spawn: op_spawn,
+    op_cas: op_cas, op_spawn: op_spawn, op_apply: op_apply,
     op_gc: op_gc, op_obj: op_obj,
     op_argv: op_argv, op_hasargs: op_hasargs, op_argi: op_argi,
     op_now: op_now, op_time: op_time, op_timef: op_timef,

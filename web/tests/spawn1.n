@@ -3,7 +3,7 @@
 ; closes it; a dequeue after the close yields the sentinel 0. Atoms exercise
 ; set/get/fetch-add/cas. Expected output (8 lines):
 ;   0, 0, <chan>, 5, 9, 1, 0, 77
-'spaw spawn c!
+spaw spawn c!
 c dequeue print
 c dequeue print
 c print

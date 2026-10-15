@@ -121,7 +121,7 @@ effect. The value flows on; a leftover below never disturbs later lines
 (operations read from the top, and bodies drain at `ret`). Square with
 `5 3 sub d! d mul` — the pass-through *is* the operand. One caution: don't
 place a store *between* pushing a call's arguments — the leftover splices
-into the argument window (`100 3 x! 5 _call add2` passes 3 and 5, not 100
+into the argument window (`100 3 x! 5 'add2` passes 3 and 5, not 100
 and 5). Keep side effects on their own lines, or `consume` the leftover.
 
 **4. Built-in containers and utilities.** Integers, floats, and strings can
@@ -148,15 +148,19 @@ field, `_#` skips a slot. A plain `x!` always stores the *whole* value —
 `!` never reaches inside. A bind that cannot resolve (non-container,
 out-of-bounds slot, missing key) dies at its source line.
 
-**8. Labels are the functions.** `name:` defines, `'name` references,
-`_call` invokes; parameters bind with `p!` directly after the definition's
-colon; every code path ends in `ret`. A callee's entire stack is drained on
-return — only the `ret` value reaches the caller, so callees cannot leak
-operands.
+**8. Labels are the functions.** `name:` defines, the **bare name**
+references, `'name` invokes; parameters bind with `p!` directly after the
+definition's colon; every code path ends in `ret` (see
+[Functions](#functions) for the fn value and the anonymous `:` / `':`
+forms). A callee's entire stack
+is drained on return — only the `ret` value reaches the caller, so callees
+cannot leak operands. A bare label name pushes its **fn** — an ordinary
+value carrying the label's arity: store it in a variable, collect fns in a
+list, hand one to any callback-taking operation.
 
 **9. Blocks drive control flow and callbacks.** `if`, `while`, and `for`
-call labeled blocks such as `'step`, and blocks also serve as callbacks for
-operations such as `filter`.
+take labeled blocks by bare reference (`3 step for`), and blocks also serve
+as callbacks for operations such as `filter`.
 
 **10. Parallel pipelines with `weave`.** Process files and large datasets
 without managing threads or passing results between them by hand. Define
@@ -170,6 +174,68 @@ the system C compiler, and runs the native result; it can also emit C or a
 standalone binary. Eligible compute work can use a Vulkan GPU automatically
 when the toolchain and device are available, while `--device cpu` keeps it
 on the CPU. `nks` runs programs in a sandbox.
+
+## Functions
+
+Labels are the functions, and they come in named and anonymous forms —
+four spellings of one idea:
+
+| | define (a value) | call |
+|---|---|---|
+| named | `sq:` | `'sq` |
+| anonymous | `:` … `ret` | `':` … `ret` |
+
+A named function is a label: parameters bind right after the colon, every
+code path ends in `ret`, and the caller sees only the returned value —
+a callee's entire stack is drained on return.
+
+```nmerkar
+3 'price print                    ; 15 — 'name calls it
+ret
+price: quantity!                  ; Define a reusable helper.
+  ret quantity 5 mul              ; Return the quantity times the $5 unit price.
+```
+
+A bare label name is its **fn** — an ordinary value carrying the
+function's arity. Store it, collect fns in a list, hand one to any
+callback-taking operation:
+
+```nmerkar
+sq h!                             ; h now holds the fn for sq
+[1 2 3] h array_map print         ; [1, 4, 9]
+ret
+sq: x!                            ; The named definition, as usual.
+  ret x x mul
+```
+
+An **anonymous function** is `:` — a label definition without a name,
+written inline. The body runs to its `ret` (same line), leading parameter
+binds are optional, and whatever the body leaves on top is the result:
+
+```nmerkar
+[1 2 3] xs!
+xs : 2 mul ret array_map print    ; [2, 4, 6] — double every element
+xs : 2 gt ret filter print        ; [3] — keep elements over 2
+xs : x! x x mul ret array_map print   ; [1, 4, 9] — a bind when a name earns it
+: 42 ret spawn ch!                ; thread body
+ch dequeue print                  ; 42
+ret
+```
+
+Because the body is written right at the consumer, it compiles inline —
+no named label elsewhere, nothing to name.
+
+The `':` form calls an anonymous function immediately. Push the arguments
+as a list first — it is the argument vector — and `':` spreads it and
+runs:
+
+```nmerkar
+[3 4] ': add ret print            ; 7
+[3 4] ': a! b! a b add ret print  ; 7, with names
+: x! x x mul ret sqf!             ; store an anonymous fn
+[7] sqf apply print               ; 49 — apply works on any stored fn
+ret
+```
 
 ## Examples
 
@@ -187,11 +253,11 @@ A loop calls a helper to price three orders of increasing size:
 
 ```nmerkar
 0 total!                                   ; Start the running total at zero.
-3 'add_order for                            ; Run add_order with indexes 0, 1, and 2.
+3 add_order for                            ; Run add_order with indexes 0, 1, and 2.
 total print                                ; Print the total cost of all three orders.
 ret                                        ; Finish the main program before the helper blocks.
 add_order: index!                          ; Give each loop index a name.
-  index 1 add _call price total add total! ; Price one more item than the index, then add it to the total.
+  index 1 add 'price total add total! ; Price one more item than the index, then add it to the total.
   ret                                      ; Return to the loop.
 price: quantity!                           ; Define a reusable helper that receives a quantity.
   ret quantity 5 mul                       ; Return the quantity times the $5 unit price.
@@ -204,7 +270,7 @@ Running it creates `weave-prices.txt` in the current directory:
 "weave-prices.txt" "10\n20\n30" write_file            ; Write three sample prices to a file.
 weave                                               ; Begin a task graph.
   task prices:                                      ; Define the file-processing task.
-    "weave-prices.txt" list 'collect_price file_fold_lines values! ; Stream file lines into a list.
+    "weave-prices.txt" list collect_price file_fold_lines values! ; Stream file lines into a list.
     ret values float tensor                         ; Turn the parsed prices into a float tensor.
   collect_price: values! line!                       ; Receive the accumulated list and the next line.
     ret values line parse_float append              ; Parse the price and add it to the list.
@@ -218,7 +284,7 @@ run total "%.2f" format print                       ; Run the graph and print 54
 Use `nk` inline to efficiently process data with `bash`:
 
 ```
-$ grep ',Retail,' bench/data/sales.csv | nk 'dict p! dict c! "/dev/stdin" "," 0 '\''r file_split_lines z! p 5 top_n print c 5 top_n print ret r: a! n! p 4 10 field_float field_add_to c 3 10 field_float field_add_to ret a'
+$ grep ',Retail,' bench/data/sales.csv | nk 'dict p! dict c! "/dev/stdin" "," 0 r file_split_lines z! p 5 top_n print c 5 top_n print ret r: a! n! p 4 10 field_float field_add_to c 3 10 field_float field_add_to ret a'
 
 > [["Bundle B",23912165787.440258],["Refurb Unit",23788674041.119873],["Gadget X1",23781641142.379787],["Spare Part",23776965024.160465],["Widget Pro",23759658166.90052]]
 [["Mexico",13218417280.809916],["USA",13212495563.130194],["Canada",13160810726.84009],["Colombia",9948195871.5800667],["Egypt",9948038758.9899693]]
@@ -273,7 +339,7 @@ use lib1 "gh:curvedinf/lib@v1.2" allow fs.read   ; alias + least privilege
 use lib2 "gh:curvedinf/lib@v2"                   ; two versions, side by side
 
 entry:
-  21 _call lib1:double print                     ; alias:name is the API
+  21 'lib1:double print                     ; alias:name is the API
   _offset lib1:Point.x print                     ; structs qualify too
   ret
 ```

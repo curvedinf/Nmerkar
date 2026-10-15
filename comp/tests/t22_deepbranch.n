@@ -4,73 +4,73 @@
 ; (cat's elif chain, base64's nested ladder). Run: nk comp/tests/t22_deepbranch.n
 ; elif chain matching the 9th arm (116 = 't')
 116 v!
-v 98 eq 'is98 'n98 if_else
+v 98 eq is98 n98 if_else
 ret
 is98: "98?" print ret
-n98: v 69 eq 'is69 'n69 if_else
+n98: v 69 eq is69 n69 if_else
 ret
 is69: "69?" print ret
-n69: v 110 eq 'is110 'n110 if_else
+n69: v 110 eq is110 n110 if_else
 ret
 is110: "110?" print ret
-n110: v 115 eq 'is115 'n115 if_else
+n110: v 115 eq is115 n115 if_else
 ret
 is115: "115?" print ret
-n115: v 84 eq 'is84 'n84 if_else
+n115: v 84 eq is84 n84 if_else
 ret
 is84: "84?" print ret
-n84: v 118 eq 'is118 'n118 if_else
+n84: v 118 eq is118 n118 if_else
 ret
 is118: "118?" print ret
-n118: v 65 eq 'is65 'n65 if_else
+n118: v 65 eq is65 n65 if_else
 ret
 is65: "65?" print ret
-n65: v 101 eq 'is101 'n101 if_else
+n65: v 101 eq is101 n101 if_else
 ret
 is101: "101?" print ret
-n101: v 116 eq 'is116 'dflt if_else
+n101: v 116 eq is116 dflt if_else
 ret
 is116: "hit-116" print ret
 dflt: "none" print ret
 ; nested if ladder, 10 levels deep (inline depth 10 > cap 8)
 1 c!
-c 'b1 if
+c b1 if
 ret
 b1:
   1 c!
-  c 'b2 if
+  c b2 if
   ret
 b2:
   1 c!
-  c 'b3 if
+  c b3 if
   ret
 b3:
   1 c!
-  c 'b4 if
+  c b4 if
   ret
 b4:
   1 c!
-  c 'b5 if
+  c b5 if
   ret
 b5:
   1 c!
-  c 'b6 if
+  c b6 if
   ret
 b6:
   1 c!
-  c 'b7 if
+  c b7 if
   ret
 b7:
   1 c!
-  c 'b8 if
+  c b8 if
   ret
 b8:
   1 c!
-  c 'b9 if
+  c b9 if
   ret
 b9:
   1 c!
-  c 'b10 if
+  c b10 if
   ret
 b10:
   "deep10" print

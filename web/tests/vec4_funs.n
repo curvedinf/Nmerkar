@@ -1,22 +1,22 @@
 ; array_map / array_reduce / argsort / search_sorted / transpose
 list 1 append 2 append 3 append 0 array a!
-"map dbl: " print a _addr dbl array_map print
-"map sq: " print a _addr sq array_map print
-"reduce +: " print a 0 _addr addb array_reduce print
+"map dbl: " print a dbl array_map print
+"map sq: " print a sq array_map print
+"reduce +: " print a 0 addb array_reduce print
 ;float reduce
 list 1.5 append 2.5 append 0.5 append float tensor ft!
-"reduce float: " print ft 0.5 _addr addb array_reduce print
+"reduce float: " print ft 0.5 addb array_reduce print
 ;fold over a list (C converts list -> float tensor)
-list 1 append 2 append 3 append 1 _addr addb array_reduce print
+list 1 append 2 append 3 append 1 addb array_reduce print
 ;fold over a matrix
 [2 2] float tensor mm!
 mm 0 1.0 set
 mm 1 2.0 set
 mm 2 3.0 set
 mm 3 4.0 set
-"reduce mat: " print mm 0 _addr addb array_reduce print
+"reduce mat: " print mm 0 addb array_reduce print
 ;map over a matrix keeps the matrix shape
-"map mat: " print mm _addr mm2 array_map print
+"map mat: " print mm mm2 array_map print
 ;argsort: stable, ties keep left index first
 list 3 append 1 append 2 append 0 array s!
 "argsort: " print s array_argsort print

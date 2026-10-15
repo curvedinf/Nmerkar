@@ -3,8 +3,8 @@ entry:
   0 v0!               ; v0 = F(k), starting at F(0) = 0
   1 v1!               ; v1 = F(k+1), starting at F(1) = 1
   20 v2!              ; v2 = iterations remaining
-  _addr v3            ; push address of the condition body (v3)
-  _addr v4            ; push address of the loop body (v4)
+  v3            ; push address of the condition body (v3)
+  v4            ; push address of the loop body (v4)
   while               ; call v3 each round; run v4 until it returns 0
   v0                 ; push the final F(20)
   "fib(20)=%d" format ; render with the printf-style template

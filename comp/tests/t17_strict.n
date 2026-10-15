@@ -44,17 +44,17 @@ d "k" w set
 ; loosen the element before comparing. The filter result is strict again;
 ; length accepts it.
 [1 2 3 4] strict nums!
-"s6: " print nums 'big filter length print
+"s6: " print nums big filter length print
 ; s7: strict shared counter; the cond label loosens before `lt`, so `while`
 ; never truthiness-coerces a strict value (shared i++ is an atomic RMW — raw,
 ; no coercion).
 0 strict i!
-'cond 'body while
+cond body while
 "s7: " print i loose print
 ; s8: strictness crosses call boundaries — the argument taints the callee's
 ; parameter, and the callee's strict return taints the call result.
 "yo" strict m!
-"s8: " print m _call echo print
+"s8: " print m 'echo print
 ; s9: `cast` is the dynamic explicit coercer: a strict string parses; the
 ; result stays strict, and print accepts it.
 "42" strict int cast

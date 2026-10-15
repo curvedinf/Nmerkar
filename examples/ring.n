@@ -1,7 +1,7 @@
 ; ring.n — v13: spawn + channel, and a weave DAG
 ; (the channel is a global: locals are frame-scoped and the post-weave
 ;  code runs in its own body frame)
-'sender spawn ch!     ; spawn sender in a detached thread; ch (global) = its result channel
+sender spawn ch!     ; spawn sender in a detached thread; ch (global) = its result channel
 weave                 ; begin task-DAG definition
   task one:           ; task `one` — no inputs
     ret 21            ; task result = 21

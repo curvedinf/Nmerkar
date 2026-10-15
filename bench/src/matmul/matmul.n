@@ -6,7 +6,7 @@
 ; weave task `mmul` contains exactly one op (`mul`) — the auto device
 ; dispatches it as a GPU matmul kernel launch; --device cpu runs it inline.
 512 n!
-has_args 'setn if
+has_args setn if
 n n mul n2!
 [n n] 0 n2 range concat float tensor kmat!
 kmat 0.000001 mul 1.0 add a!

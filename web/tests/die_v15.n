@@ -1,4 +1,4 @@
-"abc" 0 _addr f array_reduce
+"abc" 0 f array_reduce
 f:
   add
   ret

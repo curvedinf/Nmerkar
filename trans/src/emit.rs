@@ -9,7 +9,7 @@
 //     declared shared at top level
 //   - one label per C function; `main` becomes `entry:`
 //   - every C variable is a unique slot `vN`, local to the function's body
-//     (construct labels merge into that body; `_call` entries get fresh
+//     (construct labels merge into that body; `'label` call entries get fresh
 //     frames, so no save/restore is needed around calls)
 //   - control flow uses quotation labels: conditions/bodies are separate
 //     labels defined after the function body (so the body's `ret` comes
@@ -21,10 +21,10 @@
 //     body tail and by `continue`, so `continue` still increments
 //   - early `return` from inside control flow binds `rv`, sets `fr`, and
 //     the remaining statements of the enclosing list are wrapped behind
-//     `fr 'c 'b if_else`; loop conditions are `fr`-guarded so loops
+//     `fr c b if_else`; loop conditions are `fr`-guarded so loops
 //     exit; the function epilogue returns `fr rv mul` (early value when
 //     flagged, else 0) and resets the flag
-//   - `return e;` in `main` is `e _call exit` (process exit code)
+//   - `return e;` in `main` is `e 'exit` (process exit code)
 
 use crate::ast::*;
 use crate::error::{Error, Result};
@@ -72,7 +72,7 @@ pub fn emit(prog: &Program) -> Result<String> {
     // v14: declare the cross-body registers once at top level (plain names;
     // a name assigned in several label bodies must be shared). rv/fr carry
     // the early-return value/flag, frv is the epilogue temp, pt holds a call
-    // result for `ret pt`. C-variable slots stay frame-local: every _call
+    // result for `ret pt`. C-variable slots stay frame-local: every call
     // entry gets a fresh local frame, so no call-save stack is needed.
     if !prog.functions.is_empty() {
         e.out.push_str("0 rv! 0 fr! 0 frv! 0 pt!\nret\n");
@@ -97,7 +97,7 @@ struct Emitter {
     /// Function-level label buffers flushed after every construct label.
     /// k-call wrappers and for-post labels go to `hoisted`; early-return
     /// guard labels go to `hoisted_guards`. Nmerkar's break/continue
-    /// validation is a linear scan that treats a `_call`-target label as a
+    /// validation is a linear scan that treats a call-target label as a
     /// new non-loop context, so a guard body containing `continue`/`break`
     /// must be defined BEFORE any call-wrapper label: guards flush first.
     hoisted: String,
@@ -172,7 +172,7 @@ impl Emitter {
         debug_assert!(!terminated || !ctx.is_main, "main body ends in exit; list handled it");
 
         let epilogue = if is_main {
-            "0 _call exit\nret\n"
+            "0 'exit\nret\n"
         } else {
             "fr rv mul frv! 0 fr! ret frv\n"
         };
@@ -204,7 +204,7 @@ impl Emitter {
                 // of this list must be skipped via the early-return flag.
                 let c = self.fresh_label();
                 let b = self.fresh_label();
-                buf.code.push_str(&format!("fr 'c{c} 'b{b} if_else\n"));
+                buf.code.push_str(&format!("fr c{c} b{b} if_else\n"));
                 let mut rest = Buf::new();
                 let terminated = self.stmt_list(&mut rest, &stmts[idx + 1..], ctx, ListCtx::LabelBody)?;
                 self.hoisted_guards.push_str(&format!("b{b}:\n{}", rest.code));
@@ -222,13 +222,13 @@ impl Emitter {
 
     /// Emit a `return`. Returns true when the emitted text itself ends a
     /// label body with `ret` (only the non-main LabelBody form does —
-    /// `main`'s `_call exit` never returns at runtime but is not a `ret`
+    /// `main`'s `'exit` never returns at runtime but is not a `ret`
     /// instruction, so its enclosing label body still needs a terminator).
     fn return_stmt(&mut self, buf: &mut Buf, s: &Stmt, ctx: &mut FnCtx, lctx: ListCtx) -> Result<bool> {
         let Stmt::Return { value, .. } = s else { unreachable!() };
         self.expr(buf, value, ctx)?;
         if ctx.is_main {
-            buf.code.push_str("_call exit\n");
+            buf.code.push_str("'exit\n");
             Ok(false)
         } else if lctx == ListCtx::LabelBody {
             buf.code.push_str("rv! 1 fr! 0 ret\n");
@@ -260,9 +260,9 @@ impl Emitter {
             Stmt::Break { .. } => buf.code.push_str("break\n"),
             Stmt::Continue { .. } => match ctx.loops.last() {
                 // PushAddr jump into the post label (same frame, like the
-                // loop tail) — a `_call` would push a fresh frame and the
+                // loop tail) — a call would push a fresh frame and the
                 // post's slot writes would miss the loop's locals
-                Some(Some(inc)) => buf.code.push_str(&format!("1 '{inc} if continue\n")),
+                Some(Some(inc)) => buf.code.push_str(&format!("1 {inc} if continue\n")),
                 _ => buf.code.push_str("continue\n"),
             },
             // Blocks are transparent: same buffers, same context. A return
@@ -278,8 +278,8 @@ impl Emitter {
                 let t = self.fresh_label();
                 let e_label = else_.as_ref().map(|_| self.fresh_label());
                 match e_label {
-                    Some(e) => buf.code.push_str(&format!("'i{t} 'e{e} if_else\n")),
-                    None => buf.code.push_str(&format!("'i{t} if\n")),
+                    Some(e) => buf.code.push_str(&format!("i{t} e{e} if_else\n")),
+                    None => buf.code.push_str(&format!("i{t} if\n")),
                 }
                 let mut then_buf = Buf::new();
                 let terminated = self.stmt_list(&mut then_buf, stmt_of(then), ctx, ListCtx::LabelBody)?;
@@ -315,13 +315,13 @@ impl Emitter {
                     buf.labels.push_str("0 ret\n");
                 }
                 buf.labels.push_str(&body_buf.labels);
-                buf.code.push_str(&format!("'c{c} 'b{b} while\n"));
+                buf.code.push_str(&format!("c{c} b{b} while\n"));
             }
             Stmt::DoWhile { body, cond } => {
                 let df = self.fresh_label();
                 let c = self.fresh_label();
                 let b = self.fresh_label();
-                // df=1 forces the first condition pass true — `'c 'b while`
+                // df=1 forces the first condition pass true — `c b while`
                 // checks before the first body run, do-while must not.
                 buf.code.push_str(&format!("1 df{df}!\n"));
                 ctx.loops.push(None);
@@ -338,7 +338,7 @@ impl Emitter {
                 self.expr(&mut cond_buf, cond, ctx)?;
                 buf.labels.push_str(&cond_buf.labels);
                 buf.labels.push_str(&format!("c{c}:\nfr not df{df} {}or and ret\n", cond_buf.code));
-                buf.code.push_str(&format!("'c{c} 'b{b} while\n"));
+                buf.code.push_str(&format!("c{c} b{b} while\n"));
             }
             Stmt::For { init, cond, post, body } => {
                 match init {
@@ -370,7 +370,7 @@ impl Emitter {
                 let mut body_buf = Buf::new();
                 let terminated = self.stmt_list(&mut body_buf, stmt_of(body), ctx, ListCtx::LabelBody)?;
                 ctx.loops.pop();
-                body_buf.code.push_str(&format!("fr not '{inc} if\n"));
+                body_buf.code.push_str(&format!("fr not {inc} if\n"));
                 buf.labels.push_str(&format!("b{b}:\n{}", body_buf.code));
                 if !terminated {
                     buf.labels.push_str("0 ret\n");
@@ -382,7 +382,7 @@ impl Emitter {
                 }
                 self.hoisted.push_str(&post_buf.labels);
                 self.hoisted.push_str(&format!("{inc}:\n{}0 ret\n", post_buf.code));
-                buf.code.push_str(&format!("'c{c} 'b{b} while\n"));
+                buf.code.push_str(&format!("c{c} b{b} while\n"));
             }
         }
         Ok(())
@@ -511,7 +511,7 @@ impl Emitter {
                 // v14: direct call. Arguments are evaluated inline in the
                 // caller's body (same frame, so slot locals resolve); the
                 // callee's param binds pop them and its ret leaves the single
-                // return value on the stack. Fresh frames per _call make the
+                // return value on the stack. Fresh frames per call make the
                 // old kN wrapper (globals save/restore) unnecessary.
                 for a in args {
                     self.expr(buf, a, ctx)?;
@@ -526,14 +526,14 @@ impl Emitter {
                     }
                     buf.code.push_str(&format!("{} ", args.len() - fixed));
                 }
-                buf.code.push_str(&format!("_call {name} "));
+                buf.code.push_str(&format!("'{name} "));
             }
             ExprKind::Index { name, index } => {
                 let slot = self.slot_of(ctx, name, e.line, e.col)?;
                 self.expr(buf, index, ctx)?;
                 // Raw data pointer via strstr(s, ""), pointer+int arithmetic,
                 // byte load, mask.
-                buf.code.push_str(&format!("{slot} \"\" _call strstr add load 255 and "));
+                buf.code.push_str(&format!("{slot} \"\" 'strstr add load 255 and "));
             }
             ExprKind::Argv(index) => {
                 self.expr(buf, index, ctx)?;
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn while_label_shape() {
         let out = transpile("int main() { int x = 0; while (x < 3) { x = x + 1; } return 0; }");
-        assert!(out.contains("'c1 'b2 while"), "missing while instruction:\n{out}");
+        assert!(out.contains("c1 b2 while"), "missing while instruction:\n{out}");
         assert!(out.contains("c1:\nfr not"), "missing guarded cond label:\n{out}");
         assert!(out.contains("b2:\n"), "missing body label:\n{out}");
     }
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn calls_are_direct_v14() {
         let out = transpile("int g(int a) { return g(a); } int main() { return g(1); }");
-        assert!(out.contains("1 _call g "), "missing direct call:\n{out}");
+        assert!(out.contains("1 'g "), "missing direct call:\n{out}");
         assert!(!out.contains("k1:") && !out.contains("k2:"), "wrappers must be gone:\n{out}");
         assert!(!out.contains("svst"), "call-save stack must be gone:\n{out}");
         assert!(out.contains("0 rv! 0 fr! 0 frv! 0 pt!"), "missing register prologue:\n{out}");
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn early_return_guards_remainder() {
         let out = transpile("int f(int n) { if (n) { return 1; } return 0; }");
-        assert!(out.contains("fr 'c"), "missing guard:\n{out}");
+        assert!(out.contains("fr c"), "missing guard:\n{out}");
         assert!(out.contains("fr rv mul"), "missing epilogue:\n{out}");
     }
 
@@ -641,7 +641,7 @@ mod tests {
         let def = out.find("n1:\n").or_else(|| out.find("n2:\n")).or_else(|| out.find("n3:\n"));
         assert!(def.is_some(), "missing post label definition:\n{out}");
         assert!(out.contains(" if continue\n"), "continue must run the post label frame-safely:\n{out}");
-        assert!(!out.contains("_call n"), "continue must not _call the post label:\n{out}");
+        assert!(!out.contains("'.n"), "continue must not call the post label:\n{out}");
     }
 
     #[test]

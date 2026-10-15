@@ -5,7 +5,7 @@
 ; are bit-identical to `--device cpu`. At N=2048 auto may use the GPU;
 ; samples stay within the documented matmul reassociation tolerance.
 512 n!
-has_args 'setn if
+has_args setn if
 n n mul n2!
 0 n2 range vals!
 [n n] vals concat vals!

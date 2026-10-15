@@ -1,7 +1,7 @@
 ; iterators
-0 5 range iter 'dbl iter_map collect length print
-0 5 range iter 'dbl iter_map collect 3 get print
-0 10 range iter 'ev iter_filter collect length print
+0 5 range iter dbl iter_map collect length print
+0 5 range iter dbl iter_map collect 3 get print
+0 10 range iter ev iter_filter collect length print
 ; next
 0 3 range iter it!
 it next v# m#
@@ -27,19 +27,19 @@ j "s" get print
 j to_json print
 "[1.5, 2]" parse_json 0 get print
 ; try / retry
-'good try r# ok#
+good try r# ok#
 r print
 ok print
-'bad try r# ok#
+bad try r# ok#
 r print
 ok print
 0 cnt!
-2 'flaky retry r# ok#
+2 flaky retry r# ok#
 r print
 ok print
 cnt print
 ; spawn
-'work spawn c!
+work spawn c!
 c dequeue print
 "done" print
 ret
@@ -48,6 +48,6 @@ dbl: n! ret n 2 mul
 ev: n! ret n 2 rem 0 eq
 good: ret 42
 bad: ret 1 0 div
-flaky: cnt inc cnt! cnt 2 lt 'do_err if ret 99
+flaky: cnt inc cnt! cnt 2 lt do_err if ret 99
 do_err: ret 1 0 div
 work: ret 7 7 mul

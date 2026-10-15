@@ -178,7 +178,7 @@ fn pi(p: &mut Parsed, ins: Ins, line: u32) {
 // body, so the operand is exactly the return expression.
 fn is_hard_boundary(t: &(u32, Tok)) -> bool {
     matches!(&t.1,
-        Tok::LabelDef(_) | Tok::Task { .. } | Tok::TaskEnd(_) | Tok::Wrun(_)
+        Tok::LabelDef(_) | Tok::AnonDef | Tok::AnonCall | Tok::Task { .. } | Tok::TaskEnd(_) | Tok::Wrun(_)
         | Tok::Entry | Tok::MacroDef(..) | Tok::StructDef(..) | Tok::Import(_)
         | Tok::Export(_) | Tok::Use(_) | Tok::Mod(_) | Tok::Pub
         | Tok::Extern(_) | Tok::Method(_)
@@ -247,12 +247,18 @@ struct ParseCtx<'a> {
     weave_ctr: usize,
     cur_weave: Vec<(String, Vec<Param>, i64)>,
     expand_depth: usize,
+    // v16 anonymous labels: collected bodies wait here and are appended to
+    // the token stream after the main flow drains, so the PushAddr emitted
+    // at the collection site stays adjacent to its consumer
+    anon_ctr: usize,
+    hoisted_anon: Vec<(String, Vec<(u32, Tok)>)>,
 }
 
 impl<'a> ParseCtx<'a> {
     fn run(&mut self) {
-        while let Some((line, t)) = self.q.pop_front() {
-            match t {
+        loop {
+            while let Some((line, t)) = self.q.pop_front() {
+                match t {
                 Tok::Op("RET") => self.parse_ret(line),
                 Tok::Op("FOR") => pi(&mut self.p, Ins::For, line),
                 Tok::Op("IF") => pi(&mut self.p, Ins::If, line),
@@ -328,12 +334,38 @@ impl<'a> ParseCtx<'a> {
                 Tok::Dict(body) => self.requeue_literal(body, "@dictstart", "@dictlit", line),
                 Tok::Wrun(terminal) => self.parse_wrun(terminal, line),
                 Tok::LabelDef(n) => self.parse_label_def(n, line),
+                Tok::AnonDef => self.parse_anon(false, line),
+                Tok::AnonCall => self.parse_anon(true, line),
                 Tok::Entry => {
                     self.p.labels.insert("entry".to_string(), self.p.ins.len());
                     self.p.label_lines.insert(self.p.ins.len(), line);
                     self.p.entry_label = Some("entry".to_string());
                 }
                 Tok::Ident(n) => self.parse_ident(n, line),
+            }
+            }
+            // v16: hoisted anonymous bodies append to the stream once the
+            // main flow drains; processing a body may hoist more (nested
+            // anon defs), so drain until both queues are empty
+            if self.q.is_empty() && !self.hoisted_anon.is_empty() {
+                // the main flow must never fall into a hoisted body
+                if !matches!(
+                    self.p.ins.last(),
+                    Some(Ins::Ret) | Some(Ins::Break) | Some(Ins::Cont) | Some(Ins::Goto(_)) | Some(Ins::IfElse)
+                ) {
+                    pi(&mut self.p, Ins::Ret, 0);
+                }
+                let rest = std::mem::take(&mut self.hoisted_anon);
+                for (name, body) in rest {
+                    let start_line = body.first().map(|&(l, _)| l).unwrap_or(0);
+                    self.q.push_back((start_line, Tok::LabelDef(name)));
+                    for t in body {
+                        self.q.push_back(t);
+                    }
+                }
+            }
+            if self.q.is_empty() {
+                break;
             }
         }
     }
@@ -419,7 +451,14 @@ impl<'a> ParseCtx<'a> {
                     if matches!(self.q.front().map(|t| &t.1), Some(Tok::Op("SEND"))) {
                         user_err!("parse", Some(line), "bare selectors were removed — name the receiver: '{}.<method> send`", label);
                     }
-                    pi(&mut self.p, Ins::PushAddr(label), line);
+                    // v16: a bare label reference is an implicit fn load (the
+                    // merge rewrites it); 'name is the call form
+                    user_err!(
+                        "parse",
+                        Some(line),
+                        "the quoted-address form was removed — write `{}` bare (a label reference is an implicit fn load) or `'{}` to call it",
+                        label, label
+                    );
                 }
             }
             "CALL" => {
@@ -788,6 +827,68 @@ impl<'a> ParseCtx<'a> {
         self.cur_weave.clear();
     }
 
+    // v16 anonymous label (`:` / `':`). The body is the following tokens
+    // through the matching depth-0 `ret` (ret is load-bearing: it closes
+    // the body and must sit on the same line). The fn cell is pushed at the
+    // collection site; the body ins are hoisted to the end of the stream,
+    // so a callback consumer written right after stays adjacent to the
+    // PushAddr and keeps the inline fast path + continuation semantics.
+    fn parse_anon(&mut self, call: bool, line: u32) {
+        let name = format!("__q{}", self.anon_ctr);
+        self.anon_ctr += 1;
+        let mut body: Vec<(u32, Tok)> = Vec::new();
+        let mut depth: i32 = 1;
+        let mut closed = false;
+        while let Some((ln, t)) = self.q.pop_front() {
+            match &t {
+                Tok::AnonDef | Tok::AnonCall => {
+                    depth += 1;
+                    body.push((ln, t));
+                }
+                Tok::Op("RET") => {
+                    depth -= 1;
+                    body.push((ln, t));
+                    if depth == 0 {
+                        // the closing ret is bare — the value is already on
+                        // the stack (the anon idiom); unlike a label body
+                        // (where ret precedes a label def), main-flow code
+                        // follows here and must not be absorbed as an
+                        // operand
+                        if ln != line {
+                            user_err!(
+                                "parse",
+                                Some(line),
+                                "anonymous body must close with `ret` on the same line — name a label for a multi-line body"
+                            );
+                        }
+                        closed = true;
+                        break;
+                    }
+                }
+                Tok::LabelDef(_) | Tok::Entry => {
+                    user_err!(
+                        "parse",
+                        Some(ln),
+                        "labels cannot be defined inside an anonymous body — define it outside and reference it by name"
+                    );
+                }
+                _ => body.push((ln, t)),
+            }
+        }
+        if !closed {
+            user_err!(
+                "parse",
+                Some(line),
+                "anonymous body must end with `ret` — the body runs to end of input without one"
+            );
+        }
+        pi(&mut self.p, Ins::PushAddr(name.clone()), line);
+        if call {
+            pi(&mut self.p, simple_ins("FNAPPLY"), line);
+        }
+        self.hoisted_anon.push((name, body));
+    }
+
     fn parse_label_def(&mut self, n: String, line: u32) {
         let mut n = n;
         if let Some(tname) = self.pending_method.take() {
@@ -1044,6 +1145,84 @@ fn check_loop_exits_in_loop(p: &Parsed) {
     }
 }
 
+// v16: a bare label name is its callable (implicit fn load). Rewritten at
+// TU-parse time so label-body checks, loop-exit attribution, and the merge
+// all see the fn reference. Body-scoped param binds shadow (a weave task's
+// inputs bind task names: `task c: a! b!` with tasks a and b), and a label
+// name may not also be a variable — one name, one meaning.
+fn rewrite_label_refs(p: &mut Parsed) {
+    // this TU's shared declarations: top-level prefix assignments
+    let first_label = p.labels.values().copied().min().unwrap_or(p.ins.len());
+    let mut shared_decls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for pc in 0..first_label.min(p.ins.len()) {
+        if let Ins::LocalSet(n) = &p.ins[pc] {
+            if !p.param_pcs.contains_key(&pc) {
+                shared_decls.insert(n.clone());
+            }
+        }
+    }
+    let mut label_pcs: Vec<usize> = p.labels.values().copied().collect();
+    label_pcs.sort_unstable();
+    label_pcs.dedup();
+    // body-scoped param names: a read inside a body whose params bind the
+    // name resolves to the frame slot, not the callable
+    let mut body_params: HashMap<usize, std::collections::HashSet<String>> = HashMap::new();
+    for (&pc, _) in p.param_pcs.iter() {
+        if let Some(Ins::LocalSet(n)) = p.ins.get(pc) {
+            let body = label_pcs.iter().filter(|&&l| l <= pc).max().copied().unwrap_or(0);
+            body_params.entry(body).or_default().insert(n.clone());
+        }
+    }
+    for i in 0..p.ins.len() {
+        let (is_read, name) = match &p.ins[i] {
+            Ins::LocalGet(n) => (true, n.clone()),
+            Ins::LocalSet(n) | Ins::IncLocal(n) | Ins::AddLocal(n) => (false, n.clone()),
+            _ => continue,
+        };
+        if !p.labels.contains_key(&name) {
+            continue;
+        }
+        let body = label_pcs.iter().filter(|&&l| l <= i).max().copied().unwrap_or(0);
+        let shadowed = body_params
+            .get(&body)
+            .map(|ps| ps.contains(&name))
+            .unwrap_or(false);
+        if shadowed && !matches!(p.ins[i], Ins::LocalSet(_)) {
+            continue; // frame-slot read/update inside the binding body
+        }
+        if shadowed && matches!(p.ins[i], Ins::LocalSet(_)) && !p.param_pcs.contains_key(&i) {
+            // a non-param re-assignment of a param name that is also a label
+            user_err!(
+                "parse",
+                Some(p.ins_lines[i]),
+                "name collision: '{}' is both a label and a variable — rename one (a label name may only be read, as its callable)",
+                name
+            );
+        }
+        if p.param_pcs.contains_key(&i) {
+            continue; // the param bind itself (task input / label param)
+        }
+        if is_read {
+            if shared_decls.contains(&name) {
+                user_err!(
+                    "parse",
+                    Some(p.ins_lines[i]),
+                    "name collision: '{}' is both a label and a shared variable — rename one (a bare read of a label name pushes its callable)",
+                    name
+                );
+            }
+            p.ins[i] = Ins::PushAddr(name);
+        } else {
+            user_err!(
+                "parse",
+                Some(p.ins_lines[i]),
+                "name collision: '{}' is both a label and a variable — rename one (a label name may only be read, as its callable)",
+                name
+            );
+        }
+    }
+}
+
 pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Parsed {
     let mut ctx = ParseCtx {
         p: empty_parsed(),
@@ -1058,6 +1237,8 @@ pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Par
         weave_ctr: 0,
         cur_weave: Vec::new(),
         expand_depth: 0,
+        anon_ctr: 0,
+        hoisted_anon: Vec::new(),
     };
     ctx.run();
     let mut p = ctx.p;
@@ -1066,6 +1247,7 @@ pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Par
     for (n, &pc) in &p.labels {
         p.label_names.entry(pc).or_insert_with(|| n.clone());
     }
+    rewrite_label_refs(&mut p);
     check_label_bodies_end_with_ret(&p);
     check_loop_exits_in_loop(&p);
     // Note: resolve_locals is deferred to merge_tus, where all TU offsets
@@ -1472,14 +1654,41 @@ pub fn resolve_locals(p: &mut Parsed, extra_shared: std::collections::HashSet<St
     }
 }
 pub fn prefix_task_labels(body: Vec<(u32, Tok)>, prefix: &str) -> Vec<(u32, Tok)> {
-    body.into_iter()
-        .map(|(ln, t)| (ln, match t {
-            Tok::LabelDef(n) => Tok::LabelDef(format!("{}{}", prefix, n)),
-            Tok::Jump(op, l) => Tok::Jump(op, format!("{}{}", prefix, l)),
-            Tok::MacroDef(n, mbody) => Tok::MacroDef(n, prefix_task_labels(mbody, prefix)),
-            other => other,
-        }))
-        .collect()
+    // v16: bare label references are Tok::Ident — prefix the ones naming a
+    // label defined in this same task body (a caller-scope name that shares
+    // a task-local label's name is a one-name-one-meaning error anyway)
+    fn collect_labels(toks: &[(u32, Tok)], out: &mut std::collections::HashSet<String>) {
+        for (_, t) in toks {
+            match t {
+                Tok::LabelDef(n) => {
+                    out.insert(n.clone());
+                }
+                Tok::List(b) | Tok::Dict(b) => collect_labels(b, out),
+                Tok::MacroDef(_, mb) => collect_labels(mb, out),
+                _ => {}
+            }
+        }
+    }
+    fn walk(
+        toks: Vec<(u32, Tok)>,
+        prefix: &str,
+        labels: &std::collections::HashSet<String>,
+    ) -> Vec<(u32, Tok)> {
+        toks.into_iter()
+            .map(|(ln, t)| (ln, match t {
+                Tok::LabelDef(n) => Tok::LabelDef(format!("{}{}", prefix, n)),
+                Tok::Jump(op, l) => Tok::Jump(op, format!("{}{}", prefix, l)),
+                Tok::Ident(n) if labels.contains(n.as_str()) => Tok::Ident(format!("{}{}", prefix, n)),
+                Tok::List(b) => Tok::List(walk(b, prefix, labels)),
+                Tok::Dict(b) => Tok::Dict(walk(b, prefix, labels)),
+                Tok::MacroDef(n, mb) => Tok::MacroDef(n, walk(mb, prefix, labels)),
+                other => other,
+            }))
+            .collect()
+    }
+    let mut labels = std::collections::HashSet::new();
+    collect_labels(&body, &mut labels);
+    walk(body, prefix, &labels)
 }
 
 // Merge per-TU Parsed units into one image; tus[0] is the main TU (pc 0).
@@ -1524,15 +1733,8 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
         // declares shared vars — in directory mode an init TU's top-level
         // assignment publishes cross-thread state, and it sits after the
         // merged program's first label so the single-prefix scan in
-        // resolve_locals would miss it
-        let tu_first_label = tu.labels.values().copied().min().unwrap_or(tu.ins.len());
-        for pc in 0..tu_first_label.min(tu.ins.len()) {
-            if let Ins::LocalSet(n) = &tu.ins[pc] {
-                if !tu.param_pcs.contains_key(&pc) {
-                    tu_shared.insert(n.clone());
-                }
-            }
-        }
+        // resolve_locals would miss it (v16: computed for all TUs in the
+        // pre-pass above)
         let str_base = m.strings.len();
         let mut imp_map: Vec<usize> = Vec::new();
         for im in &tu.imports {
@@ -1557,7 +1759,19 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
                 Ins::PushI(v) => Ins::PushI(*v),
                 Ins::PushF(v) => Ins::PushF(*v),
                 Ins::PushS(i) => Ins::PushS(i + str_base),
-                Ins::PushAddr(l) => Ins::PushAddr(local(l)),
+                Ins::PushAddr(l) => {
+                    // v16 cross-TU: a label name another TU declares shared
+                    // is a collision (the TU-local case errored in parse)
+                    if !l.contains(':') && tu_shared.contains(l.as_str()) {
+                        user_err!(
+                            "parse",
+                            Some(tu.ins_lines[li]),
+                            "name collision: '{}' is both a label and a shared variable — rename one (a bare read of a label name pushes its callable)",
+                            l
+                        );
+                    }
+                    Ins::PushAddr(local(l))
+                }
                 Ins::Simple(h) => Ins::Simple(h),
                 Ins::Goto(l) => Ins::Goto(local(l)),
                 Ins::For => Ins::For,
@@ -1835,6 +2049,7 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "RANGEFOLD" => "op_rangefold",
         "TRANSPOSE" => "op_transpose",
         "DCAST" => "op_dcast",
+        "FNAPPLY" => "op_apply",
         "DBG" => "op_dbg", "CHECK" => "op_check", "TIMER" => "op_timer", "MEMSTATS" => "op_memstats",
 
         other => panic!("no helper for {}", other),
@@ -1853,6 +2068,9 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         "op_sqrt" | "op_inc" | "op_dec" | "op_not" | "op_bnot" => (1, 1),
         // containers
         "op_get" | "op_getq" | "op_orelse" | "op_has" | "op_contains" => (2, 1),
+        // v16: spread the list as args and call the fn cell (the callee's
+        // arity is checked at runtime — the cell carries it)
+        "op_apply" => (2, 1),
         "op_set" => (3, 0),
         "op_append" | "op_push" => (2, 1),
         "op_lpop" => (1, 1),
@@ -3075,7 +3293,7 @@ mod tests {
     #[test]
     fn label_arity_error_is_a_parse_diagnostic() {
         let d = crate::diag::catch_diag(|| {
-            let mut p = parse_src("entry:\n  _call big\n  ret\nbig: n!\n  ret n\n");
+            let mut p = parse_src("entry:\n  'big\n  ret\nbig: n!\n  ret n\n");
             specialize_builtin_sends(&mut p);
         check_label_arity(&p);
         });
@@ -3089,7 +3307,7 @@ mod tests {
 
     #[test]
     fn label_arity_accepts_a_satisfied_call() {
-        let mut p = parse_src("entry:\n  5 _call dbl ret\ndbl: n!\n  ret n n add\n");
+        let mut p = parse_src("entry:\n  5 'dbl ret\ndbl: n!\n  ret n n add\n");
         specialize_builtin_sends(&mut p);
         check_label_arity(&p); // must not panic
     }
@@ -3104,7 +3322,7 @@ mod tests {
             parse_src("entry:\n  x print\n  ret\n");
         });
         assert_eq!(d.stage, "parse");
-        assert!(d.message.contains("'x' is read but never assigned anywhere"), "{}", d.message);
+        assert!(d.message.contains("x' is read but never assigned anywhere"), "{}", d.message);
     }
 
     #[test]
@@ -3113,15 +3331,58 @@ mod tests {
             parse_src("x print\nentry:\n  ret\n");
         });
         assert_eq!(d.stage, "parse");
-        assert!(d.message.contains("'x' is read but never assigned anywhere"), "{}", d.message);
+        assert!(d.message.contains("x' is read but never assigned anywhere"), "{}", d.message);
     }
 
-    // Using a body's local from another body is a compile error (the bodies
+    // Using a bodys local from another body is a compile error (the bodies
     // are distinct frames; the write would not alias).
     #[test]
+    // ---- v16 anonymous functions ----
+    #[test]
+    fn anon_parses_to_pushaddr_and_hoisted_body() {
+        let mut p = parse_src("[1 2 3] : 2 mul ret array_map\nret\n");
+        let pa = p.ins.iter().position(|i| matches!(i, Ins::PushAddr(l) if l.contains("__q"))).unwrap();
+        assert!(matches!(p.ins[pa + 1], Ins::Simple(_)), "consumer follows the fn ref");
+        let (_lbl, pc) = p.labels.iter().find(|(n, _)| n.contains("__q")).map(|(n, &pc)| (n.clone(), pc)).unwrap();
+        assert!(matches!(p.ins[pc], Ins::PushI(2)), "hoisted body starts with the collected ops");
+        assert!(matches!(p.ins[pc + 1], Ins::Simple("op_mul")));
+        assert!(matches!(p.ins[pc + 2], Ins::Ret), "body ends with the collected ret");
+    }
+
+    #[test]
+    fn anon_call_lowers_to_apply() {
+        let p = parse_src("[3 4] ': add ret\n");
+        assert!(p.ins.iter().any(|i| matches!(i, Ins::Simple("op_apply"))));
+        assert!(p.ins.iter().any(|i| matches!(i, Ins::PushAddr(l) if l.contains("__q"))));
+    }
+
+    #[test]
+    fn anon_missing_ret_is_an_error() {
+        let d = crate::diag::catch_diag(|| {
+            parse_src("1 : 2 mul\n");
+        });
+        assert!(d.message.contains("anonymous body must end with `ret`"), "{}", d.message);
+    }
+
+    #[test]
+    fn anon_multiline_body_is_an_error() {
+        let d = crate::diag::catch_diag(|| {
+            parse_src("1 : 2 mul\n  ret\nret\n");
+        });
+        assert!(d.message.contains("same line"), "{}", d.message);
+    }
+
+    #[test]
+    fn anon_label_def_inside_body_is_an_error() {
+        let d = crate::diag::catch_diag(|| {
+            parse_src("1 : h: 2 ret ret\nret\n");
+        });
+        assert!(d.message.contains("labels cannot be defined inside an anonymous body"), "{}", d.message);
+    }
+
     fn scope_rejects_cross_body_local_read() {
         let d = crate::diag::catch_diag(|| {
-            parse_src("entry:\n  1 y!\n  _call other\n  ret\nother:\n  y print\n  ret\n");
+            parse_src("entry:\n  1 y!\n  'other\n  ret\nother:\n  y print\n  ret\n");
         });
         assert_eq!(d.stage, "parse");
         assert!(d.message.contains("name collision: 'y'"), "{}", d.message);
@@ -3129,12 +3390,12 @@ mod tests {
 
     // Params bind frame slots: reads inside the owning body resolve; the
     // same name bound as a param in two bodies is legal (per-invocation
-    // slots); continuation chains share their invoker's frame.
+    // slots); continuation chains share their invokers frame.
     #[test]
     fn scope_accepts_param_binds_and_continuation_chains() {
         parse_src(
-            "entry:\n  5 'fbody for\n  0 'c 'b while\n  ret\n\
-             fbody: k!\n  k 1 eq 'p 'q if_else\n  ret 0\n\
+            "entry:\n  5 fbody for\n  0 c b while\n  ret\n\
+             fbody: k!\n  k 1 eq p q if_else\n  ret 0\n\
              p:\n  k print\n  ret 0\n\
              q: ret 1\n\
              c: ret 1\n\
@@ -3149,7 +3410,7 @@ mod tests {
     #[test]
     fn label_arity_error_fires_with_callee_defined_first() {
         let d = crate::diag::catch_diag(|| {
-            let mut p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 _call add2\n  print\n  ret\n");
+            let mut p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 'add2\n  print\n  ret\n");
             specialize_builtin_sends(&mut p);
         check_label_arity(&p);
         });
@@ -3163,7 +3424,7 @@ mod tests {
     #[test]
     fn label_arity_error_fires_with_callee_defined_first_zero_args() {
         let d = crate::diag::catch_diag(|| {
-            let mut p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  _call add2\n  ret\n");
+            let mut p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  'add2\n  ret\n");
             specialize_builtin_sends(&mut p);
         check_label_arity(&p);
         });
@@ -3177,7 +3438,7 @@ mod tests {
 
     #[test]
     fn label_arity_accepts_satisfied_call_with_callee_first() {
-        let mut p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 4 _call add2\n  print\n  ret\n");
+        let mut p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 4 'add2\n  print\n  ret\n");
         specialize_builtin_sends(&mut p);
         check_label_arity(&p); // must not panic
     }
@@ -3187,7 +3448,7 @@ mod tests {
     #[test]
     fn label_arity_rejects_underbound_filter_callback() {
         let d = crate::diag::catch_diag(|| {
-            let mut p = parse_src("[1 2 3] 'big filter\nret\nbig: a! b!\n  ret 1\n");
+            let mut p = parse_src("[1 2 3] big filter\nret\nbig: a! b!\n  ret 1\n");
             specialize_builtin_sends(&mut p);
         check_label_arity(&p);
         });
@@ -3202,7 +3463,7 @@ mod tests {
     #[test]
     fn label_arity_rejects_underbound_spawn_body() {
         let d = crate::diag::catch_diag(|| {
-            let mut p = parse_src("entry:\n  'w spawn\n  ret\nw: x!\n  ret x\n");
+            let mut p = parse_src("entry:\n  w spawn\n  ret\nw: x!\n  ret x\n");
             specialize_builtin_sends(&mut p);
         check_label_arity(&p);
         });
@@ -3216,7 +3477,7 @@ mod tests {
 
     #[test]
     fn label_arity_accepts_for_body_binding() {
-        let mut p = parse_src("entry:\n  5 'fbody for\n  ret\nfbody: k!\n  k print\n  ret 0\n");
+        let mut p = parse_src("entry:\n  5 fbody for\n  ret\nfbody: k!\n  k print\n  ret 0\n");
         specialize_builtin_sends(&mut p);
         check_label_arity(&p); // must not panic
     }
@@ -3241,50 +3502,50 @@ mod tests {
                 true,
             ),
             (
-                "using a body's local from another body",
-                "entry:\n  1 y!\n  _call other\n  ret\nother:\n  y print\n  ret\n",
+                "using a bodys local from another body",
+                "entry:\n  1 y!\n  'other\n  ret\nother:\n  y print\n  ret\n",
                 "name collision: 'y'",
                 true,
             ),
             (
                 "name assigned in two distinct bodies",
-                "entry:\n  1 v!\n  _call other\n  ret\nother:\n  2 v!\n  ret\n",
+                "entry:\n  1 v!\n  'other\n  ret\nother:\n  2 v!\n  ret\n",
                 "is assigned in 2 distinct bodies",
                 true,
             ),
             (
                 "call site leaves fewer values than declared arity (callee first)",
-                "add2: a! b!\n  ret a b add\nentry:\n  3 _call add2\n  ret\n",
+                "add2: a! b!\n  ret a b add\nentry:\n  3 'add2\n  ret\n",
                 "but the call site leaves only 1 value(s)",
                 true,
             ),
             (
                 "call site leaves fewer values than declared arity (caller first)",
-                "entry:\n  _call big\n  ret\nbig: n!\n  ret n\n",
+                "entry:\n  'big\n  ret\nbig: n!\n  ret n\n",
                 "but the call site leaves only 0 value(s)",
                 true,
             ),
             (
                 "callback declares more bindings than the op provides",
-                "[1 2 3] 'big filter\nret\nbig: a! b!\n  ret 1\n",
+                "[1 2 3] big filter\nret\nbig: a! b!\n  ret 1\n",
                 "but the `filter` callback provides only 1 value(s)",
                 true,
             ),
             (
                 "satisfied call, callee first (no error)",
-                "add2: a! b!\n  ret a b add\nentry:\n  3 4 _call add2\n  print\n  ret\n",
+                "add2: a! b!\n  ret a b add\nentry:\n  3 4 'add2\n  print\n  ret\n",
                 "",
                 false,
             ),
             (
                 "for-body index binding (no error)",
-                "entry:\n  5 'fbody for\n  ret\nfbody: k!\n  k print\n  ret 0\n",
+                "entry:\n  5 fbody for\n  ret\nfbody: k!\n  k print\n  ret 0\n",
                 "",
                 false,
             ),
             (
                 "param reads inside the owning body (no error)",
-                "entry:\n  7 _call big\n  print\n  ret\nbig: n!\n  ret n\n",
+                "entry:\n  7 'big\n  print\n  ret\nbig: n!\n  ret n\n",
                 "",
                 false,
             ),

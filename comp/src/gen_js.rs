@@ -44,7 +44,7 @@ const JS_OPS: &[&str] = &[
     "op_vsearchsorted", "op_vwhere", "op_transpose",
     "op_malloc", "op_free", "op_buf", "op_bufcopy", "op_loadx", "op_storex",
     "op_chan", "op_enq", "op_deq", "op_close", "op_atom", "op_aget", "op_aset",
-    "op_aadd", "op_cas", "op_spawn",
+    "op_aadd", "op_cas", "op_spawn", "op_apply",
     "op_addto", "op_agg", "op_argi", "op_argv", "op_badd", "op_bfs",
     "op_bloom", "op_btest", "op_chunk", "op_dfs", "op_exec", "op_faddto",
     "op_fatof", "op_fatoi", "op_fbyte", "op_feach", "op_femit", "op_ffold",
@@ -943,20 +943,30 @@ pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
         }
         o.push_str("};\n");
     }
-    // code-address table: every segment start reachable through a code cell
-    let mut first = true;
-    o.push_str("var __NKAD={");
-    for &pc in &dyns {
-        if !first {
-            o.push(',');
+    // code-address table: every segment start reachable through a code cell.
+    // v16: the fn carries its declared arity (f.ar) and name (f.nm) for the
+    // dynamic callback check (mirrors the native UfFn record).
+    {
+        let mut fnm: HashMap<usize, String> = HashMap::new();
+        for (n, &pc) in &p.labels {
+            fnm.entry(pc).or_insert_with(|| p.label_names.get(&pc).cloned().unwrap_or_else(|| n.clone()));
         }
-        first = false;
-        o.push_str(&format!(
-            "{}:RT.A(function(rt,fr){{return F_{}(rt,fr);}})",
-            pc, pc
-        ));
+        let mut first = true;
+        o.push_str("var __NKAD={");
+        for &pc in &dyns {
+            if !first {
+                o.push(',');
+            }
+            first = false;
+            let ar = p.label_params.get(&pc).map(|v| v.len()).unwrap_or(0);
+            let nm = fnm.get(&pc).cloned().unwrap_or_else(|| format!("pc{}", pc));
+            o.push_str(&format!(
+                "{}:(function(){{var f=function(rt,fr){{return F_{}(rt,fr);}};f.ar={};f.nm=\"{}\";return RT.A(f);}})()",
+                pc, pc, ar, nm
+            ));
+        }
+        o.push_str("};\n");
     }
-    o.push_str("};\n");
     // error-site table (mirrors the C uf_sites_v): per instruction,
     // [innermost label name or null, file index, source line]. die() formats
     // it as "L<line> [label]"; __SF (multi-TU only) carries the file stems.

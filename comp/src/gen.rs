@@ -277,6 +277,19 @@ fn addr_lab(start: usize, end: usize, prefix: &str, t: usize) -> String {
     }
 }
 
+
+// v16: re-materialized callback references push fn cells (arity + name ride
+// the interned record, same as the Ins::PushAddr arm)
+fn fn_meta(p: &Parsed, pc: usize) -> (usize, String) {
+    let ar = p.label_params.get(&pc).map(|v| v.len()).unwrap_or(0);
+    let nm = p
+        .label_names
+        .get(&pc)
+        .cloned()
+        .unwrap_or_else(|| format!("pc{}", pc));
+    (ar, nm)
+}
+
 // v13: the data-stack pointer a body's guarded param pops compare against —
 // the caller's saved sp (the just-pushed cs entry), or the outline's own
 // pre-arg pointer, or 0 at the top level.
@@ -877,7 +890,10 @@ pub fn emit_range(
                 } else {
                     plab("", t)
                 };
-                e.push_str(&format!("pushp(cx,(void*)&&{});\n", lab))
+                // v16: a label reference is a fn cell — the declared arity
+                // and name ride the interned record for dynamic checks
+                let ar = p.label_params.get(&t).map(|v| v.len()).unwrap_or(0);
+                e.push_str(&format!("pushfn(cx,(void*)&&{},{},\"{}\");\n", lab, ar, l))
             }
             Ins::Simple(h) => {
                 let bin = match *h {
@@ -1242,7 +1258,7 @@ pub fn emit_range(
                                 // analysis): the generic op pops it.
                                 if depth >= 8 && inline_ffolds.contains_key(&i) {
                                     if let Some((bs, _)) = inline_ffolds.get(&i).copied() {
-                                        e.push_str(&format!("pushp(cx,(void*)&&{});", addr_lab(start, end, prefix, bs)));
+                                        e.push_str(&format!("pushfn(cx,(void*)&&{},{},\"{}\");", addr_lab(start, end, prefix, bs), fn_meta(p, bs).0, fn_meta(p, bs).1));
                                     }
                                 }
                                 e.push_str(&format!("uf_cur_op=\"{}\";{}(cx);\n", h, h));
@@ -1381,10 +1397,10 @@ pub fn emit_range(
                         // re-materialized: the generic path pops the body
                         // address from the stack.
                         if let Some((bs, _)) = inline_fors.get(&i).copied() {
-                            e.push_str(&format!("pushp(cx,(void*)&&{});", addr_lab(start, end, prefix, bs)));
+                            e.push_str(&format!("pushfn(cx,(void*)&&{},{},\"{}\");", addr_lab(start, end, prefix, bs), fn_meta(p, bs).0, fn_meta(p, bs).1));
                         }
                         e.push_str(&format!(
-                        "{{const void* t=((void*)pop(cx).i);int64_t cnt=pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};for(int64_t k=0;k<cnt;k++){{pushi(cx,k);uf_cspush(cx,&&K_{}{},cx->sp-1);goto *t;K_{}{}:;if(cx->sp>0)pop(cx);K_FC_{}{}:;}}K_FE_{}{}:;cx->lsp=fr;}}\n",
+                        "{{const void* t=uf_fn_addr(pop(cx));int64_t cnt=pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};for(int64_t k=0;k<cnt;k++){{pushi(cx,k);uf_cspush(cx,&&K_{}{},cx->sp-1);goto *t;K_{}{}:;if(cx->sp>0)pop(cx);K_FC_{}{}:;}}K_FE_{}{}:;cx->lsp=fr;}}\n",
                         prefix, i, prefix, i, prefix, i, prefix, i, prefix, i, prefix, i
                         ));
                     }
@@ -1546,7 +1562,7 @@ pub fn emit_range(
                 // the generic path below pops the address, so re-push it.
                 if depth >= 8 {
                     if let Some((tbs, _, _, _)) = inline_ifs.get(&i).copied() {
-                        e.push_str(&format!("pushp(cx,(void*)&&{});", addr_lab(start, end, prefix, tbs)));
+                        e.push_str(&format!("pushfn(cx,(void*)&&{},{},\"{}\");", addr_lab(start, end, prefix, tbs), fn_meta(p, tbs).0, fn_meta(p, tbs).1));
                     }
                 }
                 // v13: the body's declared arity sets the drain point (the
@@ -1582,11 +1598,11 @@ pub fn emit_range(
                 }
                 if tail_if {
                     e.push_str(&format!(
-                        "{{const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c))goto *b;}}\n"
+                        "{{const void* b=uf_fn_addr(pop(cx));Cell c=pop(cx);if(uf_truthy(c))goto *b;}}\n"
                     ));
                 } else {
                     e.push_str(&format!(
-                        "{{const void* b=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *b;K_{}{}:;}}}}\n",
+                        "{{const void* b=uf_fn_addr(pop(cx));Cell c=pop(cx);if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *b;K_{}{}:;}}}}\n",
                         prefix, i, if_arity, if_arity, prefix, i
                     ))
                 }
@@ -1617,9 +1633,9 @@ pub fn emit_range(
                 if depth >= 8 {
                     if let Some((tbs, _, ebs, _)) = inline_ifs.get(&i).copied() {
                         e.push_str(&format!(
-                            "pushp(cx,(void*)&&{});pushp(cx,(void*)&&{});",
-                            addr_lab(start, end, prefix, tbs),
-                            addr_lab(start, end, prefix, ebs)
+                            "pushfn(cx,(void*)&&{},{},\"{}\");pushfn(cx,(void*)&&{},{},\"{}\");",
+                            addr_lab(start, end, prefix, tbs), fn_meta(p, tbs).0, fn_meta(p, tbs).1,
+                            addr_lab(start, end, prefix, ebs), fn_meta(p, ebs).0, fn_meta(p, ebs).1
                         ));
                     }
                 }
@@ -1657,7 +1673,7 @@ pub fn emit_range(
                     }
                 }
                 e.push_str(&format!(
-                    "{{const void* el=(const void*)pop(cx).i;const void* th=(const void*)pop(cx).i;Cell c=pop(cx);if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *th;}}else{{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *el;}}K_{}{}:;{}}}\n",
+                    "{{const void* el=uf_fn_addr(pop(cx));const void* th=uf_fn_addr(pop(cx));Cell c=pop(cx);if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *th;}}else{{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *el;}}K_{}{}:;{}}}\n",
                     prefix, i, th_ar, th_ar, prefix, i, el_ar, el_ar, prefix, i, cont
                 ))
             }
@@ -1677,9 +1693,9 @@ pub fn emit_range(
                     if depth >= 8 {
                         if let Some((bbs, _, cbs, _)) = inline_whiles.get(&i).copied() {
                             e.push_str(&format!(
-                                "pushp(cx,(void*)&&{});pushp(cx,(void*)&&{});",
-                                addr_lab(start, end, prefix, cbs),
-                                addr_lab(start, end, prefix, bbs)
+                                "pushfn(cx,(void*)&&{},{},\"{}\");pushfn(cx,(void*)&&{},{},\"{}\");",
+                                addr_lab(start, end, prefix, cbs), fn_meta(p, cbs).0, fn_meta(p, cbs).1,
+                                addr_lab(start, end, prefix, bbs), fn_meta(p, bbs).0, fn_meta(p, bbs).1
                             ));
                         }
                     }
@@ -1870,7 +1886,7 @@ pub fn emit_range(
                     }
                 }
                 e.push_str(&format!(
-                    "{{const void* bod=(const void*)pop(cx).i;const void* cnd=(const void*)pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;\n\
+                    "{{const void* bod=uf_fn_addr(pop(cx));const void* cnd=uf_fn_addr(pop(cx));long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;\n\
                      K_WT_{}{}:;cx->loops[fr].cont=&&K_WT_{}{};cx->loops[fr].end=&&K_WE_{}{};\n\
                      uf_cspush(cx,&&K_WC_{}{},cx->sp>{}?cx->sp-{}:0);goto *cnd;K_WC_{}{}:;\n\
                      if(uf_zero(pop(cx)))goto K_WE_{}{};\n\

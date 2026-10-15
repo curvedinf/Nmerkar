@@ -57,6 +57,7 @@ pub fn opcode_index(c: char) -> Option<usize> {
 
 // v15 syntax glyphs (not runtime opcodes; single-token in Qwen3-0.6B):
 pub const GLYPH_LABEL_DEF: char = '\u{1F3F7}'; // 🏷 dense label-definition marker
+pub const GLYPH_ANON_DEF: char = '\u{1F516}'; // 🔖 dense anonymous-label marker (a v-run + 🏷 is a named def, so anon needs its own)
 pub const GLYPH_TAG_SIZEOF: char = '\u{1F4CF}'; // 📏 compile-time `size_of Struct`
 pub const GLYPH_TAG_OFFSET: char = '\u{1F4CD}'; // 📍 compile-time `offset Struct.field`
 pub const GLYPH_TAG_OBJSIZE: char = '\u{1F4E6}'; // 📦 `_obj` struct-size immediate
@@ -98,7 +99,7 @@ pub const OP_NAMES: [&str; 222] = [
     "LIT", "~1", "~2", "~3", "~4", "~5", "ADD", "SUB", "MUL", "AND", "SHR", "INC", "DEC",
     "POW", "SQRT", "LTE", "FOR", "CALL", "RET", "OBJ", "GET", "SET", "GTE", "ARR", "SHUTDOWN", "~25",
     "CLONE", "CAST", "MACRO", "TENSOR", "~30", "~31", "~32", "SETV", "GETV", "STR", "CAT", "FMT",
-    "BUF", "~39", "BUFCOPY", "ADDR", "LOADX", "STOREX", "SIZEOF", "OFFSET", "STRUCT", "MALLOC",
+    "BUF", "~39", "BUFCOPY", "FNAPPLY", "LOADX", "STOREX", "SIZEOF", "OFFSET", "STRUCT", "MALLOC",
     "FREE", "SYS", "GC", "IMPORT", "EXPORT", "EXTERN", "PRINT", "SCAN",
     // v9 kept
     "DICT", "~57", "~58", "~59", "~60", "~61", "LIST", "PUSH", "POP", "CHAN",
@@ -162,8 +163,8 @@ pub fn op_usage(name: &str) -> &'static str {
         "LTE" => "a b → 0/1 | a<=b",
         "GTE" => "a b → 0/1 | a>=b",
         "SHUTDOWN" => "→ | graceful weave shutdown (drains and exits)",
-        "FOR" => "count body_addr → | pushes index k per iter",
-        "CALL" => "(label operand) | call subroutine",
+        "FOR" => "count fn → | pushes index k per iter",
+        "CALL" => "'label | call subroutine",
         "RET" => "→ | return from call",
         "OBJ" => "→ h | type immediate (struct id)",
         "GET" => "h k → v | polymorphic container get",
@@ -180,7 +181,7 @@ pub fn op_usage(name: &str) -> &'static str {
         "FMT" => "args… fmt → h | format string",
         "BUF" => "size → ptr | raw untracked buffer",
         "BUFCOPY" => "dst src n → | memory copy",
-        "ADDR" => "→ code address | 'label",
+        "FNAPPLY" => "list fn → r | spread list as args and call the fn cell",
         "LOADX" => "addr → value | raw memory read",
         "STOREX" => "value addr → | raw memory write",
         "SIZEOF" => "type → n",
@@ -247,9 +248,9 @@ pub fn op_usage(name: &str) -> &'static str {
         "XOR" => "a b → a^b | ints only",
         "SHL" => "a b → a<<b | ints only",
         "BNOT" => "a → ~a | ints only",
-        "IF" => "cond body_addr → | call body if cond nonzero",
-        "IFELSE" => "cond then_addr else_addr →",
-        "WHILE" => "cond_addr body_addr → | loop until cond=0",
+        "IF" => "cond body_fn → | call body if cond nonzero",
+        "IFELSE" => "cond then_fn else_fn →",
+        "WHILE" => "cond_fn body_fn → | loop until cond=0",
         "BREAK" => "→ | exit nearest loop",
         "CONT" => "→ | next iteration of nearest loop",
         "GETQ" => "h k → v_or_0 | never dies on absence",
@@ -258,9 +259,9 @@ pub fn op_usage(name: &str) -> &'static str {
         "KEYS" => "h → list | dict keys or obj fields",
         "RANGE" => "start stop → list | ints [start, stop)",
         "SORT" => "seq → seq' | stable sort",
-        "FILTER" => "list pred_addr → list' | keep where pred truthy",
-        "SOME" => "list pred_addr → 0/1 | any element passes",
-        "EVERY" => "list pred_addr → 0/1 | all elements pass",
+        "FILTER" => "list pred_fn → list' | keep where pred truthy",
+        "SOME" => "list pred_fn → 0/1 | any element passes",
+        "EVERY" => "list pred_fn → 0/1 | all elements pass",
         "VEMAX" => "arr arr → arr' | elementwise max",
         "VEQ" => "arr scalar → bitmap",
         "VLT" => "arr scalar → bitmap",
@@ -277,8 +278,8 @@ pub fn op_usage(name: &str) -> &'static str {
         "VMIN" => "arr → scalar | empty dies",
         "VMAX" => "arr → scalar | empty dies",
         "DEL" => "h k → | remove (dict: tombstone)",
-        "VMAP" => "arr fn_addr → arr' | elementwise fn",
-        "VFOLD" => "arr init fn_addr → acc | reduction",
+        "VMAP" => "arr fn → arr' | elementwise fn",
+        "VFOLD" => "arr init fn → acc | reduction",
         "NOW" => "→ t | CLOCK_REALTIME nanos",
         "TIME" => "str fmt → t | \"unix\" or strptime",
         "TIMEF" => "t fmt → str | \"unix\" or strftime",
@@ -288,8 +289,8 @@ pub fn op_usage(name: &str) -> &'static str {
         "SLURP" => "path → str | whole file",
         "SPIT" => "path str → | create/truncate",
         "ARGV" => "→ list | program argv as strings",
-        "GROUP" => "list fn_addr → dict | group by key fn",
-        "AGG" => "dict fn_addr → dict' | aggregate groups",
+        "GROUP" => "list fn → dict | group by key fn",
+        "AGG" => "dict fn → dict' | aggregate groups",
         "UNIQUE" => "list → list' | dedup, first-occurrence order",
         "FLAT" => "list → list' | flatten one level",
         "CHUNK" => "seq size → list | split into pieces",
@@ -297,18 +298,18 @@ pub fn op_usage(name: &str) -> &'static str {
         "VSEARCHSORTED" => "sorted_arr val → idx | binary search",
         "VWHERE" => "arr arr bm → arr' | blend by bitmap",
         "MMAP" => "path → str | read-only zero-copy",
-        "FEACH" => "path fn_addr → | call fn per line, early stop",
-        "FFOLD" => "path init fn_addr → acc | streaming reduce lines",
-        "FSPLIT" => "path sep init fn_addr → acc | streaming split",
+        "FEACH" => "path fn → | call fn per line, early stop",
+        "FFOLD" => "path init fn → acc | streaming reduce lines",
+        "FSPLIT" => "path sep init fn → acc | streaming split",
         "FGET" => "field_idx → str | zero-copy field view",
         "FATOI" => "field_idx → int | parse field, no alloc",
         "FATOF" => "field_idx → float | parse field, no alloc",
         "FSGET" => "field_idx off len → str | field substring",
         "FBYTE" => "field_idx off → int | single byte from field",
         "FMATCH" => "path pat → chan | stream regex-matching lines",
-        "BFS" => "start fn_addr → list | breadth-first visit",
-        "DFS" => "start fn_addr → list | depth-first pre-order",
-        "WFIND" => "start fn_addr pred_addr → v_or_0 | BFS early exit",
+        "BFS" => "start fn → list | breadth-first visit",
+        "DFS" => "start fn → list | depth-first pre-order",
+        "WFIND" => "start fn pred_fn → v_or_0 | BFS early exit",
         "VGET" => "h idx → v | direct typed array read",
         "VSET" => "h idx v → | direct typed array write",
         "ADDTO" => "dict key amount → | dict[key] += amount",
@@ -319,12 +320,12 @@ pub fn op_usage(name: &str) -> &'static str {
         "ITER" => "h → it | create cursor",
         "NEXT" => "it → v more | more=0 exhausted",
         "COLLECT" => "it → list | drain iterator",
-        "IMAP" => "it fn_addr → it' | lazy map",
-        "IFILTER" => "it pred_addr → it' | lazy filter",
+        "IMAP" => "it fn → it' | lazy map",
+        "IFILTER" => "it pred_fn → it' | lazy filter",
         "FEMIT" => "path it → n | stream iterable to file",
-        "TRY" => "body_addr → result ok | catch die",
-        "RETRY" => "n body_addr → result ok | try n+1 times",
-        "SPAWN" => "body_addr → chan | detached thread",
+        "TRY" => "body_fn → result ok | catch die",
+        "RETRY" => "n body_fn → result ok | try n+1 times",
+        "SPAWN" => "body_fn → chan | detached thread",
         "VEMIN" => "arr arr → arr' | elementwise min",
         "ATOI" => "str → int | strtoll base 10",
         "ATOF" => "str → float | strtod",
@@ -716,6 +717,13 @@ impl Lexer {
                 0x130BD => self.err("je removed — use if/ifelse"),
                 _ => {}
             }
+            // ---- v16: anonymous-label glyph ----
+            if c == GLYPH_ANON_DEF {
+                self.prev_ret = false;
+                self.bump();
+                out.push((self.line, Tok::AnonDef));
+                continue;
+            }
             // ---- ASCII tokens ----
             match c {
                 '[' => {
@@ -733,12 +741,14 @@ impl Lexer {
                     continue;
                 }
                 '\'' => {
-                    // ADDR: '<label> (v-run or ASCII)
+                    // v16: '<label> calls; '<recv.method> is the method
+                    // reference (send position only, parser-enforced)
                     self.prev_ret = false;
                     self.bump();
                     self.skip_ws();
                     let label = self.jump_label("ADDR");
-                    out.push((self.line, Tok::Jump("ADDR", label)));
+                    let op = if label.contains('.') { "ADDR" } else { "CALL" };
+                    out.push((self.line, Tok::Jump(op, label)));
                     continue;
                 }
                 '+' => self.err("'+' removed in v13 — use `add`"),
@@ -910,13 +920,19 @@ impl Lexer {
                 }
                 out.push((self.line, Tok::PushS(self.lex_string())));
             }
-            "JMP" | "JZ" | "JE" | "CALL" | "ADDR" => {
+            "JMP" | "JZ" | "JE" | "CALL" => {
                 self.skip_ws();
-                let label = self.jump_label(name);
-                if name == "JMP" { self.err("jmp removed — use entry/if/while/for"); }
-                if name == "JZ" { self.err("jz removed — use if/ifelse/while"); }
-                if name == "JE" { self.err("je removed — use if/ifelse"); }
-                out.push((self.line, Tok::Jump(OP_NAMES[idx], label)));
+                if name == "CALL" && self.peek() == Some(GLYPH_ANON_DEF) {
+                    // v16: CALL glyph + anon glyph = ': — anonymous + apply
+                    self.bump();
+                    out.push((self.line, Tok::AnonCall));
+                } else {
+                    let label = self.jump_label(name);
+                    if name == "JMP" { self.err("jmp removed — use entry/if/while/for"); }
+                    if name == "JZ" { self.err("jz removed — use if/ifelse/while"); }
+                    if name == "JE" { self.err("je removed — use if/ifelse"); }
+                    out.push((self.line, Tok::Jump(OP_NAMES[idx], label)));
+                }
             }
             "ENTRY" => {
                 out.push((self.line, Tok::Entry));
@@ -1215,11 +1231,11 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "SHR" => "shr", "INC" => "inc", "DEC" => "dec",
         "POW" => "pow", "SQRT" => "sqrt", "LTE" => "lte", "GTE" => "gte",
         "SHUTDOWN" => "shutdown",
-        "FOR" => "for", "CALL" => "_call", "RET" => "ret", "OBJ" => "_obj",
+        "FOR" => "for", "CALL" => "'", "RET" => "ret", "OBJ" => "_obj",
         "GET" => "get", "SET" => "set", "ARR" => "array", "CLONE" => "copy", "CAST" => "_cast",
         "MACRO" => "macro", "TENSOR" => "tensor", "SETV" => "setv", "GETV" => "getv",
         "STR" => "_str", "CAT" => "concat", "FMT" => "format", "BUF" => "buffer", "BUFCOPY" => "copy_memory",
-        "ADDR" => "_addr", "LOADX" => "load", "STOREX" => "store", "SIZEOF" => "_size_of",
+        "FNAPPLY" => "apply", "LOADX" => "load", "STOREX" => "store", "SIZEOF" => "_size_of",
         "OFFSET" => "_offset", "STRUCT" => "struct", "MALLOC" => "malloc", "FREE" => "free",
         "SYS" => "_syscall", "GC" => "gc", "IMPORT" => "import", "EXPORT" => "export",
         "EXTERN" => "extern", "PRINT" => "print", "SCAN" => "scan",
@@ -1521,10 +1537,10 @@ impl TextLexer {
     }
     // call/addr operand position: reserved mnemonics are legal here — an
     // IMPORT may bind a C symbol named like an opcode (`import c"send"`;
-    // the __asm__ aliasing keeps the C side safe), and `_call`/`'` consume
-    // their operand unambiguously, so no collision exists in this position
+    // the __asm__ aliasing keeps the C side safe), and the call forms
+    // consume their operand unambiguously, so no collision exists in this
+    // position
     fn label_token(&mut self, what: &str) -> String {
-        let l = self.line();
         let t = self.next().unwrap_or_else(|| self.err(&format!("{} needs a label", what)));
         if is_bad_ident(&t) {
             self.err(&format!("{}: '{}' — identifiers may not start with '_'", what, t));
@@ -1583,9 +1599,12 @@ impl TextLexer {
             }
             if let Some(label) = tok.strip_prefix('\'') {
                 self.pos += 1;
+                // v16: 'name calls; 'recv.method is the method reference
+                // (send position only, parser-enforced)
                 if label.is_empty() {
                     let nm = self.label_token("addr");
-                    out.push((l, Tok::Jump("ADDR", nm)));
+                    let op = if nm.contains('.') { "ADDR" } else { "CALL" };
+                    out.push((l, Tok::Jump(op, nm)));
                 } else if let Some((recv, meth)) = label.split_once('.') {
                     // method reference: 'recv.method — valid only in send
                     // position (the parser enforces that)
@@ -1601,8 +1620,20 @@ impl TextLexer {
                     }
                     out.push((l, Tok::Jump("ADDR", label.to_string())));
                 } else {
-                    check_ident(l, label, "addr");
-                    out.push((l, Tok::Jump("ADDR", label.to_string())));
+                    // v16: '': is the anonymous + apply form; other bare
+                    // 'name tokens are the call form
+                    if label == ":" {
+                        out.push((l, Tok::AnonCall));
+                    } else {
+                        // call operand: reserved mnemonics are legal here — an
+                        // IMPORT may bind a C symbol named like an opcode
+                        // (`import c"send"`; 'send calls it), the same
+                        // exemption label_token gives the dense form
+                        if is_bad_ident(label) {
+                            self.err("call: identifiers may not start with '_'");
+                        }
+                        out.push((l, Tok::Jump("CALL", label.to_string())));
+                    }
                 }
                 continue;
             }
@@ -1616,6 +1647,12 @@ impl TextLexer {
                     self.err(&format!("@ needs a type name (e.g. @Point, @list), not `@{}`", mname));
                 }
                 out.push((l, Tok::Method(mname.to_string())));
+                continue;
+            }
+            // v16: ':' (anon label def; '': is handled in the quote branch)
+            if tok == ":" {
+                self.pos += 1;
+                out.push((l, Tok::AnonDef));
                 continue;
             }
             if let Some(name) = tok.strip_suffix(':') {
@@ -1845,15 +1882,13 @@ impl TextLexer {
                 "jz" => self.err("jz removed — use if/ifelse/while"),
                 "je" => self.err("je removed — use if/ifelse"),
                 "_call" => {
-                    let nm = self.label_token("call");
-                    out.push((l, Tok::Jump("CALL", nm)));
+                    self.err("_call removed — write 'label (the call form)")
                 }
                 "entry" => {
                     out.push((l, Tok::Entry));
                 }
                 "_addr" => {
-                    let nm = self.label_token("addr");
-                    out.push((l, Tok::Jump("ADDR", nm)));
+                    self.err("_addr removed — write the bare label name (a label reference is an implicit fn load)")
                 }
                 "_syscall" => {
                     let n = match self.peek() {

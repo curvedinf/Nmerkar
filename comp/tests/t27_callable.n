@@ -1,0 +1,72 @@
+; t27_callable.n — v16 fn cells: code is a value.
+; A bare label name is an implicit fn reference (tag 22); 'label is the
+; call form (retires _call); every callback-taking op accepts a fn cell.
+; Run: nk comp/tests/t27_callable.n
+
+; 1. the call form
+3 4 'add2 total!
+total 7 eq check
+
+; 2. bare references feeding for/while
+5 dbl for
+0 n!
+3 less tick while
+n 3 eq check
+
+; 3. fn cell stored in a var, passed to array_map/filter
+[1 2 3] cells!
+cells sq array_map mapped!
+mapped to_json "[1,4,9]" eq check
+cells keep filter to_json "[3]" eq check
+
+; 4. fn cells inside containers — a list of fns, fetched and applied
+[sq keep] fns!
+cells fns 0 get array_map to_json "[1,4,9]" eq check
+
+; 5. try/spawn accept bare body references
+diver try ok# _#
+ok 0 eq check
+worker spawn ch!
+ch dequeue 42 eq check
+
+; 6. type_of reports the fn tag (22)
+sq f!
+f type_of 22 eq check
+
+; 7. frame-shared while continuations (fib-style iteration, bare refs)
+0 a2! 1 b2! 10 i2!
+more cond2 while
+a2 55 eq check
+
+; 8. method dispatch unchanged: 'recv.method send
+[1 2 3] lst!
+lst 'lst.length send 3 eq check
+
+; 9. a weave task body references its task-local helper label bare
+weave
+  task wtot:
+    [1 2 3] 0 wadd array_reduce
+    ret
+  wadd: acc2! v2!
+    ret acc2 v2 add
+run
+w!  w 6 eq check
+
+ret
+add2: a! b!
+  ret a b add
+dbl: k!
+  k 2 mul 0
+  ret 0
+less: ret n 3 lt
+tick: n 1 add n!
+  ret 0
+sq: x!
+  ret x x mul
+keep: v!
+  ret v 2 gt
+diver: ret 1 0 div
+worker: ret 42
+more: a2 b2 add t2!  b2 a2!  t2 b2!  i2 1 sub i2!
+  ret 0
+cond2: ret i2 0 gt

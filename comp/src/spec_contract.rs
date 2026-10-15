@@ -34,10 +34,11 @@ fn table_shape_and_retirement() {
     assert_eq!(retired_in_place, Vec::<usize>::new(), "no op may be retired in place");
     let live = live_indices();
     assert_eq!(live.len(), 197, "live-op count");
-    // 26 "~NN" retired slots, all glyph-less (18 through v15; v15.1 retired
-    // the eight scalar_/array_ arithmetic aliases, slots 128..=135)
+    // 25 "~NN" retired slots, all glyph-less (18 through v15; v15.1 retired
+    // the eight scalar_/array_ arithmetic aliases, slots 128..=135; slot 41
+    // was retired with ADDR and revived in v16 as `apply`)
     let retired: Vec<usize> = (0..OP_NAMES.len()).filter(|&i| OP_NAMES[i].starts_with('~')).collect();
-    assert_eq!(retired.len(), 25, "retired ~NN slot count (128 revived as send)");
+    assert_eq!(retired.len(), 25, "retired ~NN slot count (128 revived as send, 41 as apply)");
     for &i in &retired {
         assert_eq!(OP_GLYPHS[i], 0, "retired slot {} ({}) must have no glyph", i, OP_NAMES[i]);
     }

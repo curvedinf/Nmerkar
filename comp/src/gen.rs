@@ -2184,19 +2184,17 @@ pub fn emit_range(
                 e.push_str(&gen_call_ext(im, &format!("uf_im{}", ii)));
             }
             Ins::Send => {
-                vdiscard(&mut e, &mut vstack, &mut vcache);
-                // v13: the method's declared arity sets the drain point
-                let mut snd_arity = 0usize;
-                for (_, _, l) in &p.methods {
-                    if let Some(&pc) = p.labels.get(l) {
-                        if let Some(v) = p.label_params.get(&pc) {
-                            snd_arity = snd_arity.max(v.len());
-                        }
-                    }
-                }
+                vflush(&mut e, &mut vstack, &mut vcache);
+                // v16 methods: pop the selector, pop the receiver, compute
+                // its dispatch key (typeof-style: handle header tag, or
+                // 1000+struct-id for objects, or the scalar cell tag), look
+                // up (key, selector) in uf_mt, and call with the receiver
+                // pushed back — the frame drains below the method's declared
+                // arity, so the receiver binds the LAST parameter and any
+                // args below it bind in caller order
                 e.push_str(&format!(
-                "{{int64_t mid=pop(cx).i;Cell rc=pop(cx);Hdr*h=(Hdr*)rc.i;int64_t tk=(h->tag==HT_OBJ)?1000+(int64_t)h->len:(int64_t)h->tag;const void*lab=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].tk==tk&&uf_mt[q].mh==mid){{lab=uf_mt[q].lab;break;}}if(!lab)die(\"SEND: no such method\");pushc(cx,rc);uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *lab;K_{}{}:;}}\n",
-                prefix, i, snd_arity, snd_arity, prefix, i
+                "{{int64_t mid=pop(cx).i;Cell rc=pop(cx);int64_t tk;if(rc.tag==T_PTR){{if(!rc.i)tk=2;else{{Hdr*a=uf_gc_find((void*)rc.i);tk=a?((a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag):2;}}}}else tk=(int64_t)rc.tag;int64_t ar=1;const void*lab=0;const char*mn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].tk==tk&&uf_mt[q].mh==mid){{lab=uf_mt[q].lab;ar=uf_mt[q].ar;mn=uf_mt[q].nm;break;}}if(!lab){{const char*sn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].mh==mid){{sn=uf_mt[q].nm;break;}}uf_die_send(sn,mid,tk);}}pushc(cx,rc);uf_cspush(cx,&&K_{}{},cx->sp>=ar?cx->sp-ar:0);goto *lab;K_{}{}:;}}\n",
+                prefix, i, prefix, i
                 ))
             }
             Ins::Weave(tasks) => {
@@ -3225,13 +3223,18 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool, profile: bool, coverage
         o.push_str(&format!("  if(pc==0) goto L_{};\n", eidx));
     }
     o.push_str("  goto *labtab[pc];\n");
-    // method dispatch table (SEND): (type key, name hash) -> code address
-    o.push_str("  static const struct { int64_t tk; int64_t mh; const void* lab; } uf_mt[] = {");
+    // method dispatch table (SEND): (type key, selector hash, arity, name,
+    // code address). Arity comes from the method label's declared params —
+    // the receiver is the last parameter.
+    o.push_str("  static const struct { int64_t tk; int64_t mh; int64_t ar; const char* nm; const void* lab; } uf_mt[] = {");
     if p.methods.is_empty() {
-        o.push_str("{0,0,&&L_0}");
+        o.push_str("{0,0,1,0,&&L_0}");
     } else {
         for (tk, mh, l) in &p.methods {
-            o.push_str(&format!("{{{},{}LL,&&L_{}}},", tk, mh, resolve(l)));
+            let pc = resolve(l);
+            let ar = p.label_params.get(&pc).map(|v| v.len()).unwrap_or(1).max(1);
+            let nm = l.rsplit('.').next().unwrap_or(l);
+            o.push_str(&format!("{{{},{}LL,{},\"{}\",&&L_{}}},", tk, mh, ar, nm, pc));
         }
     }
     o.push_str("};\n");

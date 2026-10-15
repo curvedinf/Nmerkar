@@ -14,8 +14,9 @@ pub fn fnv64(s: &str) -> i64 {
     h as i64
 }
 
-// method dispatch type key: struct names -> 1000+sid, container names -> HT_*,
-// scalar type keywords -> 0..3 or 21 (bool)
+// method dispatch type key: struct names -> 1000+sid; otherwise the value's
+// tag (identical to what `type_of` reports — HT_* for handles, T_* for
+// scalars), so `@list` methods dispatch on any list, `@Point` on its objs
 pub fn method_typekey(name: &str, structs: &StructMap) -> Option<i64> {
     if let Some((_, _, sid)) = structs.get(name) {
         return Some(1000 + sid);
@@ -26,14 +27,22 @@ pub fn method_typekey(name: &str, structs: &StructMap) -> Option<i64> {
         "ptr" | "handle" => Some(2),
         "byte" => Some(3),
         "bool" => Some(21),
-        "arr" => Some(5),
+        "arr" | "array" => Some(5),
         "tensor" => Some(6),
         "dyn" | "list" => Some(7),
         "map" | "dict" => Some(8),
-        "ring" | "chan" => Some(9),
-        "atom" => Some(10),
-        "str" => Some(11),
+        "str" => Some(9),
+        "ring" | "chan" => Some(10),
+        "atom" => Some(11),
+        "buf" | "buffer" => Some(12),
         "obj" => Some(13),
+        "bitmap" => Some(14),
+        "time" => Some(15),
+        "dur" => Some(16),
+        "bloom" => Some(17),
+        "iter" => Some(18),
+        "set" => Some(19),
+        "matrix" => Some(20),
         _ => None,
     }
 }
@@ -173,6 +182,7 @@ impl<'a> ParseCtx<'a> {
                 Tok::Op("STRICT") => pi(&mut self.p, Ins::Strict, line),
                 Tok::Op("LOOSE") => pi(&mut self.p, Ins::Loose, line),
                 Tok::Op("CAST") => self.parse_cast(line),
+                Tok::Op("SEND") => pi(&mut self.p, Ins::Send, line),
                 Tok::Op(name) if name.starts_with('~') => retired_op_panic(name, line),
                 Tok::Op(name) => {
                     gate_op(name, self.caps, line);
@@ -309,7 +319,25 @@ impl<'a> ParseCtx<'a> {
 
     fn parse_jump(&mut self, op: &'static str, label: String, line: u32) {
         match op {
-            "ADDR" => pi(&mut self.p, Ins::PushAddr(label), line),
+            "ADDR" => {
+                // method reference: 'recv.method is the sugar for
+                // `recv 'method` (receiver load + selector); the bare
+                // 'method form is the selector alone. Both require send
+                // position — anything else is a compile error.
+                if let Some((recv, meth)) = label.split_once('.') {
+                    if !matches!(self.q.front().map(|t| &t.1), Some(Tok::Op("SEND"))) {
+                        user_err!("parse", Some(line), "'{}.{}: a dotted reference is only valid in send position — write `{}.{} send`", recv, meth, recv, meth);
+                    }
+                    self.parse_ident(recv.to_string(), line);
+                    pi(&mut self.p, Ins::PushI(fnv64(meth)), line);
+                } else {
+                    if matches!(self.q.front().map(|t| &t.1), Some(Tok::Op("SEND"))) {
+                        pi(&mut self.p, Ins::PushI(fnv64(&label)), line);
+                    } else {
+                        pi(&mut self.p, Ins::PushAddr(label), line);
+                    }
+                }
+            }
             "CALL" => {
                 if let Some(ii) = self.p.imports.iter().position(|im| im.name == label) {
                     pi(&mut self.p, Ins::CallExt(ii), line);
@@ -677,16 +705,29 @@ impl<'a> ParseCtx<'a> {
     }
 
     fn parse_label_def(&mut self, n: String, line: u32) {
+        let mut n = n;
+        if let Some(tname) = self.pending_method.take() {
+            if self.pending_pub {
+                user_err!("parse", Some(line), "@{} {}: methods are send-only — `pub` has no effect; drop it", tname, n);
+            }
+            let tk = method_typekey(&tname, self.structs)
+                .unwrap_or_else(|| user_err!("parse", Some(line), "@{}: unknown type for a method — declare the struct first or use a type keyword (list, dict, str, …)", tname));
+            if self.p.methods.iter().any(|(t, m, _)| *t == tk && *m == fnv64(&n)) {
+                user_err!("parse", Some(line), "duplicate method {} on {} — one implementation per (type, name)", n, tname);
+            }
+            // the method's label lives in the type's namespace (Type.name):
+            // dots cannot appear in identifiers, so methods never collide
+            // with ordinary labels, and the name is unspellable in source —
+            // method code is reachable only through send
+            let mangled = format!("{}.{}", tname, n);
+            self.p.methods.push((tk, fnv64(&n), mangled.clone()));
+            n = mangled;
+        }
         self.p.labels.insert(n.clone(), self.p.ins.len());
         self.p.label_lines.insert(self.p.ins.len(), line);
         if self.pending_pub {
             self.p.pubs.push(n.clone());
             self.pending_pub = false;
-        }
-        if let Some(tname) = self.pending_method.take() {
-            let tk = method_typekey(&tname, self.structs)
-                .unwrap_or_else(|| user_err!("parse", Some(line), "METHOD: unknown type {}", tname));
-            self.p.methods.push((tk, fnv64(&n), n.clone()));
         }
         if let Some(x) = self.pending_export.take() {
             self.p.exports.push((x, n));

@@ -747,6 +747,27 @@ var RT = (function () {
     }
     rt.st.push(I(tag));
   }
+  // SEND dispatch key: mirrors op_typeof's tags; objects dispatch on
+  // 1000+struct-id (the C target's rule)
+  function sendKey(c) {
+    if (c.t === "ob") return 1000 + Number(c.v.sid);
+    switch (c.t) {
+      case "i": return 0;
+      case "f": return 1;
+      case "n": case "a": return 2;
+      case "y": return 3;
+      case "l": return 7;
+      case "d": return 8;
+      case "s": return 9;
+      case "t": return 18;
+      case "b": return 21;
+      case "m": return 14;
+      case "tm": return 15;
+      case "bl": return 17;
+      case "v": return c.v.kind === "mat" ? 20 : (c.v.kind === "tensor" ? 6 : 5);
+    }
+    return 2;
+  }
   function op_len(rt) {
     var h = pop(rt, "len");
     switch (h.t) {
@@ -774,7 +795,7 @@ var RT = (function () {
     if (h.t === "l") { var ix = iOf(k); if (ix < 0n || ix >= BigInt(h.v.length)) die(rt, "GET: index out of bounds"); rt.st.push(h.v[Number(ix)]); return; }
     if (h.t === "s") { var j = iOf(k); if (j < 0n || j >= BigInt(h.v.length)) die(rt, "GET: index out of bounds"); rt.st.push(I(h.v.charCodeAt(Number(j)))); return; }
     if (h.t === "v") { var ixv = iOf(k); if (ixv < 0n || ixv >= BigInt(h.v.len)) die(rt, "index out of bounds"); rt.st.push(vread(h, Number(ixv))); return; }
-    if (h.t === "ob") { var og = objOff(h.v, k); if (og < 0 || og >= h.v.esz / 8) die(rt, "GET: no such field"); rt.st.push(h.v.data[og >> 3]); return; }
+    if (h.t === "ob") { var og = objOff(h.v, k); if (og < 0 || og >= h.v.esz) die(rt, "GET: no such field"); rt.st.push(h.v.data[og >> 3]); return; }
     die(rt, "GET: unsupported handle"); // a, t
   }
   function op_getq(rt) {
@@ -815,7 +836,7 @@ var RT = (function () {
       vwrite(h, Number(ixv), v);
     } else if (h.t === "ob") {
       var os = objOff(h.v, k);
-      if (os < 0 || os >= h.v.esz / 8) die(rt, "SET: no such field");
+      if (os < 0 || os >= h.v.esz) die(rt, "SET: no such field");
       h.v.data[os >> 3] = v;
     } else {
       die(rt, "SET: unsupported handle");
@@ -3770,7 +3791,7 @@ var RT = (function () {
     op_div: op_div, op_rem: op_rem, op_lt: op_lt, op_gt: op_gt,
     op_lte: op_lte, op_gte: op_gte, op_eq: op_eq, op_seq: op_seq,
     op_sne: op_sne, op_not: op_not, op_orelse: op_orelse, op_drop: op_drop,
-    op_cast: op_cast, op_dcast: op_dcast, op_typeof: op_typeof, op_len: op_len,
+    op_cast: op_cast, op_dcast: op_dcast, op_typeof: op_typeof, op_len: op_len, sendKey: sendKey,
     op_list: op_list, op_dict: op_dict, op_get: op_get, op_getq: op_getq,
     op_set: op_set, op_del: op_del, op_has: op_has, op_keys: op_keys,
     op_cat: op_cat, op_slice: op_slice, op_push: op_push, op_lpop: op_lpop,

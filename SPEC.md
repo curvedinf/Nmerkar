@@ -16,11 +16,19 @@ garbage-collected (scripts never `free` managed objects).
 
 ## Revision status
 
-Current revision: **v15.2**. Packages: schemed `use` sources (`gh:` /
-`https:` / `path:`) with per-use-site capability grants, the `.nk/lock` +
-approvals content-addressed package system, and the `nk install` command
-family — see "Packages" (backward compatible: bare `use "name"` local
-mods are unchanged; grant clauses are new syntax). Not backward compatible
+Current revision: **v15.2**. Adds **@Type methods with `send` dispatch**
+(SPEC "Methods"): data-owned processes — `@Type label:` declares a method
+in the type's namespace (send-only, one implementation per (type, name),
+any TU can extend any type including built-in tags), `recv 'name send`
+dispatches on the receiver's type, `'recv.method send` is sugar. Also adds
+packages: schemed `use` sources (`gh:` / `https:` / `path:`) with `:`
+namespacing under use aliases, per-use-site capability grants (zero by
+default, compile-gated) plus the `NK_CAP_CEILING` runtime ceiling,
+`.nk/lock` + approvals with Ed25519 publisher signing, tool bins compiled
+at install with `nk run` policy ceilings, and the `nk install` command
+family — see "Packages" and "Methods" (backward compatible: bare
+`use "name"` local mods are unchanged; grant clauses and `@Type` are new
+syntax). Not backward compatible
 with v15 (stores pass
 through everywhere — a shared store no longer consumes its value, removing
 the local/shared stack-effect asymmetry; destructuring is explicit `#` — a
@@ -56,7 +64,7 @@ auto-detection).
 
 | space | range | contents |
 |-------|-------|----------|
-| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 196 live (193 with dense glyphs; `cap`/`caps`/`consume` are text-only) |
+| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 197 live (194 with dense glyphs; `cap`/`caps`/`consume` are text-only) |
 | v-space | U+1F941+ interleaved with other emoji | variable/label name atoms, runs fold |
 | l-space | U+1F130+ (enclosed alphanumerics) | base-64 digit atoms (self-evaluating numbers) |
 | delimiters | U+13100..U+13108 | chat-template delimiters, stripped pre-compilation |
@@ -349,6 +357,63 @@ list/dict/str/chan/atom/buf/obj/bitmap/bloom) have a `{tag, len, esz}` header
 preceded by a GC header. Execution state (data stack, call stack, locals) lives
 in a `Ctx` so weave tasks and spawned threads each get a fresh one.
 
+## Methods (@Type + send)
+
+Data owns processes: a method binds a label to a **type**, and any value
+of that type can invoke it. The method's label lives in the type's
+namespace, so the same method name can exist on any number of types, and
+method code is reachable only through dispatch.
+
+**Declaration** — `@Type` marks the next label def (dense: 🔧TypeName;
+the type name is ASCII in both encodings):
+
+```nmerkar
+@Point area: p!                     ; struct method — key = struct id
+  ret p "x" get p "y" get mul
+@list area: l!                      ; built-in tag method — key = tag
+  ret l length 100 mul
+@int twice: n!                      ; scalars dispatch on their cell tag
+  ret n 2 mul
+```
+
+- The type is a struct name or a type keyword (`list`, `dict`, `str`,
+  `int`, … — any tag `type_of` reports). Unknown type = compile error.
+- The label mangles to `Type.name` internally: dots cannot appear in
+  identifiers, so methods never collide with ordinary labels, and the
+  name is unspellable in source — **methods are send-only** (`_call`
+  cannot reach them). One implementation per `(type, name)`; duplicates
+  are compile errors. `pub` on a method is an error (send-only).
+- Methods are linkable across TUs by nature (dispatch goes through a
+  global `(type key, selector)` table, not name resolution), and any TU
+  or package can extend a type it does not own — including built-in tags:
+  linking a package that defines `@list` methods extends every list.
+
+**Call** — receiver, then selector, then `send`:
+
+```nmerkar
+p 'area send print                 ; dispatch on p's actual type
+'p.area send print                 ; sugar — identical after lowering
+2 'p.scale send q!                 ; extra args ride below the receiver
+[1 2 3] 'area send print           ; same selector, list type
+```
+
+- `'name` before `send` is the selector (an FNV-1a hash pushed at parse
+  time). `'recv.method` is sugar for `recv 'method`: the receiver load +
+  selector, one token (the dotted form is valid **only** in send
+  position). The bare `'name` form takes the receiver from the stack, so
+  results chain: `p 'area send 'twice send print`.
+- The receiver binds the **last** declared parameter; values below it
+  bind in caller order (`scale: f! p!` with `2 'p.scale send` gives
+  f=2, p=receiver). A method's arity is its declared parameter count.
+- A miss dies at the source site naming the method (when any
+  implementation exists anywhere) and the receiver's type key. There is
+  no static call form — the value always decides.
+- Dense: `send` is 📡; `'recv.method` is the addr glyph + ASCII
+  `recv.method` (the struct-immediate spelling).
+
+Both targets implement the same table and dispatch. Gate:
+`comp/tests/t25_methods.n`.
+
 ## Struct fields
 
 `struct Name { field:type, … }` declares a record layout (OBJ). Obj fields
@@ -427,7 +492,7 @@ The same applies to `tensor`. Elements are coerced to the element type
 
 ## Opcode reference
 
-222 slots (0..221); **196 live opcodes**. Each live opcode except the
+222 slots (0..221); **197 live opcodes**. Each live opcode except the
 text-only `cap`/`caps`/`consume` (no dense glyph — they cannot be written in
 dense source) has a unique dense glyph; the text mnemonics are the
 full-word/`snake_case` names listed below. Glyph assignments are 1:1 and
@@ -546,6 +611,7 @@ outside a loop are compile errors.
 | 116 | 😘 | `while` | cond_addr body_addr → | exit on 0, else CALL body, repeat |
 | 117 | 🚢 | `break` | → | to end of nearest enclosing while/for |
 | 118 | 🤧 | `continue` | → | next iteration of nearest enclosing loop |
+| 128 | 📡 | `send` | args… recv 'name → r | method dispatch on the receiver's type (see "Methods") |
 
 ### Sequences
 
@@ -1760,7 +1826,7 @@ environment.
 
 ## Totals
 
-222 opcode slots (0..221); **196 live opcodes**. 193 of them have unique
+222 opcode slots (0..221); **197 live opcodes**. 194 of them have unique
 dense glyph codepoints (`cap`/`caps`/`consume` are text-only).
 
 ## Non-goals

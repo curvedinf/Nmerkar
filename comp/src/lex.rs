@@ -10,7 +10,7 @@ pub const TYPE_BASE: u32 = 0x13110;
 // Opcode glyphs (204 live ops; 201 glyphed — `cap`/`caps`/`consume` are text-only,
 // slot 0 means no glyph). Index = OP_NAMES array position.
 // All colored emoji (U+1F300+), each exactly one Qwen3 token.
-pub const OP_GLYPHS: [u32; 222] = [0x1F300,0x0,0x0,0x0,0x0,0x0,0x1F682,0x1F910,0x1F302,0x1F602,0x1F683,0x1F911,0x1F303,0x1FA94,0x1FA91,0x1FA92,0x1F603,0x1F684,0x1F912,0x1F304,0x1F604,0x1F685,0x1FA90,0x1F913,0x1FAAB,0x0,0x1F305,0x1F605,0x1F686,0x1F914,0x0,0x0,0x0,0x1F306,0x1F606,0x1F687,0x1F915,0x1F307,0x1F607,0x0,0x1F689,0x1F916,0x1F308,0x1F608,0x1F68A,0x1F917,0x1F309,0x1F609,0x1F68C,0x1F918,0x1F30A,0x1F60A,0x1F68D,0x1F919,0x1F30B,0x1F60B,0x1F690,0x0,0x0,0x0,0x0,0x0,0x1F91A,0x1F30C,0x1F60C,0x1F691,0x1F91B,0x1F30D,0x1F60D,0x1F692,0x1F91C,0x1F30E,0x1F60E,0x1F693,0x1F91D,0x1F30F,0x0,0x0,0x1F60F,0x1F694,0x1F91E,0x1F310,0x1F610,0x0,0x1F91F,0x1F311,0x0,0x0,0x1F611,0x1F696,0x1F920,0x1F313,0x1F612,0x1F697,0x1F921,0x1F314,0x1F613,0x1F698,0x1F922,0x1F315,0x1F614,0x1F699,0x1F923,0x1F318,0x1F615,0x1F69A,0x1F924,0x1F319,0x1F616,0x1F69B,0x1F925,0x1F31A,0x1F617,0x1F69C,0x1F926,0x1F31B,0x1F618,0x1F6A2,0x1F927,0x1F31C,0x1F619,0x1F6A3,0x1F928,0x1F31D,0x1F61A,0x1F6A6,0x1F929,0x1F31E,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1F61D,0x1F6A9,0x1F92C,0x1F321,0x1F61E,0x1F6AA,0x1F92D,0x1F324,0x1F61F,0x1F6AB,0x1F92E,0x1F325,0x1F620,0x1F6AC,0x1F92F,0x0,0x1F326,0x1F621,0x1F6B2,0x1F930,0x1F327,0x1F622,0x1F6B4,0x1F931,0x1F328,0x1F623,0x1F6B5,0x1F932,0x1F329,0x1F624,0x1F6B6,0x1F933,0x1F32A,0x1F625,0x1F6B9,0x1F934,0x1F32B,0x1F626,0x1F6BC,0x1F935,0x1F32C,0x1F627,0x1F6BE,0x1F936,0x1F32E,0x1F628,0x1F6BF,0x1F937,0x1F32F,0x1F629,0x1F6C0,0x1F938,0x1F330,0x1F62A,0x1F6C1,0x1F939,0x1F331,0x1F62B,0x1F6CB,0x1F93D,0x1F332,0x1F62C,0x1F6CC,0x1F93E,0x1F333,0x1F62D,0x1F6CD,0x1F940,0x1F334,0x1F62E,0x1F6CE,0x1F95B,0x1F95C,0x1F95D,0x1F95E,0x1F958,0x1F959,0x1F95A,0x1F500,0x1F512,0x1F513,0x1F501,0x1F50D,0x1F3AF,0x1F552,0x1F4CA,];
+pub const OP_GLYPHS: [u32; 222] = [0x1F300,0x0,0x0,0x0,0x0,0x0,0x1F682,0x1F910,0x1F302,0x1F602,0x1F683,0x1F911,0x1F303,0x1FA94,0x1FA91,0x1FA92,0x1F603,0x1F684,0x1F912,0x1F304,0x1F604,0x1F685,0x1FA90,0x1F913,0x1FAAB,0x0,0x1F305,0x1F605,0x1F686,0x1F914,0x0,0x0,0x0,0x1F306,0x1F606,0x1F687,0x1F915,0x1F307,0x1F607,0x0,0x1F689,0x1F916,0x1F308,0x1F608,0x1F68A,0x1F917,0x1F309,0x1F609,0x1F68C,0x1F918,0x1F30A,0x1F60A,0x1F68D,0x1F919,0x1F30B,0x1F60B,0x1F690,0x0,0x0,0x0,0x0,0x0,0x1F91A,0x1F30C,0x1F60C,0x1F691,0x1F91B,0x1F30D,0x1F60D,0x1F692,0x1F91C,0x1F30E,0x1F60E,0x1F693,0x1F91D,0x1F30F,0x0,0x0,0x1F60F,0x1F694,0x1F91E,0x1F310,0x1F610,0x0,0x1F91F,0x1F311,0x0,0x0,0x1F611,0x1F696,0x1F920,0x1F313,0x1F612,0x1F697,0x1F921,0x1F314,0x1F613,0x1F698,0x1F922,0x1F315,0x1F614,0x1F699,0x1F923,0x1F318,0x1F615,0x1F69A,0x1F924,0x1F319,0x1F616,0x1F69B,0x1F925,0x1F31A,0x1F617,0x1F69C,0x1F926,0x1F31B,0x1F618,0x1F6A2,0x1F927,0x1F31C,0x1F619,0x1F6A3,0x1F928,0x1F31D,0x1F61A,0x1F6A6,0x1F929,0x1F31E,0x1F4E1,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1F61D,0x1F6A9,0x1F92C,0x1F321,0x1F61E,0x1F6AA,0x1F92D,0x1F324,0x1F61F,0x1F6AB,0x1F92E,0x1F325,0x1F620,0x1F6AC,0x1F92F,0x0,0x1F326,0x1F621,0x1F6B2,0x1F930,0x1F327,0x1F622,0x1F6B4,0x1F931,0x1F328,0x1F623,0x1F6B5,0x1F932,0x1F329,0x1F624,0x1F6B6,0x1F933,0x1F32A,0x1F625,0x1F6B9,0x1F934,0x1F32B,0x1F626,0x1F6BC,0x1F935,0x1F32C,0x1F627,0x1F6BE,0x1F936,0x1F32E,0x1F628,0x1F6BF,0x1F937,0x1F32F,0x1F629,0x1F6C0,0x1F938,0x1F330,0x1F62A,0x1F6C1,0x1F939,0x1F331,0x1F62B,0x1F6CB,0x1F93D,0x1F332,0x1F62C,0x1F6CC,0x1F93E,0x1F333,0x1F62D,0x1F6CD,0x1F940,0x1F334,0x1F62E,0x1F6CE,0x1F95B,0x1F95C,0x1F95D,0x1F95E,0x1F958,0x1F959,0x1F95A,0x1F500,0x1F512,0x1F513,0x1F501,0x1F50D,0x1F3AF,0x1F552,0x1F4CA,];
 
 // v-space: base-64 digits for variable/label name atoms (colored emoji).
 pub const V_SPACE: [u32; 64] = [
@@ -61,6 +61,7 @@ pub const GLYPH_TAG_SIZEOF: char = '\u{1F4CF}'; // 📏 compile-time `size_of St
 pub const GLYPH_TAG_OFFSET: char = '\u{1F4CD}'; // 📍 compile-time `offset Struct.field`
 pub const GLYPH_TAG_OBJSIZE: char = '\u{1F4E6}'; // 📦 `_obj` struct-size immediate
 pub const GLYPH_TAG_CAST: char = '\u{1F3AD}';    // 🎭 `_cast` struct-id immediate
+pub const GLYPH_METHOD: char = '\u{1F527}';      // 🔧 @Type method-declaration marker
 // Kept for emit.rs compatibility (dense glyph for an opcode by name).
 pub fn op_glyph_of(name: &str) -> char {
     glyph_of(op_index(name).expect("op_index"))
@@ -115,7 +116,7 @@ pub const OP_NAMES: [&str; 222] = [
     "GETQ", "HAS", "ORELSE", "KEYS", "RANGE", "SORT", "FILTER", "SOME", "EVERY",
     // v10: vector ops (v15.1: VADD/VSUB/VMUL/VDIV/VEADD/VESUB/VEMUL/VEDIV retired —
     // scalar_*/array_* were parser aliases of the core add/sub/mul/div)
-    "~128", "~129", "~130", "~131", "~132", "~133", "~134", "~135", "VEMAX",
+    "SEND", "~129", "~130", "~131", "~132", "~133", "~134", "~135", "VEMAX",
     "VEQ", "VLT", "VGT", "VGE", "VLE", "VAND", "VOR", "VNOT", "VCOUNT", "VGATHER",
     "VSUM", "VMEAN", "VMIN", "VMAX", "~151", "DEL", "VMAP", "VFOLD",
     // v10: time, bloom, script I/O
@@ -215,6 +216,7 @@ pub fn op_usage(name: &str) -> &'static str {
         "WEAVE" => "(directive) | begin task scope",
         "TASK" => "(directive) | begin task body",
         "CONSUME" => "v → | consume the top value (text-only, v15.1)",
+        "SEND" => "args… recv 'name → r | dispatch on the receiver's type (@Type methods)",
         "WRUN" => "(directive) | schedule DAG, wait, publish",
         "SH" => "cmd → stdout stderr status | /bin/sh -c",
         "SHP" => "cmd → chan | stream stdout line-by-line",
@@ -698,6 +700,15 @@ impl Lexer {
                 }
                 continue;
             }
+            // ---- method declaration marker: 🔧<TypeName> before a label def ----
+            if c == GLYPH_METHOD {
+                self.prev_ret = false;
+                self.bump();
+                self.skip_ws();
+                let sym = self.tag_name("method type");
+                out.push((self.line, Tok::Method(sym)));
+                continue;
+            }
             // ---- retired JMP/JZ/JE glyphs (removed in v10.1) ----
             match cp {
                 0x130BB => self.err("jmp removed — use entry/if/while/for"),
@@ -830,6 +841,16 @@ impl Lexer {
         }
         if is_bad_ident(&label) {
             self.err(&format!("{} label '{}' — identifiers may not start with '_'", op, label));
+        }
+        // dense method reference: recv.method after the addr glyph (ASCII,
+        // same spelling as the struct immediates)
+        if self.peek() == Some('.') {
+            self.bump();
+            let meth = self.lex_ident();
+            if meth.is_empty() {
+                self.err(&format!("{}: empty method name in a dotted reference", op));
+            }
+            return format!("{}.{}", label, meth);
         }
         label
     }
@@ -1206,7 +1227,7 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "ENQ" => "enqueue", "DEQ" => "dequeue", "CLOSE" => "close", "ATOM" => "atomic", "AGET" => "atomic_get",
         "ASET" => "atomic_set", "AADD" => "atomic_add", "CAS" => "cas", "TYPEOF" => "type_of", "LEN" => "length",
         "USE" => "use", "MOD" => "mod", "PUB" => "pub", "WEAVE" => "weave", "TASK" => "task",
-        "CONSUME" => "consume", "WRUN" => "run",
+        "CONSUME" => "consume", "WRUN" => "run", "SEND" => "send",
         "SH" => "shell", "SHP" => "shell_stream", "EXEC" => "execute",
         "CAP" => "cap", "CAPS" => "caps",
         "MATCH" => "regex_match", "REPLACE" => "regex_replace", "RSPLIT" => "regex_split", "GLOB" => "glob_match",
@@ -1498,6 +1519,18 @@ impl TextLexer {
         check_ident(l, &t, what);
         t
     }
+    // call/addr operand position: reserved mnemonics are legal here — an
+    // IMPORT may bind a C symbol named like an opcode (`import c"send"`;
+    // the __asm__ aliasing keeps the C side safe), and `_call`/`'` consume
+    // their operand unambiguously, so no collision exists in this position
+    fn label_token(&mut self, what: &str) -> String {
+        let l = self.line();
+        let t = self.next().unwrap_or_else(|| self.err(&format!("{} needs a label", what)));
+        if is_bad_ident(&t) {
+            self.err(&format!("{}: '{}' — identifiers may not start with '_'", what, t));
+        }
+        t
+    }
     // stop: 0 = eof, 1 = '}', 3 = ']', 5 = "task"/"run" (weave body end)
     fn run(&mut self, out: &mut Vec<(u32, Tok)>, stop: u8) {
         loop {
@@ -1551,12 +1584,38 @@ impl TextLexer {
             if let Some(label) = tok.strip_prefix('\'') {
                 self.pos += 1;
                 if label.is_empty() {
-                    let nm = self.name_token("addr");
+                    let nm = self.label_token("addr");
                     out.push((l, Tok::Jump("ADDR", nm)));
+                } else if let Some((recv, meth)) = label.split_once('.') {
+                    // method reference: 'recv.method — valid only in send
+                    // position (the parser enforces that)
+                    if recv.is_empty() || meth.is_empty() || meth.contains('.') {
+                        self.err(&format!("bad method reference '{}'", label));
+                    }
+                    for part in [recv, meth] {
+                        if part.chars().next().map_or(true, |c| !c.is_ascii_alphabetic())
+                            || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            self.err(&format!("bad method reference '{}' — both halves must be identifiers", label));
+                        }
+                    }
+                    out.push((l, Tok::Jump("ADDR", label.to_string())));
                 } else {
                     check_ident(l, label, "addr");
                     out.push((l, Tok::Jump("ADDR", label.to_string())));
                 }
+                continue;
+            }
+            if let Some(mname) = tok.strip_prefix('@') {
+                // method declaration marker: @Type before the label def
+                self.pos += 1;
+                if mname.is_empty()
+                    || mname.chars().next().map_or(true, |c| !c.is_ascii_alphabetic())
+                    || !mname.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    self.err(&format!("@ needs a type name (e.g. @Point, @list), not `@{}`", mname));
+                }
+                out.push((l, Tok::Method(mname.to_string())));
                 continue;
             }
             if let Some(name) = tok.strip_suffix(':') {
@@ -1780,14 +1839,14 @@ impl TextLexer {
                 "jz" => self.err("jz removed — use if/ifelse/while"),
                 "je" => self.err("je removed — use if/ifelse"),
                 "_call" => {
-                    let nm = self.name_token("call");
+                    let nm = self.label_token("call");
                     out.push((l, Tok::Jump("CALL", nm)));
                 }
                 "entry" => {
                     out.push((l, Tok::Entry));
                 }
                 "_addr" => {
-                    let nm = self.name_token("addr");
+                    let nm = self.label_token("addr");
                     out.push((l, Tok::Jump("ADDR", nm)));
                 }
                 "_syscall" => {
@@ -1954,7 +2013,7 @@ mod tests {
             );
             seen.push(m);
         }
-        assert_eq!(seen.len(), 196);
+        assert_eq!(seen.len(), 197);
     }
 
     #[test]

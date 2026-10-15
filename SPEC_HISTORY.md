@@ -6,6 +6,27 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-15 — @Type methods + `send` (slot 128 revived; new syntax)
+
+- `send` (128, 📡, `args… recv 'name → r`) — added: method dispatch on the
+  receiver's type. `@Type label:` declares a method (dense 🔧TypeName);
+  the label mangles `Type.name`, making methods send-only and
+  collision-free against ordinary labels; one implementation per
+  (type, name); any TU can extend any type, including built-in tags.
+  `'recv.method send` is sugar for `recv 'method send` (dotted refs are
+  valid only in send position). The receiver binds the last declared
+  parameter; values below bind in caller order. The dormant SEND backend
+  (method table, dispatch, scope/arity interplay) was finished: per-method
+  arity in the table, scalar-tag keys, house-style miss errors, and a full
+  JS-target mirror (`__NKMT` + `RT.sendKey`). Fixed along the way:
+  `method_typekey` tag numbers were stale (str/chan/atom mapped wrong),
+  the JS obj get/set bounds check compared byte offsets against slot
+  counts (any field past the first died on the JS target only), and
+  `_call`/`'` operands named like opcodes (e.g. libc `send` via FFI) were
+  rejected as reserved — call/addr position is unambiguous, so mnemonic
+  names are legal there again (imports resolve first, per the FFI aliasing
+  design). Gate: `comp/tests/t25_methods.n` (both targets).
+
 ## 2026-10-14 — ret-operand @-sentinel boundary (fixed compiler bug, no opcode change)
 
 - A `ret` operand beginning with a source-level sentinel immediate

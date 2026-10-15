@@ -332,6 +332,14 @@ static void uf_req_one(const char*pkg,long i){
     die(m);
   }
 }
+/* SEND miss: house-style die naming the method (when any implementation
+   exists anywhere) and the receiver's type key */
+static void uf_die_send(const char* nm, int64_t mid, int64_t tk){
+  char m[256];
+  if(nm) snprintf(m,sizeof m,"SEND: no method `%s` for this value's type (type key %lld)",nm,(long long)tk);
+  else snprintf(m,sizeof m,"SEND: no method with selector hash %lld for this value's type (type key %lld)",(long long)mid,(long long)tk);
+  die(m);
+}
 
 /* sandbox workspace gate: resolve the path (its parent for not-yet-existing
    write targets) and require it under a workspace root. No-op when the

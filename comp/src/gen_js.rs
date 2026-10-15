@@ -280,6 +280,17 @@ fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
             ));
             o.push_str(&format!("rt.lsp=_f{};\n", i));
         }
+        Ins::Send => {
+            // SEND: pop selector, pop receiver, compute its dispatch key
+            // (mirror of the C target's inline dispatch), find (key, hash)
+            // in __NKMT, and call through the same frame protocol as Call
+            o.push_str("if(iv.length)st.push.apply(st,iv.splice(0));\n");
+            let caller_n = p.local_counts.get(&ctx.ins_body[i]).copied().unwrap_or(0);
+            o.push_str(&format!(
+                "var _mid=st.pop();var _rc=st.pop();var _tk=RT.sendKey(_rc);var _es=(__NKMT[_mid.v.toString()])||null;var _mf=null;var _ar=1;if(_es){{for(var _qi=0;_qi<_es.length;_qi++)if(_es[_qi][0]===_tk){{_mf=_es[_qi][2];_ar=_es[_qi][1];break;}}}}if(!_mf)RT.die(rt,\"SEND: no method for this value's type (type key \"+_tk+\")\");st.push(_rc);var _lb{0}=rt.lb;rt.lb+={1};await _mf(rt,{{drain:st.length>_ar?st.length-_ar:0,base:rt.lb}});rt.lb=_lb{0};\n",
+                i, caller_n
+            ));
+        }
         Ins::Call(l) => {
             o.push_str("if(iv.length)st.push.apply(st,iv.splice(0));\n");
             let t = resolve_label(p, l);
@@ -733,9 +744,6 @@ pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
     if !p.exports.is_empty() {
         user_err!("gen_js", None, "exports: not supported by the JavaScript target");
     }
-    if !p.methods.is_empty() {
-        user_err!("gen_js", None, "methods: not supported by the JavaScript target");
-    }
     if !p.init_pcs.is_empty() {
         user_err!("gen_js", None, "init threads: not supported by the JavaScript target");
     }
@@ -825,6 +833,10 @@ pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
             _ => {}
         }
     }
+    // method bodies are dynamic re-entry points (SEND gotos into them)
+    for (_, _, l) in &p.methods {
+        dyns.insert(resolve_label(p, l));
+    }
     // the entry label starts its own segment; main's prologue jumps straight
     // to it, so F_0's body is just the jump when it is not pc 0 itself
     let entry_pc = p
@@ -891,6 +903,24 @@ pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
         o.push_str("];\n");
     }
     o.push_str("var rt=RT.makeRt();var st=rt.st;var iv=rt.iv;\n");
+    // method dispatch table (SEND): selector hash -> [[type key, arity, F_]]
+    if !p.methods.is_empty() {
+        let mut by_mh: std::collections::HashMap<i64, Vec<(i64, usize, usize)>> = std::collections::HashMap::new();
+        for (tk, mh, l) in &p.methods {
+            let pc = resolve_label(p, l);
+            let ar = p.label_params.get(&pc).map(|v| v.len()).unwrap_or(1).max(1);
+            by_mh.entry(*mh).or_default().push((*tk, ar, pc));
+        }
+        o.push_str("var __NKMT={");
+        for (mh, v) in &by_mh {
+            o.push_str(&format!("\"{}\":[", mh));
+            for (tk, ar, pc) in v {
+                o.push_str(&format!("[{},{},F_{}],", tk, ar, pc));
+            }
+            o.push_str("],");
+        }
+        o.push_str("};\n");
+    }
     // code-address table: every segment start reachable through a code cell
     let mut first = true;
     o.push_str("var __NKAD={");

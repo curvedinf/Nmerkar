@@ -1,0 +1,33 @@
+; t25_methods.n — v16 @Type methods + send dispatch (SPEC "Methods")
+; struct methods (alias-free: mangled Point.area), tag methods (same name,
+; different type), scalar + str methods, 'recv.method sugar, multi-arg
+; receiver-last binding, missing-method die parity.
+struct Point { x:int, y:int, }
+@Point area: p!
+  ret p "x" get p "y" get mul
+@Point scale: f! p!
+  p "x" f p "x" get mul set consume
+  p "y" f p "y" get mul set consume
+  ret p
+@list area: l!
+  ret l length 100 mul
+@list bump: l!
+  ret l length 1 add
+@int twice: n!
+  ret n 2 mul
+@str exclaim: s!
+  ret s "!" concat
+
+entry:
+  0 0 _obj Point p!
+  p "x" 3 set p "y" 4 set consume consume
+  p 'area send 12 structural_equal check          ; struct dispatch
+  'p.area send 12 structural_equal check          ; sugar form
+  2 'p.scale send q!                              ; args bind caller-order,
+  q 'area send 48 structural_equal check          ; receiver last (f! p!)
+  [1 2 3] 'area send 300 structural_equal check   ; same name, list type
+  [1 2 3] 'bump send 4 structural_equal check
+  21 'twice send 42 structural_equal check        ; scalar receiver
+  "go" 'exclaim send "go!" structural_equal check ; str receiver
+  "methods ok" print
+  ret

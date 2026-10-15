@@ -112,6 +112,7 @@ pub fn emit_text(toks: &[(u32, Tok)]) -> String {
                 }
                 o.push(' ');
             }
+            Tok::Method(n) => o.push_str(&format!("@{} ", n)),
             Tok::Mod(n) => o.push_str(&format!("mod \"{}\" ", escape_str(n))),
             Tok::Pub => o.push_str("pub "),
             Tok::Method(n) => o.push_str(&format!("method {}: ", n)),
@@ -315,7 +316,13 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
                     let idx = op_index(op).expect("jump");
                     if *op == "ADDR" {
                         o.push('\'');
-                        o.push_str(&nm(l, names, next));
+                        if l.contains('.') {
+                            // method reference (recv.method): ASCII, the same
+                            // spelling as the struct immediates
+                            o.push_str(l);
+                        } else {
+                            o.push_str(&nm(l, names, next));
+                        }
                     } else if *op == "JE" {
                         o.push_str("=");
                         o.push_str(&nm(l, names, next));
@@ -356,6 +363,7 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
                     o.push_str(&format!("{}\"{}\"", glyph_of(78), escape_str(&spec.source)));
                 }
                 Tok::Mod(n) => o.push_str(&format!("{}\"{}\"", glyph_of(79), escape_str(n))),
+                Tok::Method(n) => o.push_str(&format!("{}{}", crate::lex::GLYPH_METHOD, escape_str(n))),
                 Tok::Pub => o.push_str(&format!("{}", glyph_of(80))),
                 Tok::Method(_) => user_err!("emit", None, "emit-dense: METHOD was removed in v10"),
                 Tok::MacroDef(n, body) => {

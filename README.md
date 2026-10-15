@@ -224,15 +224,6 @@ $ grep ',Retail,' bench/data/sales.csv | nk 'dict p! dict c! "/dev/stdin" "," 0 
 [["Mexico",13218417280.809916],["USA",13212495563.130194],["Canada",13160810726.84009],["Colombia",9948195871.5800667],["Egypt",9948038758.9899693]]
 ```
 
-## Documentation
-
-Full language spec (every opcode, semantics, encoding rules) in
-[`SPEC.md`](SPEC.md).
-
-## Status
-
-Experimental, under active development.
-
 ## Sandboxing
 
 Building Nmerkar by default produces two compilers: `nk` and
@@ -435,9 +426,18 @@ stderr, the die message (without the `nk: ` prefix), and the exit code.
 Boundaries:
 
 - Full op coverage: every op, including the four debug ops, works on the
-  JavaScript target. The parity suite (`bash web/tests/run_tests.sh`, 84
+  JavaScript target. The parity suite (`bash web/tests/run_tests.sh`, 85
   gates) compiles and runs every `comp/tests` gate, every example (including
   the GNU transpiler outputs), and every benchmark program on both targets and
   compares the captured streams byte for byte.
 - `--profile`, `--coverage`, and the all-thread crash dump are native target
   only; `memstats` reads zeros on the JS target (the host manages the heap).
+
+## Documentation
+
+Full language spec (every opcode, semantics, encoding rules) in
+[`SPEC.md`](SPEC.md).
+
+## Status
+
+Experimental, under active development.

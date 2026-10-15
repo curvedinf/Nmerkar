@@ -185,7 +185,7 @@ e 0 get 1 eq 'bmsg if
 
 breg:                                  ; e = [0 fd]: register + replay
 e 1 get f2!
-cl f2 append cl!
+cl f2 append consume
 hist length 'brep for
 0 ret
 
@@ -194,7 +194,7 @@ brep: i! hist i get msg!
 
 bmsg:                                  ; e = [1 msg]: frame, store, fan out
 "data: " e 1 get concat "\n\n" concat fr!
-hist fr append hist!
+hist fr append consume
 hist length 100 gt 'hcap if
 list cl2!                              ; start fresh live-client list
 cl length 'bc for                    ; fan out to all registered clients
@@ -205,7 +205,7 @@ bc: i! cl i get bf!
     bf fr fr length 0 _call send 0 lt 'bdead 'balive if_else
     ret
 
-balive: cl2 bf append cl2! 0 ret       ; client still alive: keep in new list
+balive: cl2 bf append consume 0 ret    ; client still alive: keep in new list
 bdead:  bf 3 _syscall 1 0 ret              ; send failed: close fd, drop client
 hcap:   hist hist length 100 sub hist length slice hist! 0 ret
 

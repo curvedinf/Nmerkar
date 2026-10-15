@@ -11,7 +11,7 @@ d keys length print
 d "a" remove
 d "a" contains print
 list l!
-l 10 append 20 append 30 append l!
+l 10 append 20 append 30 append consume
 l 0 get print
 l 2 get print
 l 9 get_or_zero print

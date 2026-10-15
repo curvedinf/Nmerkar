@@ -177,7 +177,7 @@ A shopping list stores items in order:
 
 ```nmerkar
 ["apples" "bread" "milk"] groceries!      ; Create a shopping list with a list literal.
-groceries "eggs" append groceries!        ; Add eggs to the existing list.
+groceries "eggs" append consume           ; Add eggs to the list in place.
 groceries length print                    ; Print how many items to buy.
 groceries 0 get print                     ; Print the first item.
 groceries print                           ; Print the complete shopping list.

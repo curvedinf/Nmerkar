@@ -4321,6 +4321,15 @@ static void op_apply(Ctx*cx){
   uf_call_fn(cx,c,0,-1,(long)d->len);
 }
 
+/* FNCALL (v16): args… fn -> r — dynamic call. 'x on a variable holding a
+   fn cell lowers here; the cell's declared arity takes the stack below
+   (no list, no packing — the consumer-style calling convention). */
+static void op_call(Ctx*cx){
+  Cell c=pop(cx);
+  UfFn*f=uf_fn(c);
+  uf_call_addr(cx,f->addr,0,-1,(long)f->ar);
+}
+
 /* SPAWN: body_addr -> chan (cap 1; body's top-of-stack enqueued at end,
    then closed — deq on it is a join) */
 static long nk_spawn_frame(const void* body){

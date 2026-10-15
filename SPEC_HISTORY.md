@@ -6,6 +6,18 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-15 — dynamic calls (`'x` on a variable) + `call`
+
+- `FNCALL` (25, 📞, `call` — `args… fn → r`) — added (slot retired since
+  v12): pops a fn cell and invokes it with the cell's own declared arity
+  taking the stack below — the consumer-style calling convention with no
+  list packing. Powers the `'x`-on-a-variable rewrite (`'` now applies
+  whatever the name means: label → static call, variable → load + `call`;
+  unambiguous by the one-name rule) and applies computed cells directly
+  (`d "op" get call`). Wrong arity dies at the site naming the label;
+  non-fn cells die with `expected a fn`; `try` contains both. The legacy
+  `call`→`_call` lex alias is gone. Gate: `comp/tests/t29_fncall.n`.
+
 ## 2026-10-15 — anonymous functions (`:` / `':`) + `apply`
 
 - `FNAPPLY` (41, 🤖, `apply` — `list fn → r`) — added (slot retired with

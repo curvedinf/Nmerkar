@@ -353,8 +353,9 @@ impl<'a> ParseCtx<'a> {
                     self.p.ins.last(),
                     Some(Ins::Ret) | Some(Ins::Break) | Some(Ins::Cont) | Some(Ins::Goto(_)) | Some(Ins::IfElse)
                 ) {
+                    if std::env::var("NK_DBG_ANON").is_ok() { eprintln!("[flush] synthetic Ret at ins {}", self.p.ins.len()); }
                     pi(&mut self.p, Ins::Ret, 0);
-                }
+                } else if std::env::var("NK_DBG_ANON").is_ok() { eprintln!("[flush] last ins already a terminator, len={}", self.p.ins.len()); }
                 let rest = std::mem::take(&mut self.hoisted_anon);
                 for (name, body) in rest {
                     let start_line = body.first().map(|&(l, _)| l).unwrap_or(0);
@@ -1723,6 +1724,28 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
         label_lines: HashMap::new(),
     };
     let file_names = mods.clone();
+    // v16: every variable name visible anywhere (per-TU locals + all TUs'
+    // shared declarations), for the 'x-on-a-variable dynamic-call rewrite —
+    // cross-TU shared names must resolve from any TU, in any merge order
+    let mut all_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (tu, _) in tus.iter().zip(mods.iter()) {
+        for ins in &tu.ins {
+            let n = match ins {
+                Ins::LocalSet(n) | Ins::LocalGet(n) | Ins::IncLocal(n) | Ins::AddLocal(n)
+                | Ins::SetV(n) | Ins::GetV(n) => n.clone(),
+                _ => continue,
+            };
+            all_vars.insert(n);
+        }
+        let tu_first_label = tu.labels.values().copied().min().unwrap_or(tu.ins.len());
+        for pc in 0..tu_first_label.min(tu.ins.len()) {
+            if let Ins::LocalSet(n) = &tu.ins[pc] {
+                if !tu.param_pcs.contains_key(&pc) {
+                    all_vars.insert(n.clone());
+                }
+            }
+        }
+    }
     for (tu_idx, (tu, defmod)) in tus.into_iter().zip(mods).enumerate() {
         let modname = tu.modname.clone().unwrap_or(defmod);
         let off = m.ins.len();
@@ -1754,7 +1777,25 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
                 l.clone()
             }
         };
+        // v16: TU-local positions where the 'x-on-variable rewrite inserts
+        // an extra instruction — label pcs after them shift by the count
+        let mut call_shifts: Vec<usize> = Vec::new();
         for (li, ins) in tu.ins.iter().enumerate() {
+            // v16: 'x where x is a variable (never also a label — the
+            // one-name rule) is a dynamic call: load the fn cell, then
+            // invoke it with the stack below
+            if let Ins::Call(l) = ins {
+                if !l.contains(':') && !tu.labels.contains_key(l) && all_vars.contains(l.as_str()) {
+                    call_shifts.push(li);
+                    m.ins.push(Ins::LocalGet(l.clone()));
+                    m.ins_lines.push(tu.ins_lines[li]);
+                    m.ins_files.push(tu_idx);
+                    m.ins.push(Ins::Simple("op_call"));
+                    m.ins_lines.push(tu.ins_lines[li]);
+                    m.ins_files.push(tu_idx);
+                    continue;
+                }
+            }
             m.ins.push(match ins {
                 Ins::PushI(v) => Ins::PushI(*v),
                 Ins::PushF(v) => Ins::PushF(*v),
@@ -1814,11 +1855,15 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
             m.ins_lines.push(tu.ins_lines[li]);
             m.ins_files.push(tu_idx);
         }
+        let shift_of = |idx: usize| -> usize {
+            off + idx + call_shifts.iter().filter(|&&s| s < idx).count()
+        };
         for (name, idx) in &tu.labels {
-            m.labels.insert(format!("{}:{}", modname, name), idx + off);
-            m.label_names.entry(idx + off).or_insert_with(|| name.clone());
+            let at = shift_of(*idx);
+            m.labels.insert(format!("{}:{}", modname, name), at);
+            m.label_names.entry(at).or_insert_with(|| name.clone());
             if let Some(ln) = tu.label_lines.get(idx) {
-                m.label_lines.insert(idx + off, *ln);
+                m.label_lines.insert(at, *ln);
             }
         }
         // a TU's top-level flow must not fall through into the next TU
@@ -1830,9 +1875,9 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
                 let ln = tu.label_lines.get(&tu.labels[name]).copied();
                 user_err!("parse", ln, "duplicate PUB label {}", name);
             }
-            m.labels.insert(name.clone(), tu.labels[name] + off);
+            m.labels.insert(name.clone(), shift_of(tu.labels[name]));
             if let Some(ln) = tu.label_lines.get(&tu.labels[name]) {
-                m.label_lines.entry(tu.labels[name] + off).or_insert(*ln);
+                m.label_lines.entry(shift_of(tu.labels[name])).or_insert(*ln);
             }
             m.pubs.push(name.clone());
         }
@@ -1862,11 +1907,12 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
             }
         }
         // v13: label params and param-pop pcs shift with the TU offset
+        // (v16: plus any 'x-on-variable rewrite insertions before them)
         for (&pc, ps) in &tu.label_params {
-            m.label_params.insert(pc + off, ps.clone());
+            m.label_params.insert(shift_of(pc), ps.clone());
         }
         for (&pc, &k) in &tu.param_pcs {
-            m.param_pcs.insert(pc + off, k);
+            m.param_pcs.insert(shift_of(pc), k);
         }
     }
     m.file_names = file_names;
@@ -2050,6 +2096,7 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "TRANSPOSE" => "op_transpose",
         "DCAST" => "op_dcast",
         "FNAPPLY" => "op_apply",
+        "FNCALL" => "op_call",
         "DBG" => "op_dbg", "CHECK" => "op_check", "TIMER" => "op_timer", "MEMSTATS" => "op_memstats",
 
         other => panic!("no helper for {}", other),
@@ -2071,6 +2118,9 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         // v16: spread the list as args and call the fn cell (the callee's
         // arity is checked at runtime — the cell carries it)
         "op_apply" => (2, 1),
+        // v16 dynamic call: pops the cell plus a variable number of args
+        // (the cell's declared arity) — not statically modelable; leaving
+        // it out of this table poisons the arity walk conservatively
         "op_set" => (3, 0),
         "op_append" | "op_push" => (2, 1),
         "op_lpop" => (1, 1),
@@ -3378,6 +3428,38 @@ mod tests {
             parse_src("1 : h: 2 ret ret\nret\n");
         });
         assert!(d.message.contains("labels cannot be defined inside an anonymous body"), "{}", d.message);
+    }
+
+    // ---- v16 dynamic calls ('x on a variable holding a fn cell) ----
+    #[test]
+    fn call_on_var_rewrites_to_load_and_op_call() {
+        let mut p = parse_src("0 f!\n3 4 'f\nret\n");
+        let i = p.ins.iter().position(|x| matches!(x, Ins::Simple("op_call"))).expect("op_call");
+        assert!(matches!(p.ins[i - 1], Ins::GetV(_) | Ins::LocalGetI(_)), "load precedes the call");
+        assert!(matches!(p.ins[i + 1], Ins::Ret));
+    }
+
+    #[test]
+    fn call_on_label_stays_a_static_call() {
+        let mut p = parse_src("3 4 'add2\nret\nadd2: a! b!\n  ret a b add\n");
+        assert!(p.ins.iter().any(|x| matches!(x, Ins::Call(l) if l.ends_with("add2"))));
+        assert!(!p.ins.iter().any(|x| matches!(x, Ins::Simple("op_call"))));
+    }
+
+    #[test]
+    fn call_rewrite_does_not_shift_late_labels() {
+        // regression: the 'f rewrite inserts an instruction mid-stream; a
+        // label defined after the call site must still point at its body
+        let mut p = parse_src("0 f!\n3 4 'f\nret\nhelper: a! b!\n  ret a b add\n");
+        let (lbl, pc) = p.labels.iter().find(|(n, _)| n.ends_with("helper")).map(|(n, &pc)| (n.clone(), pc)).unwrap();
+        assert!(
+            matches!(p.ins[pc], Ins::LocalSet(_) | Ins::LocalSetI(_)),
+            "label {} must point at its param bind, got {:?}",
+            lbl, p.ins[pc]
+        );
+        // the param binds (reversed), body ops, then its ret — all within
+        // the label's own region
+        assert!(p.ins[pc..pc + 8].iter().any(|x| matches!(x, Ins::Ret)), "body must end in ret");
     }
 
     fn scope_rejects_cross_body_local_read() {

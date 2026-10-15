@@ -43,9 +43,11 @@ The v16 migration campaign (in progress) makes **78 built-in ops automatic
 methods** (SPEC "Built-in methods") and turns **code into a value**: `'name`
 is the call form (retiring the `_call` spelling), a bare label name is an
 implicit **fn** reference (tag 22, retiring `_addr`), every callback-taking
-op accepts a fn cell from the stack, and **anonymous functions** — `:` body
+op accepts a fn cell from the stack, **anonymous functions** — `:` body
 `ret` defines one inline, `':` body `ret` applies it to a list argument
-vector via the revived `apply` op (slot 41) — see "Label parameters" and
+vector via the revived `apply` op (slot 41) — and **dynamic calls**: `'x`
+on a variable holding a fn cell lowers to the revived `call` op (slot 25),
+whose declared arity takes the stack below — see "Label parameters" and
 "Anonymous functions". Not backward compatible with v15.2 source using
 `_call`/`_addr` or quoted callback references.
 Per-operation history is in `SPEC_HISTORY.md`; this document is the current
@@ -73,7 +75,7 @@ auto-detection).
 
 | space | range | contents |
 |-------|-------|----------|
-| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 197 live (194 with dense glyphs; `cap`/`caps`/`consume` are text-only) |
+| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 198 live (195 with dense glyphs; `cap`/`caps`/`consume` are text-only) |
 | v-space | U+1F941+ interleaved with other emoji | variable/label name atoms, runs fold |
 | l-space | U+1F130+ (enclosed alphanumerics) | base-64 digit atoms (self-evaluating numbers) |
 | delimiters | U+13100..U+13108 | chat-template delimiters, stripped pre-compilation |
@@ -250,6 +252,23 @@ fn cell, same as any dynamic callback):
 ```nmerkar
 [3 4] ': add ret print             ; 7
 [3 4] ': a! b! a b add ret print   ; 7, named
+```
+
+**`'x` on a variable (dynamic call).** `'x` applies whatever the name
+means: a label resolves to the static call; a **variable** holding a fn
+cell lowers to `[load x, call]` — the `call` op (📞, `args… fn → r`) pops
+the cell and invokes it with **its own declared arity** taking the stack
+below (the consumer-style convention — no list packing). `call` also
+applies a computed cell directly (`7 d "op" get call`). The one-name rule
+makes the resolution unambiguous; a var holding a non-fn dies with
+`expected a fn`; a short stack dies at the site naming the label, and
+`try` contains both.
+
+```nmerkar
+addf f!
+3 4 'f                          ; 7 — no [3 4] list
+: x! x 1 add ret bump!
+10 'bump 'bump 'bump            ; 13 — threads without list churn
 ```
 
 Lowering: `:` collects the body, pushes the fn cell at the collection site
@@ -587,7 +606,7 @@ The same applies to `tensor`. Elements are coerced to the element type
 
 ## Opcode reference
 
-222 slots (0..221); **197 live opcodes**. Each live opcode except the
+222 slots (0..221); **198 live opcodes**. Each live opcode except the
 text-only `cap`/`caps`/`consume` (no dense glyph — they cannot be written in
 dense source) has a unique dense glyph; the text mnemonics are the
 full-word/`snake_case` names listed below. Glyph assignments are 1:1 and
@@ -619,6 +638,7 @@ v15.1; its formerly reserved glyph is freed.)
 | 22 | 🪐 | `gte` | a b → 0/1 | a≥b; coerces both sides to Number, NaN → 0 |
 | 23 | 🤓 | `array` | len_or_list type → h | polymorphic: top is a length or a list to copy; `_array <type>` immediate form; 64-aligned typed array |
 | 24 | 🪫 | `shutdown` | → | graceful weave shutdown: sets the drain flag (see Concurrency) |
+| 25 | 📞 | `call` | args… fn → r | dynamic call — the fn cell's declared arity takes the stack below (`'x` on a var) |
 | 26 | 🌅 | `copy` | h → h' | deep copy |
 | 27 | 😅 | `_cast` | v type → v' | static cast (immediate type): int/float/ptr/byte/bool, struct id = checked downcast; dies on mismatch |
 | 28 | 🚆 | `macro` | (directive) | `macro name { body }` |
@@ -1921,7 +1941,7 @@ environment.
 
 ## Totals
 
-222 opcode slots (0..221); **197 live opcodes**. 194 of them have unique
+222 opcode slots (0..221); **198 live opcodes**. 195 of them have unique
 dense glyph codepoints (`cap`/`caps`/`consume` are text-only).
 
 ## Non-goals

@@ -256,10 +256,16 @@ callback-taking operation:
 ```nmerkar
 sq h!                             ; h now holds the fn for sq
 [1 2 3] h array_map print         ; [1, 4, 9]
+5 'h print                        ; 25 — ' applies a var-held fn too
 ret
 sq: x!                            ; The named definition, as usual.
   ret x x mul
 ```
+
+`'x` applies whatever the name means — a label calls it directly, a
+variable holding a fn cell is a dynamic call whose declared arity takes
+the stack below (no list packing), and a fn pulled out of a dict runs
+through the `call` op: `7 d "op" get call`.
 
 An **anonymous function** is `:` — a label definition without a name,
 written inline. The body runs to its `ret` (same line), leading parameter

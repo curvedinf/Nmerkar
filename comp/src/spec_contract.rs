@@ -33,12 +33,12 @@ fn table_shape_and_retirement() {
         .collect();
     assert_eq!(retired_in_place, Vec::<usize>::new(), "no op may be retired in place");
     let live = live_indices();
-    assert_eq!(live.len(), 197, "live-op count");
+    assert_eq!(live.len(), 198, "live-op count");
     // 25 "~NN" retired slots, all glyph-less (18 through v15; v15.1 retired
     // the eight scalar_/array_ arithmetic aliases, slots 128..=135; slot 41
     // was retired with ADDR and revived in v16 as `apply`)
     let retired: Vec<usize> = (0..OP_NAMES.len()).filter(|&i| OP_NAMES[i].starts_with('~')).collect();
-    assert_eq!(retired.len(), 25, "retired ~NN slot count (128 revived as send, 41 as apply)");
+    assert_eq!(retired.len(), 24, "retired ~NN slot count (128 revived as send, 41 as apply, 25 as call)");
     for &i in &retired {
         assert_eq!(OP_GLYPHS[i], 0, "retired slot {} ({}) must have no glyph", i, OP_NAMES[i]);
     }
@@ -62,7 +62,7 @@ fn glyph_spaces_unique_disjoint_roundtrip() {
             seen.push((g, i));
         }
     }
-    assert_eq!(seen.len(), 194, "nonzero opcode glyph count");
+    assert_eq!(seen.len(), 195, "nonzero opcode glyph count");
     // v-space / l-space: 64 unique codepoints each
     for (name, space) in [("V_SPACE", &V_SPACE), ("L_SPACE", &L_SPACE)] {
         assert_eq!(space.len(), 64);

@@ -3705,6 +3705,13 @@ var RT = (function () {
     for (var i = 0; i < l.v.length; i++) rt.st.push(l.v[i]);
     await preludeCall(rt, c.v, l.v.length);
   }
+  // FNCALL (v16): args… fn -> r — dynamic call ('x on a var holding a fn
+  // cell); the cell's carried arity takes the stack below
+  async function op_call(rt) {
+    var c = pop(rt, "call");
+    if (c.t !== "a") die(rt, "call: expected a fn cell");
+    await preludeCall(rt, c.v, typeof c.v.ar === "number" ? c.v.ar : 0);
+  }
   async function op_try(rt) {
     var body = pop(rt, "try");
     var sp0 = rt.st.length;
@@ -3835,7 +3842,7 @@ var RT = (function () {
     op_bufcopy: op_bufcopy, op_loadx: op_loadx, op_storex: op_storex,
     op_chan: op_chan, op_enq: op_enq, op_deq: op_deq, op_close: op_close,
     op_atom: op_atom, op_aget: op_aget, op_aset: op_aset, op_aadd: op_aadd,
-    op_cas: op_cas, op_spawn: op_spawn, op_apply: op_apply,
+    op_cas: op_cas, op_spawn: op_spawn, op_apply: op_apply, op_call: op_call,
     op_gc: op_gc, op_obj: op_obj,
     op_argv: op_argv, op_hasargs: op_hasargs, op_argi: op_argi,
     op_now: op_now, op_time: op_time, op_timef: op_timef,

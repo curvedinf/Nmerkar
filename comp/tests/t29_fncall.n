@@ -1,0 +1,35 @@
+; t29_fncall.n — v16 dynamic calls: 'x on a variable holding a fn cell,
+; and the `call` op for computed cells. The cell's declared arity takes
+; the stack below — no list packing.
+; Run: nk comp/tests/t29_fncall.n
+
+; 1. 'x on a var holding a named fn
+addf f!
+3 4 'f 7 eq check
+
+; 2. 'x on a var holding an anonymous fn
+: x! x 2 mul ret m!
+[5] m apply 10 eq check
+5 'm 10 eq check
+
+; 3. the call op on a computed cell (out of a dict)
+dict d!
+: v! v 3 mul ret g!
+d "op" g set
+7 d "op" get call 21 eq check
+
+; 4. wrong arity on a var-held fn dies at the site naming the label,
+;    and try contains it
+: 1 'f ret try ok# _#
+ok 0 eq check
+
+; 5. fn cells thread through calls without list churn
+: x! x 1 add ret bump!
+10 'bump 'bump 'bump 13 eq check
+
+; 6. a named fn via 'name (label resolution) still works alongside
+3 4 'addf 7 eq check
+
+ret
+addf: a! b!
+  ret a b add

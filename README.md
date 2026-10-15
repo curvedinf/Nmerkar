@@ -175,6 +175,59 @@ standalone binary. Eligible compute work can use a Vulkan GPU automatically
 when the toolchain and device are available, while `--device cpu` keeps it
 on the CPU. `nks` runs programs in a sandbox.
 
+## Examples
+
+A shopping list stores items in order:
+
+```nmerkar
+["apples" "bread" "milk"] groceries!      ; Create a shopping list with a list literal.
+groceries "eggs" append consume           ; Add eggs to the list in place.
+groceries length print                    ; Print how many items to buy.
+groceries 0 get print                     ; Print the first item.
+groceries print                           ; Print the complete shopping list.
+```
+
+A loop calls a helper to price three orders of increasing size:
+
+```nmerkar
+0 total!                                   ; Start the running total at zero.
+3 add_order for                            ; Run add_order with indexes 0, 1, and 2.
+total print                                ; Print the total cost of all three orders.
+ret                                        ; Finish the main program before the helper blocks.
+add_order: index!                          ; Give each loop index a name.
+  index 1 add 'price total add total! ; Price one more item than the index, then add it to the total.
+  ret                                      ; Return to the loop.
+price: quantity!                           ; Define a reusable helper that receives a quantity.
+  ret quantity 5 mul                       ; Return the quantity times the $5 unit price.
+```
+
+A `weave` streams prices from a file, discounts them as a tensor, and totals the result.
+Running it creates `weave-prices.txt` in the current directory:
+
+```nmerkar
+"weave-prices.txt" "10\n20\n30" write_file            ; Write three sample prices to a file.
+weave                                               ; Begin a task graph.
+  task prices:                                      ; Define the file-processing task.
+    "weave-prices.txt" list collect_price file_fold_lines values! ; Stream file lines into a list.
+    ret values float tensor                         ; Turn the parsed prices into a float tensor.
+  collect_price: values! line!                       ; Receive the accumulated list and the next line.
+    ret values line parse_float append              ; Parse the price and add it to the list.
+  task discounted: prices!                          ; Wait for the prices task and receive its tensor.
+    ret prices 0.9 mul                              ; Apply a 10 percent discount to each price.
+  task total: discounted!                           ; Wait for the discounted tensor.
+    ret discounted sum                              ; Sum the discounted prices.
+run total "%.2f" format print                       ; Run the graph and print 54.00.
+```
+
+Use `nk` inline to efficiently process data with `bash`:
+
+```
+$ grep ',Retail,' bench/data/sales.csv | nk 'dict p! dict c! "/dev/stdin" "," 0 r file_split_lines z! p 5 top_n print c 5 top_n print ret r: a! n! p 4 10 field_float field_add_to c 3 10 field_float field_add_to ret a'
+
+> [["Bundle B",23912165787.440258],["Refurb Unit",23788674041.119873],["Gadget X1",23781641142.379787],["Spare Part",23776965024.160465],["Widget Pro",23759658166.90052]]
+[["Mexico",13218417280.809916],["USA",13212495563.130194],["Canada",13160810726.84009],["Colombia",9948195871.5800667],["Egypt",9948038758.9899693]]
+```
+
 ## Functions
 
 Labels are the functions, and they come in named and anonymous forms —
@@ -235,59 +288,6 @@ runs:
 : x! x x mul ret sqf!             ; store an anonymous fn
 [7] sqf apply print               ; 49 — apply works on any stored fn
 ret
-```
-
-## Examples
-
-A shopping list stores items in order:
-
-```nmerkar
-["apples" "bread" "milk"] groceries!      ; Create a shopping list with a list literal.
-groceries "eggs" append consume           ; Add eggs to the list in place.
-groceries length print                    ; Print how many items to buy.
-groceries 0 get print                     ; Print the first item.
-groceries print                           ; Print the complete shopping list.
-```
-
-A loop calls a helper to price three orders of increasing size:
-
-```nmerkar
-0 total!                                   ; Start the running total at zero.
-3 add_order for                            ; Run add_order with indexes 0, 1, and 2.
-total print                                ; Print the total cost of all three orders.
-ret                                        ; Finish the main program before the helper blocks.
-add_order: index!                          ; Give each loop index a name.
-  index 1 add 'price total add total! ; Price one more item than the index, then add it to the total.
-  ret                                      ; Return to the loop.
-price: quantity!                           ; Define a reusable helper that receives a quantity.
-  ret quantity 5 mul                       ; Return the quantity times the $5 unit price.
-```
-
-A `weave` streams prices from a file, discounts them as a tensor, and totals the result.
-Running it creates `weave-prices.txt` in the current directory:
-
-```nmerkar
-"weave-prices.txt" "10\n20\n30" write_file            ; Write three sample prices to a file.
-weave                                               ; Begin a task graph.
-  task prices:                                      ; Define the file-processing task.
-    "weave-prices.txt" list collect_price file_fold_lines values! ; Stream file lines into a list.
-    ret values float tensor                         ; Turn the parsed prices into a float tensor.
-  collect_price: values! line!                       ; Receive the accumulated list and the next line.
-    ret values line parse_float append              ; Parse the price and add it to the list.
-  task discounted: prices!                          ; Wait for the prices task and receive its tensor.
-    ret prices 0.9 mul                              ; Apply a 10 percent discount to each price.
-  task total: discounted!                           ; Wait for the discounted tensor.
-    ret discounted sum                              ; Sum the discounted prices.
-run total "%.2f" format print                       ; Run the graph and print 54.00.
-```
-
-Use `nk` inline to efficiently process data with `bash`:
-
-```
-$ grep ',Retail,' bench/data/sales.csv | nk 'dict p! dict c! "/dev/stdin" "," 0 r file_split_lines z! p 5 top_n print c 5 top_n print ret r: a! n! p 4 10 field_float field_add_to c 3 10 field_float field_add_to ret a'
-
-> [["Bundle B",23912165787.440258],["Refurb Unit",23788674041.119873],["Gadget X1",23781641142.379787],["Spare Part",23776965024.160465],["Widget Pro",23759658166.90052]]
-[["Mexico",13218417280.809916],["USA",13212495563.130194],["Canada",13160810726.84009],["Colombia",9948195871.5800667],["Egypt",9948038758.9899693]]
 ```
 
 ## Sandboxing

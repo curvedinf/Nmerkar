@@ -250,8 +250,13 @@ fn spec_has_no_glued_directive_spellings() {
         while let Some(i) = spec[start..].find(kw) {
             let at = start + i;
             let preceded_by_quote = at > 0 && bytes[at - 1] == b'"';
+            // a quoted word ENDING in the keyword (`"ffi.use"`) closes its
+            // quote right after the match; a real glued directive always
+            // continues with quoted content (`use"name"`)
+            let after = bytes.get(at + kw.len()).copied();
+            let closes_quoted_word = after.map_or(true, |c| !(c.is_ascii_alphanumeric() || c == b'"' || c == b'_'));
             assert!(
-                preceded_by_quote,
+                preceded_by_quote || closes_quoted_word,
                 "SPEC.md documents the glued directive spelling `{}` — the lexer requires a space (write `{} \"name\"`)",
                 kw, bare
             );

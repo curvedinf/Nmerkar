@@ -1,0 +1,2 @@
+; nk package approvals — content-roots a human approved
+approve source=path:/tmp/nkpkg-gate.RF7jxv/tooldemo root=nkph1:a70fcfc602e2ba8d6abd2cabd09c4a27eda25b5b33b0763b0f40ccf86955472a date=2026-10-15 by=flag(--yes)

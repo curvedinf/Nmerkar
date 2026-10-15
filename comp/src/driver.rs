@@ -565,8 +565,12 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 eprintln!("");
                 eprintln!("  packages (SPEC.md \"Packages\"):");
                 eprintln!("       nk install [gh:owner/repo[@ref] | https://… | path:dir]   fetch + approve + pin");
-                eprintln!("       nk install DIR [--locked] [--refresh SRC] [--yes]         reconcile .nk/lock");
-                eprintln!("       nk pkg gc                          sweep unreachable package roots from the store");
+                eprintln!("              [--grant fs.read,proc]                              tool bins: grant capabilities at install");
+                eprintln!("       nk install DIR [--locked] [--refresh SRC] [--yes]         reconcile .nk/lock (libs, deps, .nk/tools)");
+                eprintln!("       nk run NAME [--policy P] args…                            run an installed tool under a ceiling");
+                eprintln!("       nk tools list | rm NAME                                    manage installed tool bins");
+                eprintln!("       nk pkg gc | keygen | pub SEED | sign SEED                  store GC; ed25519 publisher signing");
+                eprintln!("       use lib1 \"gh:owner/repo@ref\" allow fs.read                 in source: alias + grants (SPEC \"Packages\")");
                 eprintln!("");
                 eprintln!("  compiler diagnostics:");
                 eprintln!("       --compiler-backtrace[=full]  show a Rust compiler backtrace on panic");

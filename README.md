@@ -89,6 +89,7 @@ nk prog.n                      # compile + run (cached)
 nk -c prog.n -o hello          # compile to standalone binary
 nk --emit-c prog.n             # dump the generated C
 nk --to-text prog.nd           # convert dense → text
+nk install gh:user/repo        # fetch + approve + pin a package
 nk somedir/                    # directory mode (auto-discovers main + init threads)
 ```
 
@@ -262,6 +263,65 @@ nk --device vk0 prog.n  # pin a specific Vulkan device
 Nmerkar's project includes a transpiler which converts simple C programs and
 libraries to Nmerkar-native versions. This allows automated creation of training
 data for language models.
+
+## Packages
+
+Use libraries straight from GitHub (or any HTTPS URL, or a local directory)
+with per-use-site capability grants. Installing fetches, hashes, and pins the
+exact bytes into `.nk/lock` after your approval; compiling never touches the
+network.
+
+```sh
+nk install gh:curvedinf/lib      # fetch + approve + pin (latest semver tag)
+nk install .                     # reconcile the project's pins (and tools)
+nk install . --locked            # verify-only — the CI entry
+```
+
+```nmerkar
+use lib1 "gh:curvedinf/lib@v1.2" allow fs.read   ; alias + least privilege
+use lib2 "gh:curvedinf/lib@v2"                   ; two versions, side by side
+
+entry:
+  21 _call lib1:double print                     ; alias:name is the API
+  _offset lib1:Point.x print                     ; structs qualify too
+  ret
+```
+
+Grant clauses are plain algebra — `((policy ∪ allow) − deny) ∩ declared ∩
+program policy` — and a `use` with no clauses gets **zero privileges**:
+package code that reads files or spawns shells simply will not compile until
+you grant it. At run time `NK_CAP_CEILING` (or `nk run --policy`) can only
+restrict further; `cap`/`caps` report the effective set so libraries degrade
+gracefully. Every package's identity is the SHA-256 Merkle root of its
+canonical content (`nkph1:…`) — pins are byte-exact, the store dedupes
+across versions, and `--locked` fails on any drift.
+
+Publishers sign releases with Ed25519:
+
+```sh
+nk pkg keygen                                     # once — keep the seed private
+printf '%s' "$(grep lib .nk/lock | sed 's/.*root=//')" | nk pkg sign $SEED > nk.sig
+```
+
+A valid signature is verified before any approval prompt; tampered content
+can never verify; a package that drops its signature is drift.
+
+Packages can also declare tools (`bin hello = main.n` in `nk.pkg`) — installed
+bins are compiled locally from the approved source and shimmed into
+`~/.nk/bin`:
+
+```sh
+nk install gh:curvedinf/tool --grant proc         # caps granted at install
+hello world                                       # direct exec = install grants
+nk run hello --policy data world                  # or tighter, per run
+```
+
+A repo pins its whole toolchain in `.nk/tools` (`tool hello = gh:u/r
+grant proc`), so a fresh clone is two commands: `nk install . --locked`
+then `nk .`.
+
+Full rules (namespacing, grants, ceilings, signing, tools): `SPEC.md`
+"Packages".
 
 ## Observability
 

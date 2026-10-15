@@ -1878,6 +1878,30 @@ The four debugging ops work on the JS target and are parity-gated.
 wasm bundle has no equivalent instrumentation hook, and the JS host heap exposes no
 stats to `memstats` (hence its zeros there).
 
+## Capability grammar
+
+One grammar names capabilities everywhere they appear: `.ufs` `allow`/`deny`
+lines, package `nk.pkg` declarations, `use` grant clauses, the
+`NK_CAP_CEILING` environment variable, and the `cap`/`caps` ops.
+
+```
+cap      := name | pattern
+name     := "fs.read" | "fs.write" | "proc" | "ffi.use" | "ffi.import"
+          | "raw.syscall" | "raw.mem" | "host.argv"
+pattern  := name-segment "." "*" | "*"
+```
+
+- `prefix.*` matches every capability under the prefix (`fs.*` = fs.read +
+  fs.write); bare `*` matches all eight.
+- Pseudo-caps `fs.workspace` and `compute` are queryable (`cap` op) but not
+  grantable.
+- Resolution rules differ by surface: `.ufs` files resolve overlapping
+  patterns by specificity (exact > `prefix.*` > `*`, a more specific allow
+  beats a deny); `use` grant clauses are plain set algebra
+  (`(policy ∪ allow) − deny`, deny subtracts); `NK_CAP_CEILING` is a
+  comma-separated allow-list (absent env = no restriction, empty string =
+  allow none).
+
 ## Sandboxing and capabilities
 
 `nk` compiles unrestricted. `nks` — built by default alongside `nk`

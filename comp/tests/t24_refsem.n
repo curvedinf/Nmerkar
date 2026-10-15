@@ -1,0 +1,24 @@
+; t24_refsem.n — reference semantics: a container handle IS the object.
+; Mutation ops (append/pop/set/…) act in place; every name bound to the same
+; handle sees the change, and growth never re-allocates the handle — no
+; re-store after append.
+; Expected: stdout "ok\n"; rc 0.
+entry:
+list a!
+a b!                          ; alias: both names denote the same list
+40 'grow for                  ; grow far past the initial capacity
+a length 40 eq check          ; original name sees every append
+b length 40 eq check          ; alias sees them too — b was never re-stored
+b 7 get 7 eq check            ; values readable through the alias
+b pop consume                 ; pop mutates in place
+a length 39 eq check          ; …visible through the other name
+dict d!
+d e!
+100 'dfill for                ; crosses the dict's growth threshold
+d length 100 eq check
+e length 100 eq check
+e 50 get 50 eq check
+"ok" print
+ret
+grow: k! a k append consume ret
+dfill: k! d k k set ret

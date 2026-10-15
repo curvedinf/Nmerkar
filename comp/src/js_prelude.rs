@@ -1375,8 +1375,8 @@ var RT = (function () {
     if (st.t === "s") rt.st.push(S(st.v.slice(Number(i), Number(j))));
     else rt.st.push(L(st.v.slice(Number(i), Number(j))));
   }
-  // PUSH: h v -> h' (C returns a new grown handle; JS mutates and re-pushes
-  // the same object — documented divergence)
+  // PUSH: h v -> h (reference semantics: mutates in place and re-pushes the
+  // same object — identical to the C target's stable-handle growth)
   function op_push(rt) {
     var v = pop(rt, "push");
     var h = pop(rt, "push");

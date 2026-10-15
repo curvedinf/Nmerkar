@@ -118,6 +118,7 @@ const SPECS = [
   ["comp/tests/t21_strarith.n", {}],
   ["comp/tests/t22_deepbranch.n", {}],
   ["comp/tests/t23_sharedpoly.n", {}],
+  ["comp/tests/t24_refsem.n", {}],
   // examples: repo example programs
   ["examples/hello.n", {}],
   ["examples/fib.n", {}],

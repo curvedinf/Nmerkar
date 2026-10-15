@@ -21,16 +21,16 @@ struct Point { x:int, y:int, }
 entry:
   0 0 _obj Point p!
   p "x" 3 set p "y" 4 set consume consume
-  'p.area send 12 structural_equal check          ; struct dispatch (dotted)
-  'p.area send 12 structural_equal check          ; idempotent form
-  2 'p.scale send q!                              ; args bind caller-order,
-  'q.area send 48 structural_equal check          ; receiver last (f! p!)
+  'p.area 12 structural_equal check          ; struct dispatch (dotted)
+  'p.area 12 structural_equal check          ; idempotent form
+  2 'p.scale q!                              ; args bind caller-order,
+  'q.area 48 structural_equal check          ; receiver last (f! p!)
   [1 2 3] l2!
-  'l2.area send 300 structural_equal check        ; same name, list type
-  'l2.bump send 4 structural_equal check
+  'l2.area 300 structural_equal check        ; same name, list type
+  'l2.bump 4 structural_equal check
   21 n!
-  'n.twice send 42 structural_equal check         ; scalar receiver
+  'n.twice 42 structural_equal check         ; scalar receiver
   "go" s!
-  's.exclaim send "go!" structural_equal check    ; str receiver
+  's.exclaim "go!" structural_equal check    ; str receiver
   "methods ok" print
   ret

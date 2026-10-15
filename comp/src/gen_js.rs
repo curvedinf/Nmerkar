@@ -44,7 +44,7 @@ const JS_OPS: &[&str] = &[
     "op_vsearchsorted", "op_vwhere", "op_transpose",
     "op_malloc", "op_free", "op_buf", "op_bufcopy", "op_loadx", "op_storex",
     "op_chan", "op_enq", "op_deq", "op_close", "op_atom", "op_aget", "op_aset",
-    "op_aadd", "op_cas", "op_spawn", "op_apply", "op_call",
+    "op_aadd", "op_cas", "op_spawn", "op_apply", "op_call", "op_weave_run", "op_wchk",
     "op_addto", "op_agg", "op_argi", "op_argv", "op_badd", "op_bfs",
     "op_bloom", "op_btest", "op_chunk", "op_dfs", "op_exec", "op_faddto",
     "op_fatof", "op_fatoi", "op_fbyte", "op_feach", "op_femit", "op_ffold",

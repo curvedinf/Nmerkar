@@ -252,6 +252,8 @@ struct ParseCtx<'a> {
     // at the collection site stays adjacent to its consumer
     anon_ctr: usize,
     hoisted_anon: Vec<(String, Vec<(u32, Tok)>)>,
+    weave_methods_done: bool,
+    saved_weave: bool,
 }
 
 impl<'a> ParseCtx<'a> {
@@ -269,7 +271,6 @@ impl<'a> ParseCtx<'a> {
                 Tok::Op("STRICT") => pi(&mut self.p, Ins::Strict, line),
                 Tok::Op("LOOSE") => pi(&mut self.p, Ins::Loose, line),
                 Tok::Op("CAST") => self.parse_cast(line),
-                Tok::Op("SEND") => pi(&mut self.p, Ins::Send, line),
                 // v16 methods campaign: bare migrated tokens stay direct op
                 // calls (the built-in, a.k.a. the "super" form); only the
                 // dotted 'recv.method send dispatches through the method
@@ -333,6 +334,7 @@ impl<'a> ParseCtx<'a> {
                 Tok::List(body) => self.requeue_literal(body, "@liststart", "@listlit", line),
                 Tok::Dict(body) => self.requeue_literal(body, "@dictstart", "@dictlit", line),
                 Tok::Wrun(terminal) => self.parse_wrun(terminal, line),
+                Tok::WSave => self.parse_wsave(line),
                 Tok::LabelDef(n) => self.parse_label_def(n, line),
                 Tok::AnonDef => self.parse_anon(false, line),
                 Tok::AnonCall => self.parse_anon(true, line),
@@ -361,6 +363,97 @@ impl<'a> ParseCtx<'a> {
                     let start_line = body.first().map(|&(l, _)| l).unwrap_or(0);
                     self.q.push_back((start_line, Tok::LabelDef(name)));
                     for t in body {
+                        self.q.push_back(t);
+                    }
+                }
+            }
+            // v16: synthesize the built-in @Weave methods once (a user
+            // declaration of the same (Weave, name) wins and is kept)
+            if self.q.is_empty() && self.hoisted_anon.is_empty() && !self.weave_methods_done && self.saved_weave {
+                self.weave_methods_done = true;
+                // the main flow must never fall into a synthesized body
+                if !matches!(
+                    self.p.ins.last(),
+                    Some(Ins::Ret) | Some(Ins::Break) | Some(Ins::Cont) | Some(Ins::Goto(_)) | Some(Ins::IfElse)
+                ) {
+                    pi(&mut self.p, Ins::Ret, 0);
+                }
+                if let Some(&(_, _, sid)) = self.structs.get("Weave") {
+                    let tk = 1000 + sid as i64;
+                    let have = |nm: &str| self.p.methods.iter().any(|(t, m, _)| *t == tk && *m == fnv64(nm));
+                    let mut toks: Vec<(u32, Tok)> = Vec::new();
+                    macro_rules! m { ($tok:expr) => { toks.push((0, $tok)); } }
+                    if !have("add") {
+                        // add takes one spec dict {name fn in count} + the
+                        // receiver; fields bind to locals first (del-shape)
+                        m!(Tok::Method("Weave".into()));
+                        m!(Tok::LabelDef("add".into()));
+                        for n in ["__spec", "__w"] { m!(Tok::LocalSet(n.into())); }
+                        // sf = spec "fn" get; si = spec "in" get; sc = spec "count" get
+                        m!(Tok::LocalGet("__spec".into()));
+                        m!(Tok::PushS("fn".into()));
+                        m!(Tok::Op("GET"));
+                        m!(Tok::LocalSet("__sf".into()));
+                        m!(Tok::LocalGet("__spec".into()));
+                        m!(Tok::PushS("in".into()));
+                        m!(Tok::Op("GET"));
+                        m!(Tok::LocalSet("__si".into()));
+                        m!(Tok::LocalGet("__spec".into()));
+                        m!(Tok::PushS("count".into()));
+                        m!(Tok::Op("GET"));
+                        m!(Tok::LocalSet("__sc".into()));
+                        // d = w "tasks" get
+                        m!(Tok::LocalGet("__w".into()));
+                        m!(Tok::PushS("tasks".into()));
+                        m!(Tok::Op("GET"));
+                        m!(Tok::LocalSet("__d".into()));
+                        // d spec.name [sf si sc] set
+                        m!(Tok::LocalGet("__d".into()));
+                        m!(Tok::LocalGet("__spec".into()));
+                        m!(Tok::PushS("name".into()));
+                        m!(Tok::Op("GET"));
+                        m!(Tok::List(vec![
+                            (0, Tok::LocalGet("__sf".into())),
+                            (0, Tok::LocalGet("__si".into())),
+                            (0, Tok::LocalGet("__sc".into())),
+                        ]));
+                        m!(Tok::Op("SET"));
+                        m!(Tok::LocalGet("__w".into()));
+                        m!(Tok::Op("RET"));
+                    }
+                    if !have("del") {
+                        m!(Tok::Method("Weave".into()));
+                        m!(Tok::LabelDef("del".into()));
+                        for n in ["__n", "__w"] { m!(Tok::LocalSet(n.into())); }
+                        m!(Tok::LocalGet("__w".into()));
+                        m!(Tok::PushS("tasks".into()));
+                        m!(Tok::Op("GET"));
+                        m!(Tok::LocalGet("__n".into()));
+                        m!(Tok::Op("DEL"));
+                        m!(Tok::LocalGet("__w".into()));
+                        m!(Tok::Op("RET"));
+                    }
+                    if !have("run") {
+                        m!(Tok::Method("Weave".into()));
+                        m!(Tok::LabelDef("run".into()));
+                        m!(Tok::LocalSet("__w".into()));
+                        m!(Tok::LocalGet("__w".into()));
+                        m!(Tok::PushS("tasks".into()));
+                        m!(Tok::Op("GET"));
+                        m!(Tok::Op("WRUN_DYN"));
+                        m!(Tok::Op("RET"));
+                    }
+                    if !have("check") {
+                        m!(Tok::Method("Weave".into()));
+                        m!(Tok::LabelDef("check".into()));
+                        m!(Tok::LocalSet("__w".into()));
+                        m!(Tok::LocalGet("__w".into()));
+                        m!(Tok::PushS("tasks".into()));
+                        m!(Tok::Op("GET"));
+                        m!(Tok::Op("WCHK"));
+                        m!(Tok::Op("RET"));
+                    }
+                    for t in toks {
                         self.q.push_back(t);
                     }
                 }
@@ -443,15 +536,12 @@ impl<'a> ParseCtx<'a> {
                 // 'method selector was removed with the built-in methods
                 // campaign (a bare stack-top selector has no receiver).
                 if let Some((recv, meth)) = label.split_once('.') {
-                    if !matches!(self.q.front().map(|t| &t.1), Some(Tok::Op("SEND"))) {
-                        user_err!("parse", Some(line), "'{}.{}: a dotted reference is only valid in send position — write `{}.{} send`", recv, meth, recv, meth);
-                    }
+                    // v16: the dotted quote IS the call — recv + selector +
+                    // dispatch, self-applying (send retired)
                     self.parse_ident(recv.to_string(), line);
                     pi(&mut self.p, Ins::PushI(fnv64(meth)), line);
+                    pi(&mut self.p, Ins::Send, line);
                 } else {
-                    if matches!(self.q.front().map(|t| &t.1), Some(Tok::Op("SEND"))) {
-                        user_err!("parse", Some(line), "bare selectors were removed — name the receiver: '{}.<method> send`", label);
-                    }
                     // v16: a bare label reference is an implicit fn load (the
                     // merge rewrites it); 'name is the call form
                     user_err!(
@@ -729,11 +819,123 @@ impl<'a> ParseCtx<'a> {
             self.q.push_front(t);
         }
     }
-    fn parse_wrun(&mut self, terminal: Option<String>, line: u32) {
-        // static DAG checks: inputs must name tasks in this weave; acyclic
+    // v16 `weave ... save` — end the block and push a Weave value: a
+    // Weave struct instance whose "tasks" field is {name -> [fn, inputs,
+    // count]} over the DAG-node tasks (function tasks stay plain labels).
+    // Editable via the @Weave methods ('w.add / 'w.del / 'w.run / 'w.check).
+    fn parse_wsave(&mut self, line: u32) {
+        self.saved_weave = true;
+        let names: Vec<String> = self.cur_weave.iter().map(|(n, _, _)| n.clone()).collect();
+        let is_node = self.weave_node_flags();
+        // validate node inputs (same rule as run)
+        for (i, (n, ins, count)) in self.cur_weave.iter().enumerate() {
+            if !is_node[i] {
+                continue;
+            }
+            for inp in ins {
+                let x = match inp {
+                    Param::Local(x) | Param::Global(x) => x,
+                    Param::Discard => unreachable!(),
+                };
+                match names.iter().position(|y| y == x) {
+                    Some(j) => {
+                        if !is_node[j] {
+                            user_err!("parse", Some(line),
+                                "WEAVE: task {} inputs {}, which is a function task (it binds non-task parameters) — only DAG tasks can be inputs", n, x);
+                        }
+                    }
+                    None => user_err!("parse", Some(line), "WEAVE: task {} has unknown input {}", n, x),
+                }
+            }
+            if *count > 1 && ins.is_empty() {
+                user_err!("parse", Some(line), "WEAVE: fanout task {} ({} workers) must have at least one input", n, count);
+            }
+        }
+        // build the tasks dict: d!; per node: d name [fn ins count] set
+        let uid = self.weave_ctr;
+        self.weave_ctr += 1;
+        let wv = format!("__wv{}", uid);
+        let wo = format!("__wo{}", uid);
+        pi(&mut self.p, Ins::Simple("op_dict"), line);
+        pi(&mut self.p, Ins::LocalSet(wv.clone()), line);
+        for (i, (n, ins, count)) in self.cur_weave.iter().enumerate() {
+            if !is_node[i] {
+                continue;
+            }
+            pi(&mut self.p, Ins::LocalGet(wv.clone()), line);
+            let k = self.p.strings.len();
+            self.p.strings.push(n.clone());
+            pi(&mut self.p, Ins::PushS(k), line);
+            // [fn, inputs, count]
+            pi(&mut self.p, Ins::ListStart, line);
+            pi(&mut self.p, Ins::PushAddr(n.clone()), line);
+            pi(&mut self.p, Ins::ListStart, line);
+            for inp in ins {
+                let x = match inp {
+                    Param::Local(x) | Param::Global(x) => x,
+                    Param::Discard => unreachable!(),
+                };
+                let ik = self.p.strings.len();
+                self.p.strings.push(x.clone());
+                pi(&mut self.p, Ins::PushS(ik), line);
+            }
+            pi(&mut self.p, Ins::ListLit, line);
+            pi(&mut self.p, Ins::PushI(*count), line);
+            pi(&mut self.p, Ins::ListLit, line);
+            pi(&mut self.p, Ins::Simple("op_set"), line);
+            pi(&mut self.p, Ins::Simple("op_drop"), line);
+        }
+        // Weave struct instance with the tasks field
+        let (_, tsz, sid) = self
+            .structs
+            .get("Weave")
+            .cloned()
+            .unwrap_or_else(|| user_err!("parse", Some(line), "WEAVE: the Weave struct is not registered"));
+        pi(&mut self.p, Ins::PushI(tsz as i64 | ((sid as i64) << 32)), line);
+        pi(&mut self.p, Ins::Simple("op_obj"), line);
+        pi(&mut self.p, Ins::LocalSet(wo.clone()), line);
+        let fk = self.p.strings.len();
+        self.p.strings.push("tasks".to_string());
+        pi(&mut self.p, Ins::LocalGet(wo.clone()), line);
+        pi(&mut self.p, Ins::PushS(fk), line);
+        pi(&mut self.p, Ins::LocalGet(wv.clone()), line);
+        pi(&mut self.p, Ins::Simple("op_set"), line);
+        pi(&mut self.p, Ins::LocalGet(wo.clone()), line);
+        self.cur_weave.clear();
+    }
+
+    // v16 classification: with the `task` keyword gone, every block-level
+    // label in a weave block is a task. A task is a DAG **node** iff every
+    // leading bind names a sibling task (zero binds = source node); any
+    // other bind makes it a **function task** — a plain callable label
+    // with parameters, never scheduled.
+    fn weave_node_flags(&self) -> Vec<bool> {
         let names: Vec<&String> = self.cur_weave.iter().map(|(n, _, _)| n).collect();
+        (0..self.cur_weave.len())
+            .map(|i| {
+                self.cur_weave[i].1.iter().all(|p| {
+                    let x = match p {
+                        Param::Local(x) | Param::Global(x) => x,
+                        Param::Discard => unreachable!(),
+                    };
+                    names.contains(&x)
+                })
+            })
+            .collect()
+    }
+
+    fn parse_wrun(&mut self, terminal: Option<String>, line: u32) {
+        // static DAG checks: inputs must name node tasks in this weave; acyclic
+        let names: Vec<&String> = self.cur_weave.iter().map(|(n, _, _)| n).collect();
+        let is_node = self.weave_node_flags();
+        // node tasks keep their cur_weave index -> metas index mapping
+        let mut meta_of: Vec<usize> = vec![usize::MAX; self.cur_weave.len()];
         let mut metas: Vec<WeaveMeta> = Vec::new();
-        for (n, ins, count) in &self.cur_weave {
+        for (i, (n, ins, count)) in self.cur_weave.iter().enumerate() {
+            if !is_node[i] {
+                continue; // function task — callable label, not scheduled
+            }
+            meta_of[i] = metas.len();
             let mut idxs = Vec::new();
             for inp in ins {
                 let inp_name = match inp {
@@ -741,7 +943,14 @@ impl<'a> ParseCtx<'a> {
                     Param::Discard => unreachable!(),
                 };
                 match names.iter().position(|x| *x == inp_name) {
-                    Some(i) => idxs.push(i),
+                    Some(j) => {
+                        if !is_node[j] {
+                            user_err!("parse", Some(line),
+                                "WEAVE: task {} inputs {}, which is a function task (it binds non-task parameters) — only DAG tasks can be inputs", n, inp_name);
+                        }
+                        // input indices are metas-space (function tasks excluded)
+                        idxs.push(meta_of[j]);
+                    }
                     None => user_err!("parse", Some(line), "WEAVE: task {} has unknown input {}", n, inp_name),
                 }
             }
@@ -774,7 +983,12 @@ impl<'a> ParseCtx<'a> {
         let mut terminal_idx: Option<usize> = None;
         if let Some(t) = &terminal {
             match names.iter().position(|x| *x == t) {
-                Some(i) => terminal_idx = Some(i),
+                Some(i) => {
+                    if !is_node[i] {
+                        user_err!("parse", Some(line), "WEAVE: run names {}, a function task — only a DAG task can be the terminal", t);
+                    }
+                    terminal_idx = Some(meta_of[i]);
+                }
                 None => user_err!("parse", Some(line), "WEAVE: run names unknown task {}", t),
             }
         }
@@ -1225,6 +1439,12 @@ fn rewrite_label_refs(p: &mut Parsed) {
 }
 
 pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Parsed {
+    // v16: the Weave struct is built in — `weave ... save` constructs
+    // instances and the @Weave methods dispatch on its struct id
+    if !structs.contains_key("Weave") {
+        let sid = structs.len();
+        structs.insert("Weave".to_string(), (vec![("tasks".to_string(), 8)], 16, sid as i64));
+    }
     let mut ctx = ParseCtx {
         p: empty_parsed(),
         q: toks.into(),
@@ -1240,6 +1460,8 @@ pub fn parse(toks: Vec<(u32, Tok)>, structs: &mut StructMap, caps: &Caps) -> Par
         expand_depth: 0,
         anon_ctr: 0,
         hoisted_anon: Vec::new(),
+        weave_methods_done: false,
+        saved_weave: false,
     };
     ctx.run();
     let mut p = ctx.p;
@@ -2096,7 +2318,7 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "TRANSPOSE" => "op_transpose",
         "DCAST" => "op_dcast",
         "FNAPPLY" => "op_apply",
-        "FNCALL" => "op_call",
+        "WRUN_DYN" => "op_weave_run", "WCHK" => "op_wchk",
         "DBG" => "op_dbg", "CHECK" => "op_check", "TIMER" => "op_timer", "MEMSTATS" => "op_memstats",
 
         other => panic!("no helper for {}", other),
@@ -2118,6 +2340,7 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         // v16: spread the list as args and call the fn cell (the callee's
         // arity is checked at runtime — the cell carries it)
         "op_apply" => (2, 1),
+        "op_weave_run" | "op_wchk" => (1, 1),
         // v16 dynamic call: pops the cell plus a variable number of args
         // (the cell's declared arity) — not statically modelable; leaving
         // it out of this table poisons the arity walk conservatively

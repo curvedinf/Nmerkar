@@ -4321,6 +4321,129 @@ static void op_apply(Ctx*cx){
   uf_call_fn(cx,c,0,-1,(long)d->len);
 }
 
+
+/* ---- v16 editable weaves: the Weave struct's tasks dict is
+   {name -> [fn, inputs(list of task-name strs), count]} ---- */
+typedef struct { Cell name; Cell fn; Cell ins; int64_t cnt; } WTsk;
+static long wt_name_eq(Cell a, Cell b){
+  Hdr*ha=uf_gc_find((void*)a.i); Hdr*hb=uf_gc_find((void*)b.i);
+  if(!ha||!hb||ha->tag!=HT_STR||hb->tag!=HT_STR)return 0;
+  if(ha->len!=hb->len)return 0;
+  return memcmp(uf_sbytes((Str*)ha),uf_sbytes((Str*)hb),(size_t)ha->len)==0;
+}
+/* collect + validate the tasks dict; dies naming the task on a bad shape,
+   missing input, or cycle. Returns the topo-ordered index permutation. */
+static long uf_wprepare(Ctx*cx, Map*m, WTsk** out, long* n_out, long** out_order){
+  long cap=0; for(uint64_t i=0;i<m->cap;i++) if(m->st[i]==1) cap++;
+  WTsk*t=(WTsk*)uf_alloc((size_t)(cap?cap:1)*sizeof(WTsk),0);
+  *out=t; *n_out=0;
+  for(uint64_t i=0;i<m->cap;i++){
+    if(m->st[i]!=1)continue;
+    Cell v=m->vals[i];
+    Hdr*hv=uf_gc_find((void*)v.i);
+    if(!hv||hv->tag!=HT_DYN||hv->len!=3){
+      char b[160];snprintf(b,sizeof(b),"weave: task '%.48s' must map to [fn, inputs, count]",uf_sptr(m->keys[i]));die(b);
+    }
+    Dyn*d=(Dyn*)hv;
+    if(d->data[0].tag!=T_FN){char b[160];snprintf(b,sizeof(b),"weave: task '%.48s' has no fn cell",uf_sptr(m->keys[i]));die(b);}
+    Hdr*hi=uf_gc_find((void*)d->data[1].i);
+    if(!hi||hi->tag!=HT_DYN){char b[160];snprintf(b,sizeof(b),"weave: task '%.48s' inputs must be a list",uf_sptr(m->keys[i]));die(b);}
+    t[*n_out].name=m->keys[i]; t[*n_out].fn=d->data[0]; t[*n_out].ins=d->data[1];
+    t[*n_out].cnt=uf_i(d->data[2]);
+    (*n_out)++;
+  }
+  long n=*n_out;
+  /* resolve inputs -> indices */
+  long* adj=(long*)uf_alloc((size_t)(n?n:1)*sizeof(long),0); /* indegree */
+  long** edges=(long**)uf_alloc((size_t)(n?n:1)*sizeof(long*),0);
+  for(long i=0;i<n;i++){
+    Dyn*di=(Dyn*)uf_gc_find((void*)t[i].ins.i);
+    edges[i]=(long*)uf_alloc((size_t)(di->len?di->len:1)*sizeof(long),0);
+    for(uint64_t k=0;k<di->len;k++){
+      long found=-1;
+      for(long j=0;j<n;j++) if(wt_name_eq(t[j].name,di->data[k])){found=j;break;}
+      if(found<0){char b[192];snprintf(b,sizeof(b),"weave: task '%.48s' has missing input '%.48s'",uf_sptr(t[i].name),uf_sptr(di->data[k]));die(b);}
+      edges[i][k]=found; adj[i]++; /* i depends on found */
+    }
+  }
+  /* Kahn */
+  long* order=(long*)uf_alloc((size_t)(n?n:1)*sizeof(long),0);
+  long done_n=0; char* ready=(char*)uf_alloc((size_t)(n?n:1),0);
+  for(long pass=0;pass<n;pass++){
+    long pick=-1;
+    for(long i=0;i<n;i++) if(!ready[i]&&adj[i]==0){pick=i;break;}
+    if(pick<0){char b[160];snprintf(b,sizeof(b),"weave: cycle in the task DAG (task '%.48s' is stuck)",uf_sptr(t[0].name));die(b);}
+    ready[pick]=1; order[done_n++]=pick;
+    /* every task waiting on pick loses one unresolved input */
+    for(long i=0;i<n;i++){
+      if(ready[i])continue;
+      Dyn*di2=(Dyn*)uf_gc_find((void*)t[i].ins.i);
+      for(uint64_t k=0;k<di2->len;k++) if(edges[i][k]==pick){adj[i]--;break;}
+    }
+  }
+  (void)cx;
+  *out_order=order;
+  return done_n;
+}
+
+/* WRUN_DYN: tasks-dict -> results-dict (dependency order; count>1 fans the
+   single input's list out — fn per element, results collected into a list) */
+static void op_weave_run(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"weave_run");
+  if(a->tag!=HT_MAP)die("weave_run: expected the tasks dict");
+  Map*m=(Map*)a;
+  UF_PROTECT((void**)(void*)&h.i);
+  WTsk*t; long n; long* order;
+  uf_wprepare(cx,m,&t,&n,&order);
+  Cell*res=(Cell*)uf_alloc((size_t)(n?n:1)*sizeof(Cell),0);
+  for(long k=0;k<n;k++){
+    long i=order[k];
+    if(t[i].cnt>1){
+      Dyn*di=(Dyn*)uf_gc_find((void*)t[i].ins.i);
+      if(di->len!=1){char b[128];snprintf(b,sizeof(b),"weave: fanout task '%.48s' needs exactly one input",uf_sptr(t[i].name));die(b);}
+      long ii=-1; for(long j=0;j<n;j++) if(wt_name_eq(t[j].name,di->data[0])){ii=j;break;}
+      Hdr*ic=uf_gc_find((void*)res[ii].i);
+      if(!ic||!(ic->tag==HT_DYN||ic->tag==HT_ARR)){char b[144];snprintf(b,sizeof(b),"weave: fanout input of '%.48s' must be a list",uf_sptr(t[i].name));die(b);}
+      Dyn*lst=(ic->tag==HT_DYN)?(Dyn*)ic:NULL;
+      uint64_t cnt=ic->len;
+      Dyn*out=uf_dyn_new(cnt?cnt:1); UF_PROTECT(&out);
+      for(uint64_t e=0;e<cnt;e++){
+        Cell item=lst?lst->data[e]:uf_cidx(res[ii],(int64_t)e);
+        pushc(cx,item);
+        uf_call_fn(cx,t[i].fn,0,-1,1);
+        out->data[e]=pop(cx); out->len=e+1;
+      }
+      UF_UNPROTECT();
+      res[i]=uf_mkp(out);
+    } else {
+      Dyn*di=(Dyn*)uf_gc_find((void*)t[i].ins.i);
+      for(uint64_t e=0;e<di->len;e++){
+        long j=-1; for(long q=0;q<n;q++) if(wt_name_eq(t[q].name,di->data[e])){j=q;break;}
+        pushc(cx,res[j]);
+      }
+      uf_call_fn(cx,t[i].fn,0,-1,(long)di->len);
+      res[i]=pop(cx);
+    }
+  }
+  Map*r=uf_map_new(); UF_PROTECT(&r);
+  for(long i=0;i<n;i++) map_put(r,t[i].name,res[i]);
+  UF_UNPROTECT(); UF_UNPROTECT();
+  pushp(cx,r);
+}
+
+/* WCHK: tasks-dict -> order (list of task names, dependency order) */
+static void op_wchk(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"weave_check");
+  if(a->tag!=HT_MAP)die("weave_check: expected the tasks dict");
+  Map*m=(Map*)a;
+  WTsk*t; long n; long* order;
+  uf_wprepare(cx,m,&t,&n,&order);
+  Dyn*l=uf_dyn_new(n?(uint64_t)n:1); UF_PROTECT(&l);
+  for(long k=0;k<n;k++){ l->data[k]=t[order[k]].name; l->len=(uint64_t)k+1; }
+  UF_UNPROTECT();
+  pushp(cx,l);
+}
+
 /* FNCALL (v16): args… fn -> r — dynamic call. 'x on a variable holding a
    fn cell lowers here; the cell's declared arity takes the stack below
    (no list, no packing — the consumer-style calling convention). */

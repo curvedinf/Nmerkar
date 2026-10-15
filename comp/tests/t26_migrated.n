@@ -16,16 +16,16 @@ entry:
   [4 5 6] int array copy length print
   ; dotted refs on built-in selectors
   [7 8 9] nums!
-  'nums.length send print
-  'nums.sum send print
+  'nums.length print
+  'nums.sum print
   "hi" msg!
-  'msg.uppercase send print
+  'msg.uppercase print
   ; user override: @list length beats the built-in for list receivers
   [1 2] l!
-  'l.length send print
+  'l.length print
   "str" s!
-  's.length send print
+  's.length print
   ; built-in still wins for non-overridden types
-  's.type_of send print
+  's.type_of print
   "migrated ok" print
   ret

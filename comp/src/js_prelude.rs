@@ -3705,6 +3705,79 @@ var RT = (function () {
     for (var i = 0; i < l.v.length; i++) rt.st.push(l.v[i]);
     await preludeCall(rt, c.v, l.v.length);
   }
+
+  // v16 editable weaves: tasks dict {name -> [fn, inputs, count]}
+  function wPrepare(rt, m, op) {
+    var ks = mapKeys(m).v;
+    var names = ks.map(function (c) { return strOf(rt, c); });
+    var tasks = names.map(function (n) {
+      var v = mapGet(m, S(n));
+      if (v.t !== "l" || v.v.length !== 3)
+        die(rt, "weave: task '" + n + "' must map to [fn, inputs, count]");
+      if (v.v[0].t !== "a") die(rt, "weave: task '" + n + "' has no fn cell");
+      if (v.v[1].t !== "l") die(rt, "weave: task '" + n + "' inputs must be a list");
+      return { name: n, fn: v.v[0], ins: v.v[1].v, cnt: Number(iOf(v.v[2])) };
+    });
+    var idx = {};
+    tasks.forEach(function (t, i) { idx[t.name] = i; });
+    tasks.forEach(function (t) {
+      t.insIdx = t.ins.map(function (nm) {
+        var k = strOf(rt, nm);
+        if (!(k in idx)) die(rt, "weave: task '" + t.name + "' has missing input '" + k + "'");
+        return idx[k];
+      });
+    });
+    var n = tasks.length;
+    var indeg = tasks.map(function (t) { return t.insIdx.length; });
+    var order = [];
+    var used = new Array(n).fill(false);
+    while (order.length < n) {
+      var pick = -1;
+      for (var i = 0; i < n; i++) if (!used[i] && indeg[i] === 0) { pick = i; break; }
+      if (pick < 0) die(rt, "weave: cycle in the task DAG");
+      used[pick] = true;
+      order.push(pick);
+      tasks.forEach(function (t, i) {
+        if (!used[i] && t.insIdx.indexOf(pick) >= 0) indeg[i]--;
+      });
+    }
+    return { tasks: tasks, order: order, op: op };
+  }
+  async function op_weave_run(rt) {
+    var h = pop(rt, "weave_run");
+    if (h.t !== "d") die(rt, "weave_run: expected the tasks dict");
+    var p = wPrepare(rt, h.v);
+    var res = new Array(p.tasks.length);
+    for (var k = 0; k < p.order.length; k++) {
+      var t = p.tasks[p.order[k]];
+      if (t.cnt > 1) {
+        if (t.insIdx.length !== 1)
+          die(rt, "weave: fanout task '" + t.name + "' needs exactly one input");
+        var src = res[t.insIdx[0]];
+        if (src.t !== "l" && src.t !== "v") die(rt, "weave: fanout input of '" + t.name + "' must be a list");
+        var out = [];
+        for (var e = 0; e < src.v.length; e++) {
+          rt.st.push(src.v[e]);
+          await preludeCall(rt, t.fn.v, 1);
+          out.push(pop(rt, "weave_run"));
+        }
+        res[p.order[k]] = L(out);
+      } else {
+        for (var e = 0; e < t.insIdx.length; e++) rt.st.push(res[t.insIdx[e]]);
+        await preludeCall(rt, t.fn.v, t.insIdx.length);
+        res[p.order[k]] = pop(rt, "weave_run");
+      }
+    }
+    var r = { cap: 64, len: 0, k: [], v: [], st: new Array(64).fill(0) };
+    p.tasks.forEach(function (t, i) { mapPut(r, S(t.name), res[i]); });
+    rt.st.push(D(r));
+  }
+  async function op_wchk(rt) {
+    var h = pop(rt, "weave_check");
+    if (h.t !== "d") die(rt, "weave_check: expected the tasks dict");
+    var p = wPrepare(rt, h.v);
+    rt.st.push(L(p.order.map(function (i) { return p.tasks[i].name; })));
+  }
   // FNCALL (v16): args… fn -> r — dynamic call ('x on a var holding a fn
   // cell); the cell's carried arity takes the stack below
   async function op_call(rt) {
@@ -3842,7 +3915,7 @@ var RT = (function () {
     op_bufcopy: op_bufcopy, op_loadx: op_loadx, op_storex: op_storex,
     op_chan: op_chan, op_enq: op_enq, op_deq: op_deq, op_close: op_close,
     op_atom: op_atom, op_aget: op_aget, op_aset: op_aset, op_aadd: op_aadd,
-    op_cas: op_cas, op_spawn: op_spawn, op_apply: op_apply, op_call: op_call,
+    op_cas: op_cas, op_spawn: op_spawn, op_apply: op_apply, op_call: op_call, op_weave_run: op_weave_run, op_wchk: op_wchk,
     op_gc: op_gc, op_obj: op_obj,
     op_argv: op_argv, op_hasargs: op_hasargs, op_argi: op_argi,
     op_now: op_now, op_time: op_time, op_timef: op_timef,

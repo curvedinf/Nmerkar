@@ -10,7 +10,7 @@ pub const TYPE_BASE: u32 = 0x13110;
 // Opcode glyphs (204 live ops; 201 glyphed — `cap`/`caps`/`consume` are text-only,
 // slot 0 means no glyph). Index = OP_NAMES array position.
 // All colored emoji (U+1F300+), each exactly one Qwen3 token.
-pub const OP_GLYPHS: [u32; 222] = [0x1F300,0x0,0x0,0x0,0x0,0x0,0x1F682,0x1F910,0x1F302,0x1F602,0x1F683,0x1F911,0x1F303,0x1FA94,0x1FA91,0x1FA92,0x1F603,0x1F684,0x1F912,0x1F304,0x1F604,0x1F685,0x1FA90,0x1F913,0x1FAAB,0x1F4DE,0x1F305,0x1F605,0x1F686,0x1F914,0x0,0x0,0x0,0x1F306,0x1F606,0x1F687,0x1F915,0x1F307,0x1F607,0x0,0x1F689,0x1F916,0x1F308,0x1F608,0x1F68A,0x1F917,0x1F309,0x1F609,0x1F68C,0x1F918,0x1F30A,0x1F60A,0x1F68D,0x1F919,0x1F30B,0x1F60B,0x1F690,0x0,0x0,0x0,0x0,0x0,0x1F91A,0x1F30C,0x1F60C,0x1F691,0x1F91B,0x1F30D,0x1F60D,0x1F692,0x1F91C,0x1F30E,0x1F60E,0x1F693,0x1F91D,0x1F30F,0x0,0x0,0x1F60F,0x1F694,0x1F91E,0x1F310,0x1F610,0x0,0x1F91F,0x1F311,0x0,0x0,0x1F611,0x1F696,0x1F920,0x1F313,0x1F612,0x1F697,0x1F921,0x1F314,0x1F613,0x1F698,0x1F922,0x1F315,0x1F614,0x1F699,0x1F923,0x1F318,0x1F615,0x1F69A,0x1F924,0x1F319,0x1F616,0x1F69B,0x1F925,0x1F31A,0x1F617,0x1F69C,0x1F926,0x1F31B,0x1F618,0x1F6A2,0x1F927,0x1F31C,0x1F619,0x1F6A3,0x1F928,0x1F31D,0x1F61A,0x1F6A6,0x1F929,0x1F31E,0x1F4E1,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1F61D,0x1F6A9,0x1F92C,0x1F321,0x1F61E,0x1F6AA,0x1F92D,0x1F324,0x1F61F,0x1F6AB,0x1F92E,0x1F325,0x1F620,0x1F6AC,0x1F92F,0x0,0x1F326,0x1F621,0x1F6B2,0x1F930,0x1F327,0x1F622,0x1F6B4,0x1F931,0x1F328,0x1F623,0x1F6B5,0x1F932,0x1F329,0x1F624,0x1F6B6,0x1F933,0x1F32A,0x1F625,0x1F6B9,0x1F934,0x1F32B,0x1F626,0x1F6BC,0x1F935,0x1F32C,0x1F627,0x1F6BE,0x1F936,0x1F32E,0x1F628,0x1F6BF,0x1F937,0x1F32F,0x1F629,0x1F6C0,0x1F938,0x1F330,0x1F62A,0x1F6C1,0x1F939,0x1F331,0x1F62B,0x1F6CB,0x1F93D,0x1F332,0x1F62C,0x1F6CC,0x1F93E,0x1F333,0x1F62D,0x1F6CD,0x1F940,0x1F334,0x1F62E,0x1F6CE,0x1F95B,0x1F95C,0x1F95D,0x1F95E,0x1F958,0x1F959,0x1F95A,0x1F500,0x1F512,0x1F513,0x1F501,0x1F50D,0x1F3AF,0x1F552,0x1F4CA,];
+pub const OP_GLYPHS: [u32; 222] = [0x1f300,0x0,0x0,0x0,0x0,0x0,0x1f682,0x1f910,0x1f302,0x1f602,0x1f683,0x1f911,0x1f303,0x1fa94,0x1fa91,0x1fa92,0x1f603,0x1f684,0x1f912,0x1f304,0x1f604,0x1f685,0x1fa90,0x1f913,0x1faab,0x0,0x1f305,0x1f605,0x1f686,0x1f914,0x0,0x0,0x0,0x1f306,0x1f606,0x1f687,0x1f915,0x1f307,0x1f607,0x0,0x1f689,0x1f916,0x1f308,0x1f608,0x1f68a,0x1f917,0x1f309,0x1f609,0x1f68c,0x1f918,0x1f30a,0x1f60a,0x1f68d,0x1f919,0x1f30b,0x1f60b,0x1f690,0x1f9f6,0x1f9f7,0x1f9f8,0x0,0x0,0x1f91a,0x1f30c,0x1f60c,0x1f691,0x1f91b,0x1f30d,0x1f60d,0x1f692,0x1f91c,0x1f30e,0x1f60e,0x1f693,0x1f91d,0x1f30f,0x0,0x0,0x1f60f,0x1f694,0x1f91e,0x1f310,0x0,0x0,0x1f91f,0x1f311,0x0,0x0,0x1f611,0x1f696,0x1f920,0x1f313,0x1f612,0x1f697,0x1f921,0x1f314,0x1f613,0x1f698,0x1f922,0x1f315,0x1f614,0x1f699,0x1f923,0x1f318,0x1f615,0x1f69a,0x1f924,0x1f319,0x1f616,0x1f69b,0x1f925,0x1f31a,0x1f617,0x1f69c,0x1f926,0x1f31b,0x1f618,0x1f6a2,0x1f927,0x1f31c,0x1f619,0x1f6a3,0x1f928,0x1f31d,0x1f61a,0x1f6a6,0x1f929,0x1f31e,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1f61d,0x1f6a9,0x1f92c,0x1f321,0x1f61e,0x1f6aa,0x1f92d,0x1f324,0x1f61f,0x1f6ab,0x1f92e,0x1f325,0x1f620,0x1f6ac,0x1f92f,0x0,0x1f326,0x1f621,0x1f6b2,0x1f930,0x1f327,0x1f622,0x1f6b4,0x1f931,0x1f328,0x1f623,0x1f6b5,0x1f932,0x1f329,0x1f624,0x1f6b6,0x1f933,0x1f32a,0x1f625,0x1f6b9,0x1f934,0x1f32b,0x1f626,0x1f6bc,0x1f935,0x1f32c,0x1f627,0x1f6be,0x1f936,0x1f32e,0x1f628,0x1f6bf,0x1f937,0x1f32f,0x1f629,0x1f6c0,0x1f938,0x1f330,0x1f62a,0x1f6c1,0x1f939,0x1f331,0x1f62b,0x1f6cb,0x1f93d,0x1f332,0x1f62c,0x1f6cc,0x1f93e,0x1f333,0x1f62d,0x1f6cd,0x1f940,0x1f334,0x1f62e,0x1f6ce,0x1f95b,0x1f95c,0x1f95d,0x1f95e,0x1f958,0x1f959,0x1f95a,0x1f500,0x1f512,0x1f513,0x1f501,0x1f50d,0x1f3af,0x1f552,0x1f4ca,];
 
 // v-space: base-64 digits for variable/label name atoms (colored emoji).
 pub const V_SPACE: [u32; 64] = [
@@ -97,14 +97,14 @@ pub fn glyph_type_id(c: char) -> Option<i64> {
 // compile error (unassigned glyph / unknown identifier).
 pub const OP_NAMES: [&str; 222] = [
     "LIT", "~1", "~2", "~3", "~4", "~5", "ADD", "SUB", "MUL", "AND", "SHR", "INC", "DEC",
-    "POW", "SQRT", "LTE", "FOR", "CALL", "RET", "OBJ", "GET", "SET", "GTE", "ARR", "SHUTDOWN", "FNCALL",
+    "POW", "SQRT", "LTE", "FOR", "CALL", "RET", "OBJ", "GET", "SET", "GTE", "ARR", "SHUTDOWN", "~25",
     "CLONE", "CAST", "MACRO", "TENSOR", "~30", "~31", "~32", "SETV", "GETV", "STR", "CAT", "FMT",
     "BUF", "~39", "BUFCOPY", "FNAPPLY", "LOADX", "STOREX", "SIZEOF", "OFFSET", "STRUCT", "MALLOC",
     "FREE", "SYS", "GC", "IMPORT", "EXPORT", "EXTERN", "PRINT", "SCAN",
     // v9 kept
-    "DICT", "~57", "~58", "~59", "~60", "~61", "LIST", "PUSH", "POP", "CHAN",
+    "DICT", "WSAVE", "WRUN_DYN", "WCHK", "~60", "~61", "LIST", "PUSH", "POP", "CHAN",
     "ENQ", "DEQ", "CLOSE", "ATOM", "AGET", "ASET", "AADD", "CAS", "TYPEOF", "LEN", "~76",
-    "~77", "USE", "MOD", "PUB", "WEAVE", "TASK", "CONSUME", "WRUN",
+    "~77", "USE", "MOD", "PUB", "WEAVE", "~82", "CONSUME", "WRUN",
     // shell + strings
     "SH", "CAP", "CAPS", "SHP", "EXEC",
     "MATCH", "REPLACE", "RSPLIT", "GLOB", "SPLIT", "JOIN", "SLICE", "FIND", "REPL",
@@ -117,7 +117,7 @@ pub const OP_NAMES: [&str; 222] = [
     "GETQ", "HAS", "ORELSE", "KEYS", "RANGE", "SORT", "FILTER", "SOME", "EVERY",
     // v10: vector ops (v15.1: VADD/VSUB/VMUL/VDIV/VEADD/VESUB/VEMUL/VEDIV retired —
     // scalar_*/array_* were parser aliases of the core add/sub/mul/div)
-    "SEND", "~129", "~130", "~131", "~132", "~133", "~134", "~135", "VEMAX",
+    "~128", "~129", "~130", "~131", "~132", "~133", "~134", "~135", "VEMAX",
     "VEQ", "VLT", "VGT", "VGE", "VLE", "VAND", "VOR", "VNOT", "VCOUNT", "VGATHER",
     "VSUM", "VMEAN", "VMIN", "VMAX", "~151", "DEL", "VMAP", "VFOLD",
     // v10: time, bloom, script I/O
@@ -163,7 +163,6 @@ pub fn op_usage(name: &str) -> &'static str {
         "LTE" => "a b → 0/1 | a<=b",
         "GTE" => "a b → 0/1 | a>=b",
         "SHUTDOWN" => "→ | graceful weave shutdown (drains and exits)",
-        "FNCALL" => "args… fn → r | dynamic call — the fn cell's declared arity takes the stack below",
         "FOR" => "count fn → | pushes index k per iter",
         "CALL" => "'label | call subroutine",
         "RET" => "→ | return from call",
@@ -215,10 +214,11 @@ pub fn op_usage(name: &str) -> &'static str {
         "USE" => "(directive) | use \"name\" link + manifest",
         "MOD" => "(directive) | mod \"name\" TU name",
         "PUB" => "(directive) | export next label globally",
-        "WEAVE" => "(directive) | begin task scope",
-        "TASK" => "(directive) | begin task body",
+        "WEAVE" => "(directive) | begin task scope (block-level labels are tasks)",
+        "WSAVE" => "end weave..save → weave value (the Weave struct)",
+        "WRUN_DYN" => "tasks-dict → results-dict | execute a weave value's DAG (dependency order)",
+        "WCHK" => "tasks-dict → order | validate a weave value's DAG, push the schedule",
         "CONSUME" => "v → | consume the top value (text-only, v15.1)",
-        "SEND" => "args… recv 'name → r | dispatch on the receiver's type (@Type methods)",
         "WRUN" => "(directive) | schedule DAG, wait, publish",
         "SH" => "cmd → stdout stderr status | /bin/sh -c",
         "SHP" => "cmd → chan | stream stdout line-by-line",
@@ -587,6 +587,29 @@ impl Lexer {
     }
     // lex until EOF (stop=0), until matching '}' (1), until ']' (3),
     // until the TASK or WRUN glyph (5, not consumed)
+
+    // v16 dense: does the stream at self.pos start a block-level task label
+    // ([l-run ws] v-run 🏷)? Only called inside weave task bodies (stop 5)
+    fn at_dense_task_head(&self) -> bool {
+        let mut j = self.pos;
+        // optional fanout count l-run
+        while self.chars.get(j).map_or(false, |c| is_l(*c as u32)) {
+            j += 1;
+        }
+        while self.chars.get(j).map_or(false, |c| c.is_whitespace()) {
+            j += 1;
+        }
+        // v-run
+        let vstart = j;
+        while self.chars.get(j).map_or(false, |c| is_v(*c as u32)) {
+            j += 1;
+        }
+        if j == vstart {
+            return false; // no v-run
+        }
+        self.chars.get(j).map_or(false, |c| *c == GLYPH_LABEL_DEF)
+    }
+
     fn lex_into(&mut self, out: &mut Vec<(u32, Tok)>, stop: u8) {
         loop {
             self.skip_ws();
@@ -612,28 +635,13 @@ impl Lexer {
                 self.bump();
                 return;
             }
-            if stop == 5 && (opcode_index(c) == Some(82) || opcode_index(c) == Some(84)) {
-                // TASK/WRUN glyphs bound a weave task body; leave them unconsumed
+            if stop == 5 && (opcode_index(c) == Some(84) || opcode_index(c) == Some(57)) {
+                // WRUN/WSAVE glyphs bound a weave task body; unconsumed
                 return;
             }
-            if stop == 5 && is_l(cp) && !self.prev_ret {
-                // an l-run directly before the TASK glyph is the next task's
-                // fanout worker count — leave it unconsumed
-                let mut j = self.pos;
-                while let Some(c2) = self.chars.get(j) {
-                    let c2p = *c2 as u32;
-                    if is_l(c2p) {
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-                while self.chars.get(j).map_or(false, |c2| c2.is_whitespace()) {
-                    j += 1;
-                }
-                if self.chars.get(j).map_or(false, |c2| opcode_index(*c2) == Some(82)) {
-                    return;
-                }
+            if stop == 5 && self.at_dense_task_head() {
+                // v16: [count l-run +] v-run + 🏷 starts the next task
+                return;
             }
             // ---- l-space: self-evaluating base-64 number ----
             if is_l(cp) {
@@ -1015,10 +1023,9 @@ impl Lexer {
                 out.push((self.line, Tok::Pub));
             }
             "WEAVE" => {
-                // v13: [count l-run] TASK <name v-run> [':'] body, repeated until
-                // the RUN glyph. The task body lexes until the next TASK or RUN
-                // glyph; its leading param bindings (v-run + '!') are the task's
-                // input bindings, extracted by the parser.
+                // v16: [count l-run] <name v-run> 🏷 body, repeated until the
+                // RUN or SAVE glyph — block-level label defs are tasks. The
+                // body lexes until the next task head or RUN/SAVE.
                 loop {
                     self.skip_ws();
                     match self.peek() {
@@ -1035,7 +1042,12 @@ impl Lexer {
                             out.push((self.line, Tok::Wrun(terminal)));
                             break;
                         }
-                        Some(g) if is_l(g as u32) || opcode_index(g) == Some(82) => {
+                        Some(g) if opcode_index(g) == Some(57) => {
+                            self.bump();
+                            out.push((self.line, Tok::WSave));
+                            break;
+                        }
+                        Some(g) if is_l(g as u32) || is_v(g as u32) => {
                             let mut count: Option<i64> = None;
                             if let Some(g2) = self.peek() {
                                 if is_l(g2 as u32) {
@@ -1043,11 +1055,6 @@ impl Lexer {
                                     self.skip_ws();
                                 }
                             }
-                            match self.peek() {
-                                Some(g2) if opcode_index(g2) == Some(82) => self.bump(),
-                                _ => self.err("WEAVE: expected TASK glyph after worker count"),
-                            }
-                            self.skip_ws();
                             let name = match self.peek() {
                                 Some(g2) if is_v(g2 as u32) => self.fold_slots(),
                                 _ => self.err("WEAVE: task needs a name"),
@@ -1057,11 +1064,15 @@ impl Lexer {
                                 self.bump();
                                 self.skip_ws();
                             }
+                            if self.peek() != Some(GLYPH_LABEL_DEF) {
+                                self.err("WEAVE: a block-level label in a weave block must carry the label-def marker");
+                            }
+                            self.bump();
                             let mut body = Vec::new();
                             self.lex_into(&mut body, 5);
                             out.push((self.line, Tok::Task { name, count, body }));
                         }
-                        _ => self.err("WEAVE: expected task name or RUN"),
+                        _ => self.err("WEAVE: expected task label, RUN, or SAVE"),
                     }
                 }
             }
@@ -1231,7 +1242,7 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "ADD" => "add", "SUB" => "sub", "MUL" => "mul", "AND" => "and",
         "SHR" => "shr", "INC" => "inc", "DEC" => "dec",
         "POW" => "pow", "SQRT" => "sqrt", "LTE" => "lte", "GTE" => "gte",
-        "SHUTDOWN" => "shutdown", "FNCALL" => "call",
+        "SHUTDOWN" => "shutdown",
         "FOR" => "for", "CALL" => "'", "RET" => "ret", "OBJ" => "_obj",
         "GET" => "get", "SET" => "set", "ARR" => "array", "CLONE" => "copy", "CAST" => "_cast",
         "MACRO" => "macro", "TENSOR" => "tensor", "SETV" => "setv", "GETV" => "getv",
@@ -1240,11 +1251,12 @@ pub fn text_mnemonic(idx: usize) -> &'static str {
         "OFFSET" => "_offset", "STRUCT" => "struct", "MALLOC" => "malloc", "FREE" => "free",
         "SYS" => "_syscall", "GC" => "gc", "IMPORT" => "import", "EXPORT" => "export",
         "EXTERN" => "extern", "PRINT" => "print", "SCAN" => "scan",
-        "DICT" => "dict", "LIST" => "list", "PUSH" => "append", "POP" => "pop", "CHAN" => "channel",
+        "DICT" => "dict", "WSAVE" => "save", "WRUN_DYN" => "weave_run", "WCHK" => "weave_check",
+        "LIST" => "list", "PUSH" => "append", "POP" => "pop", "CHAN" => "channel",
         "ENQ" => "enqueue", "DEQ" => "dequeue", "CLOSE" => "close", "ATOM" => "atomic", "AGET" => "atomic_get",
         "ASET" => "atomic_set", "AADD" => "atomic_add", "CAS" => "cas", "TYPEOF" => "type_of", "LEN" => "length",
-        "USE" => "use", "MOD" => "mod", "PUB" => "pub", "WEAVE" => "weave", "TASK" => "task",
-        "CONSUME" => "consume", "WRUN" => "run", "SEND" => "send",
+        "USE" => "use", "MOD" => "mod", "PUB" => "pub", "WEAVE" => "weave",
+        "CONSUME" => "consume", "WRUN" => "run",
         "SH" => "shell", "SHP" => "shell_stream", "EXEC" => "execute",
         "CAP" => "cap", "CAPS" => "caps",
         "MATCH" => "regex_match", "REPLACE" => "regex_replace", "RSPLIT" => "regex_split", "GLOB" => "glob_match",
@@ -1307,6 +1319,19 @@ pub fn is_bad_ident(name: &str) -> bool {
 }
 
 /// Combined reserved-word and _-prefix check for identifiers
+
+// v16: a token shaped like a block-level task label inside a weave block —
+// `name:` (colon attached or as the next token)
+fn is_task_head_token(tok: &str) -> bool {
+    let n = match tok.strip_suffix(':') {
+        Some(n) => n,
+        None => return false,
+    };
+    !n.is_empty()
+        && n.chars().next().map_or(false, |c| c.is_ascii_alphabetic())
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub fn check_ident(line: u32, name: &str, what: &str) {
     if is_bad_ident(name) {
         user_err!("lex", Some(line), "text lex error: {}: {} — identifiers may not start with '_'", what, name);
@@ -1569,14 +1594,18 @@ impl TextLexer {
                 self.pos += 1;
                 return;
             }
-            if stop == 5 && (tok == "task" || tok == "run") {
-                // TASK/RUN bound a weave task body; leave them unconsumed
+            if stop == 5 && (tok == "run" || tok == "save") {
+                // RUN/SAVE bound a weave task body; leave them unconsumed
+                return;
+            }
+            if stop == 5 && is_task_head_token(&tok) {
+                // v16: a block-level label def starts the next task
                 return;
             }
             if stop == 5 && !self.prev_ret && parse_text_num(&tok).is_some()
-                && self.toks.get(self.pos + 1).map(|t| t.1.as_str() == "task").unwrap_or(false) {
-                // a numeric literal directly before `task` is the next task's
-                // fanout worker count — leave it unconsumed
+                && self.toks.get(self.pos + 1).map(|t| is_task_head_token(t.1.as_str())).unwrap_or(false) {
+                // a numeric literal directly before the next task's label is
+                // its fanout worker count — leave it unconsumed
                 return;
             }
             if tok == "[" {
@@ -1818,6 +1847,8 @@ impl TextLexer {
                     out.push((l, Tok::StructDef(n, fields)));
                 }
                 "weave" => {
+                    // v16: block-level labels are tasks (no `task` keyword);
+                    // `save` ends the block and pushes a Weave value
                     loop {
                         match self.peek() {
                             Some("run") => {
@@ -1837,9 +1868,14 @@ impl TextLexer {
                                 out.push((l, Tok::Wrun(terminal)));
                                 break;
                             }
+                            Some("save") => {
+                                self.pos += 1;
+                                out.push((l, Tok::WSave));
+                                break;
+                            }
                             Some(_) => {
                                 let mut count: Option<i64> = None;
-                                // optional worker count before 'task'
+                                // optional worker count before the task label
                                 if let Some(t) = self.peek() {
                                     if let Some(Tok::PushI(v)) = parse_text_num(t) {
                                         if v > 0 {
@@ -1848,10 +1884,9 @@ impl TextLexer {
                                         }
                                     }
                                 }
-                                if self.next().as_deref() != Some("task") {
-                                    self.err("weave: expected 'task' (or 'run')");
-                                }
-                                // task name, with optional trailing ':'
+                                // task label: name: or name : (the `task`
+                                // keyword is gone — a block-level label IS
+                                // a task)
                                 let mut name = self.name_token("task");
                                 if name.ends_with(':') {
                                     name = name.trim_end_matches(':').to_string();
@@ -1863,11 +1898,11 @@ impl TextLexer {
                                 self.run(&mut body, 5);
                                 out.push((l, Tok::Task { name, count, body }));
                             }
-                            None => self.err("weave: unterminated (missing run)"),
+                            None => self.err("weave: unterminated (missing run or save)"),
                         }
                     }
                 }
-                "task" | "run" => self.err("task/run only valid inside weave..run"),
+                "task" | "run" | "save" => self.err("task/run/save only valid inside weave..run/save"),
                 "endt" => self.err("endt removed in v13 — task bodies end with `ret`"),
                 "_lit" => {
                     let n = self.next().unwrap_or_else(|| self.err("lit needs an operand"));
@@ -1963,6 +1998,9 @@ impl TextLexer {
                     }
                 }
                 "setv" | "getv" => self.err("use name! / name@ for variables"),
+                // v16: ' executes any function — no call/send words
+                "send" => self.err("send removed — 'recv.method is the method call form"),
+                "call" => self.err("call removed — 'x executes the fn in x (label, variable, or 'recv.method)"),
                 // backward-compat: old immediate-op names now _-prefixed
                 // (`cast` is now a real postfix op — the dynamic cast;
                 // `call` is now a real postfix op too — the v16 dynamic

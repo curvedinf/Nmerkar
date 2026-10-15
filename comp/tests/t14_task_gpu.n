@@ -15,15 +15,15 @@ has_args setn if
 0 n range lst!
 lst lst!
 weave
-  task kk:
+  kk:
     ret lst float tensor
-  task s: kk!
+  s: kk!
     ret kk 0.000001 mul 100.0 add
-  task k: kk!
+  k: kk!
     ret kk 0.0000005 mul 95.0 add
-  task st: kk!
+  st: kk!
     ret kk 0.0000001 mul 0.2 add
-  task price: s! k! st!
+  price: s! k! st!
     s k div 1.0 sub a!
     st st mul 0.5 mul b!
     a b add c!

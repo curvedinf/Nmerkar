@@ -171,6 +171,10 @@ pub fn emit_text(toks: &[(u32, Tok)]) -> String {
                 }
                 in_weave = false;
             }
+            Tok::WSave => {
+                o.push_str("save\n");
+                in_weave = false;
+            }
             Tok::List(body) => {
                 o.push_str("[");
                 o.push_str(&emit_text(body));
@@ -424,7 +428,9 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
                         o.push_str(&lrun(*c as u64));
                         o.push(' ');
                     }
-                    o.push_str(&format!("{}{}:\n", glyph_of(82), nm(name, names, next)));
+                    // v16: a block-level label + 🏷 is a task
+                    sep_v(o);
+                    o.push_str(&format!("{}{}\n", nm(name, names, next), GLYPH_LABEL_DEF));
                     rec(body, names, next, weave, o);
                 }
                 Tok::TaskEnd(_) => {}
@@ -435,6 +441,10 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
                         o.push_str(&nm(t, names, next));
                     }
                     o.push('\n');
+                    *weave = false;
+                }
+                Tok::WSave => {
+                    o.push_str(&format!("{}\n", glyph_of(57)));
                     *weave = false;
                 }
                 Tok::List(body) => {
@@ -488,7 +498,7 @@ mod tests {
     // must be vN-shaped — dense canonicalizes other names to slots).
     #[test]
     fn call_and_fn_ref_round_trip() {
-        let src = "3 v0 'v1 print\n4 v0 v1 filter\n5 v2 v3 while\n'v0.area send print\nret\nv1: v4! v5!\n  ret v4 v5 add\n";
+        let src = "3 v0 'v1 print\n4 v0 v1 filter\n5 v2 v3 while\n'v0.area print\nret\nv1: v4! v5!\n  ret v4 v5 add\n";
         let toks = resolve_implicit_loads(&lex_source(src));
         assert!(toks.iter().any(|(_, t)| matches!(t, Tok::Jump("CALL", l) if l == "v1")));
         assert!(toks.iter().any(|(_, t)| matches!(t, Tok::LocalGet(n) if n == "v1" || n == "v2" || n == "v3")));

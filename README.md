@@ -163,8 +163,9 @@ take labeled blocks by bare reference (`3 step for`), and blocks also serve
 as callbacks for operations such as `filter`.
 
 **10. Parallel pipelines with `weave`.** Process files and large datasets
-without managing threads or passing results between them by hand. Define
-steps as `task` blocks; `run` executes independent steps in parallel and
+without managing threads or passing results between them by hand. Block-level
+labels inside a weave block are tasks; `run` executes independent steps in
+parallel and
 passes their results to dependent steps. Add a worker count to spread
 collection items across cores; eligible tensor work can use a fused Vulkan
 GPU kernel.
@@ -207,16 +208,35 @@ Running it creates `weave-prices.txt` in the current directory:
 ```nmerkar
 "weave-prices.txt" "10\n20\n30" write_file            ; Write three sample prices to a file.
 weave                                               ; Begin a task graph.
-  task prices:                                      ; Define the file-processing task.
+  prices:                                           ; A task: a block-level label.
     "weave-prices.txt" list collect_price file_fold_lines values! ; Stream file lines into a list.
     ret values float tensor                         ; Turn the parsed prices into a float tensor.
-  collect_price: values! line!                       ; Receive the accumulated list and the next line.
-    ret values line parse_float append              ; Parse the price and add it to the list.
-  task discounted: prices!                          ; Wait for the prices task and receive its tensor.
+  collect_price: values! line!                       ; A function task: its binds don't name
+    ret values line parse_float append              ; tasks, so it stays a callable helper.
+  discounted: prices!                               ; prices! makes this task depend on prices.
     ret prices 0.9 mul                              ; Apply a 10 percent discount to each price.
-  task total: discounted!                           ; Wait for the discounted tensor.
+  total: discounted!                                ; Wait for the discounted tensor.
     ret discounted sum                              ; Sum the discounted prices.
 run total "%.2f" format print                       ; Run the graph and print 54.00.
+```
+
+A weave can also be **saved and edited as a value** — end the block with
+`save` instead of `run`, then call methods on the result (the receiver
+rides inside the dotted quote):
+
+```nmerkar
+weave
+  prices:
+    ret [10.0 20.0 30.0]
+  discounted: prices!
+    ret prices 0.9 mul
+save w!                                             ; w holds the Weave value
+w 'w.check print                                    ; dependency order
+w 'w.run print                                      ; results: {prices: [...], discounted: [...]}
+: v! v 2 mul ret f!
+{"name" "taxed" "fn" f "in" ["discounted"] "count" 1} 'w.add consume
+w 'w.run "taxed" get print                          ; [18.0 36.0 54.0]
+ret
 ```
 
 Use `nk` inline to efficiently process data with `bash`:

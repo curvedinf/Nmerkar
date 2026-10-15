@@ -1,16 +1,16 @@
 ; gate t06: weave without fanout (sequential DAG, topological order)
 weave
-  task a:
+  a:
     ret 1 2 add
-  task b:
+  b:
     ret 10 20 add
-  task c: a! b!
+  c: a! b!
     ret a b add
 run
 print
 ; single-task weave
 weave
-  task one:
+  one:
     ret 5 1 add
 run
 print

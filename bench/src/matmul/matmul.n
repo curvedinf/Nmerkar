@@ -12,7 +12,7 @@ n n mul n2!
 kmat 0.000001 mul 1.0 add a!
 1.0 kmat 0.000001 mul sub b!
 weave
-  task mmul:
+  mmul:
     ret a b mul
 run mmul
 c!

@@ -1,22 +1,22 @@
 ; t09 weave: non-fanout DAG, multi-input tasks, fanout with broadcast input
 ; 1. plain DAG, multi-input task
 weave
-  task a:
+  a:
     ret 1 2 add
-  task b:
+  b:
     ret 10 20 add
-  task c: a! b!
+  c: a! b!
     ret a b add
 run
 print
 
 ; 2. fanout: first input drives, second input broadcast
 weave
-  task items:
+  items:
     ret 1 6 range
-  task base:
+  base:
     ret 100
-  4 task work: items! base!
+  4 work: items! base!
     ret items base add
 run work
 results!
@@ -24,3 +24,4 @@ results length print
 results sort results!
 results 0 get print
 results 4 get print
+ret

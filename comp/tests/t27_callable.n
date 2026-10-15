@@ -38,13 +38,13 @@ f type_of 22 eq check
 more cond2 while
 a2 55 eq check
 
-; 8. method dispatch unchanged: 'recv.method send
+; 8. method dispatch: 'recv.method is the call
 [1 2 3] lst!
-lst 'lst.length send 3 eq check
+lst 'lst.length 3 eq check
 
 ; 9. a weave task body references its task-local helper label bare
 weave
-  task wtot:
+  wtot:
     [1 2 3] 0 wadd array_reduce
     ret
   wadd: acc2! v2!

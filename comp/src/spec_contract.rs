@@ -38,7 +38,7 @@ fn table_shape_and_retirement() {
     // the eight scalar_/array_ arithmetic aliases, slots 128..=135; slot 41
     // was retired with ADDR and revived in v16 as `apply`)
     let retired: Vec<usize> = (0..OP_NAMES.len()).filter(|&i| OP_NAMES[i].starts_with('~')).collect();
-    assert_eq!(retired.len(), 24, "retired ~NN slot count (128 revived as send, 41 as apply, 25 as call)");
+    assert_eq!(retired.len(), 24, "retired ~NN slot count (41 revived as apply, 57-59 revived for weave; 82 TASK and 25/128 retired — ' is the only call surface)");
     for &i in &retired {
         assert_eq!(OP_GLYPHS[i], 0, "retired slot {} ({}) must have no glyph", i, OP_NAMES[i]);
     }

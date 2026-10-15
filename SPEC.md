@@ -16,10 +16,10 @@ garbage-collected (scripts never `free` managed objects).
 
 ## Revision status
 
-Current revision: **v15.2**. Adds **@Type methods with `send` dispatch**
+Current revision: **v15.2**. Adds **@Type methods with type dispatch**
 (SPEC "Methods"): data-owned processes — `@Type label:` declares a method
-in the type's namespace (send-only, one implementation per (type, name),
-any TU can extend any type including built-in tags), `'recv.method send`
+in the type's namespace (dispatch-only, one implementation per (type, name),
+any TU can extend any type including built-in tags), `'recv.method`
 dispatches on the receiver's type (the dotted form is the one call form). Also adds
 packages: schemed `use` sources (`gh:` / `https:` / `path:`) with `:`
 namespacing under use aliases, per-use-site capability grants (zero by
@@ -45,10 +45,12 @@ is the call form (retiring the `_call` spelling), a bare label name is an
 implicit **fn** reference (tag 22, retiring `_addr`), every callback-taking
 op accepts a fn cell from the stack, **anonymous functions** — `:` body
 `ret` defines one inline, `':` body `ret` applies it to a list argument
-vector via the revived `apply` op (slot 41) — and **dynamic calls**: `'x`
-on a variable holding a fn cell lowers to the revived `call` op (slot 25),
-whose declared arity takes the stack below — see "Label parameters" and
-"Anonymous functions". Not backward compatible with v15.2 source using
+vector via the revived `apply` op (slot 41) — `
+and the `'`-only call surface: `'x` on a variable holding a fn cell is a
+dynamic call (the cell's declared arity takes the stack below), and
+`'recv.method` is self-applying — the `send` and `call` ops are retired
+(slot 128 and 25; bare tokens are lex errors with remedies). One operator
+executes any function. See "Label parameters" and "Anonymous functions". Not backward compatible with v15.2 source using
 `_call`/`_addr` or quoted callback references.
 Per-operation history is in `SPEC_HISTORY.md`; this document is the current
 specification only. Opcode totals are kept in lockstep with
@@ -450,7 +452,7 @@ list/dict/str/chan/atom/buf/obj/bitmap/bloom) have a `{tag, len, esz}` header
 preceded by a GC header. Execution state (data stack, call stack, locals) lives
 in a `Ctx` so weave tasks and spawned threads each get a fresh one.
 
-## Methods (@Type + send)
+## Methods (@Type + dispatch)
 
 Data owns processes: a method binds a label to a **type**, and any value
 of that type can invoke it. The method's label lives in the type's
@@ -473,39 +475,61 @@ the type name is ASCII in both encodings):
   `int`, … — any tag `type_of` reports). Unknown type = compile error.
 - The label mangles to `Type.name` internally: dots cannot appear in
   identifiers, so methods never collide with ordinary labels, and the
-  name is unspellable in source — **methods are send-only** (the call form
-  cannot reach them). One implementation per `(type, name)`; duplicates
-  are compile errors. `pub` on a method is an error (send-only).
+  name is unspellable in source — **methods are dispatch-only** (only the
+  dotted call form reaches them). One implementation per `(type, name)`; duplicates
+  are compile errors. `pub` on a method is an error (dispatch-only).
 - Methods are linkable across TUs by nature (dispatch goes through a
   global `(type key, selector)` table, not name resolution), and any TU
   or package can extend a type it does not own — including built-in tags:
   linking a package that defines `@list` methods extends every list.
 
-**Call** — receiver, then selector, then `send`:
+**Built-in `Weave` methods (v16)** — `weave ... save w!` ends a block
+and pushes a **Weave value**: a `Weave` struct instance (built in; never
+declare `struct Weave`) whose `tasks` field is `{name -> [fn, inputs,
+count]}`. Every block-level label in a weave block is a task — the `task`
+keyword is gone (retired slot 82). A task is a DAG **node** iff every
+leading bind names a sibling task (zero binds = source node); any other
+bind makes it a **function task** — a plain callable label, never
+scheduled. Tasks are spelled `name:` (leading binds = inputs),
+`4 name:` for fanout, inside `weave ... run|save`.
+
+The Weave value is editable: `'w.check` validates (dies naming the
+missing input or cycle) and pushes the dependency order; `'w.run`
+executes in dependency order (fanout count > 1 spreads the single
+input's list — fn per element, results as a list) and pushes the results
+dict; `"name" 'w.del` removes a task;
+`{"name" n "fn" f "in" [...] "count" c} 'w.add` appends one (consume
+the returned receiver — method calls leave it on the stack). The
+receiver rides inside the dotted quote — write `'w.run`, not `w 'w.run`.
+Direct dict ops also work (`w "tasks" get`). Static `weave ... run`
+keeps compile-time fusion and GPU lowering; the dynamic value schedules
+on threads.
+
+**Call** — the dotted quote is self-applying (v16 retired the `send` op; the parser lowers `'recv.method` to receiver + selector + dispatch):
 
 ```nmerkar
-'p.area send print                 ; the send form (dotted ref)
-2 'p.scale send q!                 ; extra args ride below the receiver
-'l2.area send print                ; same selector, list type
+'p.area print                      ; the method call — one token
+2 'p.scale q!                      ; extra args ride below the receiver
+'l2.area print                     ; same selector, list type
 ```
 
-- `'recv.method` is the method reference: the receiver load + selector,
-  one token (the dotted form is valid **only** in send position). The
+- `'recv.method` is the method call: the receiver load + selector +
+  dispatch, self-applying. The
   bare `'name` stack-selector form was removed — a selector without a
   named receiver has no dispatch.
 - The receiver binds the **last** declared parameter; values below it
-  bind in caller order (`scale: f! p!` with `2 'p.scale send` gives
+  bind in caller order (`scale: f! p!` with `2 'p.scale` gives
   f=2, p=receiver). A method's arity is its declared parameter count.
 - A miss dies at the source site naming the method (when any
   implementation exists anywhere) and the receiver's type key. There is
   no static call form — the value always decides.
-- Dense: `send` is 📡; `'recv.method` is the addr glyph + ASCII
-  `recv.method` (the struct-immediate spelling).
+- Dense: `'recv.method` is the addr glyph + ASCII `recv.method` (the
+  struct-immediate spelling).
 
 ### Built-in methods (the v16 migration campaign)
 
 78 type-targeting built-in ops are **automatic methods**: their selectors
-exist in the dispatch table, callable via `'recv.method send`. The bare
+exist in the dispatch table, callable via `'recv.method`. The bare
 token stays the direct op call (the built-in / "super" form) — identical
 code to before, and an override's body can call it to reach the built-in
 behavior. User `@Type` entries with the same `(type key, selector)` take
@@ -519,7 +543,7 @@ precedence over the built-in for that type.
 | structured handles | `enqueue` `dequeue` `close` `atomic_get` `atomic_set` `atomic_add` `cas` `bloom_add` `bloom_test` `next` `collect` `iter_map` `iter_filter` `transpose` |
 
 A migrated op registers on every key that currently accepts it (universal
-coercion preserved: `'s.sum send` on a string coerces, same as bare
+coercion preserved: `'s.sum` on a string coerces, same as bare
 `sum`). Defining `@list length` overrides the built-in for list
 receivers; other types still get the built-in.
 
@@ -638,7 +662,6 @@ v15.1; its formerly reserved glyph is freed.)
 | 22 | 🪐 | `gte` | a b → 0/1 | a≥b; coerces both sides to Number, NaN → 0 |
 | 23 | 🤓 | `array` | len_or_list type → h | polymorphic: top is a length or a list to copy; `_array <type>` immediate form; 64-aligned typed array |
 | 24 | 🪫 | `shutdown` | → | graceful weave shutdown: sets the drain flag (see Concurrency) |
-| 25 | 📞 | `call` | args… fn → r | dynamic call — the fn cell's declared arity takes the stack below (`'x` on a var) |
 | 26 | 🌅 | `copy` | h → h' | deep copy |
 | 27 | 😅 | `_cast` | v type → v' | static cast (immediate type): int/float/ptr/byte/bool, struct id = checked downcast; dies on mismatch |
 | 28 | 🚆 | `macro` | (directive) | `macro name { body }` |
@@ -673,6 +696,9 @@ v15.1; its formerly reserved glyph is freed.)
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
 | 56 | 🚐 | `dict` | → h | open-addressing hash map (FNV-1a) |
+| 57 | 🧶 | `save` | end weave..save | push the Weave value (see "Weave") |
+| 58 | 🧷 | `weave_run` | tasks-dict → results-dict | execute a weave value's DAG in dependency order |
+| 59 | 🧸 | `weave_check` | tasks-dict → order | validate a weave value's DAG, push the schedule |
 | 62 | 🤚 | `list` | → h | growable cell vector |
 | 63 | 🌌 | `append` | h v → h | appends in place; pushes the same handle (reference semantics) |
 | 64 | 😌 | `pop` | h → v | empty: dies |
@@ -726,7 +752,6 @@ outside a loop are compile errors.
 | 116 | 😘 | `while` | cond body → | exit on 0, else CALL body, repeat |
 | 117 | 🚢 | `break` | → | to end of nearest enclosing while/for |
 | 118 | 🤧 | `continue` | → | next iteration of nearest enclosing loop |
-| 128 | 📡 | `send` | args… recv 'name → r | method dispatch on the receiver's type (see "Methods") |
 
 ### Sequences
 
@@ -1008,8 +1033,7 @@ struct *name* to its compiler-assigned id at compile time.
 | 78 | 😏 | `use` | `use [name] "source" [policy P] [allow caps] [deny caps]` — local mod (bare name) or package (schemed; see "Packages") |
 | 79 | 🚔 | `mod` | `mod "name"` — translation-unit name |
 | 80 | 🤞 | `pub` | export next label to global namespace |
-| 81 | 🌐 | `weave` | begin task scope |
-| 82 | 😐 | `task` | begin task body (inside weave): `task name:` with input bindings |
+| 81 | 🌐 | `weave` | begin task scope (block-level labels are tasks) |
 | 84 | 🤟 | `run` | schedule the DAG, wait; optional terminal task name |
 
 Task bodies end with an explicit `ret`.
@@ -1337,38 +1361,44 @@ and weave task results trivially safe.
 ## Concurrency — weave
 
 `weave` is the single construct for task graphs, servers, and composable
-multithreaded processes. Task bodies are label-shaped: a task is introduced
-by `task name:` (with optional input bindings after the colon) and ends with an
+multithreaded processes. Tasks are label-shaped: a block-level `name:`
+inside `weave ... run|save` introduces a task (v16 removed the `task`
+keyword — every block-level label in the block is one) and ends with an
 explicit `ret`.
 
 ```
 weave
-  task a:
+  a:
     ret 1
-  task b: a!
+  b: a!
     ret a 2 add
 run
 ```
 
-- **Task bodies** use label syntax. `task name:` introduces a task; the body
+- **Task bodies** use label syntax. `name:` introduces a task; the body
   must end with `ret` (falling off the end is a compile error, exactly like a
   label). Bare `ret` returns `null`. The value named in `ret` becomes the task
   result; with fanout, each worker's `ret` value becomes one element of the
   published result list.
-- **Inputs** are parameter bindings after the colon: `task b: a!` makes task
+- **Inputs** are parameter bindings after the colon: `b: a!` makes task
   `a`'s result available as local parameter `a`; `_!` discards. Bindings are
   evaluated left-to-right, matching the label
   parameter convention.
-- **Fanout**: a numeric literal 1..64 before `task` declares the worker count:
-  `4 task worker: item!`. Only the **first** input drives fanout and must be
+- **Node vs function task**: a task whose every input bind names a sibling
+  task (zero binds = source node) is a **DAG node** — scheduled by `run`/
+  saved in a Weave value. Any other bind makes it a **function task**: a
+  plain callable label with parameters, never scheduled (its body may be
+  quoted as a callback from other tasks' bodies).
+- **Fanout**: a numeric literal 1..64 before the label declares the worker
+  count: `4 worker: item!`. Only the **first** input drives fanout and must be
   iterable (list/arr/tensor/chan/iter); additional inputs are broadcast
   (copied unchanged into every worker). Distribution is dynamic — items flow
   through an internal bounded chan and workers pull, so cheap workers never sit
   idle behind slow ones. A chan input drains until close; other iterables until
   exhaustion. Published result is a **list of per-item results in completion
   order**. Empty input → empty list. Count > 1 requires ≥1 input.
-- **Static DAG**: task inputs must name tasks in the same weave block; unknown
-  input or cycle = compile error. Task bodies are self-contained (labels
+- **Static DAG**: node inputs must name node tasks in the same weave block
+  (function tasks cannot be inputs); unknown input or cycle = compile error. Task bodies are self-contained (labels
   task-local; two tasks may reuse v-names). Shared variables cross
   task boundaries; local variables are per-task.
 - **`run [terminal]`**: `run` with no name executes every task and leaves

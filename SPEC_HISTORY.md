@@ -6,6 +6,39 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-15 — editable weaves (`weave ... save`, the Weave struct) + `task` removed
+
+- `WSAVE` (57, 🧶, `save`) — added (slot revived): ends a weave block and
+  pushes a **Weave value** — an instance of the built-in `Weave` struct
+  (fields: `tasks:dict`). The tasks dict is `{name -> [fn, inputs,
+  count]}` over the DAG-node tasks.
+- `WRUN_DYN` (58, `weave_run` — `tasks-dict → results-dict`) and `WCHK`
+  (59, `weave_check` — `tasks-dict → order`) — added (slots revived):
+  dependency-order execution (fanout spreads the single input's list)
+  and validate+schedule, both dying with the task name on missing
+  inputs and cycles.
+- `TASK` (82) — retired: block-level labels in a weave block ARE tasks
+  (`name:`, leading binds = inputs, `4 name:` = fanout). A task is a
+  node iff every bind names a sibling (zero = source node); other binds
+  make it a function task (callable, unscheduled). Corpus swept.
+- Built-in `@Weave` methods synthesized when a TU saves a weave (a user
+  `@Weave name:` wins): `check`, `run`, `del`, `add` (spec dict +
+  receiver). Gate: `comp/tests/t30_edweave.n`.
+
+## 2026-10-15 — `'` is the only call surface (`send` and `call` retired)
+
+- `SEND` (128) — retired (slot `~128`, glyph removed): `'recv.method` is
+  self-applying — the parser lowers the dotted quote to receiver load +
+  selector + dispatch, and a bare `send` token is a lex error with the
+  remedy. The method table, `@Type` declarations, built-in methods, and
+  receiver-last binding are unchanged.
+- `FNCALL` (25, `call`) — retired again (slot `~25`): `'x` on a variable
+  holding a fn cell still lowers to load + dynamic call (the helper stays,
+  unspellable; the cell's declared arity takes the stack below), and a
+  bare `call` token is a lex error. `'` executes any function: label,
+  variable, method, inline (`':`). Corpus `'recv.method send` spellings
+  swept to `'recv.method` (one token cheaper per method call).
+
 ## 2026-10-15 — dynamic calls (`'x` on a variable) + `call`
 
 - `FNCALL` (25, 📞, `call` — `args… fn → r`) — added (slot retired since

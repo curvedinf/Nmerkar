@@ -3,9 +3,9 @@
 ;  code runs in its own body frame)
 sender spawn ch!     ; spawn sender in a detached thread; ch (global) = its result channel
 weave                 ; begin task-DAG definition
-  task one:           ; task `one` — no inputs
+  one: ; task `one` — no inputs
     ret 21            ; task result = 21
-  task two: one!      ; task `two` depends on `one`, binding its result to one
+  two: one!      ; task `two` depends on `one`, binding its result to one
     ret one 2 mul    ; task result = one * 2 = 42
 run two               ; execute the DAG rooted at `two`; result lands on the stack
 print                 ; prints the weave result (42)

@@ -56,6 +56,7 @@ pub enum Tok {
     Task { name: String, count: Option<i64>, body: Vec<(u32, Tok)> }, // inside WEAVE..RUN; leading body tokens are input bindings
     TaskEnd(String),             // internal: end of task body, holds skip label
     Wrun(Option<String>),        // RUN — schedule the collected tasks; optional terminal task
+    WSave,                       // v16: SAVE — end the block and push a Weave value (the struct instance)
     List(Vec<(u32, Tok)>),      // v13: [ expr ... ] list-literal contents (closed); (line, tok)
     Dict(Vec<(u32, Tok)>),      // v13: { key val ... } dict-literal contents (closed); (line, tok)
     MacroDef(String, Vec<(u32, Tok)>),

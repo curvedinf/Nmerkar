@@ -1,7 +1,7 @@
 weave
-  task a: b!
+  a: b!
     ret 1
-  task b: a!
+  b: a!
     ret 2
 run a
 print

@@ -1,0 +1,59 @@
+; t30_edweave.n — v16 editable weaves: `weave ... save` pushes a Weave
+; value (a struct instance); block-level labels are tasks (no `task`
+; keyword); 'w.run executes the DAG (dependency order), 'w.check validates
+; and returns the schedule, 'w.add appends a task (spec dict + receiver),
+; 'w.del removes one. Call shape: args ride below the receiver INSIDE the
+; dotted quote — write `"b" 'w.del`, not `"b" w 'w.del`.
+; Run: nk comp/tests/t30_edweave.n
+
+; 1. save + check + run
+weave
+  a:
+    ret 1 2 add
+  b:
+    ret 10 20 add
+  c: a! b!
+    ret a b add
+save w!
+w 'w.check length 3 eq check
+w 'w.run "c" get 33 eq check
+
+; 2. add (spec dict: name fn in count) then run
+: x! x 2 mul ret f!
+{"name" "dbl" "fn" f "in" ["c"] "count" 1} 'w.add consume
+w 'w.run "dbl" get 66 eq check
+
+; 3. del then re-run
+"dbl" 'w.del consume
+w 'w.run "c" get 33 eq check
+w 'w.run "dbl" get_or_zero 0 eq check
+
+; 4. fanout: one input, count > 1 spreads the list
+weave
+  nums:
+    ret [1 2 3 4]
+  double: nums!
+    ret nums 2 mul
+  out: double!
+    ret double sum
+save wf!
+'wf.run "out" get 20 eq check
+
+; 5. static run still works alongside save
+weave
+  s1:
+    ret 2 3 mul
+run s1 6 eq check
+
+; 6. a function task (binds a non-task param) stays callable, unscheduled
+weave
+  n1:
+    ret 7
+  helper: v!
+    ret v 10 add
+save wh!
+'wh.run "n1" get 7 eq check
+'wh.run "helper" get_or_zero 0 eq check
+
+"weave-edit-ok" print
+ret

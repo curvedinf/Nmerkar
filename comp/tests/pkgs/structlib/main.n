@@ -1,0 +1,9 @@
+struct Pt { x:int, y:int, }
+pub
+ptsize:
+  _size_of Pt s!
+  ret s
+pub
+ptyoff:
+  _offset Pt.y o!
+  ret o

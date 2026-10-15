@@ -16,7 +16,12 @@ garbage-collected (scripts never `free` managed objects).
 
 ## Revision status
 
-Current revision: **v15.1**. Not backward compatible with v15 (stores pass
+Current revision: **v15.2**. Packages: schemed `use` sources (`gh:` /
+`https:` / `path:`) with per-use-site capability grants, the `.nk/lock` +
+approvals content-addressed package system, and the `nk install` command
+family — see "Packages" (backward compatible: bare `use "name"` local
+mods are unchanged; grant clauses are new syntax). Not backward compatible
+with v15 (stores pass
 through everywhere — a shared store no longer consumes its value, removing
 the local/shared stack-effect asymmetry; destructuring is explicit `#` — a
 bind run after a multi-return op is now a plain store of the whole value).
@@ -372,6 +377,17 @@ Six ops cover all element access, dispatched on the handle's tag:
 `length` and `type_of` complete the protocol. A null (0) handle returns 0 from
 `get_or_zero`/`contains`, dies elsewhere.
 
+## Reference semantics
+
+A container handle is a reference to the object, not a copy. Every mutation op
+— `append`, `pop`, `set`, `remove`, channel `enqueue`/`dequeue`/`close`, atom
+ops — acts in place on the object, and every name bound to the same handle
+observes the change. Growth never re-allocates: `append` pushes the same handle
+it consumed (re-storing the result is never needed, and chaining or dropping it
+is equally valid). `copy` (op 26) is the explicit deep copy. Mutation is not
+synchronized across threads: for cross-thread state use chans, atoms, or shared
+vars, not concurrent mutation of one list/dict.
+
 ## Container literals
 
 Compile-time literals exist for lists, dicts, and typed arrays/tensors. The
@@ -478,7 +494,7 @@ v15.1; its formerly reserved glyph is freed.)
 |----|---|----|----|-------|
 | 56 | 🚐 | `dict` | → h | open-addressing hash map (FNV-1a) |
 | 62 | 🤚 | `list` | → h | growable cell vector |
-| 63 | 🌌 | `append` | h v → h' | returns possibly-realloced handle |
+| 63 | 🌌 | `append` | h v → h | appends in place; pushes the same handle (reference semantics) |
 | 64 | 😌 | `pop` | h → v | empty: dies |
 | 65 | 🚑 | `channel` | cap → h | bounded MPSC ring (blocking) |
 | 66 | 🤛 | `enqueue` | h v → | blocks while full; dies on closed chan |
@@ -808,8 +824,8 @@ struct *name* to its compiler-assigned id at compile time.
 
 | idx | | mn | notes |
 |----|---|----|-------|
-| 78 | 😏 | `use` | `use"name"` — link `-l<name>`, load `mods/<name>.ufm` |
-| 79 | 🚔 | `mod` | `mod"name"` — translation-unit name |
+| 78 | 😏 | `use` | `use [name] "source" [policy P] [allow caps] [deny caps]` — local mod (bare name) or package (schemed; see "Packages") |
+| 79 | 🚔 | `mod` | `mod "name"` — translation-unit name |
 | 80 | 🤞 | `pub` | export next label to global namespace |
 | 81 | 🌐 | `weave` | begin task scope |
 | 82 | 😐 | `task` | begin task body (inside weave): `task name:` with input bindings |
@@ -827,7 +843,8 @@ dynamically for struct ids ≥1000.
 
 ## Modules: USE and binding manifests
 
-`use"name"`: links `-l<name>` and loads the binding manifest `<name>.ufm`,
+`use "name"` with a bare, scheme-less name: links `-l<name>` and loads the binding
+manifest `<name>.ufm`,
 searched in `./mods`, `~/.nk/mods`, then `$NKMODPATH` dirs. A manifest is a
 Nmerkar file containing IMPORT/EXTERN/STRUCT lines; compiled as part of the
 USEing TU. Ships: `m.ufm`, `c.ufm`, `pthread.ufm`, `curl.ufm`, `sdl2.ufm`,
@@ -849,6 +866,227 @@ USEing TU. Ships: `m.ufm`, `c.ufm`, `pthread.ufm`, `curl.ufm`, `sdl2.ufm`,
 - `extern "symbol"` — pushes the address of a global C symbol for use with
   `load`/`store`. Runtime exposes `nk_argc` and `nk_argv` this way (though
   `argv` op 163 is preferred).
+
+## Packages
+
+`use` with a **schemed** source string loads a *package* — third-party
+Nmerkar source resolved through a repo-local lockfile and a global
+content-addressed store, granted capabilities per use site. A bare,
+scheme-less `use "curl"` keeps its existing meaning (local mods manifest +
+`-l<name>` link) unchanged.
+
+### Sources
+
+| scheme | form | ref resolution |
+|---|---|---|
+| `gh:` | `gh:owner/repo[@ref]` | `@ref` = tag or 40-hex sha; `@head` = branch tip; omitted = highest semver tag at install time |
+| `https:` | `https://host/path[@ref]` | `.tar.gz`/`.tgz` archives, or a single file (the bytes are the identity — TOFU); a ref is advisory |
+| `path:` | `path:<dir>` | local directory, read in place; takes no `@ref` |
+
+Fetching is **driver-level** via subprocess (`curl`, `tar`, `git
+ls-remote`) — the `cc` precedent; the compiler is std-only. **Compile never
+fetches.** "Latest" exists only inside `install`, and the lockfile never
+records it — only resolved, byte-exact pins.
+
+### Content addressing (`nkph1:`)
+
+A package's identity is a Merkle root over its **canonical file set**:
+recursively collected, dot-directories skipped, only `.n`/`.nd`/`.ufm` and
+the metadata file `nk.pkg` kept, each file LF-normalized (CRLF and lone CR
+become LF; non-UTF-8 is an error), paths sorted, per-file SHA-256, root =
+SHA-256 over `path\0blob-sha\n` lines, written `nkph1:<hex>`. Identical
+files across versions share store blobs (dedupe for free). The store lives
+at `~/.nk/pkg/` (`NKPKG_HOME` overrides; outside every sandbox workspace —
+programs never write package bytes). The store is a cache, never a source
+of truth; `nk pkg gc` removes roots unreachable from any `.nk/lock` under
+the current directory.
+
+### Lockfile, approvals, metadata
+
+- `<project>/.nk/lock` — one line per pinned (source, version):
+  `pkg source=<id> ref=<ref> sha=<commit-sha|-> root=nkph1:…`. Found by
+  walking up from the main input's directory (like mods).
+- `<project>/.nk/approvals` — content-roots a human approved:
+  `approve source=<id> root=… date=… by=…`. Approval binds **(source id +
+  root hash)** — content, never a name — and is orthogonal to what the
+  package may *do* (capabilities live at use sites).
+- `nk.pkg` (package root) — `name <x>` and `caps <cap> required|optional`
+  lines: the **declared** capability contract the compiler enforces.
+
+### Use sites, aliases, and `:` namespacing
+
+```
+use  := "use" [name] <string> ["policy" name] ["allow" cap+] ["deny" cap+]
+```
+
+`cap` is the same grammar `.ufs` uses (dotted names, `prefix.*`, bare `*`);
+clauses appear at most once each, in fixed order, and a cap list ends at
+the first non-capability token (identifiers legally cannot contain `.`).
+Grant clauses are text-mode spellings; dense supports the plain
+`use "source"` form only.
+
+The optional leading name is the package's **alias** — its namespace
+everywhere:
+
+- **Labels** are addressable as `alias:name` (`_call libdemo:double`,
+  `'lib1:helper`). Package labels register under the alias via the standard
+  per-TU mangling; `pub` marks the API contract (all labels are addressable;
+  pub-ness is convention). Cross-package references always qualify — a
+  package's own `use` of another package reaches it as `pkgname:label`.
+- **Structs** register as `alias:Name`. Inside the package source, bare
+  `Name` refers to its own struct; at use sites and in `_cast`/`_obj`/
+  `_size_of`/`_offset` immediates the qualified name resolves (`_offset
+  lib1:Pt.y`; `.` stays field-only — `:` namespaces, `.` is data depth).
+- **Shared vars** mangle `alias__var` — a package's state is isolated from
+  every other TU, so two versions of one package never alias.
+- A package is **one namespace**: its files share it (duplicate labels
+  across a package's files are a compile error). Multiple versions of one
+  package load side by side under distinct aliases (same content under two
+  aliases shares one parse; labels and structs twin under each name). A
+  duplicate alias for two different roots is a compile error with the
+  aliasing remedy. `use "a/lib@1" as`-style suffix aliases do not exist —
+  the alias is the optional name before the source string.
+- **Deps of deps**: schemed uses inside package trees resolve transitively;
+  `install` pins them (reachability-pruned like direct uses).
+
+**Zero privileges by default.** With no clause the grant is the empty set:
+
+```
+grant = ((policy ∪ allow) − deny) ∩ declared ∩ program policy
+```
+
+`deny` subtracts (plain set algebra — no specificity rules); `deny *` is
+the explicit zero; the special policy `all` grants everything within the
+program policy (available, discouraged: the install/compile reports render
+it distinctly). Compile-time contract errors, in house style:
+
+- an `allow` naming a capability the package does not declare —
+  *grants X but Y declares no such capability*;
+- a grant that starves a `required` capability — remedies ordered
+  narrow (`allow X`) → named policy → `policy all` (discouraged).
+
+Enforcement is two-layered:
+
+- **Compile (grants)**: a package's translation units parse under the
+  capability set built from the granted caps (the union over its use
+  sites), so a gated op in package code outside the grant is the standard
+  sandbox compile error naming the `package-grants` policy. First-party
+  code is unchanged (program policy).
+- **Runtime (ceiling)**: the baked program policy is the ceiling; the env
+  var `NK_CAP_CEILING` (comma-separated caps to allow; empty = none) may
+  restrict further at exec time and may only restrict. Every gated op
+  checks the effective mask and dies loudly
+  (`cap denied: X (runtime ceiling) in op_sh`) with its source site;
+  `cap`/`caps` report `min(baked, ceiling)` so packages can degrade
+  deliberately (`"proc" cap 'spawn 'fallback if_else`). A package's
+  **required** caps are validated against the ceiling at startup — a run
+  that starves them dies before any work happens
+  (`package X requires capability Y — denied by the runtime ceiling`),
+  while starved *optional* caps degrade or die at first use. The JS
+  target has no ceiling (its `cap`/`caps` stay fixed).
+
+### Resolution and compile
+
+A `use "gh:a/lib"` with no ref is legal only when the lockfile holds
+exactly one pin for that source; a pinned ref (`…@v1.2`) must match a pin.
+Missing pin or an ambiguous bare use are compile errors naming the exact
+`nk install` remedy. Package TUs load from the
+store (root `main.n`/`main.nd` first, then others sorted; the package's
+`.ufm` manifests prepend to its first TU exactly like local mods) and
+merge via the standard MTU path — `pub` labels are the cross-TU API, all
+other names stay file-local. Schemed packages never add `-l` link flags;
+a package's own bare `use "curl"` flows through the mods path under its
+grants. The wasm library build (`compile_js`) rejects package uses with
+the install remedy.
+
+### Install commands (both `nk` and `nks`)
+
+```
+nk install gh:u/r[@ref] | https://… | path:dir   fetch → hash → approve → store → pin
+nk install DIR [--yes] [--locked] [--refresh SRC]  reconcile DIR/.nk/lock
+nk pkg gc                                        sweep unreachable store roots
+```
+
+- **Reconcile** (`install DIR`): per schemed use — explicit ref resolves
+  exactly; bare + pin re-fetches and verifies the root (mismatch = drift);
+  bare + no pin resolves latest, reports, and pins. Pins no use reaches
+  are pruned. Idempotent on a fully-pinned tree.
+- **`--locked`**: verify-only — no writes, no approvals; any drift
+  (content mismatch, missing pin, unapproved root, prunable pin) exits 1.
+  The CI entry.
+- **`--refresh <source>`**: re-resolve exactly one pin to latest (diff
+  against the previously approved root + re-approval). No bare
+  `--refresh` — upgrades are deliberate, one package at a time.
+- **Approval**: a new root prompts (y/n) — non-interactive runs need
+  `--yes`, which records `by=flag(--yes)`; `--locked` never approves.
+  Agents can request; only humans (or an explicit flag) approve.
+- Reports are TSV lines (`resolved`/`verified`/`updated`/`pruned`/`pin`)
+  plus a paste-ready `use "…"@ref`.
+
+### Tools (bins)
+
+A package declares executables in `nk.pkg` (`bin <name> = <tu-file>`, one
+line per bin). Installing a source that declares bins is a **tool
+install**: after pin + approval, each bin is *compiled locally* from the
+approved source bytes (compiler self-exec, `cc` as usual — never shipped
+prebuilt) into `~/.nk/tools/bin/<name>`, registered in
+`~/.nk/tools/registry` (name → source, root, grants, binary), and shimmed
+into `~/.nk/bin` (atomic swap on upgrade; the install report suggests
+adding it to PATH — nothing edits shell profiles silently).
+
+- **Grants at install**: `nk install <src> --grant fs.read,proc` (defaults
+  to all declared caps; a grant wider than the declaration is an error).
+  The grants bake into the binary — running the tool directly executes
+  with exactly what was approved at install.
+- **`nk run <name> [--policy P] [args…]`** executes an installed tool;
+  `--policy` translates to an `NK_CAP_CEILING` intersected with the tool's
+  grants (may only restrict). Direct shim execution is the install-time
+  grant set.
+- **Invocation-relative workspace**: tool compiles bake the workspace root
+  `.` — resolved against the *invocation* cwd at run time, never the
+  install directory.
+- **`nk tools list` / `nk tools rm <name>`** manage the registry;
+  reinstall upgrades (latest, diff, re-approval, recompile).
+
+### Signing (ed25519, RFC 8032)
+
+A publisher proves content authorship with a detached Ed25519 signature
+over the `nkph1:` root string. The package ships two root files:
+`nk.pub` (64-hex public key) and `nk.sig` (128-hex signature over the
+root). Both files are **excluded from the hashed set** — a signature
+cannot sign itself, and a key rotation must not change the root (key
+continuity lives in the approvals, which pin the publisher key per
+approval record).
+
+- **Author flow**: `nk pkg keygen` once (prints `seed=` / `pub=`; seed
+  from `/dev/urandom`, keep it private) → commit `nk.pub` →
+  `printf '%s' <root> | nk pkg sign <seed-hex> > nk.sig`. The root comes
+  from a prior `nk install` of the envelope-free content.
+- **Install**: the envelope is verified **before any approval gate** — a
+  failing or malformed signature is a hard error
+  (`signature verification FAILED … do not approve`), never a prompt.
+  A verified pin records `sig=ok` in the lock; the approval record pins
+  `key=<pub>`; a different key for the same source is flagged
+  `PUBLISHER KEY ROTATED — verify out of band` in the approval diff.
+- **Continuity**: a package that was signed turning up unsigned is drift
+  (`--locked` fails; normal mode appends `[UNSIGNED after a signed pin]`
+  to the approval diff). Tampered content against a valid envelope can
+  never verify (the root is the content).
+- Pins remain the floor: signatures vouch for *new* content; approvals
+  stay the human decision. Sigstore-style keyless identity (OIDC → cert
+  chains, `gh attestation`) layers on the same `sig=`/key-continuity
+  records when a verifying tool is present.
+
+### Repo toolchain (`.nk/tools`)
+
+A repo may pin its tools mise-style: each line
+`tool <name> = <source>[@ref] [grant <csv>]`. `nk install .` reconciles it
+with the libraries — installing/verifying pinned tools so a fresh clone's
+`nk install . --locked` brings back both the deps and the toolchain.
+
+Gate: `sh comp/tests/pkg_gate.sh` — end-to-end against the committed
+fixtures `comp/tests/pkgs/` (install, aliases/namespacing, grants,
+ceiling, drift, prune, tools, `.nk/tools`, negative gates).
 
 ## Multiple translation units (MTU)
 
@@ -884,8 +1122,9 @@ Explicit-file mode does no discovery and spawns no init threads.
 ## Garbage collection
 
 Precise, non-moving mark-sweep. Handle stability (a handle is
-never invalidated by a collection) keeps FFI, chan buffers, and weave task
-results trivially safe.
+never invalidated by a collection or by container growth — lists grow their
+buffer in place, the handle never changes identity) keeps FFI, chan buffers,
+and weave task results trivially safe.
 
 - **Heap objects**: every tagged object allocated with a GC header, linked into
   a global list. Bodies holding cells (list/dict/arr/chan/obj) are scanned for
@@ -1250,6 +1489,7 @@ jump         := (_call | "'") name
 op           := opcode-glyph | text-mnemonic
              ; text mode: immediate-operand ops are _-prefixed — see section below
 directive    := import c"name"(params)->ret | export "name" | extern "sym"
+             | use [name] <string> ["policy" name] ["allow" cap+] ["deny" cap+]  ; packages: cap = .ufs capability pattern
              | macro name { token* } | struct name { field:type, … }
              | use "name" | mod "name" | pub <labeldef>
              | weave task* run [name]
@@ -1281,6 +1521,20 @@ token is consumed as a label name, type name, or numeric operand at compile
 time. The immediate operand never touches the runtime stack — the value it
 denotes is baked into the generated code or resolved to an address by the
 compiler.
+
+Syntax categories (three, not two): **stack ops** (`add`, `print`) read
+operands from the hidden stack at runtime; **immediate ops** (`_lit`,
+`_call`, `_str`) are *runtime instructions* whose operand is a compile-time
+immediate — the `_` prefix marks exactly this; and **directives** (`use`,
+`import`, `extern`, `export`, `mod`, `pub`, `macro`, `struct`) are
+compile-time only, with no machine existence — they never emit an
+instruction. Directives are unprefixed because `_` means "immediate-operand
+runtime op", not "compile-time"; they appear in the opcode tables and carry
+dense glyphs only because dense encoding needs every syntactic element
+expressible as a single-token glyph, and the slot space is that encoding
+space. A directive keyword glued directly to its quote (no space between
+keyword and string) is a lex error with the remedy
+`write a space: use "name"` — directives are separate whitespace tokens.
 
 All other opcodes operate purely on the runtime stack.
 
@@ -1512,7 +1766,7 @@ dense glyph codepoints (`cap`/`caps`/`consume` are text-only).
 ## Non-goals
 
 B-tree/trie/skiplist/R-tree/suffix-array index structures (library candidates in
-`mods/`); dataframe ops; HTTP clients in core (`use"curl"`); Roaring bitmaps;
+`mods/`); dataframe ops; HTTP clients in core (`use "curl"`); Roaring bitmaps;
 generational/incremental/compacting GC; async I/O; object-file linking;
 pkg-config probing; hand-written SIMD (autovectorization first); remote weave
 executors; MSP/mobile targets.
@@ -1634,7 +1888,7 @@ config: the repo default `comp/sandbox.ufs` unless overridden.
 **Capabilities** (gated ops): `fs.read` (read_file, mmap,
 file_each_line/fold_lines/split_lines/match_lines), `fs.write` (write_file,
 file_emit; mmap needs both), `proc` (shell, shell_stream, execute), `ffi.use`
-(`USE"..."`, plus per-module allow/deny), `ffi.import` (`import c"..."`,
+(`USE "..."`, plus per-module allow/deny), `ffi.import` (`import c"..."`,
 `extern`), `raw.syscall` (`_syscall`), `raw.mem` (malloc, free, buffer,
 copy_memory, load, store), `host.argv` (argv, has_args, arg_index).
 Print/scan, time ops, threads, GPU compute, and all pure compute (including

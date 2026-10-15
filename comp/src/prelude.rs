@@ -49,7 +49,7 @@ typedef struct { int tag; int64_t i; } Cell;
 #define GCF_MMAP 4
 #define GCF_SEQSHIFT 8
 typedef struct { UFHDR; char data[]; } Hdr;
-typedef struct { UFHDR; uint64_t cap; Cell data[]; } Dyn;
+typedef struct { UFHDR; uint64_t cap; Cell* data; } Dyn; /* handle is stable; the buffer reallocs on growth */
 typedef struct { UFHDR; uint64_t cap; Cell* keys; Cell* vals; unsigned char* st; } Map;
 typedef struct { UFHDR; uint64_t cap; Cell* buf; uint64_t head; uint64_t tail; pthread_mutex_t mu; pthread_cond_t notfull; pthread_cond_t notempty; int closed; } Ring;
 typedef struct { UFHDR; _Atomic int64_t v; } Atom;
@@ -301,6 +301,38 @@ const char* uf_mod_deny[32]; long uf_mod_deny_n=0;
 static const char* uf_cap_names[8]={"fs.read","fs.write","proc","ffi.use","ffi.import","raw.syscall","raw.mem","host.argv"};
 static long uf_cap_index(const char*n){ for(int i=0;i<8;i++) if(!strcmp(n,uf_cap_names[i]))return i; return -1; }
 
+/* ================= runtime ceiling (packages, phase 3) =================
+   uf_sb_caps is the compile-time ceiling (baked). NK_CAP_CEILING — a
+   comma-separated list of capabilities to allow, or empty to allow none —
+   restricts further at exec time and may only restrict. The effective
+   runtime truth is uf_rt_cap(): gated ops check it and die loudly; `cap`
+   and `caps` report it so packages can degrade deliberately. */
+long uf_rt_mask[8]={1,1,1,1,1,1,1,1};
+static int uf_rt_cap(long i){ return uf_sb_caps[i]&&uf_rt_mask[i]; }
+static void uf_rt_die(long i,const char*op){
+  char m[256]; snprintf(m,sizeof m,"cap denied: %s (runtime ceiling) in %s",uf_cap_names[i],op); die(m);
+}
+static void uf_rt_ceiling(void){
+  const char*e=getenv("NK_CAP_CEILING");
+  if(!e)return;
+  { int i; for(i=0;i<8;i++)uf_rt_mask[i]=0; }
+  if(!*e)return;
+  {
+    char buf[512]; snprintf(buf,sizeof buf,"%s",e);
+    char*t=strtok(buf,",");
+    while(t){ long i=uf_cap_index(t); if(i>=0)uf_rt_mask[i]=1; t=strtok(0,","); }
+  }
+}
+/* startup validation: a package's required capability denied for this run
+   dies before any work happens (baked into main by c_bake) */
+static void uf_req_one(const char*pkg,long i){
+  if(!uf_rt_cap(i)){
+    char m[512];
+    snprintf(m,sizeof m,"package %s requires capability %s — denied by the runtime ceiling (NK_CAP_CEILING)",pkg,uf_cap_names[i]);
+    die(m);
+  }
+}
+
 /* sandbox workspace gate: resolve the path (its parent for not-yet-existing
    write targets) and require it under a workspace root. No-op when the
    sandbox or workspace enforcement is off. */
@@ -539,6 +571,7 @@ static void uf_gc_free_obj(Hdr* h){
     munmap(h,sizeof(Hdr)+(size_t)h->len*(size_t)h->esz); return;
   }
   switch(h->tag){
+    case HT_DYN: { free(((Dyn*)h)->data); break; }
     case HT_MAP: case HT_SET: { Map* m=(Map*)h; free(m->keys); free(m->vals); free(m->st); break; }
     case HT_RING: { Ring* r=(Ring*)h; pthread_mutex_destroy(&r->mu); pthread_cond_destroy(&r->notfull); pthread_cond_destroy(&r->notempty); free(r->buf); break; }
     case HT_STR: { Str* s=(Str*)h; if(s->mlen) munmap((void*)s->mdata,(size_t)s->mlen); else if(s->gc_parent==(void*)1) free((void*)s->mdata); break; }
@@ -1146,10 +1179,11 @@ static void map_del(Map*m,Cell k){
   uint64_t i=map_hash(k)%m->cap;
   for(;;){ if(m->st[i]==0)return; if(m->st[i]==1&&map_keyeq(m->keys[i],k)){ m->st[i]=2; m->len--; return; } i=(i+1)%m->cap; }
 }
-/* ---- list: grow-by-move cell vector ---- */
-static Dyn* uf_dyn_new(uint64_t cap){ if(!cap)cap=1; Dyn*d=(Dyn*)uf_gc_alloc(sizeof(Dyn)+cap*sizeof(Cell),0); d->tag=HT_DYN; d->len=0; d->esz=sizeof(Cell); d->cap=cap; return d; }
-/* grow-with-move: returns the (possibly new) list; old handle is reclaimed by GC */
-static Dyn* uf_dyn_push2(Dyn*d,Cell c){ if(d->len>=d->cap){ Dyn*n=uf_dyn_new(d->cap*2); memcpy(n->data,d->data,d->len*sizeof(Cell)); n->len=d->len; d=n; } d->data[d->len++]=c; return d; }
+/* ---- list: stable-handle cell vector (reference semantics) ---- */
+static Dyn* uf_dyn_new(uint64_t cap){ if(!cap)cap=1; Dyn*d=(Dyn*)uf_gc_alloc(sizeof(Dyn),0); d->tag=HT_DYN; d->len=0; d->esz=sizeof(Cell); d->cap=cap; d->data=(Cell*)uf_alloc((size_t)cap*sizeof(Cell),0); return d; }
+/* growth reallocs the external buffer; the handle (and every copy of it)
+   stays valid — all names for the list see the append */
+static Dyn* uf_dyn_push2(Dyn*d,Cell c){ if(d->len>=d->cap){ Cell* nd=(Cell*)realloc(d->data,(size_t)d->cap*2*sizeof(Cell)); if(!nd)die("out of memory"); d->data=nd; d->cap*=2; } d->data[d->len++]=c; return d; }
 static void uf_dyn_push(Dyn**pd,Cell c){ *pd=uf_dyn_push2(*pd,c); }
 static void uf_dyn_push_str(Dyn**pd,const char*s,size_t n){ Cell c=uf_str_new(s,n); uf_dyn_push(pd,c); }
 
@@ -1363,12 +1397,12 @@ static void op_slice(Ctx*cx){
 }
 
 /* ---- raw memory: buf, load/store, malloc/free, sizeof ---- */
-static void op_buf(Ctx*cx){ int64_t sz=pop(cx).i; if(sz<0)die("negative BUF size"); Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)sz,0); h->tag=HT_BUF; h->len=(uint64_t)sz; h->esz=1; h->gc_flags|=GCF_PINNED; memset(h->data,0,(size_t)sz); pushp(cx,h); }
-static void op_bufcopy(Ctx*cx){ int64_t n=pop(cx).i; Cell s=pop(cx),d=pop(cx); if(n>0)memmove(((void*)d.i),((void*)s.i),(size_t)n); }
-static void op_loadx(Ctx*cx){ Cell a=pop(cx); if(a.tag==T_PTR&&a.i){ Hdr*h=uf_gc_find((void*)a.i); if(h&&h->tag==HT_STR){ pushi(cx,(int64_t)(unsigned char)uf_sptr(a)[0]); return; } } pushi(cx,*(int64_t*)((void*)a.i)); }
-static void op_storex(Ctx*cx){ Cell a=pop(cx); Cell v=pop(cx); *(int64_t*)((void*)a.i)=v.i; }
-static void op_malloc(Ctx*cx){ int64_t sz=pop(cx).i; if(sz<0)die("negative MALLOC size"); void*p=malloc((size_t)sz?sz:1); if(!p)die("out of memory"); pushp(cx,p); }
-static void op_free(Ctx*cx){ Cell p=pop(cx); free(((void*)p.i)); }
+static void op_buf(Ctx*cx){ if(!uf_rt_cap(6))uf_rt_die(6,"op_buf"); int64_t sz=pop(cx).i; if(sz<0)die("negative BUF size"); Hdr*h=(Hdr*)uf_gc_alloc(sizeof(Hdr)+(size_t)sz,0); h->tag=HT_BUF; h->len=(uint64_t)sz; h->esz=1; h->gc_flags|=GCF_PINNED; memset(h->data,0,(size_t)sz); pushp(cx,h); }
+static void op_bufcopy(Ctx*cx){ if(!uf_rt_cap(6))uf_rt_die(6,"op_bufcopy"); int64_t n=pop(cx).i; Cell s=pop(cx),d=pop(cx); if(n>0)memmove(((void*)d.i),((void*)s.i),(size_t)n); }
+static void op_loadx(Ctx*cx){ if(!uf_rt_cap(6))uf_rt_die(6,"op_loadx"); Cell a=pop(cx); if(a.tag==T_PTR&&a.i){ Hdr*h=uf_gc_find((void*)a.i); if(h&&h->tag==HT_STR){ pushi(cx,(int64_t)(unsigned char)uf_sptr(a)[0]); return; } } pushi(cx,*(int64_t*)((void*)a.i)); }
+static void op_storex(Ctx*cx){ if(!uf_rt_cap(6))uf_rt_die(6,"op_storex"); Cell a=pop(cx); Cell v=pop(cx); *(int64_t*)((void*)a.i)=v.i; }
+static void op_malloc(Ctx*cx){ if(!uf_rt_cap(6))uf_rt_die(6,"op_malloc"); int64_t sz=pop(cx).i; if(sz<0)die("negative MALLOC size"); void*p=malloc((size_t)sz?sz:1); if(!p)die("out of memory"); pushp(cx,p); }
+static void op_free(Ctx*cx){ if(!uf_rt_cap(6))uf_rt_die(6,"op_free"); Cell p=pop(cx); free(((void*)p.i)); }
 static void op_sizeof(Ctx*cx){ int64_t ty=pop(cx).i; pushi(cx,(ty==3||ty==T_BOOL)?1:8); }
 
 /* ================= fmt / print / scan ================= */
@@ -1508,8 +1542,8 @@ static void op_scan(Ctx*cx){
 
 /* ================= list / dict / chan / atom ops ================= */
 static void op_list(Ctx*cx){ pushp(cx,uf_dyn_new(8)); }
-/* PUSH (was APPEND): h v -> h' (list grows by move; the returned handle is
-   the live one — the old handle is reclaimed by the GC) */
+/* PUSH (was APPEND): h v -> h (list grows in place; the pushed handle is
+   the same object — re-storing it is never needed) */
 static void op_push(Ctx*cx){ Cell v=pop(cx),h=pop(cx); Hdr*a=uf_handle(h,"PUSH"); if(a->tag!=HT_DYN)die("PUSH: not a list"); pushp(cx,uf_dyn_push2((Dyn*)a,v)); }
 static void op_lpop(Ctx*cx){ Cell h=pop(cx); Hdr*a=uf_handle(h,"POP"); if(a->tag!=HT_DYN)die("POP: not a list"); Dyn*d=(Dyn*)a; if(d->len==0)die("POP: empty list"); pushc(cx,d->data[--d->len]); }
 static void op_dict(Ctx*cx){ pushp(cx,uf_map_new()); }
@@ -1774,7 +1808,7 @@ static int uf_wait_status(int r){
 /* ================= shell ops ================= */
 /* SH (merged SH+SHX): cmd -> out err status (always captures both streams
    as fresh strings; status on top: -1 spawn failure, 128+signal) */
-static void op_sh(Ctx*cx){
+static void op_sh(Ctx*cx){ if(!uf_rt_cap(2))uf_rt_die(2,"op_sh");
   Cell c=pop(cx); const char*cmd=uf_sptr(c);
 #ifdef _WIN32
   char tmp[256]; tmpnam(tmp);
@@ -1835,7 +1869,7 @@ static void* uf_shp_worker(void*arg){
   uf_gc_worker_leave();
   return 0;
 }
-static void op_shp(Ctx*cx){
+static void op_shp(Ctx*cx){ if(!uf_rt_cap(2))uf_rt_die(2,"op_shp");
   Cell c=pop(cx);
   Ring*r=uf_ring_new(64);
   UfShp* g=(UfShp*)malloc(sizeof(UfShp)); if(!g)die("out of memory"); g->r=r; g->cmd=strdup(uf_sptr(c));
@@ -1845,7 +1879,7 @@ static void op_shp(Ctx*cx){
   pushp(cx,r);
 }
 /* EXEC: list -> status (argv list, no shell) */
-static void op_exec(Ctx*cx){
+static void op_exec(Ctx*cx){ if(!uf_rt_cap(2))uf_rt_die(2,"op_exec");
   Cell h=pop(cx); Hdr*a=uf_handle(h,"EXEC"); if(a->tag!=HT_DYN)die("EXEC: not a list");
   Dyn*d=(Dyn*)a;
   if(d->len==0)die("EXEC: empty argv");
@@ -3478,7 +3512,7 @@ static void op_group(Ctx*cx){
   for(uint64_t i=0;i<s->len;i++){
     pushc(cx,s->data[i]); uf_call_addr(cx,(const void*)f.i,0,-1,1); Cell key=pop(cx);
     Cell lst;
-    if(map_get(m,key,&lst)){ Dyn* nd=uf_dyn_push2((Dyn*)uf_gc_find((void*)lst.i),s->data[i]); if((void*)nd!=(void*)lst.i) map_put(m,key,uf_mkp(nd)); }
+    if(map_get(m,key,&lst)){ uf_dyn_push2((Dyn*)uf_gc_find((void*)lst.i),s->data[i]); }
     else { Dyn* d=uf_dyn_new(4); d=uf_dyn_push2(d,s->data[i]); map_put(m,key,uf_mkp(d)); uf_dyn_push(&order,key); }
   }
   UF_UNPROTECT(); UF_UNPROTECT(); UF_UNPROTECT();
@@ -3604,7 +3638,7 @@ static void op_btest(Ctx*cx){
 
 /* ================= script I/O ================= */
 /* SLURP: path -> str (whole file; not found/unreadable: dies) */
-static void op_slurp(Ctx*cx){
+static void op_slurp(Ctx*cx){ if(!uf_rt_cap(0))uf_rt_die(0,"op_slurp");
   Cell p=pop(cx);
   uf_fs_gate(uf_sptr(p),0);
   FILE* f=fopen(uf_sptr(p),"rb"); if(!f)die("SLURP: cannot open file");
@@ -3612,7 +3646,7 @@ static void op_slurp(Ctx*cx){
   Cell r=uf_str_new(b,strlen(b)); free(b); pushc(cx,r);
 }
 /* SPIT: path str ->  (create/truncate; error: dies) */
-static void op_spit(Ctx*cx){
+static void op_spit(Ctx*cx){ if(!uf_rt_cap(1))uf_rt_die(1,"op_spit");
   Cell st=pop(cx),p=pop(cx);
   uf_fs_gate(uf_sptr(p),1);
   FILE* f=fopen(uf_sptr(p),"wb"); if(!f)die("SPIT: cannot open file");
@@ -3621,18 +3655,18 @@ static void op_spit(Ctx*cx){
   fclose(f);
 }
 /* ARGV: -> list of strings */
-static void op_argv(Ctx*cx){
+static void op_argv(Ctx*cx){ if(!uf_rt_cap(7))uf_rt_die(7,"op_argv");
   Dyn* d=uf_dyn_new((uint64_t)nk_argc); UF_PROTECT(&d);
   char** av=(char**)nk_argv;
   for(int64_t i=0;i<nk_argc;i++){ Cell s=uf_str_new(av[i],strlen(av[i])); uf_dyn_push(&d,s); }
   UF_UNPROTECT(); pushp(cx,d);
 }
 /* HASARGS: -> int (1 if argv has >1 element, else 0) */
-static void op_hasargs(Ctx*cx){
+static void op_hasargs(Ctx*cx){ if(!uf_rt_cap(7))uf_rt_die(7,"op_hasargs");
   pushi(cx, nk_argc>1 ? 1 : 0);
 }
 /* ARGI: index -> int (argv[index] parsed as integer) */
-static void op_argi(Ctx*cx){
+static void op_argi(Ctx*cx){ if(!uf_rt_cap(7))uf_rt_die(7,"op_argi");
   int64_t idx=uf_i(pop(cx));
   if(idx<0||idx>=nk_argc) die("ARGI: index out of bounds");
   pushi(cx,(int64_t)strtoll(((char**)nk_argv)[idx],0,10));
@@ -3642,7 +3676,7 @@ static void op_argi(Ctx*cx){
 /* MMAP: path -> str (read-only zero-copy; tag str, GC-registered, munmap'd
    when swept; falls back to an owned copy for page-aligned sizes so the
    NUL terminator never crosses the mapping) */
-static void op_mmap(Ctx*cx){
+static void op_mmap(Ctx*cx){ if(!(uf_rt_cap(0)&&uf_rt_cap(1)))uf_rt_die(0,"op_mmap");
   Cell p=pop(cx);
   const char* path=uf_sptr(p);
   uf_fs_gate(path,0);
@@ -3668,7 +3702,7 @@ static void op_mmap(Ctx*cx){
   pushp(cx,s);
 }
 /* FEACH: path fn_addr ->  (fn: line -> cont; streamed; 0 stops early) */
-static void op_feach(Ctx*cx){
+static void op_feach(Ctx*cx){ if(!uf_rt_cap(0))uf_rt_die(0,"op_feach");
   Cell f=pop(cx),p=pop(cx);
   uf_fs_gate(uf_sptr(p),0);
   FILE* fp=fopen(uf_sptr(p),"r"); if(!fp)die("FEACH: cannot open file");
@@ -3682,7 +3716,7 @@ static void op_feach(Ctx*cx){
   free(line); fclose(fp);
 }
 /* FFOLD: path init fn_addr -> acc (fn: acc line -> acc) */
-static void op_ffold(Ctx*cx){
+static void op_ffold(Ctx*cx){ if(!uf_rt_cap(0))uf_rt_die(0,"op_ffold");
   Cell f=pop(cx),acc=pop(cx),p=pop(cx);
   uf_fs_gate(uf_sptr(p),0);
   FILE* fp=fopen(uf_sptr(p),"r"); if(!fp)die("FFOLD: cannot open file");
@@ -3705,7 +3739,7 @@ static _Thread_local char* uf_fsplit_line = 0;
 static _Thread_local Hdr* uf_fsplit_parent = 0; /* GC line string for view tracing */
 static _Thread_local int64_t uf_fsplit_offsets[256];
 static _Thread_local int uf_fsplit_nfields = 0;
-static void op_fsplit(Ctx*cx){
+static void op_fsplit(Ctx*cx){ if(!uf_rt_cap(0))uf_rt_die(0,"op_fsplit");
   Cell f=pop(cx),acc=pop(cx),sep=pop(cx),p=pop(cx);
   uf_fs_gate(uf_sptr(p),0);
   FILE* fp=fopen(uf_sptr(p),"r"); if(!fp)die("FSPLIT: cannot open file");
@@ -3868,7 +3902,7 @@ static void* uf_fmatch_worker(void* arg){
   uf_gc_worker_leave();
   return 0;
 }
-static void op_fmatch(Ctx*cx){
+static void op_fmatch(Ctx*cx){ if(!uf_rt_cap(0))uf_rt_die(0,"op_fmatch");
   Cell pat=pop(cx),p=pop(cx);
   uf_fs_gate(uf_sptr(p),0);
   Ring* r=uf_ring_new(64);
@@ -4092,7 +4126,7 @@ static void op_unjson(Ctx*cx){
 /* ================= streaming sink ================= */
 /* FEMIT: it path -> n (path on top; one item per line; ints/floats decimal,
    strings as-is, everything else unjson) */
-static void op_femit(Ctx*cx){
+static void op_femit(Ctx*cx){ if(!uf_rt_cap(1))uf_rt_die(1,"op_femit");
   Cell p=pop(cx),h=pop(cx);
   uf_fs_gate(uf_sptr(p),1);
   FILE* f=fopen(uf_sptr(p),"w"); if(!f)die("FEMIT: cannot open file");
@@ -4127,14 +4161,14 @@ static void op_cap(Ctx*cx){
   if(!strcmp(s,"compute")){ pushi(cx,1); return; }
   long i=uf_cap_index(s);
   if(i<0)die("CAP: unknown capability (valid: fs.read fs.write proc ffi.use ffi.import raw.syscall raw.mem host.argv fs.workspace compute)");
-  pushi(cx,uf_sb_caps[i]);
+  pushi(cx,uf_rt_cap(i));
 }
 /* CAPS: -> dict {policy, <each capability>, fs.workspace, workspace, modules, device} */
 static void op_caps(Ctx*cx){
   Map* d=uf_map_new(); UF_PROTECT(&d);
   map_put(d,uf_str_new("policy",6),uf_str_new(uf_sb_policy,strlen(uf_sb_policy)));
   for(int i=0;i<8;i++)
-    map_put(d,uf_str_new(uf_cap_names[i],strlen(uf_cap_names[i])),uf_mki(uf_sb_caps[i]));
+    map_put(d,uf_str_new(uf_cap_names[i],strlen(uf_cap_names[i])),uf_mki(uf_rt_cap(i)));
   map_put(d,uf_str_new("fs.workspace",12),uf_mki((uf_sb_on&&uf_ws_nroots>0)?1:0));
   map_put(d,uf_str_new("device",6),uf_str_new(uf_device,strlen(uf_device)));
   {

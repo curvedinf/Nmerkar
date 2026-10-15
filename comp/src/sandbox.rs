@@ -36,7 +36,7 @@ pub fn op_capability(helper: &str) -> Option<&'static str> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Tri {
+pub enum Tri {
     Allowed,
     Denied,
 }
@@ -59,7 +59,7 @@ pub struct SandboxFile {
 
 // ---- pattern matching ----
 // specificity: 2 = exact name, 1 = prefix wildcard (fs.*), 0 = bare *
-fn pattern_matches(pat: &str, cap: &str) -> Option<u8> {
+pub fn pattern_matches(pat: &str, cap: &str) -> Option<u8> {
     if pat == "*" {
         Some(0)
     } else if let Some(prefix) = pat.strip_suffix(".*") {
@@ -75,7 +75,7 @@ fn pattern_matches(pat: &str, cap: &str) -> Option<u8> {
     }
 }
 
-fn resolve_cap(rules: &Rules, cap: &str) -> Tri {
+pub fn resolve_cap(rules: &Rules, cap: &str) -> Tri {
     let mut best_allow: Option<u8> = None;
     for p in &rules.allow {
         if let Some(s) = pattern_matches(p, cap) {
@@ -339,6 +339,20 @@ pub fn path_within(path: &Path, root: &Path) -> bool {
     }
 }
 
+/// A Caps allowing exactly `grants` (the always-on pure compute is never
+/// gated): the compile-time gate for package translation units
+/// (SPEC.md "Packages"). Structurally tighten-only — grants are always a
+/// subset of the program policy by construction.
+pub fn caps_for_grants(grants: &[String], base_dir: &Path) -> Caps {
+    let mut rules = Rules::default();
+    rules.deny.push("*".to_string());
+    for g in grants {
+        rules.allow.push(g.clone());
+    }
+    let sf = SandboxFile { base: rules, policies: HashMap::new(), name: Some("package-grants".to_string()) };
+    effective(Some((&sf, "package use grants")), None, &[], &[], base_dir)
+}
+
 /// Build the effective capability set.
 ///
 /// - `baked`: the build-time .ufs (None for an unrestricted `uf`).
@@ -439,7 +453,7 @@ fn policy_list(sf: &SandboxFile) -> String {
 /// C statements baking the capability table + workspace roots into a compiled
 /// program's main() (consumed by op_cap/op_caps and uf_fs_gate; the globals
 /// themselves live in the prelude with unrestricted defaults).
-pub fn c_bake(caps: &Caps, device: &str) -> String {
+pub fn c_bake(caps: &Caps, device: &str, required: &[(String, Vec<String>)]) -> String {
     let mut s = String::new();
     s.push_str(&format!("uf_sb_on={};\n", caps.is_sandboxed as i64));
     s.push_str(&format!("uf_sb_policy=\"{}\";\n", c_escape(&caps.policy_name)));
@@ -451,6 +465,17 @@ pub fn c_bake(caps: &Caps, device: &str) -> String {
     ));
     for (i, v) in cap_vals.iter().enumerate() {
         s.push_str(&format!("uf_sb_caps[{}]={};\n", i, v));
+    }
+    // phase 3: runtime ceiling (NK_CAP_CEILING) + per-package required-cap
+    // validation — dies before main's body runs when a required capability
+    // is denied for that run
+    s.push_str("uf_rt_ceiling();\n");
+    for (alias, reqs) in required {
+        for r in reqs {
+            if let Some(i) = CAP_NAMES.iter().position(|c| c == r) {
+                s.push_str(&format!("uf_req_one(\"{}\",{});\n", c_escape(alias), i));
+            }
+        }
     }
     let roots = caps.workspace.clone().unwrap_or_default();
     s.push_str("uf_ws_nroots=0;\n");

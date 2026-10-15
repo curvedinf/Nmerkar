@@ -6,6 +6,27 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-14 — ret-operand @-sentinel boundary (fixed compiler bug, no opcode change)
+
+- A `ret` operand beginning with a source-level sentinel immediate
+  (`ret _size_of Pt`, `ret _offset Pt.y`, `ret _obj Pt`, `ret _cast Pt`)
+  mis-parsed: the operand scanner treated every `@`-prefixed identifier as
+  a statement boundary, so the `ret` was emitted *before* its operand and
+  the body fell off the end (`body must end with ret`). The boundary rule
+  now covers only the five internal rewrite sentinels
+  (`@flush`/`@liststart`/`@dictstart`/`@listlit`/`@dictlit`); the
+  `@sizeof:`/`@offset:`/`@objsize:`/`@cast:` tokens are ordinary operand
+  tokens. Covered by the package fixtures (`comp/tests/pkgs/structlib`).
+
+## 2026-10-14 — list reference semantics (behavior-only; opcode 63 unchanged)
+
+- `append` (63, 🌌) — changed (behavior): lists grow their external buffer in
+  place and the handle pushed is the same object that was consumed — growth
+  previously re-allocated and returned a new handle, making
+  `lst 42 append lst!` a mandatory re-store (and aliases silently diverged
+  after a growth). All names bound to a list handle now observe appends; see
+  SPEC "Reference semantics". Gate: `comp/tests/t24_refsem.n`.
+
 ## v15.1 — 2026-10-14 (uniform pass-through stores, `#` destructuring, vector coercion, alias retirement)
 
 - Deep-branch inline-cap fallback — fixed (compiler bug, no language

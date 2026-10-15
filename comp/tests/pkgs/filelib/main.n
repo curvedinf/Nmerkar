@@ -1,0 +1,3 @@
+pub
+slurp: p!
+  ret p read_file

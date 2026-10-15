@@ -93,7 +93,7 @@ fn collect_init_dir(
 
 /// Discover source files from a directory for directory mode.
 /// Returns (file_paths, init_flags).
-fn discover_directory(root: &str) -> (Vec<String>, Vec<bool>) {
+pub(crate) fn discover_directory(root: &str) -> (Vec<String>, Vec<bool>) {
     let rootpath = std::path::Path::new(root);
     let mut files: Vec<String> = Vec::new();
     let mut init_flags: Vec<bool> = Vec::new();
@@ -291,7 +291,7 @@ Literals and opcodes both work:
 | Tensor | `[1.0 2.0] float tensor` | same as array |
 | String | `"hello\n"` or `_str` | bare quoted strings are preferred |
 
-`append` returns a (possibly reallocated) handle — always keep the result: `lst 42 append lst!`
+Containers are references: `append` (and every mutation op) acts in place and pushes the same handle back — all names bound to a handle see the change (`lst 42 append` is enough; `copy` makes a deep copy)
 
 ## Key opcode signatures
 
@@ -452,6 +452,24 @@ pub fn run(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
 }
 
 fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
+    // package subcommands (both binaries): fetching is driver-level, and
+    // compile itself never fetches (SPEC.md "Packages")
+    if args.get(1).map(|s| s.as_str()) == Some("install") {
+        crate::pkg::cmd_install(&args[2..]);
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("pkg") {
+        crate::pkg::cmd_pkg(&args[2..]);
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("tools") {
+        crate::pkg::cmd_tools(&args[2..]);
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("run") {
+        crate::pkg::cmd_run(&args[2..], baked_sb);
+        return;
+    }
     let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
     let mut emit_c = false;
@@ -544,6 +562,11 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 eprintln!("       nk -c input.n... [-o output] [--emit-c|--emit-js|--emit-text|--emit-dense]");
                 eprintln!("       nk --to-text prog.nd | --to-dense prog.n   convert encodings (writes prog.n/.nd)");
                 eprintln!("       nk -s | --skill                    print agent SKILL.md template");
+                eprintln!("");
+                eprintln!("  packages (SPEC.md \"Packages\"):");
+                eprintln!("       nk install [gh:owner/repo[@ref] | https://… | path:dir]   fetch + approve + pin");
+                eprintln!("       nk install DIR [--locked] [--refresh SRC] [--yes]         reconcile .nk/lock");
+                eprintln!("       nk pkg gc                          sweep unreachable package roots from the store");
                 eprintln!("");
                 eprintln!("  compiler diagnostics:");
                 eprintln!("       --compiler-backtrace[=full]  show a Rust compiler backtrace on panic");
@@ -648,6 +671,10 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let mut tus: Vec<Parsed> = Vec::new();
     let mut mods: Vec<String> = Vec::new();
     let mut emit_toks: Vec<(u32, Tok)> = Vec::new();
+    // schemed use sites (packages), collected across all input TUs
+    let mut pkg_specs: Vec<(crate::ast::UseSpec, u32)> = Vec::new();
+    // pass-A stashed units: (defmod, tokens, bare mod uses, canonical input path)
+    let mut units: Vec<(String, Vec<(u32, Tok)>, Vec<String>, Option<std::path::PathBuf>)> = Vec::new();
     // the cache key must change whenever the codegen/runtime changes, so fold
     // in the compiler executable's own mtime (rebuild => new cache entries)
     let mut hash_src = String::from("codegen-rev: v13-sandbox-compute\n");
@@ -691,44 +718,101 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 Err(e) => user_err!("driver", None, "cannot read {}: {}", input, e),
             }
         };
-        let mut toks = lex_source(&src);
+        let toks = lex_source(&src);
         hash_src.push('\u{1}');
         hash_src.push_str(&src);
-        if emitting {
-            emit_toks.append(&mut toks);
-            continue;
-        }
-        // USE"name" manifests prepend to the TU that asked for them
+        // pass A: stash the lexed unit; parsing happens after packages load
         let uses: Vec<String> = toks
             .iter()
             .filter_map(|(_, t)| match t {
-                Tok::Use(n) => Some(n.clone()),
+                Tok::Use(s) => {
+                    let (id, _) = crate::pkg::split_ref(&s.source);
+                    if crate::pkg::is_schemed(&id) {
+                        None
+                    } else {
+                        Some(s.source.clone())
+                    }
+                }
                 _ => None,
             })
             .collect();
+        for (tl, t) in toks.iter() {
+            if let Tok::Use(s) = t {
+                let (id, _) = crate::pkg::split_ref(&s.source);
+                // dedupe on the full spec: the same source bound under two
+                // aliases (or grant sets) are distinct use sites
+                if crate::pkg::is_schemed(&id) && !pkg_specs.iter().any(|(u, _)| u == s) {
+                    pkg_specs.push((s.clone(), *tl));
+                }
+            }
+        }
         let is_path = input != "-"
             && (input.ends_with(".nd") || input.ends_with(".n") || std::path::Path::new(input).exists());
         let canon_base = is_path.then(|| std::path::Path::new(input).canonicalize().ok()).flatten();
-        let base_path = canon_base.as_deref();
-        let mut manifest_toks = Vec::new();
-        for u in &uses {
-            let msrc = find_manifest(u, base_path)
-                .unwrap_or_else(|| user_err!("driver", None, "USE\"{}\": no mods/{}.ufm found (searched near input, CWD/mods, ~/.nk/mods, NKMODPATH)", u, u));
-            hash_src.push_str(&msrc);
-            let mut mt = lex_source(&msrc);
-            // manifest imports are exempt from ffi.import gating: loading the
-            // module was itself gated by the ffi.use module policy
-            for t in mt.iter_mut() {
-                if let (ln, Tok::Import(im)) = t {
-                    *t = (*ln, Tok::ManifestImport(im.clone()));
-                }
-            }
-            manifest_toks.append(&mut mt);
+        units.push((defmod, toks, uses, canon_base));
+    }
+    // Packages load BEFORE inputs parse: their alias-qualified structs must
+    // be registered for caller-side `_cast alias:Name` resolution, and
+    // their parsed TUs join the merge after the inputs (TU 0 stays main).
+    let mut loaded_pkgs: Vec<crate::pkg::LoadedPkg> = Vec::new();
+    if !emitting && !pkg_specs.is_empty() {
+        loaded_pkgs = crate::pkg::resolve_and_load(
+            &pkg_specs,
+            &base_dir,
+            &caps,
+            baked_parsed.as_ref().map(|(f, _)| f),
+            &mut structs,
+        );
+        for lp in &loaded_pkgs {
+            hash_src.push_str(&format!(
+                "pkg {} root={} grant={}\n",
+                lp.pin.source,
+                lp.pin.root,
+                lp.grant.join(",")
+            ));
         }
-        manifest_toks.append(&mut toks);
-        let parsed = parse(manifest_toks, &mut structs, &caps);
-        tus.push(parsed);
-        mods.push(defmod);
+    }
+    let mut init_flags = init_flags;
+    if emitting {
+        for (_, toks, _, _) in &units {
+            emit_toks.extend(toks.iter().cloned());
+        }
+    } else {
+        // pass B: parse each input TU (manifests prepend per-TU), then the
+        // package TUs under their aliases
+        for (defmod, toks, uses, canon_base) in &units {
+            let base_path = canon_base.as_deref();
+            let mut manifest_toks = Vec::new();
+            for u in uses {
+                let msrc = find_manifest(u, base_path)
+                    .unwrap_or_else(|| user_err!("driver", None, "USE \"{}\": no mods/{}.ufm found (searched near input, CWD/mods, ~/.nk/mods, NKMODPATH)", u, u));
+                hash_src.push_str(&msrc);
+                let mut mt = lex_source(&msrc);
+                // manifest imports are exempt from ffi.import gating: loading the
+                // module was itself gated by the ffi.use module policy
+                for t in mt.iter_mut() {
+                    if let (ln, Tok::Import(im)) = t {
+                        *t = (*ln, Tok::ManifestImport(im.clone()));
+                    }
+                }
+                manifest_toks.append(&mut mt);
+            }
+            let mut toks = toks.clone();
+            manifest_toks.append(&mut toks);
+            let parsed = parse(manifest_toks, &mut structs, &caps);
+            tus.push(parsed);
+            mods.push(defmod.clone());
+        }
+        for lp in loaded_pkgs.iter_mut() {
+            for p in lp.tus.drain(..) {
+                tus.push(p);
+            }
+            let n = lp.mods.len();
+            mods.extend(lp.mods.drain(..));
+            for _ in 0..n {
+                init_flags.push(false);
+            }
+        }
     }
     if emitting {
         let toks = resolve_implicit_loads(&emit_toks);
@@ -760,6 +844,13 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     }
     let mut parsed = merge_tus(tus, mods, &init_flags);
     if std::env::var("NK_DEBUG_PARSE").is_ok() { eprintln!("[merged] ins={}", parsed.ins.len()); }
+    // extra use aliases for the same package content: twin every mangled
+    // label and qualified struct under the second name
+    for lp in &loaded_pkgs {
+        if !lp.extra_aliases.is_empty() {
+            crate::pkg::register_extra_aliases(&mut parsed, &mut structs, &lp.alias, &lp.extra_aliases);
+        }
+    }
     check_label_arity(&parsed);
     // v14.1 strictness: propagate strict/loose taints, reject implicit
     // coercion of strict values, and erase the markers (purely static)
@@ -790,7 +881,16 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     // try in #ifdef NK_GPU); kidx only matters when the prefix defined it
     compute::register_region_kernels(region_kernels);
     // bake runtime config into the generated binary
-    let mut config_lines = c_bake(&caps, device.as_deref().unwrap_or("auto"));
+    let required: Vec<(String, Vec<String>)> = loaded_pkgs
+        .iter()
+        .map(|lp| {
+            (
+                lp.alias.clone(),
+                lp.meta.caps.iter().filter(|(_, req)| *req).map(|(c, _)| c.clone()).collect(),
+            )
+        })
+        .collect();
+    let mut config_lines = c_bake(&caps, device.as_deref().unwrap_or("auto"), &required);
     if let Some(t) = gc_threshold {
         config_lines.push_str(&format!("  setenv(\"NK_GC_THRESHOLD\",\"{}\",1);\n", t));
     }

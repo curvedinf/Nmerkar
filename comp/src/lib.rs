@@ -7,12 +7,14 @@ pub mod ast;
 pub mod compute;
 pub mod driver;
 pub mod diag;
+pub mod ed25519;
 pub mod emit;
 pub mod gen;
 pub mod gen_js;
 pub mod js_prelude;
 pub mod lex;
 pub mod parse;
+pub mod pkg;
 pub mod prelude;
 pub mod sandbox;
 
@@ -33,8 +35,16 @@ pub fn compile_js(src: &str) -> String {
     let mut structs: crate::ast::StructMap = std::collections::HashMap::new();
     let toks = crate::lex::lex_source(src);
     let parsed = crate::parse::parse(toks, &mut structs, &caps);
+    if !parsed.pkg_uses.is_empty() {
+        let (s, l) = &parsed.pkg_uses[0];
+        crate::user_err!("parse", Some(*l), "package use \"{}\" is not supported in the wasm library build — resolve packages with `nks install` and compile via the CLI", s.source);
+    }
     let mut parsed =
         crate::parse::merge_tus(vec![parsed], vec!["main".to_string()], &[false]);
+    if !parsed.pkg_uses.is_empty() {
+        let (s, l) = &parsed.pkg_uses[0];
+        crate::user_err!("parse", Some(*l), "package use \"{}\" is not supported in the wasm library build — resolve packages with `nks install` and compile via the CLI", s.source);
+    }
     crate::parse::check_label_arity(&parsed);
     crate::parse::check_strictness(&mut parsed);
     crate::gen_js::gen_js(&parsed, &structs)

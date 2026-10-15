@@ -96,7 +96,10 @@ fn is_hard_boundary(t: &(u32, Tok)) -> bool {
         // last statement, and `expr if_else ret` (v12 style) covers
         // branch-returning rets via the real-stack fallback
         | Tok::Op("RET" | "IF" | "IFELSE" | "WHILE" | "FOR")
-    ) || matches!(&t.1, Tok::Ident(n) if n.starts_with('@'))
+    ) || matches!(&t.1, Tok::Ident(n) if matches!(n.as_str(), "@flush" | "@liststart" | "@dictstart" | "@listlit" | "@dictlit"))
+    // only the five internal rewrite sentinels end an operand; the
+    // source-level @sizeof:/@offset:/@objsize:/@cast: sentinels are
+    // ordinary operand tokens (ret _size_of Pt must keep its ret last)
 }
 
 fn retired_op_panic(name: &str, line: u32) -> ! {
@@ -122,6 +125,7 @@ fn empty_parsed() -> Parsed {
         strings: Vec::new(),
         vars: Vec::new(),
         uses: Vec::new(),
+        pkg_uses: Vec::new(),
         modname: None,
         pubs: Vec::new(),
         methods: Vec::new(),
@@ -208,7 +212,7 @@ impl<'a> ParseCtx<'a> {
                 Tok::Import(im) => self.parse_import(im, line),
                 Tok::ManifestImport(im) => self.parse_manifest_import(im),
                 Tok::Export(n) => self.pending_export = Some(n),
-                Tok::Use(n) => self.parse_use(n, line),
+                Tok::Use(spec) => self.parse_use(spec, line),
                 Tok::Mod(n) => self.p.modname = Some(n),
                 Tok::Pub => self.pending_pub = true,
                 Tok::Extern(n) => self.parse_extern(n, line),
@@ -430,7 +434,19 @@ impl<'a> ParseCtx<'a> {
         }
     }
 
-    fn parse_use(&mut self, n: String, line: u32) {
+    fn parse_use(&mut self, spec: UseSpec, line: u32) {
+        let (id, _) = crate::pkg::split_ref(&spec.source);
+        if crate::pkg::is_schemed(&id) {
+            // packages resolve in the driver against .nk/lock (compile never
+            // fetches); recorded here so library embedders can reject them.
+            // The optional alias is the package's namespace (`alias:name`).
+            self.p.pkg_uses.push((spec, line));
+            return;
+        }
+        if spec.alias.is_some() || spec.policy.is_some() || !spec.allows.is_empty() || !spec.denies.is_empty() {
+            user_err!("parse", Some(line), "grant clauses apply to package sources (gh:/https:/path:) — bare `use \"{}\"` loads a local mod", spec.source);
+        }
+        let n = spec.source;
         if !self.caps.module_allowed(&n) {
             let list = match &self.caps.module_allow {
                 Some(l) if !l.is_empty() => format!("; allowed modules: {}", l.join(", ")),
@@ -1360,6 +1376,7 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
         strings: Vec::new(),
         vars: Vec::new(),
         uses: Vec::new(),
+        pkg_uses: Vec::new(),
         modname: None,
         pubs: Vec::new(),
         methods: Vec::new(),
@@ -1498,6 +1515,7 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
                 m.uses.push(u.clone());
             }
         }
+        m.pkg_uses.extend(tu.pkg_uses.iter().cloned());
         // carry entry_label from the first TU only
         if tu_idx == 0 {
             if let Some(el) = &tu.entry_label {

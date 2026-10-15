@@ -16,6 +16,16 @@ pub enum Param {
     Discard,        // _!     — bind and discard one caller cell
 }
 
+// v16 packages: `use [name] <string> [policy P] [allow caps] [deny caps]`
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UseSpec {
+    pub alias: Option<String>,   // local alias (namespaced via `:` — phase 2)
+    pub source: String,          // "curl", "gh:o/r", "gh:o/r@v1.2", "https://…", "path:dir"
+    pub policy: Option<String>,  // named policy base for the grant (∅ when absent)
+    pub allows: Vec<String>,     // capability patterns added to the base
+    pub denies: Vec<String>,     // capability patterns subtracted (deny wins)
+}
+
 #[derive(Clone, Debug)]
 pub enum Tok {
     Op(&'static str),          // simple opcode with no immediate
@@ -39,7 +49,7 @@ pub enum Tok {
     ManifestImport(Import), // import from a loaded .ufm manifest (exempt from ffi.import gating)
     Export(String),
     Extern(String),
-    Use(String),                 // USE"name" — link -lname + load mods/<name>.ufm
+    Use(UseSpec),                // USE "name" — link -lname + load mods/<name>.ufm; schemed sources are packages
     Mod(String),                 // MOD"name" — translation-unit name
     Pub,                         // PUB — export the next label def globally
     Method(String),              // METHOD TypeName: — register the next label as a method
@@ -132,6 +142,7 @@ pub struct Parsed {
     pub strings: Vec<String>,
     pub vars: Vec<String>,
     pub uses: Vec<String>,
+    pub pkg_uses: Vec<(UseSpec, u32)>, // schemed use sites, pre-resolution (driver resolves; embeddings reject)
     pub modname: Option<String>,
     pub pubs: Vec<String>, // label names marked PUB (exported cross-TU)
     pub methods: Vec<(i64, i64, String)>, // (type key, method name hash, label)

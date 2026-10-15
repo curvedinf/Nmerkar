@@ -94,7 +94,24 @@ pub fn emit_text(toks: &[(u32, Tok)]) -> String {
             Tok::Import(im) | Tok::ManifestImport(im) => o.push_str(&format!("import c\"{}\"({})->{} ", im.name, im.params.join(","), im.ret)),
             Tok::Export(n) => o.push_str(&format!("export \"{}\" ", escape_str(n))),
             Tok::Extern(n) => o.push_str(&format!("extern \"{}\" ", escape_str(n))),
-            Tok::Use(n) => o.push_str(&format!("use \"{}\" ", escape_str(n))),
+            Tok::Use(spec) => {
+                o.push_str("use ");
+                if let Some(a) = &spec.alias {
+                    o.push_str(a);
+                    o.push(' ');
+                }
+                o.push_str(&format!("\"{}\"", escape_str(&spec.source)));
+                if let Some(p) = &spec.policy {
+                    o.push_str(&format!(" policy {}", p));
+                }
+                if !spec.allows.is_empty() {
+                    o.push_str(&format!(" allow {}", spec.allows.join(" ")));
+                }
+                if !spec.denies.is_empty() {
+                    o.push_str(&format!(" deny {}", spec.denies.join(" ")));
+                }
+                o.push(' ');
+            }
             Tok::Mod(n) => o.push_str(&format!("mod \"{}\" ", escape_str(n))),
             Tok::Pub => o.push_str("pub "),
             Tok::Method(n) => o.push_str(&format!("method {}: ", n)),
@@ -332,7 +349,12 @@ pub fn emit_dense(toks: &[(u32, Tok)]) -> String {
                 Tok::Import(im) | Tok::ManifestImport(im) => o.push_str(&format!("{}c\"{}\"({})->{}", glyph_of(51), im.name, im.params.join(","), im.ret)),
                 Tok::Export(n) => o.push_str(&format!("{}\"{}\"", glyph_of(52), escape_str(n))),
                 Tok::Extern(n) => o.push_str(&format!("{}\"{}\"", glyph_of(53), escape_str(n))),
-                Tok::Use(n) => o.push_str(&format!("{}\"{}\"", glyph_of(78), escape_str(n))),
+                Tok::Use(spec) => {
+                    if spec.alias.is_some() || spec.policy.is_some() || !spec.allows.is_empty() || !spec.denies.is_empty() {
+                        user_err!("emit", None, "use aliases and grant clauses are text-mode spellings — convert with --to-text (dense emits the plain package form)");
+                    }
+                    o.push_str(&format!("{}\"{}\"", glyph_of(78), escape_str(&spec.source)));
+                }
                 Tok::Mod(n) => o.push_str(&format!("{}\"{}\"", glyph_of(79), escape_str(n))),
                 Tok::Pub => o.push_str(&format!("{}", glyph_of(80))),
                 Tok::Method(_) => user_err!("emit", None, "emit-dense: METHOD was removed in v10"),

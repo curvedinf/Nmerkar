@@ -196,7 +196,7 @@ pub fn op_usage(name: &str) -> &'static str {
         "SCAN" => "fmt → values… count | fscanf",
         "DICT" => "→ h | empty hash map",
         "LIST" => "→ h | empty growable list",
-        "PUSH" => "h v → h' | append to list",
+        "PUSH" => "h v → h | append to list in place",
         "POP" => "h → v | pop from list",
         "CHAN" => "cap → h | bounded MPSC ring",
         "ENQ" => "h v → | enqueue (blocks if full)",
@@ -956,7 +956,15 @@ impl Lexer {
                 if self.peek() != Some('"') {
                     self.err("USE must be followed by \"name\"");
                 }
-                out.push((self.line, Tok::Use(self.lex_string())));
+                // dense supports the plain package form only; aliases and
+                // grant clauses are text-mode spellings (SPEC.md "Packages")
+                out.push((self.line, Tok::Use(UseSpec {
+                    alias: None,
+                    source: self.lex_string(),
+                    policy: None,
+                    allows: Vec::new(),
+                    denies: Vec::new(),
+                })));
             }
             "MOD" => {
                 self.skip_ws();
@@ -1332,6 +1340,17 @@ pub fn text_tokens(src: &str) -> Vec<(u32, String)> {
 }
 
 // decode a quoted token (with quotes) into its string value
+// a plain identifier: [a-zA-Z][a-zA-Z0-9_]* — used for use aliases and
+// policy names in clause position
+fn is_plain_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub fn unquote(tok: &str) -> Option<String> {
     let chars: Vec<char> = tok.chars().collect();
     if chars.len() < 2 || chars[0] != '"' || chars[chars.len() - 1] != '"' {
@@ -1409,6 +1428,66 @@ impl TextLexer {
             self.pos += 1;
         }
         t
+    }
+
+    // v16 packages: [policy P] [allow caps…] [deny caps…] after a use
+    // source. Each clause at most once, fixed order; a cap list ends at the
+    // first token that is not capability-shaped (identifiers legally cannot
+    // contain '.').
+    fn lex_use_clauses(&mut self) -> (Option<String>, Vec<String>, Vec<String>) {
+        let mut policy: Option<String> = None;
+        let mut allows: Option<Vec<String>> = None;
+        let mut denies: Option<Vec<String>> = None;
+        loop {
+            match self.peek() {
+                Some("policy") => {
+                    if policy.is_some() || allows.is_some() || denies.is_some() {
+                        self.err("use clauses appear out of order — write policy, then allow, then deny, each at most once");
+                    }
+                    self.pos += 1;
+                    let n = self.next().unwrap_or_else(|| self.err("policy needs a name"));
+                    if !is_plain_ident(&n) {
+                        self.err(&format!("policy needs a policy name, not `{}`", n));
+                    }
+                    policy = Some(n);
+                }
+                Some("allow") => {
+                    if allows.is_some() || denies.is_some() {
+                        self.err("use clauses appear out of order — write policy, then allow, then deny, each at most once");
+                    }
+                    self.pos += 1;
+                    allows = Some(self.take_caps("allow"));
+                }
+                Some("deny") => {
+                    if denies.is_some() {
+                        self.err("use clauses appear out of order — write policy, then allow, then deny, each at most once");
+                    }
+                    self.pos += 1;
+                    denies = Some(self.take_caps("deny"));
+                }
+                _ => break,
+            }
+        }
+        (policy, allows.unwrap_or_default(), denies.unwrap_or_default())
+    }
+
+    fn take_caps(&mut self, which: &str) -> Vec<String> {
+        let mut caps = Vec::new();
+        while let Some(t) = self.peek() {
+            if crate::pkg::is_cap_token(t) {
+                caps.push(t.to_string());
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if caps.is_empty() {
+            self.err(&format!(
+                "use {} needs at least one capability on the same run (fs.read, proc, fs.*, * …)",
+                which
+            ));
+        }
+        caps
     }
     fn err(&self, msg: &str) -> ! {
         user_err!("lex", Some(self.line()), "text lex error at token {}: {}", self.pos, msg)
@@ -1562,12 +1641,37 @@ impl TextLexer {
                 "*" => self.err("'*' removed in v13 — use `mul`"),
                 "&" => self.err("'&' removed in v13 — use `and`"),
                 "=" => self.err("= (je) removed — use if/ifelse"),
+                t if t.starts_with("use\"")
+                    || t.starts_with("mod\"")
+                    || t.starts_with("export\"")
+                    || t.starts_with("extern\"") =>
+                {
+                    let kw = &tok[..tok.find('"').unwrap()];
+                    self.err(&format!("write a space: {} \"name\"", kw));
+                }
                 "pub" => out.push((l, Tok::Pub)),
-                "use" | "export" | "extern" | "mod" => {
+                "use" => {
+                    // v16 packages: use [name] <string> [policy P] [allow caps] [deny caps]
+                    let alias_owned = match self.peek() {
+                        Some(t) if is_plain_ident(t) => Some(t.to_string()),
+                        _ => None,
+                    };
+                    let alias = match alias_owned {
+                        Some(a) => {
+                            self.pos += 1;
+                            Some(a)
+                        }
+                        None => None,
+                    };
+                    let n = self.next().unwrap_or_else(|| self.err("use needs \"name\""));
+                    let n = unquote(&n).unwrap_or_else(|| self.err("use needs \"name\""));
+                    let (policy, allows, denies) = self.lex_use_clauses();
+                    out.push((l, Tok::Use(UseSpec { alias, source: n, policy, allows, denies })));
+                }
+                "export" | "extern" | "mod" => {
                     let n = self.next().unwrap_or_else(|| self.err(&format!("{} needs \"name\"", tok)));
                     let n = unquote(&n).unwrap_or_else(|| self.err(&format!("{} needs \"name\"", tok)));
                     out.push((l, match tok.as_str() {
-                        "use" => Tok::Use(n),
                         "export" => Tok::Export(n),
                         "mod" => Tok::Mod(n),
                         _ => Tok::Extern(n),

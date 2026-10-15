@@ -1,0 +1,3 @@
+pub
+shcmd: c!
+  ret c shell

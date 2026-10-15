@@ -1,0 +1,6 @@
+pub
+double: n!
+  ret n 2 mul
+pub
+greet: s!
+  ret s " from libdemo" concat

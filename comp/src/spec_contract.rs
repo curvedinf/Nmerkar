@@ -235,3 +235,27 @@ fn spec_numeric_claims_match_compiler_tables() {
     assert!(live_claims >= 1, "SPEC.md lost its live-opcode claim");
     assert!(glyph_claims >= 1, "SPEC.md lost its dense-glyph claim");
 }
+
+#[test]
+fn spec_has_no_glued_directive_spellings() {
+    // Directives are whitespace-separated (`use "name"`). The compiler
+    // rejects keyword-glued-to-quote spellings with a "write a space"
+    // remedy, so the spec must not document the broken form anywhere.
+    // (A keyword *inside* quotes — the grammar's `"use"` token — is fine.)
+    let spec = spec_text();
+    let bytes = spec.as_bytes();
+    for kw in ["use\"", "mod\"", "export\"", "extern\""] {
+        let bare = kw.trim_end_matches('"');
+        let mut start = 0;
+        while let Some(i) = spec[start..].find(kw) {
+            let at = start + i;
+            let preceded_by_quote = at > 0 && bytes[at - 1] == b'"';
+            assert!(
+                preceded_by_quote,
+                "SPEC.md documents the glued directive spelling `{}` — the lexer requires a space (write `{} \"name\"`)",
+                kw, bare
+            );
+            start = at + kw.len();
+        }
+    }
+}

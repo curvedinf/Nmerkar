@@ -287,7 +287,7 @@ fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
             o.push_str("if(iv.length)st.push.apply(st,iv.splice(0));\n");
             let caller_n = p.local_counts.get(&ctx.ins_body[i]).copied().unwrap_or(0);
             o.push_str(&format!(
-                "var _mid=st.pop();var _rc=st.pop();var _tk=RT.sendKey(_rc);var _es=(__NKMT[_mid.v.toString()])||null;var _mf=null;var _ar=1;if(_es){{for(var _qi=0;_qi<_es.length;_qi++)if(_es[_qi][0]===_tk){{_mf=_es[_qi][2];_ar=_es[_qi][1];break;}}}}if(!_mf)RT.die(rt,\"SEND: no method for this value's type (type key \"+_tk+\")\");st.push(_rc);var _lb{0}=rt.lb;rt.lb+={1};await _mf(rt,{{drain:st.length>_ar?st.length-_ar:0,base:rt.lb}});rt.lb=_lb{0};\n",
+                "var _mid=st.pop();var _rc=st.pop();var _tk=RT.sendKey(_rc);var _es=(__NKMT[_mid.v.toString()])||null;var _mf=null;var _ar=1;if(_es){{for(var _qi=0;_qi<_es.length;_qi++)if(_es[_qi][0]===_tk){{_mf=_es[_qi][2];_ar=_es[_qi][1];break;}}}}if(_mf){{st.push(_rc);var _lb{0}=rt.lb;rt.lb+={1};await _mf(rt,{{drain:st.length>_ar?st.length-_ar:0,base:rt.lb}});rt.lb=_lb{0};}}else{{st.push(_rc);if(!await __NKSB(_mid.v.toString(),rt))RT.die(rt,\"SEND: no method for this value's type (type key \"+_tk+\")\");}}\n",
                 i, caller_n
             ));
         }
@@ -903,6 +903,28 @@ pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
         o.push_str("];\n");
     }
     o.push_str("var rt=RT.makeRt();var st=rt.st;var iv=rt.iv;\n");
+    // v16 built-in methods: the fallback dispatch for migrated ops (after
+    // the user table). Rotates the send window (receiver on top ->
+    // receiver first, the op's push order) and calls the same op the
+    // direct path uses. Mirrors the C uf_send_builtin.
+    {
+        o.push_str("async function __NKSB(mid,rt){switch(mid){");
+        for (opname, sel, n) in crate::parse::MIGRATED {
+            let h = crate::parse::fnv64(sel);
+            // the JS runtime exports ops under the same op_* helper names
+            // the C target uses (simple_ins is that mapping)
+            let jsop = match crate::parse::simple_ins(opname) {
+                crate::ast::Ins::Simple(h) => h.to_string(),
+                _ => unreachable!("migrated ops are all simple"),
+            };
+            o.push_str(&format!("case \"{}\":", h));
+            if *n > 1 {
+                o.push_str(&format!("st.splice(st.length-{},0,st.pop());", n - 1));
+            }
+            o.push_str(&format!("rt.opName=\"{}\";await RT.{}(rt);return true;", sel, jsop));
+        }
+        o.push_str("default:return false;}}\n");
+    }
     // method dispatch table (SEND): selector hash -> [[type key, arity, F_]]
     if !p.methods.is_empty() {
         let mut by_mh: std::collections::HashMap<i64, Vec<(i64, usize, usize)>> = std::collections::HashMap::new();

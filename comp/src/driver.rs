@@ -848,6 +848,11 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     }
     let mut parsed = merge_tus(tus, mods, &init_flags);
     if std::env::var("NK_DEBUG_PARSE").is_ok() { eprintln!("[merged] ins={}", parsed.ins.len()); }
+    // v16 methods: bare migrated tokens are selector+send pairs; with no
+    // user override for the selector they specialize back to the direct
+    // helper call (identical machine code to pre-campaign). Runs BEFORE
+    // the arity checker so the pair's transient stack effect is elided.
+    crate::parse::specialize_builtin_sends(&mut parsed);
     // extra use aliases for the same package content: twin every mangled
     // label and qualified struct under the second name
     for lp in &loaded_pkgs {

@@ -2193,8 +2193,8 @@ pub fn emit_range(
                 // arity, so the receiver binds the LAST parameter and any
                 // args below it bind in caller order
                 e.push_str(&format!(
-                "{{int64_t mid=pop(cx).i;Cell rc=pop(cx);int64_t tk;if(rc.tag==T_PTR){{if(!rc.i)tk=2;else{{Hdr*a=uf_gc_find((void*)rc.i);tk=a?((a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag):2;}}}}else tk=(int64_t)rc.tag;int64_t ar=1;const void*lab=0;const char*mn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].tk==tk&&uf_mt[q].mh==mid){{lab=uf_mt[q].lab;ar=uf_mt[q].ar;mn=uf_mt[q].nm;break;}}if(!lab){{const char*sn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].mh==mid){{sn=uf_mt[q].nm;break;}}uf_die_send(sn,mid,tk);}}pushc(cx,rc);uf_cspush(cx,&&K_{}{},cx->sp>=ar?cx->sp-ar:0);goto *lab;K_{}{}:;}}\n",
-                prefix, i, prefix, i
+                "{{int64_t mid=pop(cx).i;Cell rc=pop(cx);int64_t tk;if(rc.tag==T_PTR){{if(!rc.i)tk=2;else{{Hdr*a=uf_gc_find((void*)rc.i);tk=a?((a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag):2;}}}}else tk=(int64_t)rc.tag;int64_t ar=1;const void*lab=0;const char*mn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].tk==tk&&uf_mt[q].mh==mid){{lab=uf_mt[q].lab;ar=uf_mt[q].ar;mn=uf_mt[q].nm;break;}}if(!lab){{pushc(cx,rc);if(uf_send_builtin(cx,mid))goto K_{}{};const char*sn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].mh==mid){{sn=uf_mt[q].nm;break;}}uf_die_send(sn,mid,tk);}}pushc(cx,rc);uf_cspush(cx,&&K_{}{},cx->sp>=ar?cx->sp-ar:0);goto *lab;K_{}{}:;}}\n",
+                prefix, i, prefix, i, prefix, i
                 ))
             }
             Ins::Weave(tasks) => {
@@ -3134,7 +3134,19 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool, profile: bool, coverage
     let resolve = |name: &str| -> usize {
         *p.labels.get(name).unwrap_or_else(|| user_err!("gen", None, "undefined label {}", name))
     };
-    o.push_str("\nstatic void nk_run(Ctx*cx, long pc){\n  uf_current_ctx=cx;\n  if(pc<0){ goto *(void*)uf_entry_addr; }\n  /* v11: set up the entry label's local frame (v13: capacity-checked) */\n  cx->local_frames[cx->local_fsp++]=cx->local_base; cx->local_base+=uf_lc(pc); if(cx->local_base>cx->local_cap)die(\"local frame overflow\");\n");
+    o.push_str("static void uf_rot1(Ctx*cx,long n){Cell t=cx->ds[cx->sp-1];for(long q=cx->sp-1;q>cx->sp-n;q--)cx->ds[q]=cx->ds[q-1];cx->ds[cx->sp-n]=t;}\n");
+    o.push_str("static int uf_send_builtin(Ctx*cx,int64_t mid){switch(mid){");
+    for (opname, sel, n) in crate::parse::MIGRATED {
+        let h = crate::parse::fnv64(sel);
+        let helper = match crate::parse::simple_ins(opname) {
+            crate::ast::Ins::Simple(h) => h,
+            _ => unreachable!("migrated ops are all simple"),
+        };
+        o.push_str(&format!("case {}LL:uf_rot1(cx,{});uf_cur_op=\"{}\";{}(cx);return 1;", h, n, sel, helper));
+    }
+    o.push_str("default:return 0;}}\n");
+
+o.push_str("\nstatic void nk_run(Ctx*cx, long pc){\n  uf_current_ctx=cx;\n  if(pc<0){ goto *(void*)uf_entry_addr; }\n  /* v11: set up the entry label's local frame (v13: capacity-checked) */\n  cx->local_frames[cx->local_fsp++]=cx->local_base; cx->local_base+=uf_lc(pc); if(cx->local_base>cx->local_cap)die(\"local frame overflow\");\n");
     // v14: spawn frame lookup — body address -> frame size (spawned bodies
     // bind locals; the runtime bumps the callee frame like _call does).
     // Address-of-label constants only exist inside nk_run, so the tables
@@ -3238,7 +3250,12 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool, profile: bool, coverage
         }
     }
     o.push_str("};\n");
-    // Dispatch emission: basic-block stack virtualization (see emit_range
+    // v16 built-in methods: the fallback dispatch for migrated ops. Each
+    // case rotates the send window (receiver on top -> receiver first, the
+    // helper's push order) and calls the same helper the direct opcode
+    // path uses. User @Type entries with the same selector key take
+    // precedence (the table scan runs first).
+        // Dispatch emission: basic-block stack virtualization (see emit_range
     // above) — jump targets start basic blocks.
     let targets: std::collections::HashSet<usize> = p.labels.values().copied().collect();
     // FOR inlining: a For immediately preceded by PushAddr of a compile-time

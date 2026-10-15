@@ -120,6 +120,7 @@ const SPECS = [
   ["comp/tests/t23_sharedpoly.n", {}],
   ["comp/tests/t24_refsem.n", {}],
   ["comp/tests/t25_methods.n", {}],
+  ["comp/tests/t26_migrated.n", {}],
   // examples: repo example programs
   ["examples/hello.n", {}],
   ["examples/fib.n", {}],

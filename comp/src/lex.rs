@@ -1625,7 +1625,13 @@ impl TextLexer {
                         out.push((l, Tok::Entry));
                         continue;
                     }
-                    check_ident(l, name, "label");
+                    // v16: label names may share op mnemonics — method
+                    // labels get mangled to Type.name in the parser (the
+                    // name never collides), and a bare label named like an
+                    // op is simply unreachable (dead code, not a lex error)
+                    if is_bad_ident(name) {
+                        self.err(&format!("label: {} — identifiers may not start with '_'", name));
+                    }
                     out.push((l, Tok::LabelDef(name.to_string())));
                     continue;
                 }

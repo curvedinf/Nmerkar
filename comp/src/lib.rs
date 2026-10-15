@@ -47,5 +47,6 @@ pub fn compile_js(src: &str) -> String {
     }
     crate::parse::check_label_arity(&parsed);
     crate::parse::check_strictness(&mut parsed);
+    crate::parse::specialize_builtin_sends(&mut parsed);
     crate::gen_js::gen_js(&parsed, &structs)
 }

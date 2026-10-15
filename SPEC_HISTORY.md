@@ -6,6 +6,22 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-15 — built-in methods campaign (78 ops; behavior-preserving)
+
+- 78 type-targeting built-ins are now automatic methods: their selectors
+  exist in the send dispatch table (`'l.length send`, `'s.uppercase
+  send`, …), organized by receiver type. The bare token stays the direct
+  op call (identical code — the "super" form an override's body uses to
+  reach the built-in). User `@Type` entries with the same (type key,
+  selector) override the built-in for that type; other types keep it.
+  The built-in fallback lives after the user table in the dispatch (a
+  window-rotate + the existing helper, both targets). The bare stack
+  selector `'name send` was removed — a selector without a named
+  receiver has no dispatch; use `'recv.method send`. Label names may now
+  share op mnemonics (method labels mangle to `Type.name`; ordinary
+  labels matching an op are dead code, not a lex error). Gates:
+  `comp/tests/t26_migrated.n` + updated `t25_methods.n`.
+
 ## 2026-10-15 — @Type methods + `send` (slot 128 revived; new syntax)
 
 - `send` (128, 📡, `args… recv 'name → r`) — added: method dispatch on the

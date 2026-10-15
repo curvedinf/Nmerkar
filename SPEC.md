@@ -391,17 +391,15 @@ the type name is ASCII in both encodings):
 **Call** — receiver, then selector, then `send`:
 
 ```nmerkar
-p 'area send print                 ; dispatch on p's actual type
-'p.area send print                 ; sugar — identical after lowering
+'p.area send print                 ; the send form (dotted ref)
 2 'p.scale send q!                 ; extra args ride below the receiver
-[1 2 3] 'area send print           ; same selector, list type
+'l2.area send print                ; same selector, list type
 ```
 
-- `'name` before `send` is the selector (an FNV-1a hash pushed at parse
-  time). `'recv.method` is sugar for `recv 'method`: the receiver load +
-  selector, one token (the dotted form is valid **only** in send
-  position). The bare `'name` form takes the receiver from the stack, so
-  results chain: `p 'area send 'twice send print`.
+- `'recv.method` is the method reference: the receiver load + selector,
+  one token (the dotted form is valid **only** in send position). The
+  bare `'name` stack-selector form was removed — a selector without a
+  named receiver has no dispatch.
 - The receiver binds the **last** declared parameter; values below it
   bind in caller order (`scale: f! p!` with `2 'p.scale send` gives
   f=2, p=receiver). A method's arity is its declared parameter count.
@@ -411,8 +409,31 @@ p 'area send print                 ; dispatch on p's actual type
 - Dense: `send` is 📡; `'recv.method` is the addr glyph + ASCII
   `recv.method` (the struct-immediate spelling).
 
-Both targets implement the same table and dispatch. Gate:
-`comp/tests/t25_methods.n`.
+### Built-in methods (the v16 migration campaign)
+
+78 type-targeting built-in ops are **automatic methods**: their selectors
+exist in the dispatch table, callable via `'recv.method send`. The bare
+token stays the direct op call (the built-in / "super" form) — identical
+code to before, and an override's body can call it to reach the built-in
+behavior. User `@Type` entries with the same `(type key, selector)` take
+precedence over the built-in for that type.
+
+| tranche | selectors |
+|---|---|
+| container protocol | `get` `set` `get_or_zero` `contains` `keys` `remove` `length` `type_of` |
+| strings | `split` `join` `slice` `find` `replace_all` `trim` `uppercase` `lowercase` `starts_with` `ends_with` `regex_match` `regex_replace` `regex_split` `glob_match` `parse_int` `parse_float` |
+| sequences & vectors | `append` `pop` `sort` `filter` `any` `all` `unique` `flatten` `chunk` `group_by` `aggregate` `array_map` `array_reduce` `array_max` `array_min` `array_argsort` `array_search_sorted` `array_gather` `array_where` `array_get` `array_set` `scalar_eq` `scalar_lt` `scalar_gt` `scalar_gte` `scalar_lte` `bitmap_and` `bitmap_or` `bitmap_not` `bitmap_count` `add_to` `top_n` `sort_keys` `copy` `sum` `mean` `min` `max` `to_json` `parse_json` |
+| structured handles | `enqueue` `dequeue` `close` `atomic_get` `atomic_set` `atomic_add` `cas` `bloom_add` `bloom_test` `next` `collect` `iter_map` `iter_filter` `transpose` |
+
+A migrated op registers on every key that currently accepts it (universal
+coercion preserved: `'s.sum send` on a string coerces, same as bare
+`sum`). Defining `@list length` overrides the built-in for list
+receivers; other types still get the built-in.
+
+Label names may share op mnemonics — method labels mangle to `Type.name`
+in the parser (no collision with ordinary labels or ops).
+
+Gate: `comp/tests/t25_methods.n` and `comp/tests/t26_migrated.n`.
 
 ## Struct fields
 

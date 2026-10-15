@@ -1,0 +1,31 @@
+; t26_migrated.n — v16 built-in methods campaign: 78 type-targeting ops are
+; methods; bare tokens still work (specialized to direct calls), dotted
+; refs dispatch through the table, user @Type overrides beat builtins.
+@list length: l!
+  ret l length 1000 add
+
+entry:
+  ; bare tokens unchanged (every program in the corpus exercises these)
+  [3 1 2] sort print
+  "hello" uppercase print
+  "a,b,c" "," split length print
+  [1 2 3] sum print
+  { "x" 42 } "x" get print
+  [1 2 3] 1 get print
+  "42" parse_int 1 add print
+  [4 5 6] int array copy length print
+  ; dotted refs on built-in selectors
+  [7 8 9] nums!
+  'nums.length send print
+  'nums.sum send print
+  "hi" msg!
+  'msg.uppercase send print
+  ; user override: @list length beats the built-in for list receivers
+  [1 2] l!
+  'l.length send print
+  "str" s!
+  's.length send print
+  ; built-in still wins for non-overridden types
+  's.type_of send print
+  "migrated ok" print
+  ret

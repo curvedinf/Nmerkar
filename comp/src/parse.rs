@@ -14,6 +14,87 @@ pub fn fnv64(s: &str) -> i64 {
     h as i64
 }
 
+// v16 methods campaign: built-in ops whose primary operand is a value of a
+// built-in type are METHODS — the bare token is sugar for `selector+send`,
+// dispatching through the method table (user @Type entries with the same
+// (type key, selector) override the built-in). (opcode name, selector,
+// operand count incl. the receiver). The receiver is always the FIRST
+// pushed operand; the send window holds it LAST, so the built-in fallback
+// rotates the window right by one before calling the helper.
+pub const MIGRATED: &[(&str, &str, usize)] = &[
+    // tranche 1: the container protocol (universal methods)
+    ("GET", "get", 2), ("SET", "set", 3), ("GETQ", "get_or_zero", 2),
+    ("HAS", "contains", 2), ("KEYS", "keys", 1), ("DEL", "remove", 2),
+    ("LEN", "length", 1), ("TYPEOF", "type_of", 1),
+    // tranche 2: strings
+    ("SPLIT", "split", 2), ("JOIN", "join", 2), ("SLICE", "slice", 3),
+    ("FIND", "find", 2), ("REPL", "replace_all", 3), ("TRIM", "trim", 1),
+    ("UP", "uppercase", 1), ("DOWN", "lowercase", 1),
+    ("STARTS", "starts_with", 2), ("ENDS", "ends_with", 2),
+    ("MATCH", "regex_match", 2), ("REPLACE", "regex_replace", 3),
+    ("RSPLIT", "regex_split", 2), ("GLOB", "glob_match", 2),
+    ("ATOI", "parse_int", 1), ("ATOF", "parse_float", 1),
+    // tranche 3: sequences, vectors, dicts
+    ("PUSH", "append", 2), ("POP", "pop", 1), ("SORT", "sort", 1),
+    ("FILTER", "filter", 2), ("SOME", "any", 2), ("EVERY", "all", 2),
+    ("UNIQUE", "unique", 1), ("FLAT", "flatten", 1), ("CHUNK", "chunk", 2),
+    ("GROUP", "group_by", 2), ("AGG", "aggregate", 2),
+    ("VMAP", "array_map", 2), ("VFOLD", "array_reduce", 3),
+    ("VEMAX", "array_max", 2), ("VEMIN", "array_min", 2),
+    ("VARGSORT", "array_argsort", 1), ("VSEARCHSORTED", "array_search_sorted", 2),
+    ("VGATHER", "array_gather", 2), ("VWHERE", "array_where", 3),
+    ("VGET", "array_get", 2), ("VSET", "array_set", 3),
+    ("VEQ", "scalar_eq", 2), ("VLT", "scalar_lt", 2), ("VGT", "scalar_gt", 2),
+    ("VGE", "scalar_gte", 2), ("VLE", "scalar_lte", 2),
+    ("VAND", "bitmap_and", 2), ("VOR", "bitmap_or", 2),
+    ("VNOT", "bitmap_not", 1), ("VCOUNT", "bitmap_count", 1),
+    ("ADDTO", "add_to", 3), ("TOPN", "top_n", 2), ("SORTKEYS", "sort_keys", 1),
+    ("CLONE", "copy", 1),
+    ("VSUM", "sum", 1), ("VMEAN", "mean", 1), ("VMIN", "min", 1), ("VMAX", "max", 1),
+    ("UNJSON", "to_json", 1), ("JSON", "parse_json", 1),
+    // tranche 4: structured handles
+    ("ENQ", "enqueue", 2), ("DEQ", "dequeue", 1), ("CLOSE", "close", 1),
+    ("AGET", "atomic_get", 1), ("ASET", "atomic_set", 2),
+    ("AADD", "atomic_add", 2), ("CAS", "cas", 3),
+    ("BADD", "bloom_add", 2), ("BTEST", "bloom_test", 2),
+    ("NEXT", "next", 1), ("COLLECT", "collect", 1),
+    ("IMAP", "iter_map", 2), ("IFILTER", "iter_filter", 2),
+    ("TRANSPOSE", "transpose", 1),
+];
+
+pub fn is_migrated_op(name: &str) -> bool {
+    MIGRATED.iter().any(|(n, _, _)| *n == name)
+}
+
+pub fn migrated_selector(name: &str) -> &'static str {
+    // callers are guarded by is_migrated_op; the empty fallback is unreachable
+    MIGRATED.iter().find(|(n, _, _)| *n == name).map(|(_, s, _)| *s).unwrap_or("")
+}
+
+pub fn migrated_of_hash(h: i64) -> Option<(&'static str, &'static str, usize)> {
+    MIGRATED.iter().find(|(_, s, _)| fnv64(s) == h).copied()
+}
+
+/// Rewrite bare-token pairs [PushI(hash), Send] in place: the pair becomes
+/// [Simple(helper), Nop] when no user method shares the selector — same
+/// length (no pc shifts), and the bare form costs exactly what it did
+/// before the campaign. Called after merge (all user methods are known).
+pub fn specialize_builtin_sends(p: &mut Parsed) {
+    let user_hashes: std::collections::HashSet<i64> = p.methods.iter().map(|(_, mh, _)| *mh).collect();
+    let mut i = 0;
+    while i + 1 < p.ins.len() {
+        if let (Ins::PushI(h), Ins::Send) = (&p.ins[i], &p.ins[i + 1]) {
+            if !user_hashes.contains(h) {
+                if let Some((opname, _, _)) = migrated_of_hash(*h) {
+                    p.ins[i] = simple_ins(opname);
+                    p.ins[i + 1] = Ins::Nop;
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
 // method dispatch type key: struct names -> 1000+sid; otherwise the value's
 // tag (identical to what `type_of` reports — HT_* for handles, T_* for
 // scalars), so `@list` methods dispatch on any list, `@Point` on its objs
@@ -183,6 +264,10 @@ impl<'a> ParseCtx<'a> {
                 Tok::Op("LOOSE") => pi(&mut self.p, Ins::Loose, line),
                 Tok::Op("CAST") => self.parse_cast(line),
                 Tok::Op("SEND") => pi(&mut self.p, Ins::Send, line),
+                // v16 methods campaign: bare migrated tokens stay direct op
+                // calls (the built-in, a.k.a. the "super" form); only the
+                // dotted 'recv.method send dispatches through the method
+                // table, where user @Type overrides take precedence
                 Tok::Op(name) if name.starts_with('~') => retired_op_panic(name, line),
                 Tok::Op(name) => {
                     gate_op(name, self.caps, line);
@@ -320,10 +405,10 @@ impl<'a> ParseCtx<'a> {
     fn parse_jump(&mut self, op: &'static str, label: String, line: u32) {
         match op {
             "ADDR" => {
-                // method reference: 'recv.method is the sugar for
-                // `recv 'method` (receiver load + selector); the bare
-                // 'method form is the selector alone. Both require send
-                // position — anything else is a compile error.
+                // method reference: 'recv.method loads the receiver and
+                // pushes the selector — the one send form. The bare
+                // 'method selector was removed with the built-in methods
+                // campaign (a bare stack-top selector has no receiver).
                 if let Some((recv, meth)) = label.split_once('.') {
                     if !matches!(self.q.front().map(|t| &t.1), Some(Tok::Op("SEND"))) {
                         user_err!("parse", Some(line), "'{}.{}: a dotted reference is only valid in send position — write `{}.{} send`", recv, meth, recv, meth);
@@ -332,10 +417,9 @@ impl<'a> ParseCtx<'a> {
                     pi(&mut self.p, Ins::PushI(fnv64(meth)), line);
                 } else {
                     if matches!(self.q.front().map(|t| &t.1), Some(Tok::Op("SEND"))) {
-                        pi(&mut self.p, Ins::PushI(fnv64(&label)), line);
-                    } else {
-                        pi(&mut self.p, Ins::PushAddr(label), line);
+                        user_err!("parse", Some(line), "bare selectors were removed — name the receiver: '{}.<method> send`", label);
                     }
+                    pi(&mut self.p, Ins::PushAddr(label), line);
                 }
             }
             "CALL" => {
@@ -2991,8 +3075,9 @@ mod tests {
     #[test]
     fn label_arity_error_is_a_parse_diagnostic() {
         let d = crate::diag::catch_diag(|| {
-            let p = parse_src("entry:\n  _call big\n  ret\nbig: n!\n  ret n\n");
-            check_label_arity(&p);
+            let mut p = parse_src("entry:\n  _call big\n  ret\nbig: n!\n  ret n\n");
+            specialize_builtin_sends(&mut p);
+        check_label_arity(&p);
         });
         assert_eq!(d.stage, "parse");
         assert_eq!(d.line, Some(2));
@@ -3004,7 +3089,8 @@ mod tests {
 
     #[test]
     fn label_arity_accepts_a_satisfied_call() {
-        let p = parse_src("entry:\n  5 _call dbl ret\ndbl: n!\n  ret n n add\n");
+        let mut p = parse_src("entry:\n  5 _call dbl ret\ndbl: n!\n  ret n n add\n");
+        specialize_builtin_sends(&mut p);
         check_label_arity(&p); // must not panic
     }
 
@@ -3063,8 +3149,9 @@ mod tests {
     #[test]
     fn label_arity_error_fires_with_callee_defined_first() {
         let d = crate::diag::catch_diag(|| {
-            let p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 _call add2\n  print\n  ret\n");
-            check_label_arity(&p);
+            let mut p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 _call add2\n  print\n  ret\n");
+            specialize_builtin_sends(&mut p);
+        check_label_arity(&p);
         });
         assert_eq!(d.stage, "parse");
         assert_eq!(
@@ -3076,8 +3163,9 @@ mod tests {
     #[test]
     fn label_arity_error_fires_with_callee_defined_first_zero_args() {
         let d = crate::diag::catch_diag(|| {
-            let p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  _call add2\n  ret\n");
-            check_label_arity(&p);
+            let mut p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  _call add2\n  ret\n");
+            specialize_builtin_sends(&mut p);
+        check_label_arity(&p);
         });
         assert_eq!(d.stage, "parse");
         assert!(
@@ -3089,7 +3177,8 @@ mod tests {
 
     #[test]
     fn label_arity_accepts_satisfied_call_with_callee_first() {
-        let p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 4 _call add2\n  print\n  ret\n");
+        let mut p = parse_src("add2: a! b!\n  ret a b add\nentry:\n  3 4 _call add2\n  print\n  ret\n");
+        specialize_builtin_sends(&mut p);
         check_label_arity(&p); // must not panic
     }
 
@@ -3098,8 +3187,9 @@ mod tests {
     #[test]
     fn label_arity_rejects_underbound_filter_callback() {
         let d = crate::diag::catch_diag(|| {
-            let p = parse_src("[1 2 3] 'big filter\nret\nbig: a! b!\n  ret 1\n");
-            check_label_arity(&p);
+            let mut p = parse_src("[1 2 3] 'big filter\nret\nbig: a! b!\n  ret 1\n");
+            specialize_builtin_sends(&mut p);
+        check_label_arity(&p);
         });
         assert_eq!(d.stage, "parse");
         assert!(
@@ -3112,8 +3202,9 @@ mod tests {
     #[test]
     fn label_arity_rejects_underbound_spawn_body() {
         let d = crate::diag::catch_diag(|| {
-            let p = parse_src("entry:\n  'w spawn\n  ret\nw: x!\n  ret x\n");
-            check_label_arity(&p);
+            let mut p = parse_src("entry:\n  'w spawn\n  ret\nw: x!\n  ret x\n");
+            specialize_builtin_sends(&mut p);
+        check_label_arity(&p);
         });
         assert_eq!(d.stage, "parse");
         assert!(
@@ -3125,7 +3216,8 @@ mod tests {
 
     #[test]
     fn label_arity_accepts_for_body_binding() {
-        let p = parse_src("entry:\n  5 'fbody for\n  ret\nfbody: k!\n  k print\n  ret 0\n");
+        let mut p = parse_src("entry:\n  5 'fbody for\n  ret\nfbody: k!\n  k print\n  ret 0\n");
+        specialize_builtin_sends(&mut p);
         check_label_arity(&p); // must not panic
     }
 
@@ -3200,8 +3292,9 @@ mod tests {
         for (name, src, needle, expect_err) in fixtures {
             if *expect_err {
                 let d = crate::diag::catch_diag(|| {
-                    let p = parse_src(src);
-                    check_label_arity(&p);
+                    let mut p = parse_src(src);
+                    specialize_builtin_sends(&mut p);
+        check_label_arity(&p);
                 });
                 assert_eq!(d.stage, "parse", "fixture {:?}: wrong stage", name);
                 assert!(
@@ -3213,8 +3306,9 @@ mod tests {
                 );
             } else {
                 // no diagnostic expected: a user_err panic fails the test
-                let p = parse_src(src);
-                check_label_arity(&p);
+                let mut p = parse_src(src);
+                specialize_builtin_sends(&mut p);
+        check_label_arity(&p);
             }
         }
     }

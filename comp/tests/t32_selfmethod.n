@@ -1,0 +1,61 @@
+; t32_selfmethod.n — v16.1 receiver-first method binding (Python `self`):
+; the calling object always binds the FIRST declared parameter; extra
+; arguments bind in caller order below it.
+; Run: nk comp/tests/t32_selfmethod.n
+
+struct Pt {x:int, y:int}
+
+@Pt area: self!
+  ret self "x" get self "y" get mul
+
+@Pt scale: self! f!
+  ret self "x" get f mul
+
+@Pt translate: self! dx! dy!
+  self "x" get dx add nx!
+  self "x" nx set
+  self "y" get dy add ny!
+  self "y" ny set
+  ret self
+
+@Pt sum: self!
+  ret self "x" get self "y" get add
+
+@int twice: self!
+  ret self 2 mul
+
+entry:
+  _obj Pt p!
+  p "x" 3 set p "y" 4 set consume
+
+  ; 1. single param: self only
+  'p.area 12 eq check
+
+  ; 2. self + one arg: receiver binds the first param, args in caller order
+  2 'p.scale 6 eq check
+  10 'p.scale 30 eq check
+
+  ; 3. two args after self (mutating translate)
+  1 2 'p.translate consume
+  p "x" get 4 eq check
+  p "y" get 6 eq check
+
+  ; 4. built-in tag receivers + built-in methods unchanged
+  5 iv!
+  'iv.twice 10 eq check
+  consume
+  [1 2 3] l!
+  consume
+  'l.length 3 eq check
+
+  ; 5. chained: bind the result, then the next dotted quote
+  'p.sum r!
+  consume
+  'r.twice 20 eq check
+
+  ; 6. missing arg dies at the site (contained by try), naming the param
+  : 'p.scale ret try ok# _#
+  ok 0 eq check
+
+  "self-method-ok" print
+  ret

@@ -4354,7 +4354,7 @@ static long uf_wprepare(Ctx*cx, Map*m, WTsk** out, long* n_out, long** out_order
   }
   long n=*n_out;
   /* resolve inputs -> indices */
-  long* adj=(long*)uf_alloc((size_t)(n?n:1)*sizeof(long),0); /* indegree */
+  long* adj=(long*)uf_alloc((size_t)(n?n:1)*sizeof(long),0); memset(adj,0,(size_t)(n?n:1)*sizeof(long)); /* indegree */
   long** edges=(long**)uf_alloc((size_t)(n?n:1)*sizeof(long*),0);
   for(long i=0;i<n;i++){
     Dyn*di=(Dyn*)uf_gc_find((void*)t[i].ins.i);
@@ -4368,7 +4368,7 @@ static long uf_wprepare(Ctx*cx, Map*m, WTsk** out, long* n_out, long** out_order
   }
   /* Kahn */
   long* order=(long*)uf_alloc((size_t)(n?n:1)*sizeof(long),0);
-  long done_n=0; char* ready=(char*)uf_alloc((size_t)(n?n:1),0);
+  long done_n=0; char* ready=(char*)uf_alloc((size_t)(n?n:1),0); memset(ready,0,(size_t)(n?n:1));
   for(long pass=0;pass<n;pass++){
     long pick=-1;
     for(long i=0;i<n;i++) if(!ready[i]&&adj[i]==0){pick=i;break;}

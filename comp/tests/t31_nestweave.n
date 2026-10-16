@@ -1,0 +1,47 @@
+; t31_nestweave.n — nested weaves: a Weave value built and run inside
+; another weave's task, and a saved weave edited from a task body.
+; Run: nk comp/tests/t31_nestweave.n
+
+: x! x 10 add ret g!
+
+; 1. a saved inner weave, run from an outer task's body
+weave
+  i1:
+    ret 5
+  i2: i1!
+    ret i1 2 mul
+save inner!
+
+weave
+  outer:
+    inner 'inner.run "i2" get
+    ret
+run outer 10 eq check
+
+; 2. outer task EDITS the inner weave, then runs it
+weave
+  outer2:
+    {"name" "i3" "fn" g "in" ["i2"] "count" 1} 'inner.add consume
+    inner 'inner.run "i3" get
+    ret
+run outer2 20 eq check
+
+; 3. a saved weave built at top level, run from a DIFFERENT weave's
+;    task, with the result feeding the outer DAG
+weave
+  m1:
+    ret 7
+  m2: m1!
+    ret m1 3 mul
+save mid!
+weave
+  outer3:
+    mid 'mid.run "m2" get
+    ret
+run outer3 21 eq check
+
+; 4. the inner results dict reaches the outer world
+inner 'inner.run "i1" get 5 eq check
+
+"nested-weave-ok" print
+ret

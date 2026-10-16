@@ -6,6 +6,52 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-15 — inline-while cond semantics fixed (ret value vs store pass-throughs)
+
+- t27 gate bug: section 7 spelled the fib loop `more cond2 while` — backwards;
+  `while` takes `cond body →` (SPEC op 116), so the compiler treated the BODY
+  as the cond. Native "passed" only by accident: the inline cond's trailing
+  `ret 0` value-push was trimmed as a stray, so the loop tested the top store
+  pass-through (`i` — equal to `i>0` for fib) instead of the cond's return
+  value; with different store order the loop ran until stack overflow
+  (pass-throughs accumulated, never popped). Source fixed to
+  `cond2 more while`; both targets now agree on the reversed shape too (one
+  iteration, `ret 0` tested).
+- `gen.rs` inline while: the direct-cond peel now requires the cond emission
+  to be a single data-stack push (store pass-throughs in a cond disable the
+  peel); the trailing `ret <lit>` PushI trim is skipped when the cond range
+  contains pass-through stores (`LocalSet`/`SetV`/`LocalSetI`), so the pop
+  path tests the return value with the pass-throughs below it — matching the
+  generic call path (RET drains the frame, pushes only the value); `K_WE`
+  exits reset `cx->sp=_sp0` so a pass-through cond leaves no leftovers on
+  loop exit. Web parity corpus now includes t27 (93 gates).
+
+## 2026-10-15 — receiver-first method binding (`self`) + SEND frame fix
+
+- Methods: the receiver now binds the **first** declared parameter
+  (Python-`self` style — convention `self!`), extra arguments binding the
+  remaining parameters in caller order below it; previously the receiver
+  bound the last declared parameter. Declaration spelling changes from
+  `scale: f! p!` to `scale: self! f!` (same call `2 'p.scale`). The
+  synthesized `@Weave` methods (`check`/`run`/`del`/`add`) flip to
+  receiver-first too. Gate: `comp/tests/t32_selfmethod.n`.
+- Native SEND codegen bug fixed (pre-existing since methods landed): the
+  dispatch jumped into the method body without pushing a local frame, so
+  the method's parameter binds landed on the CALLER's local slots and
+  clobbered its variables (any method taking params could corrupt caller
+  state; e.g. `'iv.twice` overwrote the caller's slot-0 local). The Send
+  arm now saves/bumps/restores `local_base` past the caller's live slots
+  exactly like the Call arm — the JS target already did this, which is why
+  the two targets disagreed. No opcode or syntax change.
+- JS `to_json` parity fix (pre-existing): vector-op results (`array_map`
+  & friends produce `{t:"v"}` cells) died "UNJSON: unsupported handle" —
+  `unjsonW` now serializes them as element arrays (bitmaps still die),
+  mirroring the C `HT_ARR`/`HT_TENSOR`/`HT_MAT` branch. Missing-parameter
+  die messages now name the right parameter for receiver-first methods on
+  both targets (the guard-offset→name mapping assumed the old full-reverse
+  emission). Web parity corpus extended to t28–t32 (92 gates; t27 stays
+  native-only — its while-continuation fn-cell path still gaps on JS).
+
 ## 2026-10-15 — editable weaves (`weave ... save`, the Weave struct) + `task` removed
 
 - `WSAVE` (57, 🧶, `save`) — added (slot revived): ends a weave block and
@@ -24,6 +70,13 @@ new semantics or performance) are listed under the commit that made them.
 - Built-in `@Weave` methods synthesized when a TU saves a weave (a user
   `@Weave name:` wins): `check`, `run`, `del`, `add` (spec dict +
   receiver). Gate: `comp/tests/t30_edweave.n`.
+- Nesting fixes found by t31_nestweave.n: `save w!` binds a shared var
+  (a plain store after the task labels would be frame-local — task
+  bodies in other frames couldn't read the weave); task-body label
+  prefixing now only re-points quotes naming labels defined in the same
+  body (`'recv.method` and cross-body refs pass through); the dynamic
+  Kahn zero-initializes its state (a second `save` in one program
+  reported phantom cycles on dirty heap).
 
 ## 2026-10-15 — `'` is the only call surface (`send` and `call` retired)
 

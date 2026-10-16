@@ -20,7 +20,25 @@ fn sb_param_info(p: &Parsed, pc: usize) -> Option<(String, usize, String)> {
     }
     let lpc = best_lpc?;
     let params = p.label_params.get(&lpc)?;
-    let name = params.get(off).map(|pr| match pr {
+    // v16.1 receiver-first methods emit [params[0], params[1..].rev()], so
+    // the guard offset (arity-1-k at emission position k) maps to a
+    // different declared index than the full-reverse order ordinary labels
+    // use: position 0 is the receiver (params[0]), position k>=1 binds
+    // params[arity-k].
+    let is_method = p
+        .methods
+        .iter()
+        .any(|(_, _, l)| p.labels.get(l).map_or(false, |&m| m == lpc));
+    let idx = if is_method {
+        if off + 1 >= params.len() {
+            0
+        } else {
+            off + 1
+        }
+    } else {
+        off
+    };
+    let name = params.get(idx).map(|pr| match pr {
         Param::Local(n) | Param::Global(n) => n.clone(),
         Param::Discard => "_!".to_string(),
     })?;
@@ -1714,7 +1732,25 @@ pub fn emit_range(
                     if let Some((bbs, bbe, cbs, cbe)) = inline_whiles.get(&i).copied() {
                         let inner_c = format!("{}WC{}_", prefix, i);
                         let inner_b = format!("{}WB{}_", prefix, i);
-                        let cbe_trim = if cbe > cbs + 1 && matches!(p.ins[cbe - 1], Ins::PushI(_)) { cbe - 1 } else { cbe };
+                        // Trim the cond's trailing PushI (the `ret <lit>`
+                        // value) only when the cond has no pass-through
+                        // stores: with stores (v15: one stack effect per
+                        // token) the trimmed ret value is what the pop path
+                        // must test — the store pass-throughs must stay
+                        // BELOW it, matching the generic call semantics
+                        // (RET drains the frame, pushes only the value).
+                        let cond_stores = (cbs..cbe).any(|k| matches!(
+                            p.ins[k],
+                            Ins::LocalSet(_) | Ins::SetV(_) | Ins::LocalSetI(_)
+                        ));
+                        let cbe_trim = if !cond_stores
+                            && cbe > cbs + 1
+                            && matches!(p.ins[cbe - 1], Ins::PushI(_))
+                        {
+                            cbe - 1
+                        } else {
+                            cbe
+                        };
                         let bbe_trim = if bbe > bbs + 1 && matches!(p.ins[bbe - 1], Ins::PushI(_)) { bbe - 1 } else { bbe };
                         // Register-cache typed locals across the loop. Nested
                         // inlined while/for/if share this cache (inherited from
@@ -1805,7 +1841,18 @@ pub fn emit_range(
                         let mut ce = String::new();
                         emit_range(&mut ce, p, targets, inline_fors, inline_ffolds, inline_whiles, inline_ifs, outlined_bodies, suppress, ext_idx, cbs, cbe_trim, &inner_c, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, &shared_hoist, false);
                         let mut direct_cond: Option<String> = None;
-                        if ce.ends_with(");") {
+                        // Peel only a clean single-push cond: with store
+                        // pass-throughs in the cond body (one stack effect
+                        // per token) the last pushi is a pass-through temp,
+                        // not the cond's value — peeling it would test the
+                        // wrong cell and leak the pushes (they never get
+                        // popped). Fall through to the pop path, which the
+                        // per-iteration sp reset cleans up.
+                        let cond_pushes: usize = ["pushi(cx,", "pushf(cx,", "pushc(cx,", "pushfn(cx,", "pushp(cx,"]
+                            .iter()
+                            .map(|t| ce.matches(t).count())
+                            .sum();
+                        if ce.ends_with(");") && cond_pushes == 1 {
                             for tag in ["pushi(cx,", "pushf(cx,"] {
                                 if let Some(pos) = ce.rfind(tag) {
                                     let expr = &ce[pos + tag.len()..ce.len() - 2];
@@ -1867,9 +1914,9 @@ pub fn emit_range(
                         // accumulators. Drop it; sp is already correct at exit.
                         let sp_stable = body_suppress && !e.contains("pop(cx)");
                         if sp_stable {
-                            e.push_str(&format!("}}goto K_WC_{}{};}}\nK_WE_{}{}:;", prefix, i, prefix, i));
+                            e.push_str(&format!("}}goto K_WC_{}{};}}\nK_WE_{}{}:;cx->sp=_sp0;", prefix, i, prefix, i));
                         } else {
-                            e.push_str(&format!("}}cx->sp=_sp0;goto K_WC_{}{};}}\nK_WE_{}{}:;", prefix, i, prefix, i));
+                            e.push_str(&format!("}}cx->sp=_sp0;goto K_WC_{}{};}}\nK_WE_{}{}:;cx->sp=_sp0;", prefix, i, prefix, i));
                         }
                         for (id, (name, ty)) in &regs {
                             if inherited.contains(id) { continue; }
@@ -2206,11 +2253,15 @@ pub fn emit_range(
                 // 1000+struct-id for objects, or the scalar cell tag), look
                 // up (key, selector) in uf_mt, and call with the receiver
                 // pushed back — the frame drains below the method's declared
-                // arity, so the receiver binds the LAST parameter and any
-                // args below it bind in caller order
+                // arity, so the receiver binds the FIRST declared parameter
+                // (Python-self style) and any args below it bind in caller
+                // order. The callee frame is pushed past the CALLER's live
+                // slots exactly like Call — without the bump, the method's
+                // parameter binds land on the caller's local slots.
+                let caller_n = p.local_counts.get(&ins_body[i]).copied().unwrap_or(0);
                 e.push_str(&format!(
-                "{{int64_t mid=pop(cx).i;Cell rc=pop(cx);int64_t tk;if(rc.tag==T_PTR){{if(!rc.i)tk=2;else{{Hdr*a=uf_gc_find((void*)rc.i);tk=a?((a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag):2;}}}}else tk=(int64_t)rc.tag;int64_t ar=1;const void*lab=0;const char*mn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].tk==tk&&uf_mt[q].mh==mid){{lab=uf_mt[q].lab;ar=uf_mt[q].ar;mn=uf_mt[q].nm;break;}}if(!lab){{pushc(cx,rc);if(uf_send_builtin(cx,mid))goto K_{}{};const char*sn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].mh==mid){{sn=uf_mt[q].nm;break;}}uf_die_send(sn,mid,tk);}}pushc(cx,rc);uf_cspush(cx,&&K_{}{},cx->sp>=ar?cx->sp-ar:0);goto *lab;K_{}{}:;}}\n",
-                prefix, i, prefix, i, prefix, i
+                "{{cx->local_frames[cx->local_fsp++]=cx->local_base;cx->local_base+={};int64_t mid=pop(cx).i;Cell rc=pop(cx);int64_t tk;if(rc.tag==T_PTR){{if(!rc.i)tk=2;else{{Hdr*a=uf_gc_find((void*)rc.i);tk=a?((a->tag==HT_OBJ)?1000+(int64_t)a->len:(int64_t)a->tag):2;}}}}else tk=(int64_t)rc.tag;int64_t ar=1;const void*lab=0;const char*mn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].tk==tk&&uf_mt[q].mh==mid){{lab=uf_mt[q].lab;ar=uf_mt[q].ar;mn=uf_mt[q].nm;break;}}if(!lab){{pushc(cx,rc);if(uf_send_builtin(cx,mid))goto K_{}{};const char*sn=0;for(unsigned long q=0;q<sizeof(uf_mt)/sizeof(uf_mt[0]);q++)if(uf_mt[q].mh==mid){{sn=uf_mt[q].nm;break;}}uf_die_send(sn,mid,tk);}}pushc(cx,rc);uf_cspush(cx,&&K_{}{},cx->sp>=ar?cx->sp-ar:0);goto *lab;K_{}{}:;cx->local_base=cx->local_frames[--cx->local_fsp];}}\n",
+                caller_n, prefix, i, prefix, i, prefix, i
                 ))
             }
             Ins::Weave(tasks) => {
@@ -3253,7 +3304,7 @@ o.push_str("\nstatic void nk_run(Ctx*cx, long pc){\n  uf_current_ctx=cx;\n  if(p
     o.push_str("  goto *labtab[pc];\n");
     // method dispatch table (SEND): (type key, selector hash, arity, name,
     // code address). Arity comes from the method label's declared params —
-    // the receiver is the last parameter.
+    // the receiver is the first parameter.
     o.push_str("  static const struct { int64_t tk; int64_t mh; int64_t ar; const char* nm; const void* lab; } uf_mt[] = {");
     if p.methods.is_empty() {
         o.push_str("{0,0,1,0,&&L_0}");

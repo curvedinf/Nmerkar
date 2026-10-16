@@ -99,7 +99,23 @@ fn sb_die_text(p: &Parsed, pc: usize) -> String {
         (Some(l), Some(prs)) => (l, prs),
         _ => return SB_DIE_FALLBACK.to_string(),
     };
-    let name = match params.get(off) {
+    // v16.1 receiver-first methods emit [params[0], params[1..].rev()] —
+    // guard offset to declared index differs from the ordinary full-reverse
+    // order (position 0 = receiver, position k>=1 binds params[arity-k]).
+    let is_method = p
+        .methods
+        .iter()
+        .any(|(_, _, l)| p.labels.get(l).map_or(false, |&m| m == lpc));
+    let idx = if is_method {
+        if off + 1 >= params.len() {
+            0
+        } else {
+            off + 1
+        }
+    } else {
+        off
+    };
+    let name = match params.get(idx) {
         Some(Param::Local(n)) | Some(Param::Global(n)) => n.clone(),
         Some(Param::Discard) => "_!".to_string(),
         None => return SB_DIE_FALLBACK.to_string(),

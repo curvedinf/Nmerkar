@@ -463,12 +463,12 @@ method code is reachable only through dispatch.
 the type name is ASCII in both encodings):
 
 ```nmerkar
-@Point area: p!                     ; struct method — key = struct id
-  ret p "x" get p "y" get mul
-@list area: l!                      ; built-in tag method — key = tag
-  ret l length 100 mul
-@int twice: n!                      ; scalars dispatch on their cell tag
-  ret n 2 mul
+@Point area: self!                  ; struct method — key = struct id
+  ret self "x" get self "y" get mul
+@list area: self!                   ; built-in tag method — key = tag
+  ret self length 100 mul
+@int twice: self!                   ; scalars dispatch on their cell tag
+  ret self 2 mul
 ```
 
 - The type is a struct name or a type keyword (`list`, `dict`, `str`,
@@ -492,6 +492,13 @@ leading bind names a sibling task (zero binds = source node); any other
 bind makes it a **function task** — a plain callable label, never
 scheduled. Tasks are spelled `name:` (leading binds = inputs),
 `4 name:` for fanout, inside `weave ... run|save`.
+
+**Nesting** — a saved weave value is an ordinary shared value, so
+weaves nest by reference: `save inner!`, then any task body in another
+weave reads `inner`, edits it (`'inner.add`), and runs it
+(`'inner.run`); results flow back as values (gate: t31_nestweave.n).
+Literal nested `weave` blocks *inside* a task body are not yet
+supported — hoist the inner block to a `save` and reference the value.
 
 The Weave value is editable: `'w.check` validates (dies naming the
 missing input or cycle) and pushes the dependency order; `'w.run`
@@ -517,9 +524,12 @@ on threads.
   dispatch, self-applying. The
   bare `'name` stack-selector form was removed — a selector without a
   named receiver has no dispatch.
-- The receiver binds the **last** declared parameter; values below it
-  bind in caller order (`scale: f! p!` with `2 'p.scale` gives
-  f=2, p=receiver). A method's arity is its declared parameter count.
+- The receiver binds the **first** declared parameter — the Python-`self`
+  position (convention: spell it `self!`); it arrives automatically from the
+  receiver named in the dotted quote. Extra arguments bind the remaining
+  parameters in caller order below it (`scale: self! f!` with `2 'p.scale`
+  gives self=receiver, f=2). A method's arity is its declared parameter
+  count.
 - A miss dies at the source site naming the method (when any
   implementation exists anywhere) and the receiver's type key. There is
   no static call form — the value always decides.

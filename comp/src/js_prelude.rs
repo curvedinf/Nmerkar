@@ -2082,6 +2082,17 @@ var RT = (function () {
         for (var j = 0; j < x.v.length; j++) { if (j) ob += ","; ob += unjsonW(rt, x.v[j]); }
         return ob + "]";
       }
+      // vector results (array_map & friends): element array like C's
+      // HT_ARR/HT_TENSOR/HT_MAT branch; bitmaps die like C's default
+      case "v": {
+        if (x.v.kind === "bm") die(rt, "UNJSON: unsupported handle (atom/chan/iter/bitmap/bloom)");
+        var ov = "[";
+        for (var jv = 0; jv < x.v.len; jv++) {
+          if (jv) ov += ",";
+          ov += unjsonW(rt, x.v.ety === 1 ? F(elD(x, jv)) : I(i64OfDouble(elD(x, jv))));
+        }
+        return ov + "]";
+      }
       case "d": {
         var oc = "{", m = x.v, first = 1;
         for (var k = 0; k < m.cap; k++) if (m.st[k] === 1) {

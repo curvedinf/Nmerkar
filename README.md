@@ -231,11 +231,12 @@ weave
   discounted: prices!
     ret prices 0.9 mul
 save w!                                             ; w holds the Weave value
-w 'w.check print                                    ; dependency order
-w 'w.run print                                      ; results: {prices: [...], discounted: [...]}
-: v! v 2 mul ret f!
+'w.check print                                      ; dependency order
+'w.run print                                        ; results: {prices: [...], discounted: [...]}
+: v! v 2 mul ret f!                                 ; an anonymous fn cell
+consume
 {"name" "taxed" "fn" f "in" ["discounted"] "count" 1} 'w.add consume
-w 'w.run "taxed" get print                          ; [18.0 36.0 54.0]
+'w.run "taxed" get print                            ; [18 36 54]
 ret
 ```
 

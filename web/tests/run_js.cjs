@@ -121,6 +121,12 @@ const SPECS = [
   ["comp/tests/t24_refsem.n", {}],
   ["comp/tests/t25_methods.n", {}],
   ["comp/tests/t26_migrated.n", {}],
+  ["comp/tests/t27_callable.n", {}],
+  ["comp/tests/t28_anonfn.n", {}],
+  ["comp/tests/t29_fncall.n", {}],
+  ["comp/tests/t30_edweave.n", {}],
+  ["comp/tests/t31_nestweave.n", {}],
+  ["comp/tests/t32_selfmethod.n", {}],
   // examples: repo example programs
   ["examples/hello.n", {}],
   ["examples/fib.n", {}],

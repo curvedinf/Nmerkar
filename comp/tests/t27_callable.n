@@ -35,7 +35,7 @@ f type_of 22 eq check
 
 ; 7. frame-shared while continuations (fib-style iteration, bare refs)
 0 a2! 1 b2! 10 i2!
-more cond2 while
+cond2 more while
 a2 55 eq check
 
 ; 8. method dispatch: 'recv.method is the call

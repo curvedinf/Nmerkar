@@ -149,7 +149,8 @@ pub struct Parsed {
     pub modname: Option<String>,
     pub pubs: Vec<String>, // label names marked PUB (exported cross-TU)
     pub methods: Vec<(i64, i64, String)>, // (type key, method name hash, label)
-    pub init_pcs: Vec<usize>, // instruction offsets of init-TU entry points (auto-thread)
+    pub init_pcs: Vec<usize>,
+    pub forced_shared: Vec<String>, // instruction offsets of init-TU entry points (auto-thread)
     pub entry_label: Option<String>, // label name of the ENTRY marker (jmp-from-pc0 target)
     pub local_counts: HashMap<usize, usize>, // v11: label pc -> frame size (local variable count)
     pub local_names: HashMap<usize, Vec<String>>, // debug: body pc -> slot names ordered by slot id

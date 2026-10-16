@@ -220,6 +220,7 @@ fn empty_parsed() -> Parsed {
         pubs: Vec::new(),
         methods: Vec::new(),
         init_pcs: Vec::new(),
+        forced_shared: Vec::new(),
         entry_label: None,
         local_counts: HashMap::new(),
         local_names: HashMap::new(),
@@ -334,7 +335,27 @@ impl<'a> ParseCtx<'a> {
                 Tok::List(body) => self.requeue_literal(body, "@liststart", "@listlit", line),
                 Tok::Dict(body) => self.requeue_literal(body, "@dictstart", "@dictlit", line),
                 Tok::Wrun(terminal) => self.parse_wrun(terminal, line),
-                Tok::WSave => self.parse_wsave(line),
+                Tok::WSave => {
+                    // v16: `save w!` — consume an immediately following store
+                    // and bind the Weave value to a SHARED var (the task
+                    // labels are already emitted by now, so a plain store
+                    // would be frame-local and cross-body reads would fail)
+                    let bind = match self.q.front() {
+                        Some((_, Tok::LocalSet(n))) => Some(n.clone()),
+                        _ => None,
+                    };
+                    self.parse_wsave(line);
+                    if let Some(n) = bind {
+                        self.q.pop_front();
+                        if !self.p.vars.contains(&n) {
+                            self.p.vars.push(n.clone());
+                        }
+                        pi(&mut self.p, Ins::LocalSet(n.clone()), line);
+                        if !self.p.forced_shared.contains(&n) {
+                            self.p.forced_shared.push(n);
+                        }
+                    }
+                }
                 Tok::LabelDef(n) => self.parse_label_def(n, line),
                 Tok::AnonDef => self.parse_anon(false, line),
                 Tok::AnonCall => self.parse_anon(true, line),
@@ -388,7 +409,7 @@ impl<'a> ParseCtx<'a> {
                         // receiver; fields bind to locals first (del-shape)
                         m!(Tok::Method("Weave".into()));
                         m!(Tok::LabelDef("add".into()));
-                        for n in ["__spec", "__w"] { m!(Tok::LocalSet(n.into())); }
+                        for n in ["__w", "__spec"] { m!(Tok::LocalSet(n.into())); }
                         // sf = spec "fn" get; si = spec "in" get; sc = spec "count" get
                         m!(Tok::LocalGet("__spec".into()));
                         m!(Tok::PushS("fn".into()));
@@ -424,7 +445,7 @@ impl<'a> ParseCtx<'a> {
                     if !have("del") {
                         m!(Tok::Method("Weave".into()));
                         m!(Tok::LabelDef("del".into()));
-                        for n in ["__n", "__w"] { m!(Tok::LocalSet(n.into())); }
+                        for n in ["__w", "__n"] { m!(Tok::LocalSet(n.into())); }
                         m!(Tok::LocalGet("__w".into()));
                         m!(Tok::PushS("tasks".into()));
                         m!(Tok::Op("GET"));
@@ -1106,7 +1127,9 @@ impl<'a> ParseCtx<'a> {
 
     fn parse_label_def(&mut self, n: String, line: u32) {
         let mut n = n;
+        let mut was_method = false;
         if let Some(tname) = self.pending_method.take() {
+            was_method = true;
             if self.pending_pub {
                 user_err!("parse", Some(line), "@{} {}: methods are send-only — `pub` has no effect; drop it", tname, n);
             }
@@ -1158,7 +1181,20 @@ impl<'a> ParseCtx<'a> {
         if !params.is_empty() {
             self.p.label_params.insert(self.p.ins.len(), params.clone());
         }
-        for (k, par) in params.iter().rev().enumerate() {
+        // v16.1 methods bind the receiver to the FIRST declared parameter
+        // (Python `self`): the receiver sits on top of the stack at entry,
+        // so it is emitted first, then the remaining parameters reversed
+        // (they bind the caller's arguments in push order). Ordinary
+        // labels keep the v13 convention (reversed emission, first
+        // declared binds the deepest cell).
+        let order: Vec<&Param> = if was_method && !params.is_empty() {
+            let mut o: Vec<&Param> = params[1..].iter().rev().collect();
+            o.insert(0, &params[0]);
+            o
+        } else {
+            params.iter().rev().collect()
+        };
+        for (k, par) in order.into_iter().enumerate() {
             let pc = self.p.ins.len();
             match par {
                 Param::Local(name) => pi(&mut self.p, Ins::LocalSet(name.clone()), line),
@@ -1170,7 +1206,7 @@ impl<'a> ParseCtx<'a> {
                 }
                 Param::Discard => pi(&mut self.p, Ins::Simple("op_drop"), line),
             }
-            // guard offset: the k-th pop (0-based, reversed emission)
+            // guard offset: the k-th pop (0-based emission order)
             // pops only when the caller left (arity - k) cells; see
             // the guard in gen.rs
             self.p.param_pcs.insert(pc, params.len() - 1 - k);
@@ -1900,7 +1936,10 @@ pub fn prefix_task_labels(body: Vec<(u32, Tok)>, prefix: &str) -> Vec<(u32, Tok)
         toks.into_iter()
             .map(|(ln, t)| (ln, match t {
                 Tok::LabelDef(n) => Tok::LabelDef(format!("{}{}", prefix, n)),
-                Tok::Jump(op, l) => Tok::Jump(op, format!("{}{}", prefix, l)),
+                // v16: only re-point quotes naming labels defined in this
+                // same body — 'recv.method refs and cross-task/shared
+                // references pass through untouched
+                Tok::Jump(op, l) if labels.contains(l.as_str()) => Tok::Jump(op, format!("{}{}", prefix, l)),
                 Tok::Ident(n) if labels.contains(n.as_str()) => Tok::Ident(format!("{}{}", prefix, n)),
                 Tok::List(b) => Tok::List(walk(b, prefix, labels)),
                 Tok::Dict(b) => Tok::Dict(walk(b, prefix, labels)),
@@ -1938,6 +1977,7 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
         pubs: Vec::new(),
         methods: Vec::new(),
         init_pcs: Vec::new(),
+        forced_shared: Vec::new(),
         entry_label: None,
         local_counts: HashMap::new(),
         local_names: HashMap::new(),
@@ -1969,6 +2009,12 @@ pub fn merge_tus(tus: Vec<Parsed>, mods: Vec<String>, init_flags: &[bool]) -> Pa
         }
     }
     for (tu_idx, (tu, defmod)) in tus.into_iter().zip(mods).enumerate() {
+        // v16: `save w!` binds a SHARED var (the task labels precede the
+        // store, so a plain top-level LocalSet scan would miss it) — the
+        // parser records the forced declarations
+        for n in &tu.forced_shared {
+            tu_shared.insert(n.clone());
+        }
         let modname = tu.modname.clone().unwrap_or(defmod);
         let off = m.ins.len();
         if init_flags.get(tu_idx).copied().unwrap_or(false) {

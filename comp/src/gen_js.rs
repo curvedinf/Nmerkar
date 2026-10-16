@@ -545,13 +545,13 @@ fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
             }
             if tail {
                 o.push_str(&format!(
-                    "var _b{}=RT.pop(rt,\"\");var _c{}=RT.pop(rt,\"\");if(RT.truthy(_c{}))return _b{}.v(rt,fr);\n",
-                    i, i, i, i
+                    "var _b{0}=RT.pop(rt,\"\");var _c{0}=RT.pop(rt,\"\");if(_c{0}.t===\"a\"){{await _c{0}.v(rt,{{drain:st.length,base:fr.base,noreturn:1}});_c{0}=RT.pop(rt,\"\");}}if(RT.truthy(_c{0}))return _b{0}.v(rt,fr);\n",
+                    i
                 ));
             } else {
                 o.push_str(&format!(
-                    "var _b{}=RT.pop(rt,\"\");var _c{}=RT.pop(rt,\"\");if(RT.truthy(_c{}))await _b{}.v(rt,{{drain:st.length>{}?st.length-{}:0,base:fr.base}});\n",
-                    i, i, i, i, if_arity, if_arity
+                    "var _b{0}=RT.pop(rt,\"\");var _c{0}=RT.pop(rt,\"\");if(_c{0}.t===\"a\"){{await _c{0}.v(rt,{{drain:st.length,base:fr.base,noreturn:1}});_c{0}=RT.pop(rt,\"\");}}if(RT.truthy(_c{0}))await _b{0}.v(rt,{{drain:st.length>{1}?st.length-{1}:0,base:fr.base}});\n",
+                    i, if_arity
                 ));
             }
         }
@@ -575,13 +575,13 @@ fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
                 (0, 0)
             };
             o.push_str(&format!(
-                "var _el{}=RT.pop(rt,\"\");var _th{}=RT.pop(rt,\"\");var _c{}=RT.pop(rt,\"\");\n",
-                i, i, i
+                "var _el{0}=RT.pop(rt,\"\");var _th{0}=RT.pop(rt,\"\");var _c{0}=RT.pop(rt,\"\");\n",
+                i
             ));
             o.push_str(&format!(
-                "if(RT.truthy(_c{})){{await _th{}.v(rt,{{drain:st.length>{}?st.length-{}:0,base:fr.base}});}}else{{await _el{}.v(rt,{{drain:st.length>{}?st.length-{}:0,base:fr.base}});}}\n",
-                i, i, th_ar, th_ar, i, el_ar, el_ar
-            ));
+                "if(_c{0}.t===\"a\"){{await _c{0}.v(rt,{{drain:st.length,base:fr.base,noreturn:1}});_c{0}=RT.pop(rt,\"\");}}if(RT.truthy(_c{0})){{await _th{0}.v(rt,{{drain:st.length>{1}?st.length-{1}:0,base:fr.base}});}}else{{await _el{0}.v(rt,{{drain:st.length>{2}?st.length-{2}:0,base:fr.base}});}}\n",
+                i, th_ar, el_ar
+            ));;
             // if the if_else is the last ins of its body (the next ins is a
             // label target) the branches' return values must be returned,
             // otherwise the value would fall through into the next body
@@ -597,17 +597,20 @@ fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
             // buffer (quiet PushAddr), the buffer is vdiscard'd, and the real
             // stack is restored to the entry point (_sp0) after the cond
             // result is popped and after every body — so a while leaves the
-            // stack exactly as it found it.
+            // stack exactly as it found it. v16.1: the cond may be a fn cell
+            // (called per iteration) or a plain value (tested once — truthy
+            // runs until break, falsy never runs).
             o.push_str(&format!(
-                "var _b{}=iv.pop();var _cnd{}=iv.pop();\n",
-                i, i
-            ));
-            o.push_str("iv.length=0;\n");
-            o.push_str(&format!("var _sp0{}=st.length;\n", i));
-            o.push_str(&format!(
-                "var _f{}=rt.lsp;rt.lsp++;if(rt.lsp>=64)RT.die(rt,\"loops nested too deep\");\n",
+                "var _b{0}=iv.pop();var _cnd{0}=iv.pop();\n",
                 i
             ));
+            o.push_str("iv.length=0;\n");
+            o.push_str(&format!("var _sp0{0}=st.length;\n", i));
+            o.push_str(&format!(
+                "var _f{0}=rt.lsp;rt.lsp++;if(rt.lsp>=64)RT.die(rt,\"loops nested too deep\");\n",
+                i
+            ));
+            o.push_str(&format!("var _cf{0}=(_cnd{0}.t===\"a\");\n", i));
             o.push_str("for(;;){try{\n");
             // noreturn:1 makes the cond's ret flush its virtual cells onto
             // the real stack instead of collapsing them: the inlined C
@@ -617,18 +620,18 @@ fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
             // leave it). A collapsed list would survive RT.zero and run a
             // phantom body iteration on a drained stream.
             o.push_str(&format!(
-                "await _cnd{}.v(rt,{{drain:_sp0{},base:fr.base,noreturn:1}});var _cv{}=RT.pop(rt,\"\");if(RT.zero(_cv{}))break;\n",
-                i, i, i, i
+                "if(_cf{0}){{await _cnd{0}.v(rt,{{drain:_sp0{0},base:fr.base,noreturn:1}});var _cv{0}=RT.pop(rt,\"\");if(!RT.truthy(_cv{0}))break;}}else if(!RT.truthy(_cnd{0}))break;\n",
+                i
             ));
             o.push_str(&format!(
-                "await _b{}.v(rt,{{drain:_sp0{},base:fr.base}});st.length=_sp0{};\n",
-                i, i, i
+                "await _b{0}.v(rt,{{drain:_sp0{0},base:fr.base}});st.length=_sp0{0};\n",
+                i
             ));
             o.push_str(&format!(
-                "}}catch(_e{}){{if(_e{}===RT.BREAK){{st.length=_sp0{};break;}}else if(_e{}===RT.CONT){{st.length=_sp0{};continue;}}else throw _e{};}}}}\n",
-                i, i, i, i, i, i
+                "}}catch(_e{0}){{if(_e{0}===RT.BREAK){{st.length=_sp0{0};break;}}else if(_e{0}===RT.CONT){{st.length=_sp0{0};continue;}}else throw _e{0};}}}}\n",
+                i
             ));
-            o.push_str(&format!("rt.lsp=_f{};\n", i));
+            o.push_str(&format!("rt.lsp=_f{0};\n", i));
         }
         Ins::Break => {
             o.push_str("iv.length=0;\n");

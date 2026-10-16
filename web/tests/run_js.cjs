@@ -127,6 +127,7 @@ const SPECS = [
   ["comp/tests/t30_edweave.n", {}],
   ["comp/tests/t31_nestweave.n", {}],
   ["comp/tests/t32_selfmethod.n", {}],
+  ["comp/tests/t33_polycond.n", {}],
   // examples: repo example programs
   ["examples/hello.n", {}],
   ["examples/fib.n", {}],

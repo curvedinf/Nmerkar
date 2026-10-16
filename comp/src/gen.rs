@@ -1539,7 +1539,11 @@ pub fn emit_range(
                 // (no ds round trip) and no continuation is pushed.
                 if i > start {
                     if let Ins::PushAddr(l) = &p.ins[i - 1] {
-                        if trivial_loop_exit(p, l) && !targets.contains(&(i - 1)) {
+                        // a fn cell immediately below the body addr is the
+                        // COND (v16.1 polymorphic conds) — the peephole
+                        // tests values only
+                        let fn_cond = i > start + 1 && matches!(p.ins[i - 2], Ins::PushAddr(_));
+                        if trivial_loop_exit(p, l) && !fn_cond && !targets.contains(&(i - 1)) {
                             let tb = resolve(l);
                             let is_break = matches!(p.ins[tb], Ins::Break);
                             let c = vpop(&mut e, &mut vstack, &mut vtmp);
@@ -1615,12 +1619,16 @@ pub fn emit_range(
                     }
                 }
                 if tail_if {
+                    // v16.1: the cond may be a plain value or a fn cell —
+                    // a fn cell is CALLED (arity 0) and its return tested
                     e.push_str(&format!(
-                        "{{const void* b=uf_fn_addr(pop(cx));Cell c=pop(cx);if(uf_truthy(c))goto *b;}}\n"
+                        "{{const void* b=uf_fn_addr(pop(cx));Cell c=pop(cx);if(c.tag==T_FN){{uf_cspush(cx,&&KF_{}{},cx->sp);goto *uf_fn_addr(c);KF_{}{}:;c=pop(cx);}}if(uf_truthy(c))goto *b;}}\n",
+                        prefix, i, prefix, i
                     ));
                 } else {
                     e.push_str(&format!(
-                        "{{const void* b=uf_fn_addr(pop(cx));Cell c=pop(cx);if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *b;K_{}{}:;}}}}\n",
+                        "{{const void* b=uf_fn_addr(pop(cx));Cell c=pop(cx);if(c.tag==T_FN){{uf_cspush(cx,&&KF_{}{},cx->sp);goto *uf_fn_addr(c);KF_{}{}:;c=pop(cx);}}if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *b;K_{}{}:;}}}}\n",
+                        prefix, i, prefix, i,
                         prefix, i, if_arity, if_arity, prefix, i
                     ))
                 }
@@ -1691,7 +1699,8 @@ pub fn emit_range(
                     }
                 }
                 e.push_str(&format!(
-                    "{{const void* el=uf_fn_addr(pop(cx));const void* th=uf_fn_addr(pop(cx));Cell c=pop(cx);if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *th;}}else{{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *el;}}K_{}{}:;{}}}\n",
+                    "{{const void* el=uf_fn_addr(pop(cx));const void* th=uf_fn_addr(pop(cx));Cell c=pop(cx);if(c.tag==T_FN){{uf_cspush(cx,&&KF_{}{},cx->sp);goto *uf_fn_addr(c);KF_{}{}:;c=pop(cx);}}if(uf_truthy(c)){{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *th;}}else{{uf_cspush(cx,&&K_{}{},cx->sp>{}?cx->sp-{}:0);goto *el;}}K_{}{}:;{}}}\n",
+                    prefix, i, prefix, i,
                     prefix, i, th_ar, th_ar, prefix, i, el_ar, el_ar, prefix, i, cont
                 ))
             }
@@ -1879,7 +1888,7 @@ pub fn emit_range(
                             // keep the test inside the block where the cond
                             // temps are declared
                             Some(expr) => e.push_str(&format!("if(({})==0)goto K_WE_{}{};}};\n", expr, prefix, i)),
-                            None => e.push_str(&format!("}}_wc=pop(cx);if(uf_zero(_wc))goto K_WE_{}{};\n", prefix, i)),
+                            None => e.push_str(&format!("}}_wc=pop(cx);if(!uf_truthy(_wc))goto K_WE_{}{};\n", prefix, i)),
                         }
                         e.push_str("{\n");
                         // Dead-flush suppression: the loop's `cx->sp=_sp0`
@@ -1933,15 +1942,15 @@ pub fn emit_range(
                     }
                 }
                 e.push_str(&format!(
-                    "{{const void* bod=uf_fn_addr(pop(cx));const void* cnd=uf_fn_addr(pop(cx));long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;\n\
+                    "{{const void* bod=uf_fn_addr(pop(cx));Cell cc=pop(cx);const void* cnd=(cc.tag==T_FN)?uf_fn_addr(cc):0;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;\n\
                      K_WT_{}{}:;cx->loops[fr].cont=&&K_WT_{}{};cx->loops[fr].end=&&K_WE_{}{};\n\
-                     uf_cspush(cx,&&K_WC_{}{},cx->sp>{}?cx->sp-{}:0);goto *cnd;K_WC_{}{}:;\n\
-                     if(uf_zero(pop(cx)))goto K_WE_{}{};\n\
+                     if(cnd){{uf_cspush(cx,&&K_WC_{}{},cx->sp>{}?cx->sp-{}:0);goto *cnd;K_WC_{}{}:;if(!uf_truthy(pop(cx)))goto K_WE_{}{};}}\n\
+                     else if(!uf_truthy(cc))goto K_WE_{}{};\n\
                      uf_cspush(cx,&&K_WB_{}{},cx->sp>{}?cx->sp-{}:0);goto *bod;K_WB_{}{}:;pop(cx);\n\
                      goto K_WT_{}{};\n\
                      K_WE_{}{}:;cx->lsp=fr;}}\n",
                     prefix, i, prefix, i, prefix, i,
-                    prefix, i, cond_arity, cond_arity, prefix, i,
+                    prefix, i, cond_arity, cond_arity, prefix, i, prefix, i,
                     prefix, i,
                     prefix, i, body_arity, body_arity, prefix, i,
                     prefix, i,
@@ -3401,7 +3410,11 @@ o.push_str("\nstatic void nk_run(Ctx*cx, long pc){\n  uf_current_ctx=cx;\n  if(p
                 }
             }
             if let (Ins::PushAddr(tl), Ins::PushAddr(el), Ins::IfElse) = (&p.ins[j - 2], &p.ins[j - 1], &p.ins[j]) {
-                if !targets.contains(&(j - 2)) && !targets.contains(&(j - 1)) {
+                // a fn cell at j-3 is the COND (v16.1 polymorphic conds) —
+                // the inline path tests the vstack value only, so route fn
+                // conds to the generic emitter (which calls them)
+                let fn_cond = j >= 3 && matches!(p.ins[j - 3], Ins::PushAddr(_));
+                if !fn_cond && !targets.contains(&(j - 2)) && !targets.contains(&(j - 1)) {
                     let tbs = resolve(tl);
                     let ebs = resolve(el);
                     if let (Some(tbe), Some(ebe)) = (for_body_range(&p.ins, tbs), for_body_range(&p.ins, ebs)) {
@@ -3416,7 +3429,10 @@ o.push_str("\nstatic void nk_run(Ctx*cx, long pc){\n  uf_current_ctx=cx;\n  if(p
         }
         if j >= 1 {
             if let (Ins::PushAddr(l), Ins::If) = (&p.ins[j - 1], &p.ins[j]) {
-                if !targets.contains(&(j - 1)) && !trivial_loop_exit(p, l) {
+                // a fn cell at j-2 is the COND (v16.1 polymorphic conds) —
+                // inline only value conds
+                let fn_cond = j >= 2 && matches!(p.ins[j - 2], Ins::PushAddr(_));
+                if !fn_cond && !targets.contains(&(j - 1)) && !trivial_loop_exit(p, l) {
                     let tbs = resolve(l);
                     if let Some(tbe) = for_body_range(&p.ins, tbs) {
                         if inlinable_for(p, tbs, tbe) {

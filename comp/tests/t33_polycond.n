@@ -1,0 +1,73 @@
+; t33_polycond.n — v16.1 polymorphic conditions: if / if_else / while accept
+; an ordinary value OR a fn reference in the cond slot.
+; - value cond: tested once with truthiness (while: falsy never runs,
+;   truthy runs until break)
+; - fn cond: called (arity 0), return tested (while: per iteration)
+; Run: nk comp/tests/t33_polycond.n
+
+; 1. value conds (the classic form) — sanity
+1 vyes if
+0 vyes if
+1 vthen vels if_else
+0 vthen vels if_else
+
+; 2. fn conds on if / if_else
+ct vfn if
+cf vfn if
+ct vt ve if_else
+cf vt ve if_else
+
+; 3. fn cond on while (re-evaluated per iteration)
+0 k!
+cfive step while
+k 5 eq check
+
+; 4. value cond on while: falsy — body never runs
+0 nvr!
+0 nbod while
+nvr 0 eq check
+
+; 5. value cond on while: truthy non-1 — runs until break
+0 fc!
+"x" fb while
+fc 3 eq check
+
+; 6. fn cond through a variable (dynamic fn cell)
+ccond cfv!
+consume
+0 j!
+cfv step2 while
+j 5 eq check
+
+; 7. fn cond on if with mutation (shared var visible through the call)
+0 hit!
+ct note if
+consume
+hit 1 eq check
+
+"polycond-ok" print
+ret
+
+; --- cond fns (arity 0) ---
+ct: ret 1
+cf: ret 0
+cfive: ret k 5 lt
+ccond: ret j 5 lt
+
+; --- bodies ---
+vyes: "value-if-once" print ret
+vthen: "then-once" print ret
+vels: "else-once" print ret
+vfn: "fn-if-once" print ret
+vt: "fn-then-once" print ret
+ve: "fn-else-once" print ret
+note: hit 1 add hit! ret 0
+nbod: nvr 1 add nvr! ret 0
+step: k 1 add k! ret 0
+step2: j 1 add j! ret 0
+fb:
+  fc 1 add fc!
+  fc 3 eq fbrk if
+  ret 0
+fbrk: break
+  ret 0

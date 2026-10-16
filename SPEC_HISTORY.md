@@ -6,6 +6,25 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-15 — polymorphic conditions (value or fn) on if / if_else / while
+
+- `IF` (114) / `IF_ELSE` (115) / `WHILE` (116) — behavior change: the cond
+  slot accepts a plain value **or** a fn reference. A value is tested once
+  with truthiness; a fn cell (tag 22, static label ref or dynamic from a
+  var) is called with arity 0 and its return tested — per iteration for
+  `while` (a dynamic fn-cell cond was previously impossible on `while`,
+  which required the cond as a ref but a *value* cond previously died
+  "expected a fn"). A value cond on `while` cannot change between
+  iterations: falsy never runs the body, truthy runs until `break`
+  (`1 body while` forever idiom). Previously a fn cell as an `if` cond was
+  itself tested (always truthy) — now it is called; no corpus program did
+  that. While's cond test unified on truthiness (`uf_truthy`/`RT.truthy`,
+  was a raw zero check) matching the SPEC's documented falsy set; the
+  inlining analyses (inline `if`/`if_else`, the tail-if peephole) now skip
+  static fn conds so they route to the generic emitters that call them
+  (`while` inlining was already fn-only by pattern). Gate:
+  `comp/tests/t33_polycond.n`.
+
 ## 2026-10-15 — inline-while cond semantics fixed (ret value vs store pass-throughs)
 
 - t27 gate bug: section 7 spelled the fib loop `more cond2 while` — backwards;

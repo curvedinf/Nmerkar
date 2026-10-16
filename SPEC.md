@@ -753,13 +753,18 @@ coerce their operands via the universal coercion rules.
 ### Structured control flow
 
 Compiler-resolved; quotation addresses via `'<label>`. `break`/`continue`
-outside a loop are compile errors.
+outside a loop are compile errors. **v16.1 polymorphic conditions**: `if`,
+`if_else`, and `while` accept an ordinary value **or** a fn reference in the
+cond slot. A value is tested once with truthiness; a fn cell is called
+(arity 0) and its return tested — for `while`, per iteration. A value cond
+on `while` cannot change: falsy never runs the body, truthy runs until
+`break` (the `1 body while` forever idiom).
 
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
-| 114 | 🤦 | `if` | cond body → | CALL body if cond nonzero |
-| 115 | 🌛 | `if_else` | cond then else → | transfers control — a body may end with it |
-| 116 | 😘 | `while` | cond body → | exit on 0, else CALL body, repeat |
+| 114 | 🤦 | `if` | cond body → | body = fn; cond = value (truthiness) or fn (called, return tested) |
+| 115 | 🌛 | `if_else` | cond then else → | branches = fn; cond as `if`; a body may end with it |
+| 116 | 😘 | `while` | cond body → | body = fn; cond = fn (called per iteration, exit on falsy) or value (tested once; truthy = until break) |
 | 117 | 🚢 | `break` | → | to end of nearest enclosing while/for |
 | 118 | 🤧 | `continue` | → | next iteration of nearest enclosing loop |
 
@@ -1557,7 +1562,9 @@ tracked string never enters pointer arithmetic; read its bytes with `get`
 
 `if`, `if_else`, `while`, `filter`, `any`, `all`, and bitmap ops use JS-style
 truthiness. Falsy values: `0`, `""`, `null`, `NaN`, and empty collections.
-Everything else is truthy (`1`).
+Everything else is truthy (`1`). A fn cell as an `if`/`if_else`/`while` cond
+is **called** (not itself tested); a fn cell in any other value position
+(e.g. under `not`) is truthy.
 
 ### Tail-position if: early returns
 

@@ -1314,6 +1314,22 @@ pub fn emit_range(
                         let inherited_arr: HashMap<String, String> = arr_ptr.clone();
                         let inherited_sh: HashMap<String, (String, VType)> = shared_hoist.clone();
                         let mut reg: HashMap<usize, (String, VType)> = reg.clone();
+                        // v16.1: the element-vs-index kind is not static, so
+                        // the body's index-bind slot may receive non-int
+                        // elements — its Int/numeric promotion (inferred
+                        // from index pushes) is only sound when the count is
+                        // a compile-time literal. The slot must be dropped
+                        // after the scan too: it re-enters reg through any
+                        // later use of the same slot in the body.
+                        let literal_count = i >= start + 2
+                            && matches!(
+                                p.ins[i - 2],
+                                Ins::PushI(_) | Ins::PushF(_)
+                            );
+                        let bind_id = match &p.ins[bs] {
+                            Ins::LocalSetI(id) => Some(*id),
+                            _ => None,
+                        };
                         {
                             let escapable = UF_DEBUG.load(Ordering::Relaxed)
                                 || range_has_escaping_ctl(p, bs..be, inline_whiles, inline_fors, inline_ifs);
@@ -1335,6 +1351,11 @@ pub fn emit_range(
                                         reg.insert(id, (format!("_r{}", id), VType::Unknown));
                                     }
                                 }
+                            }
+                        }
+                        if let (Some(bid), false) = (bind_id, literal_count) {
+                            if !inherited.contains(&bid) {
+                                reg.remove(&bid);
                             }
                         }
                         let mut regs: Vec<_> = reg.iter().collect();
@@ -1381,19 +1402,25 @@ pub fn emit_range(
                         }
                         emit_shared_hoists(&mut e, &sh_names, shared_types, &mut shared_hoist, &mut arr_ptr, &format!("{}{}", prefix, i));
                         emit_shared_mut_hoists(&mut e, &sh_muts, shared_types, &mut shared_hoist, &mut owned_mut, &format!("{}{}", prefix, i));
-                        e.push_str("{int64_t cnt=pop(cx).i;");
+                        // v16.1: count-or-collection — a list/array/tensor
+                        // iterates its ELEMENTS (length captured at entry),
+                        // anything count-shaped (int, numeric string, float)
+                        // is a count loop pushing the index.
+                        e.push_str("{Cell _fc=pop(cx);Hdr* _fh=0;int64_t cnt=uf_for_bounds(_fc,&_fh);");
                         // If the body immediately stores the index into a
                         // register-cached Int local, assign uf_k directly
                         // and skip the push/pop/store.
-                        let reg_store = if let Ins::LocalSetI(id) = &p.ins[bs] {
-                            if let Some((name, VType::Int)) = reg.get(id) {
-                                Some((name, *id))
+                        let reg_store = if literal_count {
+                            if let Ins::LocalSetI(id) = &p.ins[bs] {
+                                if let Some((name, VType::Int)) = reg.get(id) {
+                                    Some((name, *id))
+                                } else { None }
                             } else { None }
                         } else { None };
                         if let Some((name, _)) = &reg_store {
-                            e.push_str(&format!("for(int64_t uf_k=0;uf_k<cnt;uf_k++){{{}=uf_k;\n", name));
+                            e.push_str(&format!("for(int64_t uf_k=0;uf_k<cnt;uf_k++){{{}=(_fh?uf_i(uf_cidx(_fc,uf_k)):uf_k);\n", name));
                         } else {
-                            e.push_str(&format!("for(int64_t uf_k=0;uf_k<cnt;uf_k++){{pushi(cx,uf_k);\n"));
+                            e.push_str(&format!("for(int64_t uf_k=0;uf_k<cnt;uf_k++){{if(_fh)pushc(cx,uf_cidx(_fc,uf_k));else pushi(cx,uf_k);\n"));
                         }
                         let eff_bs = if reg_store.is_some() { bs + 1 } else { bs };
                         let inner = format!("{}F{}_", prefix, i);
@@ -1418,7 +1445,7 @@ pub fn emit_range(
                             e.push_str(&format!("pushfn(cx,(void*)&&{},{},\"{}\");", addr_lab(start, end, prefix, bs), fn_meta(p, bs).0, fn_meta(p, bs).1));
                         }
                         e.push_str(&format!(
-                        "{{const void* t=uf_fn_addr(pop(cx));int64_t cnt=pop(cx).i;long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};for(int64_t k=0;k<cnt;k++){{pushi(cx,k);uf_cspush(cx,&&K_{}{},cx->sp-1);goto *t;K_{}{}:;if(cx->sp>0)pop(cx);K_FC_{}{}:;}}K_FE_{}{}:;cx->lsp=fr;}}\n",
+                        "{{const void* t=uf_fn_addr(pop(cx));Cell _fc=pop(cx);Hdr* _fh=0;int64_t cnt=uf_for_bounds(_fc,&_fh);long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};for(int64_t k=0;k<cnt;k++){{if(_fh)pushc(cx,uf_cidx(_fc,k));else pushi(cx,k);uf_cspush(cx,&&K_{}{},cx->sp-1);goto *t;K_{}{}:;if(cx->sp>0)pop(cx);K_FC_{}{}:;}}K_FE_{}{}:;cx->lsp=fr;}}\n",
                         prefix, i, prefix, i, prefix, i, prefix, i, prefix, i, prefix, i
                         ));
                     }
@@ -2467,7 +2494,9 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
     // integer index, so the first LocalSetI at the start of any for-body
     // label receives an Int. This lets register caching fire for loop
     // counters even in continuation bodies (which share the parent
-    // function's body key).
+    // function's body key). v16.1: only a compile-time literal count
+    // guarantees the index form — a collection (or a dynamic count) may
+    // push arbitrary elements, so those bodies stay untyped.
     for j in 1..p.ins.len() {
         if let (Ins::PushAddr(l), Ins::For) = (&p.ins[j - 1], &p.ins[j]) {
             if let Some(&bs) = p.labels.get(l) {
@@ -2476,6 +2505,12 @@ fn compute_local_types(p: &Parsed) -> (HashMap<usize, VType>, Vec<usize>, std::c
                 // to the first declared parameter, which the reversed emission
                 // does not place first.
                 if p.label_params.get(&bs).map(|v| v.len() == 1).unwrap_or(false) {
+                    let literal_count = j >= 2
+                        && matches!(
+                            p.ins[j - 2],
+                            Ins::PushI(_) | Ins::PushF(_)
+                        );
+                    if !literal_count { continue; }
                     // The first LocalSetI at bs receives the iteration index.
                     if let Some(Ins::LocalSetI(id)) = p.ins.get(bs) {
                         let body = ins_body[bs];
@@ -3218,6 +3253,11 @@ pub fn gen(p: &Parsed, structs: &StructMap, debug: bool, profile: bool, coverage
             crate::ast::Ins::Simple(h) => h,
             _ => unreachable!("migrated ops are all simple"),
         };
+        o.push_str(&format!("case {}LL:uf_rot1(cx,{});uf_cur_op=\"{}\";{}(cx);return 1;", h, n, sel, helper));
+    }
+    // v16.1 helper methods: dispatch-only selectors, prelude helpers
+    for (sel, n, helper) in crate::parse::HELPER_METHODS {
+        let h = crate::parse::fnv64(sel);
         o.push_str(&format!("case {}LL:uf_rot1(cx,{});uf_cur_op=\"{}\";{}(cx);return 1;", h, n, sel, helper));
     }
     o.push_str("default:return 0;}}\n");

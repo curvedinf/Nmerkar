@@ -919,6 +919,21 @@ var RT = (function () {
   function vwrite(c, ix, val) { var ety = c.v.ety; if (ety === 1) c.v.data[ix] = fOf(val); else if (ety === 21) c.v.data[ix] = truthy(val) ? 1 : 0; else if (ety === 3) c.v.data[ix] = Number(iOf(val) & 0xffn); else c.v.data[ix] = iOf(val); }
   function vdims(c) { return c.v.rows + "x" + Math.floor(c.v.len / c.v.rows); }
   function vArrLike(proto, n) { return V(proto.v.kind, proto.v.ety, n, vZero(proto.v.ety, n), proto.v.kind === "mat" ? proto.v.rows : 0); }
+  // FOR (v16.1): count-or-collection bounds — h names the ordered collection
+  // (element loop via forElem) or null for a count loop; strings coerce to
+  // int counts by content; anything else dies (matching C's uf_for_bounds).
+  function forBounds(rt, c) {
+    if (c.t === "i" || c.t === "y") return { n: c.v, h: null };
+    if (c.t === "l") return { n: BigInt(c.v.length), h: c };
+    if (c.t === "v") return { n: BigInt(c.v.len), h: c };
+    if (c.t === "f" || c.t === "s") return { n: BigInt(Math.trunc(toNumber(c))), h: null };
+    RT.die(rt, "FOR: expected a count or an ordered collection (list/array/tensor)");
+  }
+  function forElem(c, k) {
+    var j = Number(k);
+    if (c.t === "l") return c.v[j];
+    return c.v.ety === 1 ? F(elD(c, j)) : I(i64OfDouble(elD(c, j)));
+  }
   function opArrnLike(rt, kind) {
     var ty = asInt(pop(rt, kind));
     var top = pop(rt, kind);
@@ -3688,6 +3703,66 @@ var RT = (function () {
     rt.st.push(L(pb));
   }
 
+  // ---- v16.1 helper methods (dispatch-only: 'recv.selector; no bare ops) ----
+  async function op_partition(rt) {
+    var gn = Number(iOf(pop(rt, "partition")));
+    var h = pop(rt, "partition");
+    if (gn < 1) die(rt, "PARTITION: group count < 1");
+    if (h.t === "v" && (h.v.kind === "arr" || h.v.kind === "tensor")) {
+      var len0 = h.v.len, proto = h.v, outA = new Array(gn), b0 = 0;
+      for (var g0 = 0; g0 < gn; g0++) {
+        var n0 = Math.floor(len0 / gn) + (g0 < len0 % gn ? 1 : 0);
+        var data0 = new Array(n0);
+        for (var z0 = 0; z0 < n0; z0++) data0[z0] = 0n;
+        var r0 = V(proto.kind, proto.ety, n0, data0, 0);
+        for (var j0 = 0; j0 < n0; j0++) vwrite(r0, j0, vread(h, b0 + j0));
+        outA[g0] = r0; b0 += n0;
+      }
+      rt.st.push(L(outA));
+      return;
+    }
+    var items = await materialize(h, rt);
+    var len = items.length, out = new Array(gn), b = 0;
+    for (var g = 0; g < gn; g++) {
+      var n = Math.floor(len / gn) + (g < len % gn ? 1 : 0);
+      out[g] = L(items.slice(b, b + n));
+      b += n;
+    }
+    rt.st.push(L(out));
+  }
+  function op_pairs(rt) {
+    var h = pop(rt, "pairs");
+    if (h.t !== "d") die(rt, "PAIRS: expected a dict");
+    var m = h.v, out = [];
+    for (var i = 0; i < m.cap; i++) if (m.st[i] === 1) out.push(L([m.k[i], m.v[i]]));
+    rt.st.push(L(out));
+  }
+  function op_pairs_dict(rt) {
+    var h = pop(rt, "dict");
+    if (h.t !== "l") die(rt, "DICT: expected a list of [key value] pairs");
+    var m = mapNew();
+    for (var i = 0; i < h.v.length; i++) {
+      var pe = h.v[i];
+      if (pe.t !== "l" || pe.v.length !== 2) die(rt, "DICT: each element must be a [key value] pair");
+      mapPut(m, pe.v[0], pe.v[1]);
+    }
+    rt.st.push(D(m));
+  }
+  function op_compact(rt) {
+    var h = pop(rt, "compact");
+    if (h.t !== "l") die(rt, "COMPACT: expected a list");
+    var out = [];
+    for (var i = 0; i < h.v.length; i++) if (h.v[i].t !== "n") out.push(h.v[i]);
+    rt.st.push(L(out));
+  }
+  function op_merge(rt) {
+    var h2 = pop(rt, "merge"), h1 = pop(rt, "merge");
+    if (h1.t !== "d" || h2.t !== "d") die(rt, "MERGE: expected dicts");
+    var m2 = h2.v;
+    for (var i = 0; i < m2.cap; i++) if (m2.st[i] === 1) mapPut(h1.v, m2.k[i], m2.v[i]);
+    rt.st.push(h1);
+  }
+
   // ============================== try / retry =============================
   // C try_once: 0-arg call, no drain; success -> [result, 1] (result on
   // bottom), contained die -> [0, 0]. Break/cont still escape the try.
@@ -3890,6 +3965,9 @@ var RT = (function () {
     makeRt: makeRt, taskRt: taskRt, pump: pump, BREAK: BREAK, CONT: CONT,
     die: die, pop: pop, truthy: truthy, zero: zero,
     asInt: asInt, iOf: iOf, fOf: fOf, toStr: toStr, toNumber: toNumber,
+    forBounds: forBounds, forElem: forElem,
+    op_partition: op_partition, op_pairs: op_pairs, op_pairs_dict: op_pairs_dict,
+    op_compact: op_compact, op_merge: op_merge,
     op_add: op_add, op_sub: op_sub, op_mul: op_mul, op_and: op_and, op_or: op_or,
     op_xor: op_xor, op_shl: op_shl, op_shr: op_shr, op_bnot: op_bnot,
     op_inc: op_inc, op_dec: op_dec, op_pow: op_pow, op_sqrt: op_sqrt,

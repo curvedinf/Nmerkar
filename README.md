@@ -106,9 +106,9 @@ JSON booleans through lists and dicts, and `to_json` writes them back as
 The mental model in eleven rules — function-level details and the full op
 reference are in [`SPEC.md`](SPEC.md).
 
-**1. Postfix dataflow over a hidden stack.** Read left to right: literals and
-variable loads push values; each operation consumes the values above it and
-leaves its result for the next operation. You never manipulate the stack —
+**1. Postfix dataflow.** Read left to right: literals and variables are
+values; each operation consumes the values to its left and leaves its
+result for the next operation.
 values reach an operation from literals, named variables, or the previous
 operation's result. `3 4 add print` prints `7`.
 
@@ -120,7 +120,7 @@ reads it back. A `;` starts a comment.
 effect. The value flows on; a leftover below never disturbs later lines
 (operations read from the top, and bodies drain at `ret`). Square with
 `5 3 sub d! d mul` — the pass-through *is* the operand. One caution: don't
-place a store *between* pushing a call's arguments — the leftover splices
+place a store *between* a call's arguments — the leftover splices
 into the argument window (`100 3 x! 5 'add2` passes 3 and 5, not 100
 and 5). Keep side effects on their own lines, or `consume` the leftover.
 
@@ -154,7 +154,7 @@ definition's colon; every code path ends in `ret` (see
 [Functions](#functions) for the fn value and the anonymous `:` / `':`
 forms). A callee's entire stack
 is drained on return — only the `ret` value reaches the caller, so callees
-cannot leak operands. A bare label name pushes its **fn** — an ordinary
+cannot leak operands. A bare label name evaluates to its **fn** — an ordinary
 value carrying the label's arity: store it in a variable, collect fns in a
 list, hand one to any callback-taking operation.
 
@@ -425,12 +425,12 @@ In a multi-file program the owning file's stem is prefixed
 Four debug ops work on both targets:
 
 - `dbg` peeks the stack top and renders it on stderr like `print`
-  (`dbg L8 [entry]: 200000`), without popping it
+  (`dbg L8 [entry]: 200000`), without consuming it
 - `check` dies at that line with `check failed` when its operand is falsy
   (exit code 1)
-- `timer` pushes the monotonic clock in nanoseconds (only differences are
+- `timer` reads the monotonic clock in nanoseconds (only differences are
   meaningful)
-- `memstats` pushes the native GC's counters as a dict: `{gc, objs, live, alloc}`
+- `memstats` returns the native GC's counters as a dict: `{gc, objs, live, alloc}`
 
 ```nmerkar
 ; the four debug ops in one small program

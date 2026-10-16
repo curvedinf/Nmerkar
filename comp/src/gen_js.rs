@@ -274,17 +274,17 @@ fn emit_ins(o: &mut String, i: usize, seg_start: usize, p: &Parsed, ctx: &Ctx) {
             o.push_str(&format!("var _sp0{}=st.length;\n", i));
             o.push_str(&format!("var _ccell{}=st[_sp0{}-1];\n", i, i));
             o.push_str(&format!(
-                "var _c{}=RT.asInt(_ccell{});st.length=_sp0{}-1;\n",
-                i, i, i
-            ));
+                "var _fb{0}=RT.forBounds(rt,_ccell{0});var _c{0}=_fb{0}.n;var _fh{0}=_fb{0}.h;st.length=_sp0{0}-1;\n",
+                i
+            ));;;
             o.push_str(&format!(
                 "var _f{}=rt.lsp;rt.lsp++;if(rt.lsp>=64)RT.die(rt,\"loops nested too deep\");\n",
                 i
             ));
             o.push_str(&format!("var _X{}=_ccell{};\n", i, i));
             o.push_str(&format!(
-                "for(var _k{}=0n;_k{}<_c{};_k{}++){{st.push(RT.I(_k{}));\n",
-                i, i, i, i, i
+                "for(var _k{0}=0n;_k{0}<_c{0};_k{0}++){{st.push(_fh{0}?RT.forElem(_fh{0},_k{0}):RT.I(_k{0}));\n",
+                i
             ));
             o.push_str(&format!(
                 "try{{await _b{}.v(rt,{{drain:_sp0{}-1,base:fr.base,noreturn:1}});if(_k{}===0n&&st.length>_sp0{}-1)_X{}=st[_sp0{}-1];st.length=_sp0{};st[_sp0{}-1]=_X{};}}\n",
@@ -938,14 +938,27 @@ pub fn gen_js(p: &Parsed, structs: &StructMap) -> String {
             };
             o.push_str(&format!("case \"{}\":", h));
             if *n > 1 {
-                o.push_str(&format!("st.splice(st.length-{},0,st.pop());", n - 1));
+                // rotate the receiver (top) down into the op's first-operand
+                // slot: insert index = length-before-pop - n (uf_rot1's order)
+                o.push_str(&format!("st.splice(st.length-{},0,st.pop());", n));
             }
             o.push_str(&format!("rt.opName=\"{}\";await RT.{}(rt);return true;", sel, jsop));
+        }
+        // v16.1 helper methods: dispatch-only selectors, prelude helpers
+        for (sel, n, helper) in crate::parse::HELPER_METHODS {
+            let h = crate::parse::fnv64(sel);
+            o.push_str(&format!("case \"{}\":", h));
+            if *n > 1 {
+                o.push_str(&format!("st.splice(st.length-{},0,st.pop());", n));
+            }
+            o.push_str(&format!("rt.opName=\"{}\";await RT.{}(rt);return true;", sel, helper));
         }
         o.push_str("default:return false;}}\n");
     }
     // method dispatch table (SEND): selector hash -> [[type key, arity, F_]]
-    if !p.methods.is_empty() {
+    // always emitted (possibly empty): the Send arm reads it unconditionally,
+    // and builtin-only programs (no user @Type) send too
+    {
         let mut by_mh: std::collections::HashMap<i64, Vec<(i64, usize, usize)>> = std::collections::HashMap::new();
         for (tk, mh, l) in &p.methods {
             let pc = resolve_label(p, l);

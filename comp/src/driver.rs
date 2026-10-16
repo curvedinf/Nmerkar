@@ -235,16 +235,17 @@ otherwise text.
 - Comments: `;` to end of line.
 - Numbers: self-evaluating. Negative numbers allowed in text mode.
 - Strings: `"hello\n"` — escapes: \n \t \r \0 \\ \"
-- Variables: `x!` (store, pass-through), `x@` (fetch) for locals; a plain name assigned at a TU's top level declares a **shared variable** (atomic, thread-safe); `x++` / `x+=` increment/accumulate.
-- Labels: `name:` defines; `'name` pushes address; `_call name` calls. Labels may declare input parameters: `add2: a! b!` then `3 4 _call add2`.
-- Control flow: `if` (cond `'label`), `if_else` (cond `'then_label 'else_label`), `while` (`'cond_label 'body_label`), `for` (count `'body_label`); `break`/`continue` in loop bodies only.
+- Variables: `x!` stores (pass-through — the value stays on the stack); a bare `x` is the load. A plain name assigned at a TU's top level declares a **shared variable** (atomic, thread-safe); `x++` / `x+=` increment/accumulate.
+- Labels: `name:` defines; a bare `name` is an implicit **fn reference** (a value — store it, pass it to any callback op); `'name` calls it. Labels may declare input parameters: `add2: a! b!` then `3 4 'add2`.
+- Control flow: `if` (cond `body`), `if_else` (cond `then` `else`), `while` (`cond` `body`), `for` (`count|coll` `body`) — bodies are fn references; the cond may be a plain value or a fn reference (called per iteration for `while`); `for` iterates a count (the body receives the index) or a list/array/tensor (the body receives each element); `break`/`continue` in loop bodies only.
 - Every label body must end with `ret` (returns null when bare; `ret expr` returns the value; `ret a b c` returns a list).
 - Container literals: `[1 2 3]` list, `{{ "a" 1 }}` dict, `[1 2] int array` typed array.
 - Entry point: `entry:` marks where execution starts (implicit jump from pc 0).
 - Printing: `print` consumes the top-of-stack value and prints a type-aware, recursive representation. Use `format` to build a formatted string: `x "v=%d" format print`.
-- Shell: `shell` takes a command string, pushes **3 values**: stdout, stderr, exit-status. Bind them with destructuring: `"cmd" shell out! err! status!`.
-- Destructuring bind: multi-return ops (`shell`, `regex_match`, `next`, `scan`, `try`, and any `_call` whose label returns a list) return a list; extract slots with `op a! b! _! c!`. Excess binds receive `null`.
-- Stack draining: when a label/task/callback returns, its data stack is drained back to the caller's saved pointer and the single `ret` value is pushed.
+- Shell: `shell` takes a command string and returns **one list**: `[stdout, stderr, status]`. Extract with a positional destructure bind: `"cmd" shell out# err# status#`, or `"cmd" shell out# _# _#` to keep only stdout.
+- Multi-return ops (`shell`, `regex_match`, `next`, `scan`, `try`) return a list; extract slots with the positional destructure binds `a# b# _# c#` (`_#` discards). `try` yields `[result, ok]` — `: body ret try v# ok#` binds both.
+- Anonymous functions: `: x! x x mul ret` is a one-line inline fn (a fn cell like any other); `':` applies one immediately with a list argument vector.
+- On return, a label/task/callback discards every intermediate value; only the single `ret` value reaches the caller.
 - Modules: `use "name"` links -l<name> and loads mods/<name>.ufm manifest.
 - FFI: `import c"fn"(arg_types)->ret` declares C functions.
 
@@ -254,28 +255,28 @@ otherwise text.
 
 ## Common mistakes
 
-**There are NO inline block keywords.** `else` and `then` are NOT opcodes. You cannot write Forth-style `if ... else ... then`. You MUST define separate labels and pass their addresses:
+**There are NO inline block keywords.** `else` and `then` are NOT opcodes. You cannot write Forth-style `if ... else ... then`. You MUST define separate labels and pass them as fn references (bare names):
 ```
-cond 'yes if                         ; one-branch
-cond 'then_label 'else_label if_else  ; two-branch
+cond yes if                          ; one-branch
+cond then_label else_label if_else   ; two-branch
 ```
 Where `yes:`, `then_label:`, `else_label:` are labels ending with `ret`.
 
 **`eq` compares ints and floats by value, pointers by identity.** String comparison with `eq` is unreliable — use `regex_match`, `starts_with`, `ends_with`, or `find` for string equality. Use `structural_equal`/`structural_not_equal` for strict equality.
 
-**`split` on text with a trailing separator creates an empty trailing element.** For example `"a\nb\n" "\n" split` produces `["a", "b", ""]`. Filter empties: `lines 'nonempty filter` where `nonempty: length 0 gt ret`.
+**`split` on text with a trailing separator creates an empty trailing element.** For example `"a\nb\n" "\n" split` produces `["a", "b", ""]`. Filter empties: `lines nonempty filter` where `nonempty: s! s length 0 gt ret`.
 
 **`split` is destructive** — it writes NULs into the source string in-place. Copy the string first if you need the original afterwards.
 
 **`regex_split` may produce unexpected results.** Prefer `split` (literal separator) which is reliable.
 
-**`add_to` argument order is `dict key amount`.** Not amount-first: `d@ "x" 5 add_to`.
+**`add_to` argument order is `dict key amount`.** Not amount-first: `d "x" 5 add_to`.
 
 **`write_file` argument order is `path str`** — path is FIRST, content is SECOND (unlike shell redirection).
 
-**`shell` idiom to keep only stdout:** `"cmd" shell out! _! _!` (binds stderr and status to discard slots, leaves stdout in `out`).
+**`shell` idiom to keep only stdout:** `"cmd" shell out# _# _#` (binds the stderr and status slots to discards, binds stdout in `out`).
 
-**Use shared variables (a plain name assigned at the top level) for state shared across labels** called via `if`/`for`/`filter`/`file_fold_lines` callbacks. Locals (`x!`/`x@`) are scoped to the calling function and may not be visible inside callback labels.
+**Use shared variables (a plain name assigned at the top level) for state shared across labels** called via `if`/`for`/`filter`/`file_fold_lines` callbacks. Locals (`x!` stores, bare `x` loads) are scoped to the calling function and may not be visible inside callback labels.
 
 ## Container construction
 
@@ -291,7 +292,7 @@ Literals and opcodes both work:
 | Tensor | `[1.0 2.0] float tensor` | same as array |
 | String | `"hello\n"` or `_str` | bare quoted strings are preferred |
 
-Containers are references: `append` (and every mutation op) acts in place and pushes the same handle back — all names bound to a handle see the change (`lst 42 append` is enough; `copy` makes a deep copy)
+Containers are references: `append` (and every mutation op) acts in place and returns the same handle — all names bound to a handle see the change (`lst 42 append` is enough; `copy` makes a deep copy)
 
 ## Key opcode signatures
 
@@ -310,75 +311,79 @@ Common ops with non-obvious stack signatures:
 | `iter` | `h → it` | create cursor from any collection |
 | `next` | `it → [value, more]` | `more`=0 means exhausted (`value` is 0) |
 | `collect` | `it → list` | drain iterator into a list |
-| `file_fold_lines` | `path init fn_addr → acc` | streaming reduce over file lines; fn is `(acc line → acc)` |
-| `file_each_line` | `path fn_addr →` | call fn per line; fn is `(line → )`, stops early if fn returns 0 |
-| `for` | `count body_addr →` | pushes loop index k per iteration |
-| `filter` | `list pred_addr → list'` | pred is `(elem → 0/1)` |
-| `array_map` | `arr fn_addr → arr'` | fn is `(elem → elem')` |
-| `array_reduce` | `arr init fn_addr → acc` | fn is `(acc elem → acc)` |
+| `file_fold_lines` | `path init fn → acc` | streaming reduce over file lines; fn is `(acc line → acc)` |
+| `file_each_line` | `path fn →` | call fn per line; fn is `(line → )`, stops early if fn returns 0 |
+| `for` | `count\|coll body →` | count: the body receives the loop index k; list/array/tensor: the body receives each ELEMENT (length captured at entry) |
+| `filter` | `list pred → list'` | pred is `(elem → 0/1)` |
+| `array_map` | `arr fn → arr'` | fn is `(elem → elem')` |
+| `array_reduce` | `arr init fn → acc` | fn is `(acc elem → acc)` |
 
 ## Worked examples
 
 ### Count lines in all .rs files (inline)
 ```
-nk '"find . -name \"*.rs\" | sort" shell out! _! _! out@ "\n" split length print ret'
+nk '"find . -name \"*.rs\" | sort" shell out# _# _# out "\n" split length print ret'
 ```
 
 ### file_fold_lines to count lines in a file
 ```
-"data.txt" 0 'step file_fold_lines "lines: %d" format print ret
+"data.txt" 0 step file_fold_lines "lines: %d" format print ret
 step: acc! _!
-  acc@ inc ret
+  acc 1 add ret
 ```
 
-### for loop
+### for loop (count form and collection form)
 ```
-5 'body for "done" print ret
+5 body for "done" print ret
 body:
-  "%d" format print ret
+  i! i "%d" format print ret
+
+[10 20 30] sumeach for t print ret   ; iterates ELEMENTS: 60 (0 t! declares t)
+sumeach: v! t v add t! ret 0
 ```
 
 ### Sum a list of numbers
 ```
-[10 20 30] int array 0 'addup array_reduce "sum: %d" format print ret
-addup:
-  add ret
+[10 20 30] int array 0 addup array_reduce "sum: %d" format print ret
+addup: a! v!
+  a v add ret
 ```
 
 ### Double every element in an array
 ```
 5 int array nums!
-nums@ 'dbl array_map nums!
-nums@ 0 get "first: %d" format print ret
-dbl:
-  2 mul ret
+nums dbl array_map nums!
+consume
+nums 0 get "first: %d" format print ret
+dbl: v!
+  v 2 mul ret
 ```
 
 ### Keep elements greater than 3
 ```
-0 10 range 'big? filter length "kept: %d" format print ret
-big?:
-  3 gt ret
+0 10 range big filter length "kept: %d" format print ret
+big: v!
+  v 3 gt ret
 ```
 
 ### Count lines matching a pattern in a file
 ```
-"log.txt" 0 'count_err file_fold_lines "errors: %d" format print ret
+"log.txt" 0 count_err file_fold_lines "errors: %d" format print ret
 count_err: acc! line!
-  line@ "ERROR" starts_with acc@ add ret
+  line "ERROR" starts_with acc add ret
 ```
 
 ### Transform a list of strings to uppercase
 ```
-list "hello" append "world" append iter 'ucase iter_map collect "\n" join print ret
-ucase:
-  uppercase ret
+list "hello" append "world" append iter ucase iter_map collect "\n" join print ret
+ucase: v!
+  v uppercase ret
 ```
 
 ## Best practices
 
 - Prefer named variables over chaining more than two ops in a row.
-- Use locals (`x!`/`x@`) for function-scoped state, shared variables (top-level plain-name assignment) for shared state.
+- Use locals (`x!` stores, bare `x` loads) for function-scoped state, shared variables (top-level plain-name assignment) for shared state.
 - Prefer structured ops (`filter`, `sort`, `array_map`, `array_reduce`) over manual loops.
 - Use `read_file`/`write_file` for file I/O, `shell` for shell commands, `parse_json`/`to_json` for structured data.
 - Text mode is the default for everything; dense mode is experimental — opt in only for token-critical one-off scripts.

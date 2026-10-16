@@ -848,6 +848,21 @@ static inline int uf_truthy(Cell c){
   }
   return 0;
 }
+/* FOR (v16.1): count-or-collection bounds. Returns the iteration count;
+   *h names the ordered collection (list/array/tensor/matrix — element loop
+   via uf_cidx) or NULL for a count loop. Strings coerce to int counts by
+   content; anything else (dict, bitmap, bloom, ...) dies. */
+static inline int64_t uf_for_bounds(Cell c,Hdr**h){*h=0;
+  if(c.tag==T_INT)return c.i;
+  if(c.tag==T_PTR&&c.i){Hdr*a=uf_gc_find((void*)c.i);
+    if(a){
+      if(a->tag==HT_DYN){*h=a;return (int64_t)((Dyn*)a)->len;}
+      if(a->tag==HT_ARR||a->tag==HT_TENSOR||a->tag==HT_MAT){*h=a;return (int64_t)a->len;}
+    }}
+  if(uf_is_str(c)||c.tag==T_FLOAT)return uf_i(c);
+  die("FOR: expected a count or an ordered collection (list/array/tensor)");
+  return 0;
+}
 static inline int uf_loose_eq(Cell a,Cell b){
   if(a.tag==T_PTR && b.tag==T_PTR && a.i && b.i){
     Hdr*ha=uf_gc_find((void*)a.i); Hdr*hb=uf_gc_find((void*)b.i);
@@ -3629,6 +3644,87 @@ static void op_chunk(Ctx*cx){
   }
   UF_UNPROTECT(); UF_UNPROTECT();
   pushp(cx,r);
+}
+
+/* ---- v16.1 helper methods (dispatch-only: 'recv.selector; no bare ops) ---- */
+/* PARTITION: list n -> n balanced groups (the first len%n groups get one
+   extra element; n groups are always produced, trailing groups may be
+   empty). Wove's batch(). */
+static void op_partition(Ctx*cx){
+  int64_t gn=pop(cx).i; Cell h=pop(cx);
+  if(gn<1)die("PARTITION: group count < 1");
+  Hdr* a=h.tag==T_PTR&&h.i?uf_gc_find((void*)h.i):0;
+  int isarr = a&&(a->tag==HT_ARR||a->tag==HT_TENSOR);
+  Dyn* s=uf_materialize(cx,h); UF_PROTECT(&s);
+  Dyn* r=uf_dyn_new((uint64_t)gn+1); UF_PROTECT(&r);
+  uint64_t len=s->len, base=0, q;
+  for(q=0;q<(uint64_t)gn;q++){
+    uint64_t n=len/(uint64_t)gn + (q<len%(uint64_t)gn?1:0);
+    if(isarr){
+      Hdr* p=(Hdr*)uf_gc_alloc(sizeof(Hdr)+n*a->esz,0);
+      p->tag=a->tag; p->len=n; p->esz=a->esz; p->ety=a->ety;
+      for(uint64_t j=0;j<n;j++)uf_cseti(uf_mkp(p),(int64_t)j,s->data[base+j]);
+      uf_dyn_push(&r,uf_mkp(p));
+    } else {
+      Dyn* p=uf_dyn_new(n?n:1);
+      for(uint64_t j=0;j<n;j++)p=uf_dyn_push2(p,s->data[base+j]);
+      uf_dyn_push(&r,uf_mkp(p));
+    }
+    base+=n;
+  }
+  UF_UNPROTECT(); UF_UNPROTECT();
+  pushp(cx,r);
+}
+/* PAIRS: dict -> [[k v] ...] in key order. Wove's undict(). */
+static void op_pairs(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"PAIRS");
+  if(a->tag!=HT_MAP)die("PAIRS: expected a dict");
+  Map*m=(Map*)a; Dyn*d=uf_dyn_new(m->len?m->len:1); UF_PROTECT(&d);
+  for(uint64_t i=0;i<m->cap;i++) if(m->st[i]==1){
+    Dyn*p=uf_dyn_new(2);
+    p=uf_dyn_push2(p,m->keys[i]);
+    p=uf_dyn_push2(p,m->vals[i]);
+    uf_dyn_push(&d,uf_mkp(p));
+  }
+  UF_UNPROTECT(); pushp(cx,d);
+}
+/* PAIRS_DICT: [[k v] ...] -> dict. Wove's redict(); the method selector is
+   `dict` (constructor-style) on the list type. */
+static void op_pairs_dict(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"DICT");
+  if(a->tag!=HT_DYN)die("DICT: expected a list of [key value] pairs");
+  Dyn*s=(Dyn*)a;
+  Map*m=uf_map_new(); UF_PROTECT(&m);
+  for(uint64_t i=0;i<s->len;i++){
+    Cell pe=s->data[i];
+    Hdr*ph=pe.tag==T_PTR&&pe.i?uf_gc_find((void*)pe.i):0;
+    if(!ph||ph->tag!=HT_DYN||((Dyn*)ph)->len!=2)die("DICT: each element must be a [key value] pair");
+    map_put(m,((Dyn*)ph)->data[0],((Dyn*)ph)->data[1]);
+  }
+  UF_UNPROTECT(); pushc(cx,uf_mkp(m));
+}
+/* COMPACT: list -> list without nulls (0, "", false, and empty collections
+   are kept — only null cells drop). Wove's denone(). */
+static void op_compact(Ctx*cx){
+  Cell h=pop(cx); Hdr*a=uf_handle(h,"COMPACT");
+  if(a->tag!=HT_DYN)die("COMPACT: expected a list");
+  Dyn*s=(Dyn*)a; Dyn*d=uf_dyn_new(s->len?s->len:1); UF_PROTECT(&d);
+  for(uint64_t i=0;i<s->len;i++){
+    Cell v=s->data[i];
+    if(v.tag==T_PTR&&!v.i)continue;
+    d=uf_dyn_push2(d,v);
+  }
+  UF_UNPROTECT(); pushp(cx,d);
+}
+/* MERGE: dict1 dict2 -> dict1 with dict2's entries added (d2 wins), in
+   place — reference semantics, the receiver handle is pushed back. */
+static void op_merge(Ctx*cx){
+  Cell h2=pop(cx),h1=pop(cx);
+  Hdr*a2=uf_handle(h2,"MERGE"); Hdr*a1=uf_handle(h1,"MERGE");
+  if(a1->tag!=HT_MAP||a2->tag!=HT_MAP)die("MERGE: expected dicts");
+  Map*m1=(Map*)a1,*m2=(Map*)a2;
+  for(uint64_t i=0;i<m2->cap;i++) if(m2->st[i]==1) map_put(m1,m2->keys[i],m2->vals[i]);
+  pushc(cx,h1);
 }
 
 /* ================= time ops (scalar cells: tag 15 time, 16 dur, i64 nanos) ================= */

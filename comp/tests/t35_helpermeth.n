@@ -1,0 +1,52 @@
+; t35_helpermeth.n — v16.1 dispatch-only helper methods (the Wove helper
+; set, renamed where it reads better): partition (batch: n balanced groups),
+; pairs (undict: dict -> [[k v] ...]), dict (redict: pairs -> dict),
+; compact (denone: drop nulls, keep other falsy), merge (dict merge in
+; place, right wins). No bare ops — selectors only.
+; Run: nk comp/tests/t35_helpermeth.n
+
+; 1. partition: n balanced groups, first len%n groups get the extra
+[1 2 3 4 5 6] l!
+2 'l.partition to_json "[[1,2,3],[4,5,6]]" eq check
+[1 2 3 4 5] l2!
+4 'l2.partition length 4 eq check
+4 'l2.partition 0 get length 2 eq check
+[1 2 3] int array ta!
+2 'ta.partition 0 get length 2 eq check
+
+; 2. pairs / dict round-trip
+{ "basic" 10 "pro" 25 } d!
+'d.pairs length 2 eq check
+'d.pairs ps!
+'ps.dict d2!
+consume
+'d2.length 'd.length eq check
+d2 "basic" get 10 eq check
+
+; 3. compact drops nulls only
+'mknull n!
+[1 n 0 "" false 3] c!
+'c.compact to_json "[1,0,0,\"\",false,3]" eq check
+[1 2 3] c2!
+'c2.compact to_json "[1,2,3]" eq check
+
+; 4. merge: in place, right wins, receiver handle pushed back
+{ "a" 1 } m1!
+{ "b" 2 "a" 9 } m2!
+m2 'm1.merge consume
+m1 "a" get 9 eq check
+m1 "b" get 2 eq check
+m1 length 2 eq check
+
+; 5. arity-2 built-in method sanity (found broken by this gate's work:
+; the compile-time send specialization and the JS rotate index mishandled
+; receivers with args below — `"x" 'd.get`)
+d "x" 42 set consume
+"x" 'd.get 42 eq check
+[1 2 3 4 5 6 7 8] l3!
+3 6 'l3.slice to_json "[4,5,6]" eq check
+
+"helper-methods-ok" print
+ret
+
+mknull: ret

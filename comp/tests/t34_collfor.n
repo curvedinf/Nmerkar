@@ -1,0 +1,59 @@
+; t34_collfor.n — v16.1 `for` over ordered collections: the count slot takes
+; an int (index loop, as before), a numeric string (coerced count), or a
+; list / typed array / tensor (ELEMENT loop; length captured at entry —
+; growth inside the loop does not extend the run). Dicts die (contained).
+; Run: nk comp/tests/t34_collfor.n
+
+0 t!
+0 t2!
+0 u!
+
+; 1. list elements
+[10 20 30] addeach for
+t 60 eq check
+
+; 2. plain count loop unchanged (index pushed)
+5 cntf for
+t2 100 eq check
+
+; 3. typed-array elements
+[1 2 3] int array dblf for
+t2 112 eq check
+
+; 4. empty collection: zero iterations
+[] zerof for
+t2 112 eq check
+
+; 5. numeric string coerces to a count (not a char loop)
+"3" strcf for
+t2 142 eq check
+
+; 6. string elements flow like any other element
+list s6!
+["a" "b"] upf for
+s6 to_json "[\"a\",\"b\"]" eq check
+
+; 7. break out of a collection loop
+[1 2 3 4 5] brkf for
+u 6 eq check
+
+; 8. dict is not an ordered collection — dies (contained by try)
+dict d2!
+: d2 zerof for ret try ok# _#
+ok 0 eq check
+
+"coll-for-ok" print
+ret
+
+addeach: v! t v add t! ret 0
+cntf: i! t2 i 10 mul add t2! ret 0
+dblf: v! t2 v 2 mul add t2! ret 0
+zerof: v! "bad" print ret 0
+strcf: i! t2 i 10 mul add t2! ret 0
+upf: v! s6 v append s6! ret 0
+brkf: v!
+  u v add u!
+  u 6 eq bstop if
+  ret 0
+bstop: break
+  ret 0

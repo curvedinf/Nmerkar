@@ -6,6 +6,64 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-16 — documentation: no stack-speak ("push"/"pop") in language docs
+
+- All language-facing documentation (SPEC prose, README, AGENTS, the
+  `nk -s` agent skill template, `nk --help`, and the opcode usage strings)
+  now describes evaluation in value/result terms — "evaluates to",
+  "returns", "the body receives", "consumes" — instead of Forth-style
+  "pushes"/"pops". The managed hidden stack stays an implementation
+  detail on purpose: readers (and LLMs) should model the language as a
+  traditional one — named variables, literals, and operation results.
+  Stack-effect signature columns (`a b → c`) are unchanged, the `pop`/`append`
+  opcode names are unchanged, and quoted runtime error strings (e.g.
+  `stack underflow in op_print`) are unchanged. No compiler behavior
+  change.
+
+## 2026-10-16 — helper methods (partition/pairs/dict/compact/merge) + arity-2 builtin-send fixes
+
+- Five **dispatch-only helper methods** (no bare ops, no opcode slots;
+  implementations in both preludes, selectors registered in the send
+  fallbacks): `partition` (list/arr/tensor, n balanced groups — Wove's
+  `batch`), `pairs` (dict → `[[k v] …]` — Wove's `undict`), `dict`
+  (pairs → dict — Wove's `redict`), `compact` (list minus nulls, other
+  falsy kept — Wove's `denone`), `merge` (dict merge in place, right
+  wins). Wove's `flatten` and `fold` were NOT added — `flatten` (167) and
+  `chunk` (168) already cover them. Gate: `comp/tests/t35_helpermeth.n`.
+- Arity-2+ **builtin method sends were broken on both targets** (never
+  gated — t26 only exercised arity-1 dotted calls): the compile-time
+  send→op specialization left the receiver in the arg slot (parse.rs now
+  specializes arity-1 only; higher arities keep the Send and the runtime
+  `uf_rot1` rotates), and the JS `__NKSB` rotate splice inserted the
+  receiver one slot too high (index is now `length - n`, matching C).
+  `"x" 'd.get` and `3 6 'l3.slice` now work everywhere.
+- JS: `__NKMT` is now always emitted (possibly empty) — builtin-only
+  programs (no user `@Type`) sent into an undefined table and died.
+
+## 2026-10-16 — `for` over ordered collections + agent-skill template sweep
+
+- `FOR` (16, 😃) — behavior change: the count slot takes an **ordered
+  collection** (list / typed array / tensor) as well as a count. A
+  collection pushes its ELEMENT per iteration (length captured at entry —
+  growth inside the loop does not extend the run; empty → zero
+  iterations); a count (int, or numeric string/float by content coercion)
+  pushes the index as before. Dicts and bitmaps die ("expected a count or
+  an ordered collection") — not ordered; `keys` + list-for covers dicts.
+  Native: `uf_for_bounds` + per-iteration `uf_cidx`; JS mirror
+  (`RT.forBounds`/`RT.forElem`). Inference fix that made it sound: the
+  for-body index-slot Int pre-seed (register caching / typed reads) now
+  fires only when the count is a compile-time literal — with a collection
+  the bind receives arbitrary Cells and an Int-typed slot coerced string
+  elements to 0. Gate: `comp/tests/t34_collfor.n` (list/array/string-count
+  elements, empty, break, contained dict die).
+- Agent skill template (`nk -s`) + opcode usage strings swept to the v16
+  forms: callbacks are bare fn references (was `'label` — now the CALL
+  form), `x@` removed (bare `x` loads; `SETV` usage now documents the
+  pass-through), `_call` gone, `shell` destructuring is the positional
+  `out# _# _#` bind (shell pushes one list), `_!`-as-discard removed from
+  prose (label-param-only), `for` row documents count|coll. All worked
+  examples re-verified against the current compiler.
+
 ## 2026-10-15 — polymorphic conditions (value or fn) on if / if_else / while
 
 - `IF` (114) / `IF_ELSE` (115) / `WHILE` (116) — behavior change: the cond

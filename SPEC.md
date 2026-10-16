@@ -90,7 +90,7 @@ Glyph assignments are in `comp/src/lex.rs` (`OP_GLYPHS`, `V_SPACE`, `L_SPACE`).
 
 `;` starts a line comment in both encodings. `"..."` is a string literal with
 escapes limited to `\n \t \r \0 \\ \"` (any other `\x` copies x literally).
-A bare `"..."` self-evaluates (pushes a string handle).
+A bare `"..."` self-evaluates (a string handle is the value).
 
 ## Numbers (l-space grammar)
 
@@ -130,7 +130,7 @@ Variable semantics (v15.1 — uniform pass-through):
   **shared** variable and leave the value on the hidden stack for chaining.
   The store passes through in both scopes (v15.1 removed the shared-consume
   asymmetry of v14/v15).
-- A bare `<name>` — **implicit load**: pushes the local (or shared) variable.
+- A bare `<name>` — **implicit load**: the value of the local (or shared) variable.
   The v14 `<name>@` varget suffix is removed; writing it is a lex error.
 - A name assigned in a TU's straight-line top level (before its first label)
   declares a **shared** variable; inside label bodies the plain name then
@@ -161,7 +161,7 @@ cross-body error above.
 
 ## Label parameters
 
-A label definition declares input bindings in its definition; callers push
+A label definition declares input bindings in its definition; callers supply
 arguments before invoking the label. This makes labels user-defined ops with
 the same postfix calling convention as built-ins: arguments first, then the
 operation.
@@ -178,7 +178,7 @@ after the label's colon:
 - `name!` — bind one cell to local `name`.
 - `_!` — bind and discard one cell.
 
-The first binding receives the first cell the caller pushed, the second the
+The first binding receives the first value the caller supplied, the second the
 second, and so on. Bindings must be contiguous at the start of the definition;
 the first non-binding token ends the parameter list.
 
@@ -193,12 +193,12 @@ the first non-binding token ends the parameter list.
   label, parameter, and declared arity. Structured-op callbacks receive the same
   static check: a body that declares more bindings than the callback provides is a
   compile error (message: … but the `filter` callback provides only M value(s)…), covering
-  `body for`'s pushed index, `filter`/`any`/`all`/`array_map`'s element,
+  `body for`'s index, `filter`/`any`/`all`/`array_map`'s element,
   `array_reduce`/`file_fold_lines`/`file_split_lines`/`range_reduce`'s accumulator
   pair, `bfs`/`dfs`/`find_first`'s node, `try`'s continuation, and `spawn`'s fresh
   frame (0 cells). Excess cells are
   silently discarded after the bindings are satisfied.
-- Structured ops pass values implicitly: `5 body for` pushes the loop index,
+- Structured ops pass values implicitly: `5 body for` provides the loop index,
   and a `body: i!` binding consumes it.
 
 ```
@@ -209,7 +209,7 @@ body: i!
 ```
 
 **Fn cells (v16)** — a bare label name in expression position is its
-callable: it pushes a **fn cell** (tag 22) carrying the label's code address,
+callable: it evaluates to a **fn cell** (tag 22) carrying the label's code address,
 declared arity, and name. `body`, `sq`, `worker` are values like any other —
 store them, pass them through vars, hand them to any callback-taking op. The
 consumer ops above (and `if`/`while`/`for`/`try`/`spawn`/…) accept a fn cell
@@ -247,7 +247,7 @@ xs : x! x x mul ret array_map      ; binds when a name earns its tokens
 ```
 
 `':` is the same definition followed by an immediate **apply**: the list
-pushed below it is the argument vector — `apply` spreads its elements onto
+supplied below it is the argument vector — `apply` spreads its elements as
 the stack and calls the body (declared arity is enforced at runtime by the
 fn cell, same as any dynamic callback):
 
@@ -258,7 +258,7 @@ fn cell, same as any dynamic callback):
 
 **`'x` on a variable (dynamic call).** `'x` applies whatever the name
 means: a label resolves to the static call; a **variable** holding a fn
-cell lowers to `[load x, call]` — the `call` op (📞, `args… fn → r`) pops
+cell lowers to `[load x, call]` — the `call` op (📞, `args… fn → r`) takes
 the cell and invokes it with **its own declared arity** taking the stack
 below (the consumer-style convention — no list packing). `call` also
 applies a computed cell directly (`7 d "op" get call`). The one-name rule
@@ -273,7 +273,7 @@ addf f!
 10 'bump 'bump 'bump            ; 13 — threads without list churn
 ```
 
-Lowering: `:` collects the body, pushes the fn cell at the collection site
+Lowering: `:` collects the body and yields the fn cell at the definition site
 (`PushAddr` of an unspellable `__qN` label), and hoists the body's
 instructions after the main flow — so a callback consumer written right
 after stays **adjacent** to the fn reference and keeps the inline fast
@@ -300,7 +300,7 @@ exempt.
 - `ret a b c` — the operand nets three values; they are combined into a list
   and that list is returned. The caller destructures it with a `#` bind run:
   `"cmd" 'run_cmd out# err# code#`.
-- Bare `ret` — return `null`; if the body pushed onto the real
+- Bare `ret` — return `null`; if the body produced values onto the real
   stack (a value sits above the frame base), that top cell is returned instead.
 
 ```
@@ -313,7 +313,7 @@ run_cmd: c!
 ```
 
 On return, the callee's **entire data stack is drained** back to the caller's
-saved pointer and the single return value is pushed on top of it. The caller's
+saved pointer and only the single return value remains. The caller's
 stack pointer is saved just below the arguments at every call boundary —
 `'label` calls, structured-op callbacks, weave tasks, `spawn` bodies, `try`/`retry`
 bodies, and `filter`/`array_reduce`/etc. callbacks. Callees can therefore never
@@ -323,7 +323,7 @@ leak transient values into the caller's stack.
 0 'foo
 add             ; 0 + 0 -> 0, not 0 + 42
 foo:
-  42            ; pushed but never named in ret
+  42            ; produced but never named in ret
   ret 0         ; caller sees only 0; the 42 is drained
 ```
 
@@ -419,14 +419,14 @@ U+13110..U+13117 = int(0) float(1) ptr(2) byte(3) void(4) handle(5→2)
 str(6→2) bool(7→21) — handle/str are ptr aliases; bool is a distinct scalar type; void is 4
 (SIZEOF void = 8, not useful).
 
-- After `LIT`: pushes the type id.
+- After `LIT`: the type id is the value.
 - Directly after the type-taking immediates (`_array`/`_tensor`/`_obj`/`_cast`/
   `_size_of` in text, the corresponding glyphs in dense): type **immediate** —
-  pushes the id with no LIT. The id lands on top of any preceding length, so
+  the id is the value with no LIT. The id lands on top of any preceding length, so
   ARR/TENSOR consume `[len, type]` with type on top.
-- Elsewhere a bare type glyph pushes its id (expression position).
+- Elsewhere a bare type glyph evaluates to its id (expression position).
 - ASCII type keywords (`int float ptr handle byte bool`) work in all the same
-  positions; a bare type keyword pushes its type id in text mode
+  positions; a bare type keyword evaluates to its type id in text mode
   (mirroring the bare type glyph in dense). `str` is not a bare keyword —
   `_str` is the immediate string op — and `void` has no text keyword
   form.
@@ -440,7 +440,7 @@ str(6→2) bool(7→21) — handle/str are ptr aliases; bool is a distinct scala
 17 bloom, 18 iter, 19 set, 20 matrix, 21 bool, 22 fn. JSON null is
 a null pointer (tag 2, payload 0). Booleans are distinct from integers and
 bytes. `true` and `false` are literals in text mode; the bool type glyph
-and `bool` keyword push type id 21. Dense emission encodes a boolean literal
+and `bool` keyword evaluate to type id 21. Dense emission encodes a boolean literal
 as an integer followed by `_cast bool`.
 
 ## Runtime cell
@@ -484,7 +484,7 @@ the type name is ASCII in both encodings):
   linking a package that defines `@list` methods extends every list.
 
 **Built-in `Weave` methods (v16)** — `weave ... save w!` ends a block
-and pushes a **Weave value**: a `Weave` struct instance (built in; never
+and yields a **Weave value**: a `Weave` struct instance (built in; never
 declare `struct Weave`) whose `tasks` field is `{name -> [fn, inputs,
 count]}`. Every block-level label in a weave block is a task — the `task`
 keyword is gone (retired slot 82). A task is a DAG **node** iff every
@@ -501,9 +501,9 @@ Literal nested `weave` blocks *inside* a task body are not yet
 supported — hoist the inner block to a `save` and reference the value.
 
 The Weave value is editable: `'w.check` validates (dies naming the
-missing input or cycle) and pushes the dependency order; `'w.run`
+missing input or cycle) and returns the dependency order; `'w.run`
 executes in dependency order (fanout count > 1 spreads the single
-input's list — fn per element, results as a list) and pushes the results
+input's list — fn per element, results as a list) and returns the results
 dict; `"name" 'w.del` removes a task;
 `{"name" n "fn" f "in" [...] "count" c} 'w.add` appends one (consume
 the returned receiver — method calls leave it on the stack). The
@@ -562,6 +562,24 @@ in the parser (no collision with ordinary labels or ops).
 
 Gate: `comp/tests/t25_methods.n` and `comp/tests/t26_migrated.n`.
 
+### Helper methods (v16.1) — dispatch-only, no bare ops
+
+Five selectors exist only in the dispatch table (implemented in both
+runtimes; there is no bare token and no opcode slot). A user `@Type` with
+the same `(type, selector)` overrides them per type.
+
+| selector | receiver | stack | behavior |
+|---|---|---|---|
+| `partition` | list / arr / tensor | `n 'l.partition` | exactly n balanced groups (first `len%n` get one extra; trailing groups may be empty); n<1 dies |
+| `pairs` | dict | `'d.pairs` | `[[k v] …]` in key order |
+| `dict` | list | `'ps.dict` | pairs → dict; each element must be a `[k v]` pair (dies otherwise) |
+| `compact` | list | `'l.compact` | new list without nulls — `0`, `""`, `false` are kept |
+| `merge` | dict | `d2 'd1.merge` | d1 gains d2's entries (d2 wins), **in place**, receiver returned |
+
+`pairs`/`dict` round-trip a dict through per-pair mapping; `partition`
+splits work into a known number of groups; `compact` drops only optional
+absence. Gate: `comp/tests/t35_helpermeth.n`.
+
 ## Struct fields
 
 `struct Name { field:type, … }` declares a record layout (OBJ). Obj fields
@@ -595,7 +613,7 @@ Six ops cover all element access, dispatched on the handle's tag:
 A container handle is a reference to the object, not a copy. Every mutation op
 — `append`, `pop`, `set`, `remove`, channel `enqueue`/`dequeue`/`close`, atom
 ops — acts in place on the object, and every name bound to the same handle
-observes the change. Growth never re-allocates: `append` pushes the same handle
+observes the change. Growth never re-allocates: `append` returns the same handle
 it consumed (re-storing the result is never needed, and chaining or dropping it
 is equally valid). `copy` (op 26) is the explicit deep copy. Mutation is not
 synchronized across threads: for cross-thread state use chans, atoms, or shared
@@ -663,7 +681,7 @@ v15.1; its formerly reserved glyph is freed.)
 | 13 | 🪔 | `pow` | a b → a^b | C/Python pow; coerces, returns float |
 | 14 | 🪑 | `sqrt` | a → √a | coerces, returns float |
 | 15 | 🪒 | `lte` | a b → 0/1 | a≤b; coerces both sides to Number, NaN → 0 |
-| 16 | 😃 | `for` | count addr → | pushes k per iteration |
+| 16 | 😃 | `for` | count\|coll body → | count: the body receives the index k; list/array/tensor: the body receives each element (length captured at entry; dicts die) |
 | 17 | 🚄 | `'` | `'label` | call subroutine; the `_call` spelling was removed in v16 |
 | 18 | 🤒 | `ret` | → | explicit return, operand expression (see Return values) |
 | 19 | 🌄 | `_obj` | → h | type immediate (struct id) |
@@ -706,11 +724,11 @@ v15.1; its formerly reserved glyph is freed.)
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
 | 56 | 🚐 | `dict` | → h | open-addressing hash map (FNV-1a) |
-| 57 | 🧶 | `save` | end weave..save | push the Weave value (see "Weave") |
+| 57 | 🧶 | `save` | end weave..save | produce the Weave value (see "Weave") |
 | 58 | 🧷 | `weave_run` | tasks-dict → results-dict | execute a weave value's DAG in dependency order |
-| 59 | 🧸 | `weave_check` | tasks-dict → order | validate a weave value's DAG, push the schedule |
+| 59 | 🧸 | `weave_check` | tasks-dict → order | validate a weave value's DAG, return the schedule |
 | 62 | 🤚 | `list` | → h | growable cell vector |
-| 63 | 🌌 | `append` | h v → h | appends in place; pushes the same handle (reference semantics) |
+| 63 | 🌌 | `append` | h v → h | appends in place; returns the same handle (reference semantics) |
 | 64 | 😌 | `pop` | h → v | empty: dies |
 | 65 | 🚑 | `channel` | cap → h | bounded MPSC ring (blocking) |
 | 66 | 🤛 | `enqueue` | h v → | blocks while full; dies on closed chan |
@@ -752,13 +770,21 @@ coerce their operands via the universal coercion rules.
 
 ### Structured control flow
 
-Compiler-resolved; quotation addresses via `'<label>`. `break`/`continue`
+Compiler-resolved; bodies are fn references (bare label names, `'label` is
+the call form — and anonymous `: … ret` bodies). `break`/`continue`
 outside a loop are compile errors. **v16.1 polymorphic conditions**: `if`,
 `if_else`, and `while` accept an ordinary value **or** a fn reference in the
 cond slot. A value is tested once with truthiness; a fn cell is called
 (arity 0) and its return tested — for `while`, per iteration. A value cond
 on `while` cannot change: falsy never runs the body, truthy runs until
 `break` (the `1 body while` forever idiom).
+
+**v16.1 `for` over ordered collections** — the count slot takes an int
+(index provided per iteration, as before), a numeric string or float (coerced
+count), or a list / typed array / tensor (the **element** provided per
+iteration; length captured at entry — growth inside the loop does not
+extend the run). Dicts and bitmaps die: they are not ordered collections
+(`d keys` + list-`for` covers dicts). Strings are counts, not char loops.
 
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
@@ -965,7 +991,7 @@ Single-use, mutable cursors. Every collection is iterable.
 | 199 | 🤾 | `retry` | n body → list | same as `try`; try up to n+1 times |
 | 200 | 🌳 | `spawn` | body → chan | detached thread; body must end with `ret`, whose value is enqueued + chan closed at body end; `dequeue` = join |
 
-`die` unwinds to the nearest `setjmp` checkpoint pushed by `try`/`retry` (they
+`die` unwinds to the nearest `setjmp` checkpoint set by `try`/`retry` (they
 nest); with no checkpoint, `die` is fatal. No backoff, jitter, or exception
 typing — count and containment are the whole policy.
 
@@ -1028,7 +1054,7 @@ struct *name* to its compiler-assigned id at compile time.
 | 208 | 🥜 | `arg_index` | idx → int | `argv[idx]` parsed as integer via `strtoll`; out of bounds: dies |
 | 209 | 🥝 | `sort_keys` | dict → key_list | `keys` + `sort` fused; returns dict keys sorted ascending |
 | 210 | 🥞 | `top_n` | dict n → list | top-n `[key value]` pairs by value descending, ties by key ascending; selection sort |
-| 211 | 🥘 | `range_reduce` | count init label → scalar | fold over range 0..count; label `(acc i → acc)` called per iteration |
+| 211 | 🥘 | `range_reduce` | count init fn → scalar | fold over range 0..count; fn `(acc i → acc)` called per iteration |
 | 215 | 🔒 | `strict` | v → v | mark the value strict — no implicit coercion from then on (compile-time; see "Strictness") |
 | 216 | 🔓 | `loose` | v → v | remove strictness from the value (compile-time) |
 
@@ -1037,7 +1063,7 @@ struct *name* to its compiler-assigned id at compile time.
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
 | 218 | 🔍 | `dbg` | v → v | peek-print the stack top to **stderr**: `dbg <site>: <value>`; same smart rendering as `print`; the stack is not changed |
-| 219 | 🎯 | `check` | v → — | one-token assert: pops the condition; a falsy value dies `check failed` at that source site |
+| 219 | 🎯 | `check` | v → — | one-token assert: consumes the condition; a falsy value dies `check failed` at that source site |
 | 220 | 🕒 | `timer` | → int | monotonic clock in nanoseconds (int cell); only differences are meaningful — the base differs across targets and clocks |
 | 221 | 📊 | `memstats` | → dict | GC stats `{gc, objs, live, alloc}`: collections run, live objects, live bytes, total bytes allocated (native GC; the JS target's heap is host-managed, so all four read 0 there) |
 
@@ -1076,14 +1102,14 @@ USEing TU. Ships: `m.ufm`, `c.ufm`, `pthread.ufm`, `curl.ufm`, `sdl2.ufm`,
   at call site. Generated C aliases the symbol (`__asm__`), so libc names
   already prototyped by the prelude are safe to import. Varargs: declare fixed
   params then `...` (e.g. `import c"printf"(ptr,...)->int`); at the call site
-  push [fixed params..., varargs..., vararg-count] — the count of variadic
+  supply [fixed params..., varargs..., vararg-count] — the count of variadic
   arguments as the topmost int cell, e.g. `"x=%d" 7 1 'printf`. The
-  runtime pops the count first, so it never scans the stack for the format
+  runtime reads the count first, so it never scans for the format
   string (unrelated pointer cells deeper on the stack could otherwise be
   misread as the format). A missing/malformed count cell fails at runtime with
   `variadic call: top cell must be the vararg count`. `->int` is C `int`
   (32-bit), sign-extended into the 64-bit cell.
-- `extern "symbol"` — pushes the address of a global C symbol for use with
+- `extern "symbol"` — yields the address of a global C symbol for use with
   `load`/`store`. Runtime exposes `nk_argc` and `nk_argv` this way (though
   `argv` op 163 is preferred).
 
@@ -1354,7 +1380,7 @@ and weave task results trivially safe.
   running code keeps its tensors; scanning conservatively past the frame
   pointer only over-retains, never frees live data), weave task results,
   chan queue contents, and per-thread temporary-root stacks (operands
-  and in-progress results held in C locals across an allocation are pushed
+  and in-progress results held in C locals across an allocation are stored
   there by runtime ops via `UF_PROTECT`/`UF_UNPROTECT`, published with
   release/acquire; thread-local destructor cleanup removes a worker's root
   registry entry when it exits, before a later collection scans the registry).
@@ -1568,7 +1594,7 @@ is **called** (not itself tested); a fn cell in any other value position
 
 ### Tail-position if: early returns
 
-When an `if`'s fall-through is only a value push and the enclosing body's
+When an `if`'s fall-through is only a value and the enclosing body's
 `ret` (tail position), the branch target's `ret` **returns from the enclosing
 label** instead of resuming after the `if`:
 
@@ -1585,7 +1611,7 @@ target's `ret` still means "continue the loop", and `if`/`if_else` elsewhere
 keep resume-after-branch semantics (the target's `ret` value is discarded).
 A limitation to know about: called-label recursion that passes frames
 through branch parameters can still mis-bind when a pass-through assignment
-(`x!`) precedes the call (vstack pass-through leak). A call pushes the
+(`x!`) precedes the call (vstack pass-through leak). A call places the
 callee's local frame past the caller's live slots (the caller body's slot
 count), so nested calls cannot alias the caller's locals; spawned bodies get
 a fresh `Ctx` and are unaffected.
@@ -1801,8 +1827,8 @@ dedicated single-token tag glyph followed by the ASCII name:
 |------|-------|----------|
 | `_size_of Point` | `📏Point` | constant `Point` size (op compiled out) |
 | `_offset Point.y` | `📍Point.y` | constant field offset (op compiled out) |
-| `_obj Point` | `📦Point` + OBJ glyph | `size \| sid<<32` push + runtime alloc |
-| `_cast Point` | `🎭Point` + CAST glyph | `1000+sid` push + runtime checked cast |
+| `_obj Point` | `📦Point` + OBJ glyph | `size \| sid<<32` immediate + runtime alloc |
+| `_cast Point` | `🎭Point` + CAST glyph | `1000+sid` immediate + runtime checked cast |
 
 The v14 `@sizeof:`-style sentinel idents are removed: `@` no longer appears
 in any encoding. (A handful of further `@`-prefixed idents — `@flush`,
@@ -1837,7 +1863,7 @@ Always-on (non-debug) error messages include the operation name and stack depth:
 e.g. `stack underflow in op_print (sp=0)`, `stack overflow in op_push (sp=1048576)`.
 
 Codegen optimizations (`comp/src/gen.rs`):
-- **Basic-block stack virtualization**: within straight-line blocks, ds push/pop
+- **Basic-block virtualization**: within straight-line blocks, ds writes/reads
   become C locals; spilled to real ds at jump targets and control-flow edges.
 - **Type specialization**: when both arithmetic operands have known types,
   emits raw C arithmetic (no tag checks), enabling SSE/autovectorization.

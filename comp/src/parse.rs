@@ -62,6 +62,18 @@ pub const MIGRATED: &[(&str, &str, usize)] = &[
     ("TRANSPOSE", "transpose", 1),
 ];
 
+/// v16.1 helper methods: dispatch-only selectors with no bare op — the
+/// implementations live in both preludes (prelude.rs / js_prelude.rs) and
+/// the send fallbacks call them directly. (selector, arity incl. receiver,
+/// prelude helper name.)
+pub const HELPER_METHODS: &[(&str, usize, &str)] = &[
+    ("partition", 2, "op_partition"),  // Wove batch(): n balanced groups
+    ("pairs", 1, "op_pairs"),           // Wove undict(): dict -> [[k v] ...]
+    ("dict", 1, "op_pairs_dict"),       // Wove redict(): [[k v] ...] -> dict
+    ("compact", 1, "op_compact"),       // Wove denone(): drop nulls only
+    ("merge", 2, "op_merge"),           // dict merge, in place, right wins
+];
+
 pub fn is_migrated_op(name: &str) -> bool {
     MIGRATED.iter().any(|(n, _, _)| *n == name)
 }
@@ -85,9 +97,16 @@ pub fn specialize_builtin_sends(p: &mut Parsed) {
     while i + 1 < p.ins.len() {
         if let (Ins::PushI(h), Ins::Send) = (&p.ins[i], &p.ins[i + 1]) {
             if !user_hashes.contains(h) {
-                if let Some((opname, _, _)) = migrated_of_hash(*h) {
-                    p.ins[i] = simple_ins(opname);
-                    p.ins[i + 1] = Ins::Nop;
+                if let Some((opname, _, n)) = migrated_of_hash(*h) {
+                    // Arity 1 only: the receiver (pushed by the quote, on
+                    // top) is already the op's single operand. With args
+                    // below (arity >= 2) the op wants receiver-FIRST order —
+                    // keep the Send and let the runtime builtin dispatch
+                    // rotate (uf_rot1 / the JS splice) into place.
+                    if n == 1 {
+                        p.ins[i] = simple_ins(opname);
+                        p.ins[i + 1] = Ins::Nop;
+                    }
                 }
             }
         }

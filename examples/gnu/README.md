@@ -13,6 +13,7 @@ so the generated code is browsable and indexable.
 | `tee.n` | `trans/tests/gnu/tee/*.c` | stdout+multi-file fan-out, -a append |
 | `cksum.n` | `trans/tests/gnu/cksum/*.c` | POSIX CRC-32 matches GNU cksum on text/binary/large files |
 | `base64.n` | `trans/tests/gnu/base64/*.c` | encode/decode with -w wrapping, round-trips |
+| `wc.n` | `trans/tests/gnu/wc/*.c` | 6 gates vs GNU wc (-l/-w/-c/-m/-L, stdin, two-files) |
 
 Regenerate: `bash trans/tests/gnu/run.sh` (re-transpiles, re-gates, and
 re-exports every `.n` here). Read a file top-down: import preamble,

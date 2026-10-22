@@ -1,0 +1,387 @@
+import c"printf"(ptr,...)->int
+import c"fprintf"(ptr,ptr,...)->int
+import c"fputc"(int,ptr)->int
+import c"ungetc"(int,ptr)->int
+import c"putchar"(int)->int
+import c"getchar"()->int
+import c"fputs"(ptr,ptr)->int
+import c"fwrite"(ptr,int,int,ptr)->int
+import c"strcmp"(ptr,ptr)->int
+import c"strncmp"(ptr,ptr,int)->int
+import c"strcpy"(ptr,ptr)->ptr
+import c"exit"(int)->void
+import c"fread"(ptr,int,int,ptr)->int
+import c"fopen"(ptr,ptr)->ptr
+import c"fclose"(ptr)->int
+import c"fgetc"(ptr)->int
+import c"strstr"(ptr,ptr)->ptr
+extern "stdout"
+extern "stdin"
+extern "stderr"
+0 rv! 0 fr! 0 frv! 0 pt!
+ret
+entry:
+0 v0!
+1 v1!
+0 v2!
+0 v3!
+0 v4!
+0 v5!
+0 v6!
+0 v12!
+"/tmp/wc_tmp" v13!
+1 v14!
+c1 b2 while
+v2 0 eq i6 if
+1 v14! 
+c7 b8 while
+fr c39 b40 if_else
+0 'exit
+ret
+c1:
+fr not v14 extern "nk_argc" load lt and ret
+b2:
+v14 8 mul extern "nk_argv" load add load v7! 
+0 v7 "" 'strstr add load 255 and 45 eq 1 v7 "" 'strstr add load 255 and 0 eq not mul not not i3 if
+v2 1 add v2! 
+v14 1 add v14! 
+0 ret
+i3:
+1 v15!
+c4 b5 while
+v14 1 add v14! 
+continue
+0 ret
+c4:
+fr not v15 v7 "" 'strstr add load 255 and 0 eq not and ret
+b5:
+v15 1 add v15! 
+0 ret
+i6:
+v13 'wc_stdin_buffer 
+v13 v7! 
+0 ret
+c7:
+fr not v14 extern "nk_argc" load lt and ret
+b8:
+v14 8 mul extern "nk_argv" load add load v7! 
+0 v7 "" 'strstr add load 255 and 45 eq 1 v7 "" 'strstr add load 255 and 0 eq not mul not not i9 if
+fr c34 b35 if_else
+0 ret
+i9:
+1 v16!
+c10 b11 while
+fr c32 b33 if_else
+0 ret
+c10:
+fr not v16 v7 "" 'strstr add load 255 and 0 eq not and ret
+b11:
+v16 v7 "" 'strstr add load 255 and 108 eq i12 e13 if_else
+fr c30 b31 if_else
+0 ret
+i12:
+v0 1 or v0! 
+0 ret
+e13:
+v16 v7 "" 'strstr add load 255 and 119 eq i14 e15 if_else
+fr c28 b29 if_else
+0 ret
+i14:
+v0 2 or v0! 
+0 ret
+e15:
+v16 v7 "" 'strstr add load 255 and 99 eq i16 e17 if_else
+fr c26 b27 if_else
+0 ret
+i16:
+v0 4 or v0! 
+0 ret
+e17:
+v16 v7 "" 'strstr add load 255 and 109 eq i18 e19 if_else
+fr c24 b25 if_else
+0 ret
+i18:
+v0 8 or v0! 
+0 ret
+e19:
+v16 v7 "" 'strstr add load 255 and 76 eq i20 e21 if_else
+fr c22 b23 if_else
+0 ret
+i20:
+v0 16 or v0! 
+0 ret
+e21:
+extern "stderr" load "wc: invalid option -- '%c'\n" v16 v7 "" 'strstr add load 255 and 1 'fprintf 
+1 'exit
+0 ret
+b23:
+0 ret
+c22:
+0 ret
+b25:
+0 ret
+c24:
+0 ret
+b27:
+0 ret
+c26:
+0 ret
+b29:
+0 ret
+c28:
+0 ret
+b31:
+v16 1 add v16! 
+0 ret
+c30:
+0 ret
+b33:
+v14 1 add v14! 
+continue
+0 ret
+c32:
+0 ret
+b35:
+1 v12! 
+0 v7 "" 'strstr add load 255 and 45 eq 1 v7 "" 'strstr add load 255 and 0 eq mul not not i36 if
+v7 'wc_lines v8! 
+v8 0 lt i37 if
+v7 'wc_words v9! 
+v7 'wc_bytes v10! 
+v7 'wc_maxline v11! 
+v8 v9 v10 v11 v0 v7 v2 0 gt 'wc_print 
+v3 v8 add v3! 
+v4 v9 add v4! 
+v5 v10 add v5! 
+v11 v6 gt i38 if
+v14 1 add v14! 
+0 ret
+i36:
+v13 'wc_stdin_buffer 
+v13 v7! 
+0 ret
+i37:
+extern "stderr" load "wc: %s: No such file or directory\n" v7 1 'fprintf 
+v14 1 add v14! 
+continue
+0 ret
+i38:
+v11 v6! 
+0 ret
+c34:
+0 ret
+b40:
+v12 not i41 if
+v2 1 gt i42 if
+0 'exit
+0 ret
+i41:
+v13 'wc_lines v8! 
+v13 'wc_words v9! 
+v13 'wc_bytes v10! 
+v13 'wc_maxline v11! 
+v8 v9 v10 v11 v0 "" 0 'wc_print 
+0 ret
+i42:
+v3 v4 v5 v6 v0 "total" 1 'wc_print 
+0 ret
+c39:
+0 ret
+wc_stdin_buffer:
+v17!
+65536 malloc v18!
+v17 "w" 'fopen v19!
+c43 b44 while
+v19 'fclose 
+v18 free 
+0 rv! 1 fr! consume consume
+fr rv mul frv! 0 fr! ret frv
+c43:
+fr not v18 1 65536 extern "stdin" load 'fread v20! 0 gt and ret
+b44:
+v18 1 v20 v19 'fwrite 
+0 ret
+wc_lines:
+v21!
+0 v23!
+v21 "r" 'fopen v24!
+v24 not i45 if
+fr c46 b47 if_else
+fr rv mul frv! 0 fr! ret frv
+i45:
+0 1 sub rv! 1 fr! 0 ret
+b47:
+c48 b49 while
+v24 'fclose 
+v23 rv! 1 fr! 0 ret
+c48:
+fr not 1 and ret
+b49:
+v24 'fgetc v22! 
+v22 -1 eq i50 if
+v22 10 eq i51 if
+0 ret
+i50:
+break
+0 ret
+i51:
+v23 1 add v23! 
+0 ret
+c46:
+0 ret
+wc_words:
+v25!
+0 v27!
+0 v28!
+v25 "r" 'fopen v29!
+v29 not i52 if
+fr c53 b54 if_else
+fr rv mul frv! 0 fr! ret frv
+i52:
+0 1 sub rv! 1 fr! 0 ret
+b54:
+c55 b56 while
+v29 'fclose 
+v27 rv! 1 fr! 0 ret
+c55:
+fr not 1 and ret
+b56:
+v29 'fgetc v26! 
+v26 -1 eq i57 if
+v26 32 eq v26 9 eq or not not v26 10 eq or not not v26 13 eq or not not v26 11 eq or not not v26 12 eq or not not i58 e59 if_else
+0 ret
+i57:
+break
+0 ret
+i58:
+0 v28! 
+0 ret
+e59:
+v28 0 eq i60 if
+0 ret
+i60:
+1 v28! 
+v27 1 add v27! 
+0 ret
+c53:
+0 ret
+wc_bytes:
+v30!
+0 v32!
+v30 "r" 'fopen v33!
+v33 not i61 if
+fr c62 b63 if_else
+fr rv mul frv! 0 fr! ret frv
+i61:
+0 1 sub rv! 1 fr! 0 ret
+b63:
+c64 b65 while
+v33 'fclose 
+v32 rv! 1 fr! 0 ret
+c64:
+fr not 1 and ret
+b65:
+v33 'fgetc v31! 
+v31 -1 eq i66 if
+v32 1 add v32! 
+0 ret
+i66:
+break
+0 ret
+c62:
+0 ret
+wc_maxline:
+v34!
+0 v36!
+0 v37!
+v34 "r" 'fopen v38!
+v38 not i67 if
+fr c68 b69 if_else
+fr rv mul frv! 0 fr! ret frv
+i67:
+0 1 sub rv! 1 fr! 0 ret
+b69:
+c70 b71 while
+v37 v36 gt i76 if
+v38 'fclose 
+v36 rv! 1 fr! 0 ret
+c70:
+fr not 1 and ret
+b71:
+v38 'fgetc v35! 
+v35 -1 eq i72 if
+v35 10 eq i73 e74 if_else
+0 ret
+i72:
+break
+0 ret
+i73:
+v37 v36 gt i75 if
+0 v37! 
+0 ret
+i75:
+v37 v36! 
+0 ret
+e74:
+v37 1 add v37! 
+0 ret
+i76:
+v37 v36! 
+0 ret
+c68:
+0 ret
+wc_print:
+v39!
+v40!
+v41!
+v42!
+v43!
+v44!
+v45!
+v43 1 and 0 eq not v46!
+v43 2 and 0 eq not v47!
+v43 4 and 0 eq not v48!
+v43 8 and 0 eq not v49!
+v43 16 and 0 eq not v50!
+v43 0 eq i77 if
+fr c79 b80 if_else
+fr rv mul frv! 0 fr! ret frv
+i77:
+"%8d %8d %8d" v39 v40 v41 3 'printf 
+v45 i78 if
+"\n" 0 'printf 
+0 rv! 1 fr! 0 ret
+i78:
+" " 0 'printf 
+"%s" v44 1 'printf 
+0 ret
+b80:
+v46 i81 if
+v47 i82 if
+v48 i83 if
+v49 i84 if
+v50 i85 if
+v45 i86 if
+"\n" 0 'printf 
+0 rv! 1 fr! 0 ret
+i81:
+"%8d" v39 1 'printf 
+0 ret
+i82:
+"%8d" v40 1 'printf 
+0 ret
+i83:
+"%8d" v41 1 'printf 
+0 ret
+i84:
+"%8d" v41 1 'printf 
+0 ret
+i85:
+"%8d" v42 1 'printf 
+0 ret
+i86:
+" " 0 'printf 
+"%s" v44 1 'printf 
+0 ret
+c79:
+0 ret

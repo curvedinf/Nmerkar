@@ -16,7 +16,7 @@ UF=${UF:-$TRANSROOT/../comp/target/release/nk}
 TRANS=${TRANS:-$TRANSROOT/target/release/trans}
 [ -x "$TRANS" ] || { echo "trans binary missing; run: (cd trans && cargo build --release)"; exit 1; }
 [ -x "$UF" ] || { echo "nk binary missing; run: (cd comp && cargo build --release)"; exit 1; }
-TOOLS="cat head nl tee cksum base64"
+TOOLS="cat head nl tee cksum base64 wc"
 EXDIR=$HERE/../../../examples/gnu
 T=$(mktemp -d)
 PASS=0; FAIL=0
@@ -141,6 +141,14 @@ for tool in $TOOLS; do
       diff -q "$T/out" "$T/b64.txt" >/dev/null && [ ! -s "$T/rerr" ] && pass_t=$((pass_t+1)) || { fail_t=$((fail_t+1)); echo "  DIFF base64 [roundtrip]"; }
       base64 -w 7 "$T/b64.txt" | timeout 10 "$T/base64_bin" -d > "$T/out" 2>/dev/null
       diff -q "$T/out" "$T/b64.txt" >/dev/null && pass_t=$((pass_t+1)) || { fail_t=$((fail_t+1)); echo "  DIFF base64 [wrapped roundtrip]"; }
+      ;;
+    wc)
+      check default -- "$T/lines.txt"
+      check l -l -- "$T/lines.txt"
+      check w -w -- "$T/lines.txt"
+      check c -c -- "$T/lines.txt"
+      check stdin -- /dev/null
+      check two-files "$T/lines.txt" "$T/text.txt"
       ;;
   esac
 

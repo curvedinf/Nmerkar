@@ -16,7 +16,7 @@ UF=${UF:-$TRANSROOT/../comp/target/release/nk}
 TRANS=${TRANS:-$TRANSROOT/target/release/trans}
 [ -x "$TRANS" ] || { echo "trans binary missing; run: (cd trans && cargo build --release)"; exit 1; }
 [ -x "$UF" ] || { echo "nk binary missing; run: (cd comp && cargo build --release)"; exit 1; }
-TOOLS="cat head nl tee cksum base64 wc"
+TOOLS="cat head nl tee cksum base64 wc diff"
 EXDIR=$HERE/../../../examples/gnu
 T=$(mktemp -d)
 PASS=0; FAIL=0
@@ -149,6 +149,11 @@ for tool in $TOOLS; do
       check c -c -- "$T/lines.txt"
       check stdin -- /dev/null
       check two-files "$T/lines.txt" "$T/text.txt"
+      ;;
+    diff)
+      check identical "$T/lines.txt" "$T/lines.txt" -- /dev/null
+      check diff1 "$T/lines.txt" "$T/text.txt" -- /dev/null
+      check diff2 "$T/text.txt" "$T/lines.txt" -- /dev/null
       ;;
   esac
 

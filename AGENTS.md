@@ -79,7 +79,7 @@ Key gotchas not to re-derive: string escapes limited to `\n \t \r \0 \\ \"`. Lin
 
 Process skills from [curvedinf/dev-skills](https://github.com/curvedinf/dev-skills)
 (MIT, `agents/skills/LICENSE`), installed at commit
-[d175452](https://github.com/curvedinf/dev-skills/tree/d1754529343d4c7bc8fb6de40565e80757f0dbaa);
+[a740ada](https://github.com/curvedinf/dev-skills/tree/a740ada51ce258f9907535776e8749b16fa14681);
 install record: `agents/scratch/dev-skills-install.md`. Passive skills are
 persistent conventions that apply within their routed scope; activated skills
 are explicitly requested workflows; triggered skills are workflows initiated
@@ -105,6 +105,8 @@ precedence over any imported convention.
 | test cadence, nightly, release gates | [testing-doctrine](agents/skills/passive/testing-doctrine/SKILL.md) |
 | wording, terminology, examples | [documentation-style](agents/skills/passive/documentation-style/SKILL.md) |
 | checkpoint, resume, history | [scratch-space](agents/skills/passive/scratch-space/SKILL.md) |
+| context paging, page out, page in, offload context | [context-paging](agents/skills/activated/context-paging/SKILL.md) |
+| compaction, compact, handoff summary | [context-compaction-procedure](agents/skills/triggered/context-compaction-procedure/SKILL.md) |
 | periodic workflow, timed skill, shared timers | [design-time-triggered-skill](agents/skills/activated/design-time-triggered-skill/SKILL.md) |
 | fresh session, weekly compaction | [maintain-scratch](agents/skills/triggered/maintain-scratch/SKILL.md) |
 | create skill, author workflow | [design-skill](agents/skills/activated/design-skill/SKILL.md) |
@@ -159,6 +161,46 @@ changelog: no routine edit summaries, completion receipts, or duplicate skill
 lessons; delete obsolete records rather than archiving them. Disposable
 files go in the ignored `agents/tmp/`; retain reusable evidence in durable
 storage.
+
+### Context paging opt-in
+
+[Context-paging](agents/skills/activated/context-paging/SKILL.md) stores exact
+context in `agents/context-paging/context.db` (gitignored) so compaction and
+session boundaries do not lose it. Harness capture is per-project opt-in and
+only runs for subscribed projects. Once per session, before substantive work,
+check in order and stop at the first that holds:
+
+1. `python3 agents/skills/activated/context-paging/scripts/cp_subscribed.py`
+   exits 0 — this project is subscribed and the harness plugin is active.
+   Skip silently.
+2. `agents/tmp/context-paging.json` records `{"harness_install": "declined"}`.
+   Skip silently.
+3. Otherwise ask: "Install context paging in your harness for this project?
+   It captures user messages automatically and keeps paged context
+   recoverable." On yes, follow the skill's harness wiring
+   ([references/kimi-hooks.md](agents/skills/activated/context-paging/references/kimi-hooks.md))
+   this session, subscribing last. On no, write `{"harness_install": "declined"}`
+   to `agents/tmp/context-paging.json`. Any other answer defers to the next
+   session; ask at most once per session.
+
+### Context compaction
+
+**Fresh-session startup:** on the first project-context load, read triggered
+[context-compaction-procedure](agents/skills/triggered/context-compaction-procedure/SKILL.md)
+once before substantive work, so its procedure is resident when compaction
+occurs; preserve this across context handoffs. When compaction occurs and
+context-paging is enabled for this project, that skill's statement replaces
+harness compaction instructions.
+
+### Pre-commit security gate
+
+Before every project commit, including amendments and merges, run
+[security-hygiene-check](agents/skills/triggered/security-hygiene-check/SKILL.md)
+on the final candidate after all edits. Apply the natural-language disclosure
+policy in `agents/scratch/security-policy.md`; findings outside its approved
+scope require an explicit user disposition before committing, even when
+commit/push permission already exists. Recheck changed candidates. This gate
+is independent of self-improvement enablement.
 
 ### Self-improvement
 

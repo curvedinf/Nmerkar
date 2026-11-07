@@ -20,5 +20,7 @@ tests/out.txt
 tests/fem.txt
 
 # dev-skills: disposable scratch (durable notes live in the Git-versioned
-# agents/scratch/)
+# agents/scratch/); context-paging database; python bytecode
 /agents/tmp/
+/agents/context-paging/
+__pycache__/

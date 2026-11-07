@@ -1,8 +1,9 @@
 # Dev Skills installation record
 
 - **Source:** https://github.com/curvedinf/dev-skills, revision `main`,
-  commit `d1754529343d4c7bc8fb6de40565e80757f0dbaa` (updated 2026-10-14;
-  prior install: `eec75da909fc954cd970cc3921859f9884a66a84`).
+  commit `a740ada51ce258f9907535776e8749b16fa14681` (updated 2026-11-07;
+  prior installs: `d1754529343d4c7bc8fb6de40565e80757f0dbaa`,
+  `eec75da909fc954cd970cc3921859f9884a66a84`).
 - **Scope:** project-wide (user option 1), destination
   `agents/skills/<passive|activated|triggered>/<name>/` at the Nmerkar root,
   branch `probe`.
@@ -107,6 +108,60 @@
 - Upstream clone fetched to the ignored `agents/tmp/` and removed after
   copy.
 
+## Update 2026-11-07: d175452 → a740ada
+
+- Scope: project-wide (update of the standing installation; scope inherited,
+  user request "Update dev-skills"). Upstream `main` resolved to
+  `a740ada51ce258f9907535776e8749b16fa14681` (2026-11-07).
+- Upstream theme: context recovery. New activated `context-paging` (exact
+  context in a per-project SQLite store, ~24 one-operation scripts, harness
+  wiring reference for kimi code CLI) and new triggered
+  `context-compaction-procedure` (read once per session; when compaction
+  occurs with paging enabled, author a minimal search-oriented statement that
+  replaces harness compaction instructions).
+- Added (complete folders): `activated/context-paging` (SKILL.md, openai.yaml,
+  references/kimi-hooks.md, scripts/), `triggered/context-compaction-procedure`
+  (SKILL.md, openai.yaml). Upstream bytecode (`__pycache__/*.pyc`, untracked
+  there) not copied. Updated from upstream: install-dev-skills (gains the
+  project-wide mandate to insert and execute the context-paging harness
+  opt-in section; local copy had matched d175452 verbatim, so taken verbatim).
+- Local divergences preserved (upstream touched neither): coordinate-work
+  baseline-freeze sentence; diagnose-and-repair corpus-scan sentence (task-end
+  refinement, commit 2dc045f — previously unrecorded, now listed under
+  Conflicts). All other skills byte-identical to upstream. Inventory now
+  22 skills (12 activated + 6 passive + 4 triggered).
+- AGENTS.md "Dev Skills" merged: pin d175452 → a740ada; two routing rows
+  added at upstream positions (context-paging, context-compaction-procedure);
+  three new subsections between Scratch space and Self-improvement:
+  "Context paging opt-in" (script path adapted to `agents/skills/...`),
+  "Context compaction" (fresh-session read of context-compaction-procedure),
+  and "Pre-commit security gate" — the last completes wiring the 2026-10-14
+  install recorded as done but never written into AGENTS.md (only
+  `agents/scratch/security-policy.md` existed); text unchanged upstream since
+  its introduction. "Self-improvement: enabled." preserved (explicit prior
+  opt-in; upstream's not inherited).
+- .gitignore: `/agents/context-paging/` and `__pycache__/` added to the
+  dev-skills block (running the cp scripts creates bytecode under scripts/).
+- timers.json: upstream's own completion history not imported; the
+  maintain-scratch entry is preserved and stamped this session (timer was 24
+  days due; pass reviewed all four records, found nothing to compact).
+- Context-paging opt-in executed during installation per the updated
+  installer: gate 1 `cp_subscribed.py` → not subscribed (rc 1); gate 2 no
+  `agents/tmp/context-paging.json`. Gate 3 asked at end of the install
+  session as a normal reply (auto-permission mode forbids the question
+  tool). User answered yes with the harness plugin already installed
+  (registry shows it active for three other local projects), so only
+  `cp_subscribe.py` was run: schema created at
+  `agents/context-paging/context.db` (gitignored), registry entry written,
+  `cp_subscribed.py` re-verified exit 0 (2026-11-07). Harness capture is
+  active for this project from the next hook event.
+- Verification: `py_compile` over all scripts OK; copied trees byte-identical
+  to upstream a740ada; every `agents/skills/...` link in AGENTS.md resolves;
+  new skills' frontmatter matches directories/category; adapters carry the
+  correct implicit-invocation flags (activated false, triggered true).
+  Upstream clone fetched to ignored `agents/tmp/` and removed after copy.
+  Current session still holds pre-update instructions; reload required.
+
 ## Adaptations
 
 - Cross-skill relative links (`../../triggered/...`, `../../passive/...`,
@@ -137,6 +192,12 @@
   a frozen source snapshot under concurrent edits. Evidence: a byte-identity
   check was contaminated by a parallel contributor's edit to a shared
   artifact during SPEC/compiler work. Reconcile on the next upstream sync.
+- Local refinement (2026-10-12, task-end self-improvement, commit 2dc045f):
+  diagnose-and-repair step 4 gained one sentence — a static corpus scan does
+  not establish value-level claims (which operand types reach a changed
+  path); behavioral gates do. Evidence: emitted-C/target representation gaps
+  surfaced only at execution during the v15.1 string-arithmetic work.
+  Reconcile on the next upstream sync.
 
 ## Corrections applied
 

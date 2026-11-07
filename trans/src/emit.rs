@@ -564,6 +564,8 @@ fn binop_mnemonic(op: BinOp) -> &'static str {
         BinOp::Add => "add",
         BinOp::Sub => "sub",
         BinOp::Mul => "mul",
+        BinOp::Div => "div",
+        BinOp::Rem => "rem",
         BinOp::Shl => "shl",
         BinOp::Shr => "shr",
         BinOp::Lt => "lt",

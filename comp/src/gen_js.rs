@@ -50,7 +50,7 @@ const JS_OPS: &[&str] = &[
     "op_fatof", "op_fatoi", "op_fbyte", "op_feach", "op_femit", "op_ffold",
     "op_fget", "op_finc", "op_fmatch", "op_fsget", "op_fsplit", "op_gc",
     "op_group", "op_hasargs", "op_mmap", "op_now", "op_obj", "op_retry",
-    "op_sh", "op_shp", "op_slurp", "op_spit", "op_time", "op_timef",
+    "op_sh", "op_shp", "op_slurp", "op_spit", "op_walk", "op_time", "op_timef",
     "op_try", "op_wfind", "op_clone", "op_sizeof", "op_shutdown",
     "op_scan", "op_cap", "op_caps",
 ];
@@ -125,8 +125,8 @@ fn sb_die_text(p: &Parsed, pc: usize) -> String {
         None => return SB_DIE_FALLBACK.to_string(),
     };
     format!(
-        "label '{}': missing parameter '{}' ({} parameter(s) declared, fewer present at runtime \u{2014} null-fill was removed)",
-        label, name, params.len()
+        "label '{}': missing parameter '{}' ({} parameter(s) declared, fewer present at runtime \u{2014} null-fill was removed; check the call/callback leaves {} value(s) below the invocation)",
+        label, name, params.len(), params.len()
     )
 }
 

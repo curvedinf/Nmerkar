@@ -1,0 +1,44 @@
+; t37_entryorder.n — v16.2 label-placement independence: top-level label
+; bodies may be defined BEFORE or BETWEEN main-flow statements. The parser
+; hoists them behind the main flow, so pc 0 is always main and a label's
+; `ret` can never absorb following main code as its return operand. Every
+; helper below is deliberately defined before the main code that uses it.
+; Run: nk comp/tests/t37_entryorder.n
+
+; helper labels first: a two-parameter file_fold_lines callback,
+; a one-parameter for callback, and a plain call helper — the shapes that
+; previously entered at pc 0 and died on arity
+count2: acc! _!
+  acc 1 add ret
+
+sumeach: v!
+  t v add t! ret 0
+
+double: n!
+  ret n 2 mul
+
+; main: the shared accumulator is declared AFTER the labels (a top-level
+; assignment anywhere in the main flow declares a shared var)
+0 t!
+0 lines!
+
+; file_fold_lines with the label-first two-parameter callback
+"tests/log.txt" 0 count2 file_fold_lines lines!
+lines 4 eq check
+
+; for over a collection with the label-first one-parameter callback
+[10 20 30] sumeach for
+t 60 eq check
+
+; plain call with the label-first callee
+21 'double 42 eq check
+
+; a mid-program label: main code continues after the body below
+70 expected!
+mid: x!
+  ret x 5 add
+65 'mid expected eq check
+
+; one more main statement after the last label body
+"entryorder-ok" print
+ret

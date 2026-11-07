@@ -33,21 +33,28 @@ fn table_shape_and_retirement() {
         .collect();
     assert_eq!(retired_in_place, Vec::<usize>::new(), "no op may be retired in place");
     let live = live_indices();
-    assert_eq!(live.len(), 198, "live-op count");
+    assert_eq!(live.len(), 199, "live-op count");
     // 25 "~NN" retired slots, all glyph-less (18 through v15; v15.1 retired
     // the eight scalar_/array_ arithmetic aliases, slots 128..=135; slot 41
-    // was retired with ADDR and revived in v16 as `apply`)
+    // was retired with ADDR and revived in v16 as `apply`; slot 1 was dup,
+    // revived in v16.2 as `walk` — every live op now has a dense glyph)
     let retired: Vec<usize> = (0..OP_NAMES.len()).filter(|&i| OP_NAMES[i].starts_with('~')).collect();
-    assert_eq!(retired.len(), 24, "retired ~NN slot count (41 revived as apply, 57-59 revived for weave; 82 TASK and 25/128 retired — ' is the only call surface)");
+    assert_eq!(retired.len(), 23, "retired ~NN slot count (41 revived as apply, 57-59 revived for weave, 1 revived as walk; 82 TASK and 25/128 retired — ' is the only call surface)");
     for &i in &retired {
         assert_eq!(OP_GLYPHS[i], 0, "retired slot {} ({}) must have no glyph", i, OP_NAMES[i]);
     }
-    // the only live ops without a dense glyph are consume (83) / cap (86) / caps (87)
+    // every live op has a dense glyph (v16.2: walk 🐾 / consume 🍴 / cap 🔑 / caps 📋 joined)
     let glyphless: Vec<usize> = live.iter().copied().filter(|&i| OP_GLYPHS[i] == 0).collect();
-    assert_eq!(glyphless, vec![83, 86, 87], "consume/cap/caps are the only text-only live ops");
+    assert_eq!(glyphless, Vec::<usize>::new(), "every live op must have a dense glyph");
+    assert_eq!(OP_NAMES[1], "WALK");
+    assert_eq!(OP_GLYPHS[1], 0x1f43e);
+    assert_eq!(text_mnemonic(1), "walk");
     assert_eq!(OP_NAMES[83], "CONSUME");
+    assert_eq!(OP_GLYPHS[83], 0x1f374);
     assert_eq!(OP_NAMES[86], "CAP");
+    assert_eq!(OP_GLYPHS[86], 0x1f511);
     assert_eq!(OP_NAMES[87], "CAPS");
+    assert_eq!(OP_GLYPHS[87], 0x1f4cb);
 }
 
 #[test]
@@ -62,7 +69,7 @@ fn glyph_spaces_unique_disjoint_roundtrip() {
             seen.push((g, i));
         }
     }
-    assert_eq!(seen.len(), 195, "nonzero opcode glyph count");
+    assert_eq!(seen.len(), 199, "nonzero opcode glyph count");
     // v-space / l-space: 64 unique codepoints each
     for (name, space) in [("V_SPACE", &V_SPACE), ("L_SPACE", &L_SPACE)] {
         assert_eq!(space.len(), 64);

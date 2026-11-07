@@ -1,0 +1,32 @@
+; t36_walk.n — v16.2 `walk`: recursive file listing with an fnmatch pattern
+; against basenames. Regular files only (directories traversed but not
+; returned, symlinked dirs not followed), full paths sorted lexicographically,
+; dotfiles match plainly (find -name semantics). Capability fs.read — runs
+; under the default sandbox policy with no proc grant.
+; Run: nk comp/tests/t36_walk.n
+
+; 1. *.txt over the fixture tree: a.txt, b.txt, sub/c.txt, .hidden.txt
+"comp/tests/walktree" "*.txt" walk length 4 eq check
+
+; 2. sorted: the dotfile sorts first, sub/ last
+"comp/tests/walktree" "*.txt" walk 0 get "comp/tests/walktree/.hidden.txt" eq check
+"comp/tests/walktree" "*.txt" walk 3 get "comp/tests/walktree/sub/c.txt" eq check
+
+; 3. *.md finds the nested file only
+"comp/tests/walktree" "*.md" walk length 1 eq check
+"comp/tests/walktree" "*.md" walk 0 get "comp/tests/walktree/sub/d.md" eq check
+
+; 4. * matches every regular file (5); directories are never returned
+"comp/tests/walktree" "*" walk length 5 eq check
+
+; 5. pattern with a character class
+"comp/tests/walktree" "[ab].txt" walk length 2 eq check
+
+; 6. no match: empty list, not an error
+"comp/tests/walktree" "*.zzz" walk length 0 eq check
+
+; 7. results are ordinary strings: read one back
+"comp/tests/walktree" "*.md" walk 0 get read_file "d\n" eq check
+
+"walk-ok" print
+ret

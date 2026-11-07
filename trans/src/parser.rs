@@ -2,7 +2,8 @@
 // Expression precedence mirrors C for the supported subset:
 //   assignment (right-assoc) → || → && → equality → relational
 //   → additive → multiplicative → unary → postfix → primary
-// Division and modulo are rejected ("no division in subset").
+// Division (`/`, `/=`) and modulo (`%`, `%=`) are supported and emit the
+// `div`/`rem` Nmerkar opcodes (the compiler maps them to `uf_cdiv`/`uf_crem`).
 
 use crate::ast::*;
 use crate::error::{Error, Result};
@@ -283,13 +284,12 @@ impl Parser {
         if self.peek().kind == Kind::Ident && next_is_assign {
             let name_tok = self.bump();
             let op_tok = self.bump();
-            if op_tok.text == "/=" || op_tok.text == "%=" {
-                return Err(Error::new(op_tok.line, op_tok.col, "no division in subset"));
-            }
             let op = match op_tok.text.as_str() {
                 "+=" => Some(BinOp::Add),
                 "-=" => Some(BinOp::Sub),
                 "*=" => Some(BinOp::Mul),
+                "/=" => Some(BinOp::Div),
+                "%=" => Some(BinOp::Rem),
                 _ => None,
             };
             let value = Box::new(self.assignment()?);
@@ -414,8 +414,15 @@ impl Parser {
                     let rhs = self.unary()?;
                     lhs = Expr { kind: ExprKind::Binary { op: BinOp::Mul, lhs: Box::new(lhs), rhs: Box::new(rhs) }, line: 0, col: 0 };
                 }
-                "/" | "%" => {
-                    return Err(Error::new(t.line, t.col, "no division in subset"));
+                "/" => {
+                    self.bump();
+                    let rhs = self.unary()?;
+                    lhs = Expr { kind: ExprKind::Binary { op: BinOp::Div, lhs: Box::new(lhs), rhs: Box::new(rhs) }, line: 0, col: 0 };
+                }
+                "%" => {
+                    self.bump();
+                    let rhs = self.unary()?;
+                    lhs = Expr { kind: ExprKind::Binary { op: BinOp::Rem, lhs: Box::new(lhs), rhs: Box::new(rhs) }, line: 0, col: 0 };
                 }
                 _ => break,
             }
@@ -586,9 +593,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_division() {
-        let toks = lex("a / b").unwrap();
-        assert!(Parser::new(toks).expr().is_err());
+    fn accepts_division_and_modulo() {
+        // `/` and `%` are left-associative: `a / b % c` == `(a / b) % c`.
+        let toks = lex("a / b % c").unwrap();
+        let e = Parser::new(toks).expr().unwrap();
+        match e.kind {
+            ExprKind::Binary { op: BinOp::Rem, lhs, .. } => {
+                match lhs.kind {
+                    ExprKind::Binary { op: BinOp::Div, .. } => {}
+                    _ => panic!("expected inner div"),
+                }
+            }
+            _ => panic!("expected rem at top"),
+        }
+    }
+
+    #[test]
+    fn rejects_division_by_zero_literal_is_still_runtime() {
+        // Division by zero is a runtime concern; the parser accepts it.
+        let toks = lex("a / 0").unwrap();
+        assert!(Parser::new(toks).expr().is_ok());
     }
 
     #[test]

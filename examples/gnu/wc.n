@@ -330,58 +330,137 @@ v37 v36!
 0 ret
 c68:
 0 ret
-wc_print:
+num_digits:
 v39!
-v40!
+v39 0 eq i77 if
+fr c78 b79 if_else
+fr rv mul frv! 0 fr! ret frv
+i77:
+1 rv! 1 fr! 0 ret
+b79:
+v39 0 lt i80 if
+1 v40!
+c81 b82 while
+v40 rv! 1 fr! 0 ret
+i80:
+0 v39 sub v39! 
+0 ret
+c81:
+fr not v39 10 lt not and ret
+b82:
+v40 1 add v40! 
+v39 10 div v39! 
+0 ret
+c78:
+0 ret
+wc_print:
 v41!
 v42!
 v43!
 v44!
 v45!
-v43 1 and 0 eq not v46!
-v43 2 and 0 eq not v47!
-v43 4 and 0 eq not v48!
-v43 8 and 0 eq not v49!
-v43 16 and 0 eq not v50!
-v43 0 eq i77 if
-fr c79 b80 if_else
+v46!
+v47!
+v45 1 and 0 eq not v48!
+v45 2 and 0 eq not v49!
+v45 4 and 0 eq not v50!
+v45 8 and 0 eq not v51!
+v45 16 and 0 eq not v52!
+1 v53!
+v45 0 eq i83 if
+fr c88 b89 if_else
 fr rv mul frv! 0 fr! ret frv
-i77:
-"%8d %8d %8d" v39 v40 v41 3 'printf 
-v45 i78 if
-"\n" 0 'printf 
-0 rv! 1 fr! 0 ret
-i78:
-" " 0 'printf 
-"%s" v44 1 'printf 
-0 ret
-b80:
-v46 i81 if
-v47 i82 if
-v48 i83 if
-v49 i84 if
-v50 i85 if
-v45 i86 if
-"\n" 0 'printf 
-0 rv! 1 fr! 0 ret
-i81:
-"%8d" v39 1 'printf 
-0 ret
-i82:
-"%8d" v40 1 'printf 
-0 ret
 i83:
-"%8d" v41 1 'printf 
-0 ret
+v41 'num_digits v54! 
+v54 v53 gt i84 if
+v42 'num_digits v54! 
+v54 v53 gt i85 if
+v43 'num_digits v54! 
+v54 v53 gt i86 if
+"%*d %*d %*d" v53 v41 v53 v42 v53 v43 6 'printf 
+v47 i87 if
+"\n" 0 'printf 
+0 rv! 1 fr! 0 ret
 i84:
-"%8d" v41 1 'printf 
+v54 v53! 
 0 ret
 i85:
-"%8d" v42 1 'printf 
+v54 v53! 
 0 ret
 i86:
-" " 0 'printf 
-"%s" v44 1 'printf 
+v54 v53! 
 0 ret
-c79:
+i87:
+" " 0 'printf 
+"%s" v46 1 'printf 
+0 ret
+b89:
+v48 i90 if
+v49 i92 if
+v50 i94 if
+v51 i96 if
+v52 i98 if
+v48 i100 if
+v49 i101 if
+v50 i102 if
+v51 i103 if
+v52 i104 if
+v47 i105 if
+"\n" 0 'printf 
+0 rv! 1 fr! 0 ret
+i90:
+v41 'num_digits v54! 
+v54 v53 gt i91 if
+0 ret
+i91:
+v54 v53! 
+0 ret
+i92:
+v42 'num_digits v54! 
+v54 v53 gt i93 if
+0 ret
+i93:
+v54 v53! 
+0 ret
+i94:
+v43 'num_digits v54! 
+v54 v53 gt i95 if
+0 ret
+i95:
+v54 v53! 
+0 ret
+i96:
+v43 'num_digits v54! 
+v54 v53 gt i97 if
+0 ret
+i97:
+v54 v53! 
+0 ret
+i98:
+v44 'num_digits v54! 
+v54 v53 gt i99 if
+0 ret
+i99:
+v54 v53! 
+0 ret
+i100:
+"%*d" v53 v41 2 'printf 
+0 ret
+i101:
+"%*d" v53 v42 2 'printf 
+0 ret
+i102:
+"%*d" v53 v43 2 'printf 
+0 ret
+i103:
+"%*d" v53 v43 2 'printf 
+0 ret
+i104:
+"%*d" v53 v44 2 'printf 
+0 ret
+i105:
+" " 0 'printf 
+"%s" v46 1 'printf 
+0 ret
+c88:
 0 ret

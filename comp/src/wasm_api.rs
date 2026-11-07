@@ -34,10 +34,12 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-// One 16 MiB linear-memory chunk, allocated once and never moved; the
+// One 64 MiB linear-memory chunk, allocated once and never moved; the
 // bump pointer walks it. Chunks from the Rust allocator are stable, so
-// offsets handed to JS stay valid for the module's lifetime.
-const CHUNK: usize = 16 << 20;
+// offsets handed to JS stay valid for the module's lifetime. (Was 16 MiB;
+// the 99-gate parity suite compiles every gate in one process and the
+// cumulative/fragmented allocations crossed it.)
+const CHUNK: usize = 64 << 20;
 // The last 128 KiB of the chunk is reserved for the panic-message region.
 // It is never handed out by nk_js_alloc.
 const MSG_SIZE: usize = 128 << 10;

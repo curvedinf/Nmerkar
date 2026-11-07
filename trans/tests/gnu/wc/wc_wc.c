@@ -92,6 +92,15 @@ int wc_maxline(char* name) {
   return maxline;
 }
 
+/* Number of decimal digits in a non-negative integer. */
+int num_digits(int v) {
+  if (v == 0) return 1;
+  if (v < 0) v = -v;
+  int d = 1;
+  while (v >= 10) { d = d + 1; v = v / 10; }
+  return d;
+}
+
 /* Print a wc output line. */
 int wc_print(int nl, int nw, int nb, int maxline, int flags, char* name, int print_name) {
   int has_l = (flags & 1) != 0;
@@ -99,19 +108,32 @@ int wc_print(int nl, int nw, int nb, int maxline, int flags, char* name, int pri
   int has_c = (flags & 4) != 0;
   int has_m = (flags & 8) != 0;
   int has_L = (flags & 16) != 0;
+  int width = 1;
+  int d;
 
   if (flags == 0) {
-    printf("%8d %8d %8d", nl, nw, nb);
+    /* Compute width for all values when printing all three. */
+    d = num_digits(nl); if (d > width) width = d;
+    d = num_digits(nw); if (d > width) width = d;
+    d = num_digits(nb); if (d > width) width = d;
+    printf("%*d %*d %*d", width, nl, width, nw, width, nb);
     if (print_name) { printf(" "); printf("%s", name); }
     printf("\n");
     return 0;
   }
 
-  if (has_l) printf("%8d", nl);
-  if (has_w) printf("%8d", nw);
-  if (has_c) printf("%8d", nb);
-  if (has_m) printf("%8d", nb);
-  if (has_L) printf("%8d", maxline);
+  /* Compute width for flag-specific values. */
+  if (has_l) { d = num_digits(nl); if (d > width) width = d; }
+  if (has_w) { d = num_digits(nw); if (d > width) width = d; }
+  if (has_c) { d = num_digits(nb); if (d > width) width = d; }
+  if (has_m) { d = num_digits(nb); if (d > width) width = d; }
+  if (has_L) { d = num_digits(maxline); if (d > width) width = d; }
+
+  if (has_l) printf("%*d", width, nl);
+  if (has_w) printf("%*d", width, nw);
+  if (has_c) printf("%*d", width, nb);
+  if (has_m) printf("%*d", width, nb);
+  if (has_L) printf("%*d", width, maxline);
   if (print_name) { printf(" "); printf("%s", name); }
   printf("\n");
   return 0;

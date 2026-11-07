@@ -130,6 +130,17 @@ const SPECS = [
   ["comp/tests/t33_polycond.n", {}],
   ["comp/tests/t34_collfor.n", {}],
   ["comp/tests/t35_helpermeth.n", {}],
+  ["comp/tests/t36_walk.n", {
+    fsPreload: {
+      "comp/tests/walktree/a.txt": repo("comp/tests/walktree/a.txt"),
+      "comp/tests/walktree/b.txt": repo("comp/tests/walktree/b.txt"),
+      "comp/tests/walktree/.hidden.txt": repo("comp/tests/walktree/.hidden.txt"),
+      "comp/tests/walktree/sub/c.txt": repo("comp/tests/walktree/sub/c.txt"),
+      "comp/tests/walktree/sub/d.md": repo("comp/tests/walktree/sub/d.md"),
+    },
+  }],
+  ["comp/tests/t37_entryorder.n", { fsPreload: { "tests/log.txt": repo("tests/log.txt") } }],
+  ["comp/tests/t38_shell.n", {}],
   // examples: repo example programs
   ["examples/hello.n", {}],
   ["examples/fib.n", {}],

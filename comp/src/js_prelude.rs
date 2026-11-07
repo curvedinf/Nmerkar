@@ -3370,6 +3370,28 @@ var RT = (function () {
     if (c === null) die(rt, "SLURP: cannot open file");
     rt.st.push(S(c));
   }
+  // WALK over the flat fs table: keys under `root/` are files (the table
+  // has no directories — implied prefixes are the dirs). Native parity:
+  // basename pattern match, files only, sorted, dotfiles match plainly.
+  function op_walk(rt) {
+    var pat = strOf(rt, pop(rt, "walk"));
+    var root = strOf(rt, pop(rt, "walk"));
+    if (pat === "") die(rt, "WALK: empty pattern — use * for all files");
+    var fs = rt.reg.env.fs || {};
+    var pre = root.charAt(root.length - 1) === "/" ? root.slice(0, -1) : root;
+    if (fsGet(rt, pre) !== null) die(rt, "WALK: cannot open directory");
+    var pre2 = pre + "/";
+    var out = [];
+    for (var k in fs) {
+      if (Object.prototype.hasOwnProperty.call(fs, k) && k.indexOf(pre2) === 0 && k.length > pre2.length) {
+        var rest = k.slice(pre2.length);
+        var base = rest.slice(rest.lastIndexOf("/") + 1);
+        if (globMatch(pat, base)) out.push(k);
+      }
+    }
+    out.sort();
+    rt.st.push(L(out.map(function (p) { return S(p); })));
+  }
   function op_spit(rt) {
     var st = strOf(rt, pop(rt, "spit"));
     var p = strOf(rt, pop(rt, "spit"));
@@ -3911,10 +3933,26 @@ var RT = (function () {
     return r.status;
   }
   function op_sh(rt) {
-    var cmd = strOf(rt, pop(rt, "sh"));
+    var c = pop(rt, "sh");
     var cp = childProc();
     if (!cp) die(rt, "JavaScript target: shell requires node");
-    var r = cp.spawnSync("/bin/sh", ["-c", cmd], { encoding: "buffer" });
+    /* list form: argv exec — no /bin/sh, no quoting (native parity) */
+    if (c.t === "l") {
+      if (c.v.length === 0) die(rt, "SH: empty argv");
+      var av = new Array(c.v.length);
+      for (var i = 0; i < c.v.length; i++) {
+        if (c.v[i].t !== "s") die(rt, "SH: argv list must contain only strings");
+        av[i] = strOf(rt, c.v[i]);
+      }
+      var rl = cp.spawnSync(av[0], av.slice(1), { encoding: "buffer", maxBuffer: 0x40000000 });
+      if (rl.error) die(rt, "SH: fork");
+      var ol = rl.stdout && rl.stdout.length ? utf8Dec(rl.stdout) : "";
+      var el = rl.stderr && rl.stderr.length ? utf8Dec(rl.stderr) : "";
+      rt.st.push(L([S(ol), S(el), I(BigInt(shStatus(rl, 0)))]));
+      return;
+    }
+    var cmd = strOf(rt, c);
+    var r = cp.spawnSync("/bin/sh", ["-c", cmd], { encoding: "buffer", maxBuffer: 0x40000000 });
     if (r.error) die(rt, "SH: fork");
     var out = r.stdout && r.stdout.length ? utf8Dec(r.stdout) : "";
     var err = r.stderr && r.stderr.length ? utf8Dec(r.stderr) : "";
@@ -3929,7 +3967,7 @@ var RT = (function () {
     var rec = reg.tasks[reg.tasks.length - 1];
     (async function () {
       if (cp) {
-        var r = cp.spawnSync("/bin/sh", ["-c", cmd], { encoding: "buffer" });
+        var r = cp.spawnSync("/bin/sh", ["-c", cmd], { encoding: "buffer", maxBuffer: 0x40000000 });
         if (!r.error) {
           var txt = r.stdout && r.stdout.length ? utf8Dec(r.stdout) : "";
           var lines = lineOf(txt);
@@ -3952,7 +3990,7 @@ var RT = (function () {
     if (!cp) die(rt, "JavaScript target: shell requires node");
     var av = new Array(h.v.length);
     for (var i = 0; i < h.v.length; i++) av[i] = strOf(rt, h.v[i]);
-    var r = cp.spawnSync(av[0], av.slice(1), { encoding: "buffer" });
+    var r = cp.spawnSync(av[0], av.slice(1), { encoding: "buffer", maxBuffer: 0x40000000 });
     /* native execvp inherits the parent fds: the child's writes reach the
        pipe before the parent's block-buffered std streams flush, so queue
        the captured output and prepend it at result time (nkOut/nkErr) */
@@ -4011,7 +4049,7 @@ var RT = (function () {
     op_clone: op_clone, op_sizeof: op_sizeof, op_shutdown: op_shutdown,
     op_scan: op_scan, op_cap: op_cap, op_caps: op_caps,
     op_bloom: op_bloom, op_badd: op_badd, op_btest: op_btest,
-    op_slurp: op_slurp, op_spit: op_spit, op_mmap: op_mmap,
+    op_slurp: op_slurp, op_spit: op_spit, op_mmap: op_mmap, op_walk: op_walk,
     op_feach: op_feach, op_ffold: op_ffold, op_fsplit: op_fsplit,
     op_fget: op_fget, op_fatoi: op_fatoi, op_fatof: op_fatof,
     op_fsget: op_fsget, op_fbyte: op_fbyte,

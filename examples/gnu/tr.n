@@ -1,0 +1,196 @@
+import c"printf"(ptr,...)->int
+import c"fprintf"(ptr,ptr,...)->int
+import c"fputc"(int,ptr)->int
+import c"ungetc"(int,ptr)->int
+import c"putchar"(int)->int
+import c"getchar"()->int
+import c"fputs"(ptr,ptr)->int
+import c"fwrite"(ptr,int,int,ptr)->int
+import c"strcmp"(ptr,ptr)->int
+import c"strncmp"(ptr,ptr,int)->int
+import c"strcpy"(ptr,ptr)->ptr
+import c"exit"(int)->void
+import c"fread"(ptr,int,int,ptr)->int
+import c"fopen"(ptr,ptr)->ptr
+import c"fclose"(ptr)->int
+import c"fgetc"(ptr)->int
+import c"strstr"(ptr,ptr)->ptr
+extern "stdout"
+extern "stdin"
+extern "stderr"
+0 rv! 0 fr! 0 frv! 0 pt!
+ret
+entry:
+1 v0!
+0 v1!
+0 v2!
+0 v3!
+0 v4!
+0 v5!
+1 v6!
+c1 b2 while
+v3 1 lt not i9 if
+v3 2 lt not i10 if
+v4 not i11 if
+fr c12 b13 if_else
+0 'exit
+ret
+c1:
+fr not v6 extern "nk_argc" load lt and ret
+b2:
+v6 8 mul extern "nk_argv" load add load v7!
+0 v7 "" 'strstr add load 255 and 45 eq 1 v7 "" 'strstr add load 255 and 0 eq not mul not not i3 if
+v3 1 add v3! 
+v6 1 add v6! 
+0 ret
+i3:
+1 v8!
+c4 b5 while
+v6 1 add v6! 
+continue
+0 ret
+c4:
+fr not v8 v7 "" 'strstr add load 255 and 0 eq not and ret
+b5:
+v8 v7 "" 'strstr add load 255 and 100 eq i6 e7 if_else
+v8 1 add v8! 
+0 ret
+i6:
+1 v1! 
+0 ret
+e7:
+v8 v7 "" 'strstr add load 255 and 115 eq i8 if
+0 ret
+i8:
+1 v2! 
+0 ret
+i9:
+1 8 mul extern "nk_argv" load add load v4! 
+0 ret
+i10:
+2 8 mul extern "nk_argv" load add load v5! 
+0 ret
+i11:
+extern "stderr" load "tr: missing operand\n" 0 'fprintf 
+1 'exit
+0 ret
+b13:
+0 1 sub v10!
+0 v11!
+c14 b15 while
+0 'exit
+0 ret
+c14:
+fr not 1 and ret
+b15:
+'getchar v9! 
+v9 -1 eq i16 if
+0 v12!
+0 v13!
+c17 b18 while
+v1 v12 mul not not i22 if
+v2 v12 mul not not i23 if
+v5 v12 mul not not i25 e26 if_else
+0 ret
+i16:
+break
+0 ret
+c17:
+fr not v13 v4 "" 'strstr add load 255 and 0 eq not and ret
+b18:
+v13 v4 "" 'strstr add load 255 and v9 eq i19 if
+v13 v4 "" 'strstr add load 255 and 45 eq v13 1 add v4 "" 'strstr add load 255 and 0 eq not mul not not i20 if
+v13 1 add v13! 
+0 ret
+i19:
+1 v12! 
+break
+0 ret
+i20:
+v13 1 sub v4 "" 'strstr add load 255 and v14!
+v13 1 add v4 "" 'strstr add load 255 and v15!
+v9 v14 lt not v9 v15 gt not mul not not i21 if
+v13 2 add v13! 
+continue
+0 ret
+i21:
+1 v12! 
+break
+0 ret
+i22:
+continue
+0 ret
+i23:
+v9 v10 eq i24 if
+v9 v10! 
+v9 'putchar 
+continue
+0 ret
+i24:
+continue
+0 ret
+i25:
+0 v16!
+0 v17!
+c27 b28 while
+v17 i31 e32 if_else
+0 ret
+c27:
+fr not v16 v4 "" 'strstr add load 255 and 0 eq not and ret
+b28:
+v16 v4 "" 'strstr add load 255 and v9 eq i29 if
+v16 v4 "" 'strstr add load 255 and 45 eq v16 1 add v4 "" 'strstr add load 255 and 0 eq not mul not not i30 if
+v16 1 add v16! 
+0 ret
+i29:
+1 v17! 
+break
+0 ret
+i30:
+v16 2 add v16! 
+continue
+0 ret
+i31:
+0 v18!
+0 v19!
+c33 b34 while
+0 v20!
+c37 b38 while
+v20 1 sub v5 "" 'strstr add load 255 and 'putchar 
+0 ret
+c33:
+fr not v18 v4 "" 'strstr add load 255 and 0 eq not and ret
+b34:
+v18 v4 "" 'strstr add load 255 and v9 eq i35 if
+v18 v4 "" 'strstr add load 255 and 45 eq v18 1 add v4 "" 'strstr add load 255 and 0 eq not mul not not i36 if
+v18 1 add v18! 
+0 ret
+i35:
+break
+0 ret
+i36:
+v18 2 add v18! 
+continue
+0 ret
+c37:
+fr not v20 v5 "" 'strstr add load 255 and 0 eq not and ret
+b38:
+v20 v5 "" 'strstr add load 255 and 45 eq v20 1 add v5 "" 'strstr add load 255 and 0 eq not mul not not i39 if
+v20 1 add v20! 
+v20 v18 gt i40 if
+0 ret
+i39:
+v20 2 add v20! 
+continue
+0 ret
+i40:
+break
+0 ret
+e32:
+v9 'putchar 
+0 ret
+e26:
+v9 'putchar 
+0 ret
+c12:
+0 ret

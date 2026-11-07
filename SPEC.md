@@ -52,6 +52,19 @@ dynamic call (the cell's declared arity takes the stack below), and
 (slot 128 and 25; bare tokens are lex errors with remedies). One operator
 executes any function. See "Label parameters" and "Anonymous functions". Not backward compatible with v15.2 source using
 `_call`/`_addr` or quoted callback references.
+**v16.2** adds the **inline-tools quartet** (all backward compatible):
+`walk` (slot 1, revived from `dup`, glyph 🐾) — `root pattern → list` of
+sorted full paths of regular files whose basename matches an fnmatch pattern
+(capability `fs.read`, so directory work needs no `proc` grant — SPEC
+"Script I/O"); the `shell` **argv list form** (`["find" "." "-name" "*.rs"]
+shell` execs argv directly — no `/bin/sh`, no quoting — same
+`[stdout, stderr, status]` result); **label-placement independence** — the
+parser hoists top-level label bodies behind the main flow, so `pc 0` is
+always the main code and a label's `ret` can never absorb following main
+code (SPEC "Names, labels, and variables"); and the CLI flags `-e/--eval`
+(explicit inline source) and `--allow CAPS` (a human grant that restores a
+policy-denied capability for one invocation; `--sandbox` tightening still
+wins — SPEC "Sandboxing and capabilities").
 Per-operation history is in `SPEC_HISTORY.md`; this document is the current
 specification only. Opcode totals are kept in lockstep with
 `comp/src/lex.rs` by a compiler unit test (`comp/src/spec_contract.rs`), so
@@ -77,7 +90,7 @@ auto-detection).
 
 | space | range | contents |
 |-------|-------|----------|
-| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 198 live (195 with dense glyphs; `cap`/`caps`/`consume` are text-only) |
+| opcodes | U+1F300+ (emoji) | 222 slots (0..221), 199 live (199 with dense glyphs; every live op is glyphed) |
 | v-space | U+1F941+ interleaved with other emoji | variable/label name atoms, runs fold |
 | l-space | U+1F130+ (enclosed alphanumerics) | base-64 digit atoms (self-evaluating numbers) |
 | delimiters | U+13100..U+13108 | chat-template delimiters, stripped pre-compilation |
@@ -158,6 +171,20 @@ own body only; a param bind satisfies reads inside its own body (it binds a
 frame slot), two bodies each binding the same name as a param is legal
 (per-invocation slots), and reading another body's param from outside is the
 cross-body error above.
+
+**Label placement is order-independent (v16.2).** The program is its
+top-level code; label bodies may be written before or between main-flow
+statements. The parser hoists every top-level label body behind the main
+flow before any analysis runs, so `pc 0` is always the main code, a label's
+`ret` can never absorb following main code as its return operand, and a
+top-level assignment anywhere in the main flow declares a shared variable.
+A body runs from its `name:` (plus preceding `pub`/`export`/`@Type` markers)
+to its first `ret` at anonymous-function depth 0, plus that `ret`'s operand
+tokens on the same line — keep a `ret` and its expression on one line, and
+start main-flow statements on a new line after a label's `ret`. A program
+with no top-level code anywhere still enters at its first label, and the
+canonical layout (main first, labels after) compiles byte-identically to
+before.
 
 ## Label parameters
 
@@ -658,13 +685,14 @@ The same applies to `tensor`. Elements are coerced to the element type
 
 ## Opcode reference
 
-222 slots (0..221); **198 live opcodes**. Each live opcode except the
-text-only `cap`/`caps`/`consume` (no dense glyph — they cannot be written in
-dense source) has a unique dense glyph; the text mnemonics are the
+222 slots (0..221); **199 live opcodes**. Every live opcode has a unique
+dense glyph; the text mnemonics are the
 full-word/`snake_case` names listed below. Glyph assignments are 1:1 and
 final in `comp/src/lex.rs`. Retired slots are not listed. (Slot 83, retired
-in place as `ENDT` since v10, is revived as the text-only `consume` in
-v15.1; its formerly reserved glyph is freed.)
+in place as `ENDT` since v10, is revived as `consume` in
+v15.1 — text-only until v16.2 gave it 🍴. Slot 1, retired as `dup` since
+v12, is revived as `walk` in v16.2, glyphed 🐾; `cap` 🔑 and `caps` 📋
+were the last text-only holdouts, glyphed in v16.2.)
 
 ### Core stack, memory, and I/O
 
@@ -716,7 +744,7 @@ v15.1; its formerly reserved glyph is freed.)
 | 53 | 🤙 | `extern` | → address | `extern "symbol"` — global C symbol via `__asm__` |
 | 54 | 🌋 | `print` | v → | type-aware recursive representation; top-level strings print raw |
 | 55 | 😋 | `scan` | fmt → list | fscanf semantics; list holds values followed by count |
-| 83 | | `consume` | v → | consume the top value (text-only — no dense glyph; the v15.1 companion to pass-through stores) |
+| 83 | 🍴 | `consume` | v → | consume the top value (the v15.1 companion to pass-through stores) |
 | 206 | 🛎 | `entry` | → | marks program entry; implicit jump from pc 0 |
 
 ### Containers
@@ -884,14 +912,15 @@ Calendar arithmetic, durations, truncation, time-series joins are library code
 | 161 | 😣 | `read_file` | path → str | whole file; not found: dies |
 | 162 | 🚵 | `write_file` | path str → | create/truncate; error: dies |
 | 163 | 🤲 | `argv` | → list | program argv as list of strings |
+| 1 | 🐾 | `walk` | root pattern → list | recursive file listing: regular files whose basename matches the fnmatch pattern, full paths, sorted lexicographically; directories traversed but not returned, symlinked dirs not followed; capability `fs.read`, workspace-gated at the root (JS target walks the fs table) |
 
 ### Shell
 
 | idx | | mn | stack | notes |
 |----|---|----|----|-------|
-| 85 | 🌑 | `shell` | cmd → list | returns `[out, err, status]`; -1 spawn failure, 128+signal |
-| 86 |  | `cap` | "name" → 0/1 | query a capability (text-only — no dense glyph); see "Capability discovery" |
-| 87 |  | `caps` | → dict | effective capability report (text-only — no dense glyph); see "Capability discovery" |
+| 85 | 🌑 | `shell` | cmd → list | returns `[out, err, status]`; -1 spawn failure, 128+signal. `cmd` is a string (`/bin/sh -c`) or a list of strings — the list form execs argv directly, no shell and no quoting (elements must be strings; empty list dies) |
+| 86 | 🔑 | `cap` | "name" → 0/1 | query a capability; see "Capability discovery" |
+| 87 | 📋 | `caps` | → dict | effective capability report; see "Capability discovery" |
 | 88 | 😑 | `shell_stream` | cmd → chan | detached thread feeds stdout line-by-line (cap 64) |
 | 89 | 🚖 | `execute` | list → status | no shell; list is argv (elem 0 = program) |
 
@@ -2014,8 +2043,8 @@ environment.
 
 ## Totals
 
-222 opcode slots (0..221); **198 live opcodes**. 195 of them have unique
-dense glyph codepoints (`cap`/`caps`/`consume` are text-only).
+222 opcode slots (0..221); **199 live opcodes**. 199 of them have unique
+dense glyph codepoints (every live op is glyphed).
 
 ## Non-goals
 
@@ -2163,7 +2192,7 @@ pattern  := name-segment "." "*" | "*"
 time bakes a config into **both** binaries) — always bakes a capability
 config: the repo default `comp/sandbox.ufs` unless overridden.
 
-**Capabilities** (gated ops): `fs.read` (read_file, mmap,
+**Capabilities** (gated ops): `fs.read` (read_file, mmap, walk,
 file_each_line/fold_lines/split_lines/match_lines), `fs.write` (write_file,
 file_emit; mmap needs both), `proc` (shell, shell_stream, execute), `ffi.use`
 (`USE "..."`, plus per-module allow/deny), `ffi.import` (`import c"..."`,
@@ -2196,13 +2225,20 @@ HTTPS modules curl/ssl, denies subprocesses/raw FFI), **build** (broader fs
 `--sandbox FILE` (tighten with a `.ufs`; repeatable; may only restrict —
 denies union, workspace roots and module allowlists intersect; runtime files
 cannot define policies), `--workspace DIR` (add/intersect a root),
-`--caps` (print the effective capability report and exit).
+`--allow CAP[,CAP…]` (v16.2 — a human grant that restores a
+policy-denied capability for this invocation, e.g. `nks --allow proc`;
+applied after the policy and before `--sandbox` files, so a tightening
+config still wins; unknown names are errors listing the valid set), and
+`--caps` (print the effective capability report and exit, including any
+`--allow` grants).
 
 **Workspace**: when `fs.*` is allowed and a workspace is configured, every
 file open resolves via realpath (parent for not-yet-existing write targets)
 and must fall under a root, else the program dies with
 `sandbox: path '<p>' is outside the workspace roots [...] (policy '<name>')`.
-Default roots: the main program's directory and `$TMPDIR/nk`. Best-effort
+A root of `~` or `~/…` expands to `$HOME` (v16.2 — previously a literal `~`
+directory was resolved under the program, blocking every path). Default
+roots: the main program's directory and `$TMPDIR/nk`. Best-effort
 (realpath prefix check; symlink escapes caught, TOCTOU not).
 
 Denied ops are **compile errors** naming the op, capability, policy, and

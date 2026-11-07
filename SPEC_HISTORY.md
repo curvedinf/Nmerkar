@@ -6,6 +6,55 @@ numbers are the current `OP_NAMES` indices in `comp/src/lex.rs`. Retired
 operations are listed with their fate. Behavior-only changes (same opcode,
 new semantics or performance) are listed under the commit that made them.
 
+## 2026-10-18 — v16.2: walk, shell argv form, label-placement independence, -e/--allow, GC fixes
+
+- **`walk`** (slot 1, revived from `dup`; glyph 🐾):
+  `root pattern → list`, recursive file listing. Regular files whose
+  basename matches the fnmatch pattern, full paths sorted lexicographically,
+  directories traversed but not returned, symlinked directories not
+  followed, unreadable subdirectories skipped (only an unopenable root
+  dies). Capability `fs.read` + workspace gate at the root — directory
+  work no longer needs `proc`/`find`/`xargs`. JS target walks the in-memory
+  fs table with the same filtering/sorting. Gate: `comp/tests/t36_walk.n`
+  (fixture tree `comp/tests/walktree/`).
+- **`shell` argv list form**: a list-of-strings operand execs argv directly
+  (`execvp` + the same pipe/tmpfile capture), no `/bin/sh` and no quoting —
+  identical `[stdout, stderr, status]` result and `proc` gate as the string
+  form. Elements must be strings; empty list dies. Win32 keeps the string
+  form only. Gate: `comp/tests/t38_shell.n`.
+- **Label-placement independence**: the parser hoists top-level label
+  bodies behind the main flow (token-level pre-pass; canonical main-first
+  programs are untouched, byte-identical). Before, a label defined before
+  or between main statements became `pc 0` (arity death at startup) and its
+  greedy `ret` absorbed the following main code as its return operand.
+  A body ends at its first `ret` at anon-depth 0 plus that `ret`'s
+  same-line operand tokens. Gate: `comp/tests/t37_entryorder.n`.
+- **GC-root fixes (signal-11 class)**: `op_sh` created its result cells
+  before the protecting `UF_PROTECT`, so a collection during a
+  large-output string allocation swept them (≥1 MB shell output segfaulted;
+  cells are now created and pushed into a pre-protected, pre-sized Dyn).
+  The two `for`-loop emitters held the iterated collection in a bare C
+  local across the body — a GC inside an allocating callback
+  (`file_fold_lines` over a big file) swept it ("index out of bounds");
+  both sites now `UF_PROTECT` the collection, with the unprotect placed on
+  the loop-exit label so `break` cannot skip it. Regression gates in
+  `comp/tests/t38_shell.n`.
+- **CLI**: `-e/--eval SRC` — explicit inline source as the main TU (no
+  file-existence probing; positional inputs behind it must be files);
+  `--allow CAP[,CAP…]` — a human grant restoring a policy-denied capability
+  for one invocation, applied after the policy and before `--sandbox`
+  tightening (which still wins), reported by `--caps`.
+- **Sandbox**: workspace roots of `~` / `~/…` now expand to `$HOME`
+  (previously resolved as a literal `~` directory under the program,
+  blocking every fs path under policies using it, e.g. `build`).
+- Denial messages and the runtime label-arity guard now state the remedy
+  (`--allow <cap>`) and the expected operand count.
+- **Dense glyphs for the last text-only ops** (2026-10-19, same changeset):
+  `walk` 🐾 U+1F43E (slot 1), `consume` 🍴 U+1F374 (83), `cap` 🔑
+  U+1F511 (86), `caps` 📋 U+1F4CB (87) — all verified single-token in the
+  Qwen3-0.6B tokenizer and collision-free against the opcode/v/l spaces.
+  Every live op is now writable in dense source; 199/199 glyphed.
+
 ## 2026-10-16 — documentation: no stack-speak ("push"/"pop") in language docs
 
 - All language-facing documentation (SPEC prose, README, AGENTS, the

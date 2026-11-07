@@ -24,7 +24,7 @@ pub const CAP_NAMES: [&str; 8] = [
 // helper name (op_*) -> capability. None = ungated op.
 pub fn op_capability(helper: &str) -> Option<&'static str> {
     Some(match helper {
-        "op_slurp" | "op_feach" | "op_ffold" | "op_fsplit" | "op_fmatch" => "fs.read",
+        "op_slurp" | "op_feach" | "op_ffold" | "op_fsplit" | "op_fmatch" | "op_walk" => "fs.read",
         // mmap maps a file read/write: needs both halves of fs
         "op_mmap" => "fs.mmap",
         "op_spit" | "op_femit" => "fs.write",
@@ -178,6 +178,8 @@ pub struct Caps {
     pub policy_name: String,
     pub origin: String,
     pub is_sandboxed: bool,
+    // capabilities restored by an explicit --allow (reporting only)
+    pub grants: Vec<String>,
 }
 
 impl Caps {
@@ -190,6 +192,7 @@ impl Caps {
             policy_name: "none".to_string(),
             origin: "unrestricted build".to_string(),
             is_sandboxed: false,
+            grants: Vec::new(),
         }
     }
 
@@ -253,6 +256,9 @@ impl Caps {
     pub fn report(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!("policy: {} ({})\n", self.policy_name, self.origin));
+        if !self.grants.is_empty() {
+            s.push_str(&format!("--allow: {}\n", self.grants.join(", ")));
+        }
         s.push_str("capabilities:\n");
         for c in CAP_NAMES {
             let v = if self.cap(c) { "allowed" } else { "DENIED" };
@@ -308,7 +314,7 @@ impl Caps {
         }
         // workspace: intersection. A layer with no workspace key is "anywhere".
         if !rules.workspace.is_empty() {
-            let new_roots: Vec<PathBuf> = rules.workspace.iter().map(PathBuf::from).collect();
+            let new_roots: Vec<PathBuf> = rules.workspace.iter().map(|p| expand_home(PathBuf::from(p))).collect();
             self.workspace = Some(match self.workspace.take() {
                 None => new_roots,
                 Some(prev) => prev
@@ -350,7 +356,24 @@ pub fn caps_for_grants(grants: &[String], base_dir: &Path) -> Caps {
         rules.allow.push(g.clone());
     }
     let sf = SandboxFile { base: rules, policies: HashMap::new(), name: Some("package-grants".to_string()) };
-    effective(Some((&sf, "package use grants")), None, &[], &[], base_dir)
+    effective(Some((&sf, "package use grants")), None, &[], &[], &[], base_dir)
+}
+
+/// Expand a leading `~` / `~/…` to `$HOME`. A workspace root of `~` means
+/// the home directory, not a literal `~` directory under the program —
+/// without this the resolved root blocks every fs path.
+pub fn expand_home(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy().to_string();
+    if s == "~" {
+        if let Ok(h) = std::env::var("HOME") {
+            return PathBuf::from(h);
+        }
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(h) = std::env::var("HOME") {
+            return PathBuf::from(h).join(rest);
+        }
+    }
+    p
 }
 
 /// Build the effective capability set.
@@ -358,12 +381,16 @@ pub fn caps_for_grants(grants: &[String], base_dir: &Path) -> Caps {
 /// - `baked`: the build-time .ufs (None for an unrestricted `uf`).
 /// - `selected_policy`: --policy NAME, must exist in `baked`.
 /// - `runtime_files`: --sandbox FILE configs, applied in order (tighten-only).
+/// - `grants`: --allow capabilities — an explicit human grant that may restore
+///   what the selected policy denied. Runtime tightening configs still win:
+///   they are applied below and re-insert their denies.
 /// - `base_dir`: directory used to resolve relative workspace roots.
 pub fn effective(
     baked: Option<(&SandboxFile, &str)>,
     selected_policy: Option<&str>,
     runtime_files: &[SandboxFile],
     extra_roots: &[String],
+    grants: &[String],
     base_dir: &Path,
 ) -> Caps {
     let mut caps = Caps::unrestricted();
@@ -395,13 +422,25 @@ pub fn effective(
         user_err!("sandbox", None, "sandbox: --policy `{}` given but this build has no baked policies", p);
     }
 
+    // --allow: a human-typed one-shot grant. Applied after the policy so it
+    // can restore a denied capability, but before the tighten-only runtime
+    // configs below — their denies therefore still win over any grant.
+    for g in grants {
+        if !CAP_NAMES.contains(&g.as_str()) {
+            user_err!("sandbox", None, "sandbox: unknown capability `{}` for --allow (valid: {})", g, CAP_NAMES.join(", "));
+        }
+        if caps.caps.remove(g).is_some() && !caps.grants.contains(g) {
+            caps.grants.push(g.clone());
+        }
+    }
+
     for rf in runtime_files {
         caps.apply_rules(&rf.base, true);
     }
 
     // --workspace roots intersect whatever is present
     if !extra_roots.is_empty() {
-        let new_roots: Vec<PathBuf> = extra_roots.iter().map(PathBuf::from).collect();
+        let new_roots: Vec<PathBuf> = extra_roots.iter().map(|p| expand_home(PathBuf::from(p))).collect();
         caps.workspace = Some(match caps.workspace.take() {
             None => new_roots,
             Some(prev) => prev
@@ -509,4 +548,61 @@ fn c_escape(s: &str) -> String {
         }
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_tilde_expands_to_home() {
+        // a `workspace ~` root must resolve under $HOME, not a literal `~`
+        // directory under the program's base dir
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let probe = std::path::Path::new(&home).join(format!("nk-tilde-test-{}", std::process::id()));
+        std::fs::create_dir_all(&probe).unwrap();
+        std::env::set_var("HOME", &probe);
+        let rules = "name t\ndeny proc\nworkspace ~\n";
+        let sf = parse_ufs(rules, "<test>");
+        let caps = effective(Some((&sf, "test")), None, &[], &[], &[], Path::new("/some/base"));
+        std::env::set_var("HOME", &home);
+        let _ = std::fs::remove_dir_all(&probe);
+        let roots = caps.workspace.expect("workspace roots");
+        assert!(
+            roots.iter().all(|r| r.starts_with(&probe)),
+            "roots {:?} should resolve under {}",
+            roots,
+            probe.display()
+        );
+    }
+
+    #[test]
+    fn allow_grant_restores_policy_deny() {
+        let rules = "name t\ndeny proc fs.read\n";
+        let sf = parse_ufs(rules, "<test>");
+        let base = Path::new("/tmp");
+        let denied = effective(Some((&sf, "test")), None, &[], &[], &[], base);
+        assert!(!denied.cap("proc"));
+        assert!(!denied.cap("fs.read"));
+        let granted = effective(Some((&sf, "test")), None, &[], &[], &["proc".to_string()], base);
+        assert!(granted.cap("proc"), "--allow proc must restore the denied cap");
+        assert!(!granted.cap("fs.read"), "un-granted caps stay denied");
+        assert_eq!(granted.grants, vec!["proc".to_string()]);
+    }
+
+    #[test]
+    fn allow_grant_cannot_override_sandbox_tightening() {
+        let baked = parse_ufs("name t\ndeny proc\n", "<baked>");
+        let tighten = parse_ufs("deny proc\n", "<tighten>");
+        let base = Path::new("/tmp");
+        let caps = effective(
+            Some((&baked, "test")),
+            None,
+            &[tighten],
+            &[],
+            &["proc".to_string()],
+            base,
+        );
+        assert!(!caps.cap("proc"), "a --sandbox tighten config still wins over --allow");
+    }
 }

@@ -1,0 +1,41 @@
+; t38_shell.n — v16.2 shell forms and large-output safety: the argv list form
+; (no /bin/sh, no quoting), stdout/stderr/status capture for both forms, and
+; the GC regression — a >1MB captured output plus a fold inside a collection
+; for must not crash or corrupt (signal-11 class bugs).
+; Run: nk comp/tests/t38_shell.n
+
+; 1. list form: argv exec, no shell quoting
+["echo" "argv-works"] shell out# _# _#
+out "argv-works\n" eq check
+
+; 2. list form captures stderr and the exit status separately
+["sh" "-c" "echo to-stderr 1>&2; exit 3"] shell out# err# st#
+err "to-stderr\n" eq check
+st 3 eq check
+
+; 3. both forms agree on stdout for a simple echo
+"echo same-output" shell out# _# _#
+["echo" "same-output"] shell out2# _# _#
+out out2 eq check
+
+; 4. large output (~1.3MB) must survive: the string, its length, and use —
+; this is the exact shape that segfaulted before the GC-root fix
+["seq" "1" "200000"] shell out# _# _#
+out length 1288895 eq check
+
+; 5. GC inside a for body over a collection: write 300k generated lines to a
+; file, then fold the file while iterating the walk result — the collection
+; lives across allocating bodies
+["sh" "-c" "seq 1 300000"] shell out# _# _#
+"/tmp/t38big.txt" out write_file
+0 total!
+countbig: p!
+  p 0 stepl file_fold_lines total add total! ret
+stepl: acc! _!
+  acc 1 add ret
+"/tmp" "t38big.txt" walk length 1 eq check
+"/tmp" "t38big.txt" walk countbig for
+total 300000 eq check
+
+"shell-ok" print
+ret

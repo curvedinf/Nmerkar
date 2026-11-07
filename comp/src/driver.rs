@@ -213,7 +213,8 @@ The data stack is an implementation detail. Source code reasons about **named lo
 Run code inline without saving a file:
 ```
 nk '"hello" print'
-nk '1 2 add print'
+nk -e '"hello" print'          ; -e/--eval: explicit inline source (main TU)
+nk -e 'prog' file2.n           ; inline main TU + extra file TUs behind it
 ```
 Or pipe via stdin with `echo '...' | nk -`
 
@@ -240,9 +241,10 @@ otherwise text.
 - Control flow: `if` (cond `body`), `if_else` (cond `then` `else`), `while` (`cond` `body`), `for` (`count|coll` `body`) — bodies are fn references; the cond may be a plain value or a fn reference (called per iteration for `while`); `for` iterates a count (the body receives the index) or a list/array/tensor (the body receives each element); `break`/`continue` in loop bodies only.
 - Every label body must end with `ret` (returns null when bare; `ret expr` returns the value; `ret a b c` returns a list).
 - Container literals: `[1 2 3]` list, `{{ "a" 1 }}` dict, `[1 2] int array` typed array.
-- Entry point: `entry:` marks where execution starts (implicit jump from pc 0).
+- Entry point: top-level code is the program (labels may be defined before or between main-flow statements — the compiler hoists them behind the main flow); `entry:` marks where execution starts (implicit jump from pc 0); a program with no top-level code enters at the first label.
+- Files: `walk` lists files recursively — `root pattern walk` returns sorted full paths of regular files whose basename matches the fnmatch pattern (dirs traversed not returned, symlinked dirs not followed); it needs only `fs.read`, so it works under the default sandbox policy.
 - Printing: `print` consumes the top-of-stack value and prints a type-aware, recursive representation. Use `format` to build a formatted string: `x "v=%d" format print`.
-- Shell: `shell` takes a command string and returns **one list**: `[stdout, stderr, status]`. Extract with a positional destructure bind: `"cmd" shell out# err# status#`, or `"cmd" shell out# _# _#` to keep only stdout.
+- Shell: `shell` takes a command string (`/bin/sh -c`) or a **list of strings** — the list form execs argv directly with no shell and no quoting — and returns **one list**: `[stdout, stderr, status]`. Extract with a positional destructure bind: `["echo" "hi"] shell out# err# status#`, or `"cmd" shell out# _# _#` to keep only stdout.
 - Multi-return ops (`shell`, `regex_match`, `next`, `scan`, `try`) return a list; extract slots with the positional destructure binds `a# b# _# c#` (`_#` discards). `try` yields `[result, ok]` — `: body ret try v# ok#` binds both.
 - Anonymous functions: `: x! x x mul ret` is a one-line inline fn (a fn cell like any other); `':` applies one immediately with a list argument vector.
 - On return, a label/task/callback discards every intermediate value; only the single `ret` value reaches the caller.
@@ -300,13 +302,14 @@ Common ops with non-obvious stack signatures:
 
 | Op | Stack effect | Notes |
 |----|-------------|-------|
-| `shell` | `cmd → [stdout,stderr,status]` | 3 return values as a list; `/bin/sh -c` |
+| `shell` | `cmd → [stdout,stderr,status]` | 3 return values as a list; cmd: string via `/bin/sh -c`, or a list of strings = direct argv exec (no shell, no quoting) |
 | `print` | `v →` | type-aware recursive representation; top-level strings print raw |
 | `format` | `args… fmt → str` | build a formatted string, then `print` it |
 | `split` | `str sep → list` | literal separator (empty sep: dies); **destructive** |
 | `join` | `list sep → str` | |
 | `read_file` | `path → str` | whole file |
 | `write_file` | `path str →` | create/truncate |
+| `walk` | `root pattern → list` | recursive file listing: full paths of regular files whose basename matches (fnmatch), sorted; needs only `fs.read` |
 | `array` | `[len_or_list] type → h` | list form copies elements |
 | `iter` | `h → it` | create cursor from any collection |
 | `next` | `it → [value, more]` | `more`=0 means exhausted (`value` is 0) |
@@ -320,9 +323,12 @@ Common ops with non-obvious stack signatures:
 
 ## Worked examples
 
-### Count lines in all .rs files (inline)
+### Count lines in all .rs files (inline, no shell — fs.read only)
 ```
-nk '"find . -name \"*.rs\" | sort" shell out# _# _# out "\n" split length print ret'
+nk -e '0 total!
+count: p! p 0 step file_fold_lines total add total! ret
+step: acc! _! acc 1 add ret
+"." "*.rs" walk count for total print ret'
 ```
 
 ### file_fold_lines to count lines in a file
@@ -494,6 +500,8 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let mut policy: Option<String> = None;
     let mut sandbox_files: Vec<String> = Vec::new();
     let mut workspace_roots: Vec<String> = Vec::new();
+    let mut allow_caps: Vec<String> = Vec::new();
+    let mut eval_src: Option<String> = None;
     let mut show_caps = false;
     let mut device: Option<String> = None;
     let mut i = 1;
@@ -549,6 +557,19 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 i += 1;
                 workspace_roots.push(args.get(i).unwrap_or_else(|| user_err!("driver", None, "--workspace needs a directory path")).clone());
             }
+            "--allow" => {
+                i += 1;
+                let a = args.get(i).unwrap_or_else(|| user_err!("driver", None, "--allow needs a capability list (e.g. proc or fs.read,proc)")).clone();
+                for c in a.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    if !allow_caps.contains(&c.to_string()) {
+                        allow_caps.push(c.to_string());
+                    }
+                }
+            }
+            "-e" | "--eval" => {
+                i += 1;
+                eval_src = Some(args.get(i).unwrap_or_else(|| user_err!("driver", None, "-e/--eval needs inline source")).clone());
+            }
             "--caps" => show_caps = true,
             "--device" => {
                 i += 1;
@@ -564,6 +585,7 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
             "-h" | "--help" => {
                 eprintln!("usage: nk [directory]                   compile+run directory (auto-discovers)");
                 eprintln!("       nk input.n... ['inline source'|-]        compile+run (cached in TMPDIR)");
+                eprintln!("       nk -e 'source' [input.n...]             compile+run explicit inline source (main TU)");
                 eprintln!("       nk -c input.n... [-o output] [--emit-c|--emit-js|--emit-text|--emit-dense]");
                 eprintln!("       nk --to-text prog.nd | --to-dense prog.n   convert encodings (writes prog.n/.nd)");
                 eprintln!("       nk -s | --skill                    print agent SKILL.md template");
@@ -594,6 +616,8 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
                 eprintln!("       --policy NAME       select a capability policy baked into this build (nks: pure|data|web|build)");
                 eprintln!("       --sandbox FILE      tighten capabilities with a .ufs config (repeatable, tighten-only)");
                 eprintln!("       --workspace DIR     add/intersect a filesystem workspace root (repeatable)");
+                eprintln!("       --allow CAPS        grant capabilities for this invocation, e.g. --allow proc or --allow fs.read,proc");
+                eprintln!("                           (overrides a policy deny; a --sandbox config still tightens over it)");
                 eprintln!("       --caps              print this build's effective capabilities and exit");
                 eprintln!("");
                 eprintln!("  compute flags:");
@@ -612,6 +636,14 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     }
     // Directory mode: bare `nk` or `nk somedir/` discovers files automatically.
     // (--caps never requires a program to be present.)
+    // -e/--eval inserts the explicit inline source as the FIRST input (the
+    // main TU) with no file-existence probing; positional inputs behind it
+    // must be real files.
+    let mut eval_first = false;
+    if let Some(src) = eval_src {
+        inputs.insert(0, src);
+        eval_first = true;
+    }
     let init_flags: Vec<bool>;
     if inputs.is_empty() && !show_caps {
         let (files, flags) = discover_directory(".");
@@ -650,7 +682,11 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     }
     // workspace/caps resolve relative roots against the main input's directory
     let base_dir: std::path::PathBuf = {
-        let first = inputs.iter().find(|s| s.as_str() != "-" && std::path::Path::new(s).exists());
+        let first = inputs
+            .iter()
+            .enumerate()
+            .find(|(k, s)| !(eval_first && *k == 0) && s.as_str() != "-" && std::path::Path::new(s).exists())
+            .map(|(_, s)| s);
         match first {
             Some(f) => std::path::Path::new(f)
                 .canonicalize()
@@ -665,6 +701,7 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
         policy.as_deref(),
         &runtime_cfgs,
         &workspace_roots,
+        &allow_caps,
         &base_dir,
     );
     if show_caps {
@@ -703,7 +740,10 @@ fn run_inner(args: Vec<String>, baked_sb: &str, bin_is_nks: bool) {
     let n_in = inputs.len();
     for (k, input) in inputs.iter().enumerate() {
         let last = k == n_in - 1;
-        let (src, defmod) = if input == "-" {
+        let (src, defmod) = if eval_first && k == 0 {
+            // -e/--eval source: explicit, never probed against the filesystem
+            (input.clone(), "main".to_string())
+        } else if input == "-" {
             let mut s = String::new();
             use std::io::Read as _;
             std::io::stdin().read_to_string(&mut s).unwrap_or_else(|e| user_err!("driver", None, "cannot read stdin: {}", e));

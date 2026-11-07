@@ -155,6 +155,7 @@ fn gate_op(name: &str, caps: &Caps, line: u32) {
         "SHP" => ("proc", "proc", "shell_stream"),
         "EXEC" => ("proc", "proc", "execute"),
         "SLURP" => ("fs.read", "fs.read", "read_file"),
+        "WALK" => ("fs.read", "fs.read", "walk"),
         "SPIT" => ("fs.write", "fs.write", "write_file"),
         "MMAP" => ("fs.mmap", "fs.read + fs.write", "mmap"),
         "FEACH" => ("fs.read", "fs.read", "file_each_line"),
@@ -177,8 +178,8 @@ fn gate_op(name: &str, caps: &Caps, line: u32) {
         user_err!(
             "sandbox",
             Some(line),
-            "sandbox: `{}` is disabled — capability `{}` is denied by policy '{}' ({}); allow it in a sandbox config, or run under a broader policy (e.g. `nks --policy build`)",
-            mnem, need, caps.policy_name, caps.origin
+            "sandbox: `{}` is disabled — capability `{}` is denied by policy '{}' ({}); grant it for this run with `--allow {}`, allow it in a sandbox config, or run under a broader policy (e.g. `nks --policy build`)",
+            mnem, need, caps.policy_name, caps.origin, need
         );
     }
 }
@@ -213,7 +214,6 @@ fn is_hard_boundary(t: &(u32, Tok)) -> bool {
 
 fn retired_op_panic(name: &str, line: u32) -> ! {
     let retired_name = match name {
-        "~1" => "dup",
         "~2" => "ovr",
         "~3" => "drop",
         "~4" => "swp",
@@ -252,6 +252,125 @@ fn empty_parsed() -> Parsed {
     }
 }
 
+/// Label placement is order-independent: a top-level label body that has
+/// main-flow code after it is hoisted behind all main code, so `pc 0` is
+/// always the main flow and a label's `ret` can never absorb following main
+/// code as its return operand. Without this, `helper: … ret` before or
+/// between main statements makes pc 0 enter the helper (arity death) and its
+/// greedy `ret` swallows the main statements that follow.
+///
+/// The scan walks the raw token stream before parsing and partitions it into
+/// main code and label bodies:
+/// - a body runs from its `LabelDef` (plus any pending `pub`/`export`/`@Type`
+///   markers) to its first `ret` at anon-depth 0, plus that `ret`'s
+///   operand tokens **on the same line** (the canonical `ret expr` spelling;
+///   multi-line absorption would defeat the fix);
+/// - declarations (struct/use/import/extern/mod/macro) and weave/task/entry
+///   tokens stay with main in order;
+/// - the stream is rebuilt only when a body is followed by more main code
+///   (canonical main-first programs come out byte-identical); otherwise the
+///   queue is left untouched.
+/// Any shape the scan does not model (unterminated body, nested label, task
+/// tokens inside a body) bails out with the queue untouched.
+fn hoist_leading_labels(q: &mut VecDeque<(u32, Tok)>) {
+    let n = q.len();
+    let mut main: Vec<(u32, Tok)> = Vec::new();
+    let mut bodies: Vec<Vec<(u32, Tok)>> = Vec::new();
+    let mut reorder = false;
+    let mut i = 0;
+    while i < n {
+        if !matches!(q[i].1, Tok::LabelDef(_)) {
+            // an anon def's body is delimited by parse_anon from the queue —
+            // the scan must not walk into or past one
+            if matches!(q[i].1, Tok::AnonDef | Tok::AnonCall) {
+                return;
+            }
+            let t = q[i].clone();
+            // pending markers (pub/export/@Type) attach to a coming label —
+            // they are not main flow and never trigger a reorder by themselves
+            let is_marker = matches!(t.1, Tok::Pub | Tok::Export(_) | Tok::Method(_));
+            if !is_marker && !bodies.is_empty() {
+                reorder = true;
+            }
+            main.push(t);
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut depth = 0i32;
+        let end;
+        loop {
+            if j >= n {
+                return; // unterminated body: leave the stream untouched
+            }
+            match &q[j].1 {
+                Tok::AnonDef | Tok::AnonCall => {
+                    depth += 1;
+                    j += 1;
+                }
+                Tok::Op("RET") => {
+                    if depth == 0 {
+                        // the ret's operand expression: same line only
+                        let mut k = j + 1;
+                        let mut first = true;
+                        while k < n && q[k].0 == q[j].0 {
+                            if is_hard_boundary(&q[k])
+                                || (!first && matches!(&q[k].1, Tok::List(_) | Tok::Dict(_)))
+                            {
+                                break;
+                            }
+                            first = false;
+                            k += 1;
+                        }
+                        end = k - 1;
+                        break;
+                    }
+                    depth -= 1;
+                    j += 1;
+                }
+                // shapes the scan does not model: bail out entirely
+                Tok::LabelDef(_)
+                | Tok::Entry
+                | Tok::Task { .. }
+                | Tok::TaskEnd(_)
+                | Tok::Wrun(_)
+                | Tok::WSave => return,
+                _ => j += 1,
+            }
+        }
+        // pending pub/export/@Type markers attach to this label: lift them
+        // out of the main tail into the body (they were the last i-start
+        // tokens appended to main)
+        let mut start = i;
+        while start > 0 && matches!(&q[start - 1].1, Tok::Pub | Tok::Export(_) | Tok::Method(_)) {
+            start -= 1;
+        }
+        let nmark = i - start;
+        let mut body: Vec<(u32, Tok)> = if nmark > 0 {
+            main.split_off(main.len() - nmark)
+        } else {
+            Vec::new()
+        };
+        body.extend(q.range(i..=end).cloned());
+        bodies.push(body);
+        i = end + 1;
+    }
+    if reorder {
+        if std::env::var("NK_DBG_HOIST").is_ok() {
+            eprintln!(
+                "[hoist] {} bodies moved behind main ({} main tokens)",
+                bodies.len(),
+                main.len()
+            );
+        }
+        let mut out = main;
+        for b in bodies {
+            out.extend(b);
+        }
+        *q = out.into_iter().collect();
+    }
+}
+
 /// Single-TU parse state threaded through the token loop: the unit under
 /// construction, the token queue, and the macro/label/weave bookkeeping.
 struct ParseCtx<'a> {
@@ -278,6 +397,7 @@ struct ParseCtx<'a> {
 
 impl<'a> ParseCtx<'a> {
     fn run(&mut self) {
+        hoist_leading_labels(&mut self.q);
         loop {
             while let Some((line, t)) = self.q.pop_front() {
                 match t {
@@ -2328,6 +2448,7 @@ pub fn simple_ins(name: &'static str) -> Ins {
         "BADD" => "op_badd",
         "BTEST" => "op_btest",
         "SLURP" => "op_slurp",
+        "WALK" => "op_walk",
         "SPIT" => "op_spit",
         "ARGV" => "op_argv",
         // v10: additional data ops
@@ -2438,6 +2559,7 @@ pub fn helper_effect(h: &str) -> Option<(i64, i64)> {
         "op_glob" => (2, 1),
         // script I/O
         "op_slurp" | "op_mmap" => (1, 1),
+        "op_walk" => (2, 1),
         "op_spit" => (2, 0),
         "op_femit" => (2, 1),
         "op_feach" => (2, 0),
@@ -3046,7 +3168,7 @@ fn strict_op_mnem(h: &str) -> String {
         "op_replace" => "regex_replace".to_string(), "op_rsplit" => "regex_split".to_string(),
         "op_trim" => "trim".to_string(), "op_up" => "uppercase".to_string(), "op_down" => "lowercase".to_string(),
         "op_starts" => "starts_with".to_string(), "op_ends" => "ends_with".to_string(), "op_slice" => "slice".to_string(),
-        "op_glob" => "glob_match".to_string(), "op_match" => "regex_match".to_string(),
+        "op_glob" => "glob_match".to_string(), "op_match" => "regex_match".to_string(), "op_walk" => "walk".to_string(),
         "op_not" => "not".to_string(), "op_orelse" => "orelse".to_string(),
         "op_veq" => "scalar_eq".to_string(), "op_vlt" => "scalar_lt".to_string(), "op_vgt" => "scalar_gt".to_string(),
         "op_vge" => "scalar_gte".to_string(), "op_vle" => "scalar_lte".to_string(),

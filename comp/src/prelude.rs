@@ -29,6 +29,7 @@ pub const PRELUDE: &str = r#"
 #else
 #include <sys/wait.h>
 #include <fnmatch.h>
+#include <dirent.h>
 #endif
 
 /* ================= value representation: type tags, Cell, GC object headers ================= */
@@ -1874,20 +1875,14 @@ static int uf_wait_status(int r){
 /* ================= shell ops ================= */
 /* SH (merged SH+SHX): cmd -> out err status (always captures both streams
    as fresh strings; status on top: -1 spawn failure, 128+signal) */
-static void op_sh(Ctx*cx){ if(!uf_rt_cap(2))uf_rt_die(2,"op_sh");
-  Cell c=pop(cx); const char*cmd=uf_sptr(c);
-#ifdef _WIN32
-  char tmp[256]; tmpnam(tmp);
-  char*full=(char*)uf_alloc(strlen(cmd)+strlen(tmp)+8,0);
-  sprintf(full,"%s 2>%s",cmd,tmp);
-  FILE* f=_popen(full,"r"); if(!f){ pushc(cx,uf_str_new("",0)); pushc(cx,uf_str_new("",0)); pushi(cx,-1); return; }
-  char*out=uf_read_all(f); int st=uf_wait_status(_pclose(f));
-  FILE* ef=fopen(tmp,"r"); char*err;
-  if(ef){ err=uf_read_all(ef); fclose(ef); remove(tmp); } else err=uf_alloc(1,0),err[0]=0;
-  Cell so=uf_str_new(out,strlen(out)); Cell se=uf_str_new(err,strlen(err));
-  free(out); free(err); free(full);
-  Dyn* shd=uf_dyn_new(3); UF_PROTECT(&shd); uf_dyn_push(&shd,so); uf_dyn_push(&shd,se); uf_dyn_push(&shd,uf_mki((int64_t)st)); UF_UNPROTECT(); pushp(cx,shd);
-#else
+/* SH result capture, shared by the string and argv forms: fork + exec with
+   stdout on a pipe and stderr on a tmpfile, then [stdout, stderr, status].
+   The result Dyn is protected BEFORE any cell is created — a collection
+   during a large-output string alloc must never sweep a cell that is only
+   reachable from this C frame (each cell is pushed the moment it exists,
+   and the Dyn is pre-sized so the pushes themselves do not allocate). */
+#ifndef _WIN32
+static Dyn* uf_sh_capture_exec(const char* path, char*const argv[], int use_execvp){
   int pfd[2]; if(pipe(pfd))die("SH: pipe");
   FILE* ef=tmpfile(); if(!ef)die("SH: tmpfile");
   pid_t pid=fork();
@@ -1896,7 +1891,8 @@ static void op_sh(Ctx*cx){ if(!uf_rt_cap(2))uf_rt_die(2,"op_sh");
     close(pfd[0]);
     if(dup2(pfd[1],1)<0)_exit(127);
     if(dup2(fileno(ef),2)<0)_exit(127);
-    execl("/bin/sh","sh","-c",cmd,(char*)0);
+    if(use_execvp) execvp(path,argv);
+    else execl("/bin/sh","sh","-c",path,(char*)0);
     _exit(127);
   }
   close(pfd[1]);
@@ -1905,9 +1901,51 @@ static void op_sh(Ctx*cx){ if(!uf_rt_cap(2))uf_rt_die(2,"op_sh");
   int rs=0; waitpid(pid,&rs,0);
   int st=uf_wait_status(rs);
   rewind(ef); char*err=uf_read_all(ef); fclose(ef);
-  Cell so=uf_str_new(out,strlen(out)); Cell se=uf_str_new(err,strlen(err));
-  free(out); free(err);
-  Dyn* shd=uf_dyn_new(3); UF_PROTECT(&shd); uf_dyn_push(&shd,so); uf_dyn_push(&shd,se); uf_dyn_push(&shd,uf_mki((int64_t)st)); UF_UNPROTECT(); pushp(cx,shd);
+  Dyn* shd=uf_dyn_new(3); UF_PROTECT(&shd);
+  uf_dyn_push(&shd,uf_str_new(out,strlen(out))); free(out);
+  uf_dyn_push(&shd,uf_str_new(err,strlen(err))); free(err);
+  uf_dyn_push(&shd,uf_mki((int64_t)st));
+  UF_UNPROTECT(); return shd;
+}
+#endif
+static void op_sh(Ctx*cx){ if(!uf_rt_cap(2))uf_rt_die(2,"op_sh");
+  Cell c=pop(cx);
+  /* list form: argv exec — no /bin/sh, no quoting */
+  Hdr* ha=c.tag==T_PTR&&c.i?uf_gc_find((void*)c.i):0;
+  if(ha&&ha->tag==HT_DYN){
+#ifdef _WIN32
+    die("SH: argv list form is not supported on this platform — pass a command string");
+#else
+    Dyn*d=(Dyn*)ha;
+    if(d->len==0)die("SH: empty argv");
+    char**av=(char**)malloc((size_t)(d->len+1)*sizeof(char*)); if(!av)die("out of memory");
+    for(uint64_t k=0;k<d->len;k++){
+      Hdr*e=d->data[k].tag==T_PTR&&d->data[k].i?uf_gc_find((void*)d->data[k].i):0;
+      if(!e||e->tag!=HT_STR){ free(av); die("SH: argv list must contain only strings"); }
+      av[k]=(char*)uf_sptr(d->data[k]);
+    }
+    av[d->len]=0;
+    Dyn* r=uf_sh_capture_exec(av[0],av,1); free(av); pushp(cx,r); return;
+#endif
+  }
+  const char*cmd=uf_sptr(c);
+#ifdef _WIN32
+  char tmp[256]; tmpnam(tmp);
+  char*full=(char*)uf_alloc(strlen(cmd)+strlen(tmp)+8,0);
+  sprintf(full,"%s 2>%s",cmd,tmp);
+  FILE* f=_popen(full,"r"); if(!f){ Dyn* shd=uf_dyn_new(3); UF_PROTECT(&shd);
+    uf_dyn_push(&shd,uf_str_new("",0)); uf_dyn_push(&shd,uf_str_new("",0)); uf_dyn_push(&shd,uf_mki(-1));
+    UF_UNPROTECT(); pushp(cx,shd); return; }
+  char*out=uf_read_all(f); int st=uf_wait_status(_pclose(f));
+  FILE* ef=fopen(tmp,"r"); char*err;
+  if(ef){ err=uf_read_all(ef); fclose(ef); remove(tmp); } else err=uf_alloc(1,0),err[0]=0;
+  Dyn* shd=uf_dyn_new(3); UF_PROTECT(&shd);
+  uf_dyn_push(&shd,uf_str_new(out,strlen(out)));
+  uf_dyn_push(&shd,uf_str_new(err,strlen(err)));
+  uf_dyn_push(&shd,uf_mki((int64_t)st));
+  UF_UNPROTECT(); free(out); free(err); free(full); pushp(cx,shd);
+#else
+  pushp(cx,uf_sh_capture_exec(cmd,0,0));
 #endif
 }
 /* SHP: cmd -> chan (worker thread streams stdout lines, closes chan at exit) */
@@ -3791,6 +3829,55 @@ static void op_slurp(Ctx*cx){ if(!uf_rt_cap(0))uf_rt_die(0,"op_slurp");
   FILE* f=fopen(uf_sptr(p),"rb"); if(!f)die("SLURP: cannot open file");
   char* b=uf_read_all(f); fclose(f);
   Cell r=uf_str_new(b,strlen(b)); free(b); pushc(cx,r);
+}
+/* WALK: path pattern -> list of file paths (recursive, sorted).
+   Regular files whose basename matches the fnmatch pattern; directories
+   are traversed but not returned; symlinked directories are not followed
+   (find-like), so results never escape the root. The result Dyn is created
+   and protected BEFORE any path string: a collection during a large walk
+   must never sweep a cell reachable only from this C frame. Dyn growth
+   reallocs outside the GC, so each string is rooted from the moment it is
+   pushed — there is no unprotected window. */
+#ifndef _WIN32
+static int uf_walk_cmp(const void*a,const void*b){
+  const char* x=uf_sptr(*(const Cell*)a); const char* y=uf_sptr(*(const Cell*)b);
+  return strcmp(x,y);
+}
+static void uf_walk_rec(Dyn*d,const char*dir,const char*pat){
+  DIR* dp=opendir(dir);
+  if(!dp)return; /* unreadable subdirectory: skip, find-like (only the root dies) */
+  struct dirent* de;
+  while((de=readdir(dp))){
+    if(!strcmp(de->d_name,".")||!strcmp(de->d_name,".."))continue;
+    size_t ln=strlen(dir)+strlen(de->d_name)+2;
+    char* full=(char*)malloc(ln); if(!full)die("out of memory");
+    snprintf(full,ln,"%s/%s",dir,de->d_name);
+    struct stat st;
+    if(!lstat(full,&st)){
+      if(S_ISDIR(st.st_mode)) uf_walk_rec(d,full,pat);
+      else if(S_ISREG(st.st_mode)&&!fnmatch(pat,de->d_name,0)){
+        uf_dyn_push(&d,uf_str_new(full,strlen(full)));
+      }
+    }
+    free(full);
+  }
+  closedir(dp);
+}
+#endif
+static void op_walk(Ctx*cx){ if(!uf_rt_cap(0))uf_rt_die(0,"op_walk");
+#ifdef _WIN32
+  (void)cx; die("WALK: not supported on this platform");
+#else
+  Cell pp=pop(cx), pc_=pop(cx); /* pattern on top, path below */
+  const char* pat=uf_sptr(pp);
+  if(!*pat)die("WALK: empty pattern — use * for all files");
+  uf_fs_gate(uf_sptr(pc_),0);
+  DIR* probe=opendir(uf_sptr(pc_)); if(!probe)die("WALK: cannot open directory"); closedir(probe);
+  Dyn* d=uf_dyn_new(16); UF_PROTECT(&d);
+  uf_walk_rec(d,uf_sptr(pc_),pat);
+  if(d->len>1)qsort(d->data,(size_t)d->len,sizeof(Cell),uf_walk_cmp);
+  UF_UNPROTECT(); pushp(cx,d);
+#endif
 }
 /* SPIT: path str ->  (create/truncate; error: dies) */
 static void op_spit(Ctx*cx){ if(!uf_rt_cap(1))uf_rt_die(1,"op_spit");

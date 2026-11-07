@@ -104,6 +104,8 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
+    Div,
+    Rem,
     Shl,
     Shr,
     Lt,

@@ -155,6 +155,10 @@ for tool in $TOOLS; do
       check diff1 "$T/lines.txt" "$T/text.txt" -- /dev/null
       check diff2 "$T/text.txt" "$T/lines.txt" -- /dev/null
       ;;
+    fold)
+      check default "$T/lines.txt"
+      check width40 "$T/lines.txt"
+      ;;
   esac
 
   if [ $fail_t = 0 ]; then

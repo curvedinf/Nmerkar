@@ -49,8 +49,8 @@ fn sb_param_info(p: &Parsed, pc: usize) -> Option<(String, usize, String)> {
 fn sb_die_expr(p: &Parsed, pc: usize) -> String {
     match sb_param_info(p, pc) {
         Some((label, arity, name)) => format!(
-            "die(\"label '{}': missing parameter '{}' ({} parameter(s) declared, fewer present at runtime — null-fill was removed)\")",
-            label, name, arity
+            "die(\"label '{}': missing parameter '{}' ({} parameter(s) declared, fewer present at runtime — null-fill was removed; check the call/callback leaves {} value(s) below the invocation)\")",
+            label, name, arity, arity
         ),
         None => "die(\"missing label parameter at runtime — null-fill was removed\")".to_string(),
     }
@@ -1406,7 +1406,7 @@ pub fn emit_range(
                         // iterates its ELEMENTS (length captured at entry),
                         // anything count-shaped (int, numeric string, float)
                         // is a count loop pushing the index.
-                        e.push_str("{Cell _fc=pop(cx);Hdr* _fh=0;int64_t cnt=uf_for_bounds(_fc,&_fh);");
+                        e.push_str("{Cell _fc=pop(cx);Hdr* _fh=0;int64_t cnt=uf_for_bounds(_fc,&_fh);/* the collection lives only in this C local across the body — a GC inside the body (file_fold_lines over a big file) must not sweep it */UF_PROTECT((void**)(void*)&_fc.i);");
                         // If the body immediately stores the index into a
                         // register-cached Int local, assign uf_k directly
                         // and skip the push/pop/store.
@@ -1425,7 +1425,7 @@ pub fn emit_range(
                         let eff_bs = if reg_store.is_some() { bs + 1 } else { bs };
                         let inner = format!("{}F{}_", prefix, i);
                         emit_range(&mut e, p, targets, inline_fors, inline_ffolds, inline_whiles, inline_ifs, outlined_bodies, suppress, ext_idx, eff_bs, be, &inner, depth + 1, local_types, ins_body, &reg, numeric, &arr_ptr, shared_types, &shared_hoist, false);
-                        e.push_str(&format!("K_FC_{}{}:;cx->sp=_sp0;}}\nK_FE_{}{}:;", prefix, i, prefix, i));
+                        e.push_str(&format!("K_FC_{}{}:;cx->sp=_sp0;}}\nK_FE_{}{}:;UF_UNPROTECT();", prefix, i, prefix, i));
                         for (id, (name, ty)) in &regs {
                             if inherited.contains(id) { continue; }
                             match ty {
@@ -1445,7 +1445,7 @@ pub fn emit_range(
                             e.push_str(&format!("pushfn(cx,(void*)&&{},{},\"{}\");", addr_lab(start, end, prefix, bs), fn_meta(p, bs).0, fn_meta(p, bs).1));
                         }
                         e.push_str(&format!(
-                        "{{const void* t=uf_fn_addr(pop(cx));Cell _fc=pop(cx);Hdr* _fh=0;int64_t cnt=uf_for_bounds(_fc,&_fh);long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};for(int64_t k=0;k<cnt;k++){{if(_fh)pushc(cx,uf_cidx(_fc,k));else pushi(cx,k);uf_cspush(cx,&&K_{}{},cx->sp-1);goto *t;K_{}{}:;if(cx->sp>0)pop(cx);K_FC_{}{}:;}}K_FE_{}{}:;cx->lsp=fr;}}\n",
+                        "{{const void* t=uf_fn_addr(pop(cx));Cell _fc=pop(cx);Hdr* _fh=0;int64_t cnt=uf_for_bounds(_fc,&_fh);long fr=cx->lsp++;if(cx->lsp>=64)die(\"loops nested too deep\");cx->loops[fr].cspl=cx->csp;cx->loops[fr].cont=&&K_FC_{}{};cx->loops[fr].end=&&K_FE_{}{};/* the collection lives only in this C local across the body — a GC inside the callback must not sweep it */UF_PROTECT((void**)(void*)&_fc.i);for(int64_t k=0;k<cnt;k++){{if(_fh)pushc(cx,uf_cidx(_fc,k));else pushi(cx,k);uf_cspush(cx,&&K_{}{},cx->sp-1);goto *t;K_{}{}:;if(cx->sp>0)pop(cx);K_FC_{}{}:;}}K_FE_{}{}:;UF_UNPROTECT();cx->lsp=fr;}}\n",
                         prefix, i, prefix, i, prefix, i, prefix, i, prefix, i, prefix, i
                         ));
                     }

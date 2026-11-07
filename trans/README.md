@@ -73,11 +73,11 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
 - Statements: `return expr;`, `if/else`, `while`, `do-while`, `for`
   (init/cond/post, any part optional), `break`, `continue`, `{ ... }`
   blocks, expression statements, empty `;`.
-- Assignment: `=`, `+=`, `-=`, `*=` — as expressions (right-associative,
+- Assignment: `=`, `+=`, `-=`, `*=`, `/=`, `%=` — as expressions (right-associative,
   value is the stored value).
 - Expressions: int/char/string literals, identifiers, calls (including
   zero-arg and vararg `printf`), parenthesized, unary `- ! ~ +`, prefix and
-  postfix `++`/`--` on variables, binary `* + -`, comparisons
+  postfix `++`/`--` on variables, binary `+ - * / %`, comparisons
   `< <= > >= == !=`, logical `&& ||` (both operands always evaluated — no
   short-circuit), with C precedence. `p[i]` on a `char*` reads byte `i`
   (via `strstr` raw-pointer idiom + `load`).
@@ -104,9 +104,6 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
 
 ## Deliberate omissions (parse-time or run-time errors)
 
-- `/` and `%` (division/modulo): no DIV opcode in the subset; the parser
-  aborts with a positioned error. Digit counting must use comparison
-  chains (see `tests/wc.c`).
 - `switch`, arrays (other than byte-indexing a `char*`), structs, enums,
   pointers other than `char*`, `long`/`float`/`double`, `goto`, the
   preprocessor.

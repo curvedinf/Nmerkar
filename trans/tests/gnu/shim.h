@@ -13,3 +13,10 @@ static char** __nk_argv_g;
 #define argv __nk_argv_g
 int tool_main();
 #define main tool_main
+
+/* Debug builtins — the transpiler lowers __dbg/__check to Nmerkar's
+   dbg/check ops (site-tagged stderr peek / falsy-die). Reference builds
+   pass through: they are debugging aids to be removed before gating
+   (gates require empty stderr and system-binary parity). */
+#define __dbg(x) ((x))
+#define __check(x) ((void) (x))

@@ -45,7 +45,8 @@ Three gated pathways:
   indexing, char literals, `printf` formats, `argc`/`argv`, and an edge
   test (dead code after return, chained/compound assignment as expression
   values, side-effecting call arguments, `for(;;)`, compound for-post).
-- **GNU multi-file tools** (`bash tests/gnu/run.sh` → `pass=6 fail=0`):
+- **GNU multi-file tools** (`bash tests/gnu/run.sh [tool ...]` →
+  `pass=6 fail=0`; no args runs every tool, `run.sh wc` iterates one):
   six multi-file adaptations of GNU coreutils tools — `cat` (16 flag
   combos incl. -A/-v M-notation, squeeze, numbering), `head` (lines/bytes
   with b/K/M/G suffixes, old-style -N, headers), `nl` (-b a/t/n, -n
@@ -56,7 +57,8 @@ Three gated pathways:
   `ls` order) are transpiled in one invocation — multi-file input — and
   gated against the system binaries. The transpiled `.n` of every tool
   is exported to `examples/gnu/` so the generated code is publicly
-  browsable.
+  browsable. Failures print labeled `got:`/`want:` summaries plus the
+  diff.
 
 Multi-file input: `trans a.c b.c ...` concatenates the sources (in
 argument order) before lexing; diagnostics report the originating file.
@@ -82,7 +84,11 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
   short-circuit), with C precedence. `p[i]` on a `char*` reads byte `i`
   (via `strstr` raw-pointer idiom + `load`).
 - Builtins: `argc`, `argv[i]` (via `extern "nk_argc"` / `extern "nk_argv"`),
-  `__byte(p)` (first byte of `p`), `NULL` (0), `EOF` (-1).
+  `__byte(p)` (first byte of `p`), `__dbg(e)` (lowered to the `dbg` op —
+  peeks `e` to stderr with its site, `dbg L<line> [label]: v`, and passes
+  the value through), `__check(e)` (lowered to the `check` op — statement
+  position; consumes `e`, dies `check failed` at the site when falsy),
+  `NULL` (0), `EOF` (-1).
 - Comments (`/* ... */`, `//`) and blank lines are fine; preprocessor lines
   (`#include` etc.) are skipped. Call libc directly; the emitted preamble
   always IMPORTs `printf fprintf fputc ungetc putchar getchar fputs fwrite
@@ -116,6 +122,18 @@ with gcc) let a bad adaptation be caught independently of the transpiler.
   `if`s.
 - Recursion works: every `'label` call entry gets a fresh local frame, so a
   callee (recursive or not) cannot clobber the caller's slots.
+
+## Emitted annotations
+
+The output is self-describing so it can be debugged against the C source:
+a leading `; transpiled from a.c b.c` banner, a `; fn name(params) @
+file:line` header above every function (`; params: a=v0 b=v1` maps C
+parameter names to slots), and a `; name` comment on each local's first
+store (`7 'sq v1! ; r`); uninitialized declarations emit `; name = vN`
+comment-only, preserving the no-zero-init shape. Comments are stripped by
+the Nmerkar lexer — behavior is identical. Runtime-error sites
+(`nk: L<line> [label]`) refer to these `.n` lines, and `__dbg`/`__check`
+drop the same site-tagged observability into fixtures while adapting them.
 
 ## Emission model
 

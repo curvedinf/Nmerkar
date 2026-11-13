@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         combined.push('\n');
         line += content.lines().count() + 1;
     }
-    match run(&combined) {
+    match run(&combined, &spans) {
         Ok(out) => {
             let mut stdout = std::io::stdout().lock();
             let _ = stdout.write_all(out.as_bytes());
@@ -59,8 +59,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(src: &str) -> error::Result<String> {
+fn run(src: &str, spans: &[(String, usize, usize)]) -> error::Result<String> {
     let toks = lexer::lex(src)?;
     let prog = parser::Parser::new(toks).parse_program()?;
-    emit::emit(&prog)
+    emit::emit(&prog, spans)
 }

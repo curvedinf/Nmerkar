@@ -4,11 +4,15 @@
 # The transpiled .n of every tool is exported to examples/gnu/ so the
 # generated Nmerkar code is visible to web indexers.
 #
+# Usage: bash run.sh [tool ...]   — no args runs every tool;
+# `bash run.sh wc tee` runs only those (fast iteration on one gate).
+#
 # Tool sources live in tests/gnu/<tool>/*.c (concatenated in ls order,
 # gnu_main.c excluded — that one is a gcc-reference-only wrapper).
 # Transpilation gates: rc 0 + empty stderr at every stage, plus the
 # behavior comparison. gcc reference builds are also checked first so a
-# bad adaptation is caught independently of the transpiler.
+# bad adaptation is caught independently of the transpiler. Failures
+# print labeled got:/want: summaries plus the full diff (head -20).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 TRANSROOT=$(cd "$HERE/../.." && pwd)
@@ -17,6 +21,8 @@ TRANS=${TRANS:-$TRANSROOT/target/release/trans}
 [ -x "$TRANS" ] || { echo "trans binary missing; run: (cd trans && cargo build --release)"; exit 1; }
 [ -x "$UF" ] || { echo "nk binary missing; run: (cd comp && cargo build --release)"; exit 1; }
 TOOLS="cat head nl tee cksum base64 wc diff"
+# Optional filter: run only the named tools.
+[ $# -gt 0 ] && TOOLS="$*"
 EXDIR=$HERE/../../../examples/gnu
 T=$(mktemp -d)
 PASS=0; FAIL=0
@@ -72,7 +78,9 @@ for tool in $TOOLS; do
     else
       fail_t=$((fail_t+1))
       echo "  DIFF $tool [$label] rc=$rc want=$rrc err=$(head -c 60 "$T/rerr")"
-      diff "$T/out" "$T/ref" 2>/dev/null | head -3 | sed 's/^/    /'
+      echo "    got:  $(head -2 "$T/out" | cat -v | tr '\n' '|' | head -c 200)"
+      echo "    want: $(head -2 "$T/ref" | cat -v | tr '\n' '|' | head -c 200)"
+      diff "$T/out" "$T/ref" 2>/dev/null | head -20 | sed 's/^/    /'
     fi
   }
 

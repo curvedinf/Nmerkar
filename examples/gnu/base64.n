@@ -1,3 +1,4 @@
+; transpiled from b64_main.c b64_tab.c
 import c"printf"(ptr,...)->int
 import c"fprintf"(ptr,ptr,...)->int
 import c"fputc"(int,ptr)->int
@@ -20,6 +21,8 @@ extern "stdin"
 extern "stderr"
 0 rv! 0 fr! 0 frv! 0 pt!
 ret
+; fn b64_read(f) @ b64_main.c:8
+; params: f=v0
 b64_read:
 v0!
 v0 0 eq i1 if
@@ -31,13 +34,18 @@ b3:
 v0 'fgetc rv! 1 fr! 0 ret
 c2:
 0 ret
+; fn b64_encode(f, wrap) @ b64_main.c:15
+; params: f=v1 wrap=v2
 b64_encode:
 v1!
 v2!
-0 v3!
-0 v7!
-0 v8!
-0 v9!
+0 v3! ; col
+; n = v4
+; v = v5
+; c = v6
+0 v7! ; b0
+0 v8! ; b1
+0 v9! ; b2
 c4 b5 while
 v3 0 eq not v2 0 eq not mul not not i19 if
 0 rv! 1 fr! consume consume
@@ -103,11 +111,15 @@ v5 63 and v3 v2 'b64_emit6 v3!
 i19:
 10 'putchar 
 0 ret
+; fn b64_decode(f) @ b64_main.c:71
+; params: f=v10
 b64_decode:
 v10!
-0 v13!
-0 v14!
-0 v15!
+; c = v11
+; idx = v12
+0 v13! ; quad
+0 v14! ; v
+0 v15! ; pad
 c20 b21 while
 fr c43 b44 if_else
 fr rv mul frv! 0 fr! ret frv
@@ -194,11 +206,13 @@ b44:
 0 rv! 1 fr! 0 ret
 c43:
 0 ret
+; fn main() @ b64_main.c:124
 entry:
-0 v16!
-76 v17!
-1 v18!
-0 v20!
+0 v16! ; decode
+76 v17! ; wrap
+1 v18! ; i
+; s = v19
+0 v20! ; f
 c45 b46 while
 fr c53 b54 if_else
 0 'exit
@@ -254,13 +268,16 @@ v20 'b64_decode 'exit
 0 ret
 c53:
 0 ret
+; fn b64_table() @ b64_tab.c:8
 b64_table:
 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
+; fn b64_index(c) @ b64_tab.c:13
+; params: c=v21
 b64_index:
 v21!
-'b64_table v22!
-0 v23!
+'b64_table v22! ; t
+0 v23! ; i
 c58 b59 while
 fr c63 b64 if_else
 fr rv mul frv! 0 fr! ret frv
@@ -281,6 +298,8 @@ b64:
 0 1 sub rv! 1 fr! 0 ret
 c63:
 0 ret
+; fn b64_out(c, col, wrap) @ b64_tab.c:26
+; params: c=v24 col=v25 wrap=v26
 b64_out:
 v24!
 v25!
@@ -301,17 +320,22 @@ i68:
 0 ret
 c66:
 0 ret
+; fn b64_emit6(v, col, wrap) @ b64_tab.c:40
+; params: v=v27 col=v28 wrap=v29
 b64_emit6:
 v27!
 v28!
 v29!
-'b64_table v30!
+'b64_table v30! ; t
 v27 v30 "" 'strstr add load 255 and v28 v29 'b64_out rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
+; fn b64_num(s) @ b64_tab.c:45
+; params: s=v31
 b64_num:
 v31!
-0 v32!
-0 v33!
+0 v32! ; i
+0 v33! ; n
+; c = v34
 0 v31 "" 'strstr add load 255 and 45 eq 0 v31 "" 'strstr add load 255 and 43 eq or not not i69 if
 v32 v31 "" 'strstr add load 255 and v34! 
 c70 b71 while

@@ -530,6 +530,18 @@ impl Parser {
                         self.expect_punct(")")?;
                         Ok(Expr { kind: ExprKind::Byte(inner), line: l, col: c })
                     }
+                    "__dbg" => {
+                        self.expect_punct("(")?;
+                        let inner = Box::new(self.expr()?);
+                        self.expect_punct(")")?;
+                        Ok(Expr { kind: ExprKind::Dbg(inner), line: l, col: c })
+                    }
+                    "__check" => {
+                        self.expect_punct("(")?;
+                        let inner = Box::new(self.expr()?);
+                        self.expect_punct(")")?;
+                        Ok(Expr { kind: ExprKind::Check(inner), line: l, col: c })
+                    }
                     "NULL" => Ok(Expr { kind: ExprKind::Null, line: l, col: c }),
                     "EOF" => Ok(Expr { kind: ExprKind::EofLit, line: l, col: c }),
                     _ => {

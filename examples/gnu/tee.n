@@ -1,3 +1,4 @@
+; transpiled from tee_main.c tee_out.c
 import c"printf"(ptr,...)->int
 import c"fprintf"(ptr,ptr,...)->int
 import c"fputc"(int,ptr)->int
@@ -20,13 +21,17 @@ extern "stdin"
 extern "stderr"
 0 rv! 0 fr! 0 frv! 0 pt!
 ret
+; fn main() @ tee_main.c:6
 entry:
-0 v0!
-1 v1!
-0 v2!
-1 v3!
-0 v4!
-0 v6!
+0 v0! ; append
+1 v1! ; i
+0 v2! ; no_more_opts
+1 v3! ; from
+0 v4! ; to
+; n = v5
+0 v6! ; chunk
+; buf = v7
+; s = v8
 c1 b2 while
 fr c10 b11 if_else
 0 'exit
@@ -109,14 +114,17 @@ i16:
 0 ret
 c10:
 0 ret
+; fn tee_write_files(from, to, buf, n, append_mode) @ tee_out.c:9
+; params: from=v9 to=v10 buf=v11 n=v12 append_mode=v13
 tee_write_files:
 v9!
 v10!
 v11!
 v12!
 v13!
-v9 v14!
-"w" v16!
+v9 v14! ; i
+; f = v15
+"w" v16! ; mode
 c23 b24 while
 fr c29 b30 if_else
 fr rv mul frv! 0 fr! ret frv

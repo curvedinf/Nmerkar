@@ -1,3 +1,4 @@
+; transpiled from wc_main.c wc_wc.c
 import c"printf"(ptr,...)->int
 import c"fprintf"(ptr,ptr,...)->int
 import c"fputc"(int,ptr)->int
@@ -20,17 +21,23 @@ extern "stdin"
 extern "stderr"
 0 rv! 0 fr! 0 frv! 0 pt!
 ret
+; fn main() @ wc_main.c:10
 entry:
-0 v0!
-1 v1!
-0 v2!
-0 v3!
-0 v4!
-0 v5!
-0 v6!
-0 v12!
-"/tmp/wc_tmp" v13!
-1 v14!
+0 v0! ; flags
+1 v1! ; i
+0 v2! ; nfiles
+0 v3! ; total_nl
+0 v4! ; total_nw
+0 v5! ; total_nb
+0 v6! ; total_max
+; name = v7
+; nl = v8
+; nw = v9
+; nb = v10
+; maxline = v11
+0 v12! ; seen_file
+"/tmp/wc_tmp" v13! ; tmpname
+1 v14! ; j
 c1 b2 while
 v2 0 eq i6 if
 1 v14! 
@@ -47,7 +54,7 @@ v2 1 add v2!
 v14 1 add v14! 
 0 ret
 i3:
-1 v15!
+1 v15! ; k
 c4 b5 while
 v14 1 add v14! 
 continue
@@ -69,7 +76,7 @@ v14 8 mul extern "nk_argv" load add load v7!
 fr c34 b35 if_else
 0 ret
 i9:
-1 v16!
+1 v16! ; k
 c10 b11 while
 fr c32 b33 if_else
 0 ret
@@ -187,10 +194,13 @@ v3 v4 v5 v6 v0 "total" 1 'wc_print
 0 ret
 c39:
 0 ret
+; fn wc_stdin_buffer(tmpname) @ wc_wc.c:9
+; params: tmpname=v17
 wc_stdin_buffer:
 v17!
-65536 malloc v18!
-v17 "w" 'fopen v19!
+65536 malloc v18! ; buf
+v17 "w" 'fopen v19! ; f
+; n = v20
 c43 b44 while
 v19 'fclose 
 v18 free 
@@ -201,10 +211,13 @@ fr not v18 1 65536 extern "stdin" load 'fread v20! 0 gt and ret
 b44:
 v18 1 v20 v19 'fwrite 
 0 ret
+; fn wc_lines(name) @ wc_wc.c:22
+; params: name=v21
 wc_lines:
 v21!
-0 v23!
-v21 "r" 'fopen v24!
+; c = v22
+0 v23! ; nl
+v21 "r" 'fopen v24! ; f
 v24 not i45 if
 fr c46 b47 if_else
 fr rv mul frv! 0 fr! ret frv
@@ -229,11 +242,14 @@ v23 1 add v23!
 0 ret
 c46:
 0 ret
+; fn wc_words(name) @ wc_wc.c:38
+; params: name=v25
 wc_words:
 v25!
-0 v27!
-0 v28!
-v25 "r" 'fopen v29!
+; c = v26
+0 v27! ; nw
+0 v28! ; in_word
+v25 "r" 'fopen v29! ; f
 v29 not i52 if
 fr c53 b54 if_else
 fr rv mul frv! 0 fr! ret frv
@@ -265,10 +281,13 @@ v27 1 add v27!
 0 ret
 c53:
 0 ret
+; fn wc_bytes(name) @ wc_wc.c:59
+; params: name=v30
 wc_bytes:
 v30!
-0 v32!
-v30 "r" 'fopen v33!
+; c = v31
+0 v32! ; nb
+v30 "r" 'fopen v33! ; f
 v33 not i61 if
 fr c62 b63 if_else
 fr rv mul frv! 0 fr! ret frv
@@ -290,11 +309,14 @@ break
 0 ret
 c62:
 0 ret
+; fn wc_maxline(name) @ wc_wc.c:74
+; params: name=v34
 wc_maxline:
 v34!
-0 v36!
-0 v37!
-v34 "r" 'fopen v38!
+; c = v35
+0 v36! ; maxline
+0 v37! ; curline
+v34 "r" 'fopen v38! ; f
 v38 not i67 if
 fr c68 b69 if_else
 fr rv mul frv! 0 fr! ret frv
@@ -330,6 +352,8 @@ v37 v36!
 0 ret
 c68:
 0 ret
+; fn num_digits(v) @ wc_wc.c:96
+; params: v=v39
 num_digits:
 v39!
 v39 0 eq i77 if
@@ -339,7 +363,7 @@ i77:
 1 rv! 1 fr! 0 ret
 b79:
 v39 0 lt i80 if
-1 v40!
+1 v40! ; d
 c81 b82 while
 v40 rv! 1 fr! 0 ret
 i80:
@@ -353,6 +377,8 @@ v39 10 div v39!
 0 ret
 c78:
 0 ret
+; fn wc_print(nl, nw, nb, maxline, flags, name, print_name) @ wc_wc.c:112
+; params: nl=v41 nw=v42 nb=v43 maxline=v44 flags=v45 name=v46 print_name=v47
 wc_print:
 v41!
 v42!
@@ -361,12 +387,13 @@ v44!
 v45!
 v46!
 v47!
-v45 1 and 0 eq not v48!
-v45 2 and 0 eq not v49!
-v45 4 and 0 eq not v50!
-v45 8 and 0 eq not v51!
-v45 16 and 0 eq not v52!
-1 v53!
+v45 1 and 0 eq not v48! ; has_l
+v45 2 and 0 eq not v49! ; has_w
+v45 4 and 0 eq not v50! ; has_c
+v45 8 and 0 eq not v51! ; has_m
+v45 16 and 0 eq not v52! ; has_L
+1 v53! ; width
+; d = v54
 v45 0 eq i83 if
 fr c88 b89 if_else
 fr rv mul frv! 0 fr! ret frv

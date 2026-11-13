@@ -1,3 +1,4 @@
+; transpiled from cksum_crc.c cksum_main.c
 import c"printf"(ptr,...)->int
 import c"fprintf"(ptr,ptr,...)->int
 import c"fputc"(int,ptr)->int
@@ -20,10 +21,12 @@ extern "stdin"
 extern "stderr"
 0 rv! 0 fr! 0 frv! 0 pt!
 ret
+; fn cksum_byte(crc, c) @ cksum_crc.c:7
+; params: crc=v0 c=v1
 cksum_byte:
 v0!
 v1!
-0 v2!
+0 v2! ; j
 v0 v1 255 and 24 shl xor v0! 
 v0 4294967295 and v0! 
 c1 b2 while
@@ -41,11 +44,13 @@ v0 1 shl 79764919 xor 4294967295 and v0!
 e4:
 v0 1 shl 4294967295 and v0! 
 0 ret
+; fn cksum_buf(crc, buf, n) @ cksum_crc.c:22
+; params: crc=v3 buf=v4 n=v5
 cksum_buf:
 v3!
 v4!
 v5!
-0 v6!
+0 v6! ; i
 c5 b6 while
 v3 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
@@ -55,6 +60,8 @@ b6:
 v3 v6 v4 "" 'strstr add load 255 and 'cksum_byte v3! 
 v6 v6 1 add v6! consume 
 0 ret
+; fn cksum_length(crc, len) @ cksum_crc.c:34
+; params: crc=v7 len=v8
 cksum_length:
 v7!
 v8!
@@ -80,13 +87,16 @@ v7 v8 24 shr 255 and 'cksum_byte v7!
 i11:
 v7 v8 32 shr 255 and 'cksum_byte v7! 
 0 ret
+; fn cksum_stream(f, print_name, name) @ cksum_main.c:6
+; params: f=v9 print_name=v10 name=v11
 cksum_stream:
 v9!
 v10!
 v11!
-0 v12!
-0 v13!
-65536 malloc v15!
+0 v12! ; crc
+0 v13! ; len
+; n = v14
+65536 malloc v15! ; buf
 c12 b13 while
 v12 v13 'cksum_length v12! 
 v12 4294967295 xor v12! 
@@ -110,8 +120,10 @@ i15:
 e16:
 "%u %d\n" v12 v13 2 'printf 
 0 ret
+; fn main() @ cksum_main.c:29
 entry:
-1 v16!
+1 v16! ; i
+; f = v17
 c17 b18 while
 fr c22 b23 if_else
 0 'exit

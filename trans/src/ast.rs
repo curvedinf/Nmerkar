@@ -95,6 +95,14 @@ pub enum ExprKind {
     Stream(&'static str),
     Argv(Box<Expr>),
     Byte(Box<Expr>),
+    /// `__dbg(expr)` — lowered to the Nmerkar `dbg` op: peeks the value to
+    /// stderr with its source site (`dbg L<line> [label]: v`) and passes it
+    /// through, so the expression's value is the operand's value.
+    Dbg(Box<Expr>),
+    /// `__check(expr)` — lowered to the Nmerkar `check` op: consumes the
+    /// value and dies `check failed` at the source site when falsy.
+    /// Statement position (net zero cells).
+    Check(Box<Expr>),
     Null,
     EofLit,
 }

@@ -101,7 +101,14 @@ int num_digits(int v) {
   return d;
 }
 
-/* Print a wc output line. */
+/* Print a wc output line.
+   GNU width rule (observed on coreutils 9.4): fields are right-aligned
+   to the widest printed value's digit count, EXCEPT when reading stdin
+   with no file arguments — GNU pads to a minimum width of 7 (the input
+   size is unknowable in advance). The older single-file tests/wc.c
+   encoded that floor; this wc_print computes only the digit-count width,
+   so the `wc [stdin]` gate is red until the floor is restored (pass a
+   min-width or stdin-mode flag in from wc_main's nfiles==0 path). */
 int wc_print(int nl, int nw, int nb, int maxline, int flags, char* name, int print_name) {
   int has_l = (flags & 1) != 0;
   int has_w = (flags & 2) != 0;

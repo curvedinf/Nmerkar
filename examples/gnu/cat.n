@@ -1,3 +1,4 @@
+; transpiled from cat_main.c cat_opts.c cat_show.c
 import c"printf"(ptr,...)->int
 import c"fprintf"(ptr,ptr,...)->int
 import c"fputc"(int,ptr)->int
@@ -20,16 +21,19 @@ extern "stdin"
 extern "stderr"
 0 rv! 0 fr! 0 frv! 0 pt!
 ret
+; fn cat_file(f, flags) @ cat_main.c:7
+; params: f=v0 flags=v1
 cat_file:
 v0!
 v1!
-1 v3!
-1 v4!
-0 v5!
-0 v6!
-v1 4 and v7!
-v1 1 and v8!
-v1 8 and v9!
+; c = v2
+1 v3! ; at_line_start
+1 v4! ; prev_nl
+0 v5! ; blank_emitted
+0 v6! ; lineno
+v1 4 and v7! ; number
+v1 1 and v8! ; nonblank
+v1 8 and v9! ; squeeze
 c1 b2 while
 0 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
@@ -75,11 +79,14 @@ e9:
 0 v3! 
 0 v4! 
 0 ret
+; fn main() @ cat_main.c:53
 entry:
-0 v10!
-1 v11!
-0 v12!
-0 v13!
+0 v10! ; flags
+1 v11! ; i
+0 v12! ; saw_file
+0 v13! ; no_more_opts
+; name = v14
+; f = v15
 c10 b11 while
 fr c26 b27 if_else
 0 'exit
@@ -151,11 +158,15 @@ i28:
 0 ret
 c26:
 0 ret
+; fn cat_set_flag(flags, bit) @ cat_opts.c:11
+; params: flags=v16 bit=v17
 cat_set_flag:
 v16!
 v17!
 v16 v17 or rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
+; fn cat_parse_short(c, flags) @ cat_opts.c:15
+; params: c=v18 flags=v19
 cat_parse_short:
 v18!
 v19!
@@ -240,10 +251,12 @@ i32:
 v19 2 'cat_set_flag rv! 1 fr! 0 ret
 c30:
 0 ret
+; fn cat_parse_arg(s, flags) @ cat_opts.c:30
+; params: s=v20 flags=v21
 cat_parse_arg:
 v20!
 v21!
-1 v22!
+1 v22! ; i
 c59 b60 while
 fr c64 b65 if_else
 fr rv mul frv! 0 fr! ret frv
@@ -265,6 +278,8 @@ b65:
 v21 rv! 1 fr! 0 ret
 c64:
 0 ret
+; fn cat_get(f) @ cat_show.c:8
+; params: f=v23
 cat_get:
 v23!
 v23 0 eq i66 if
@@ -276,10 +291,13 @@ b68:
 v23 'fgetc rv! 1 fr! 0 ret
 c67:
 0 ret
+; fn cat_render(c, flags) @ cat_show.c:16
+; params: c=v24 flags=v25
 cat_render:
 v24!
 v25!
-v25 32 and v26!
+v25 32 and v26! ; v
+; d = v27
 v24 10 eq i69 if
 fr c71 b72 if_else
 fr rv mul frv! 0 fr! ret frv

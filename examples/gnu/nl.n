@@ -1,3 +1,4 @@
+; transpiled from nl_fmt.c nl_main.c
 import c"printf"(ptr,...)->int
 import c"fprintf"(ptr,ptr,...)->int
 import c"fputc"(int,ptr)->int
@@ -20,10 +21,13 @@ extern "stdin"
 extern "stderr"
 0 rv! 0 fr! 0 frv! 0 pt!
 ret
+; fn nl_num(s) @ nl_fmt.c:5
+; params: s=v0
 nl_num:
 v0!
-0 v1!
-0 v2!
+0 v1! ; i
+0 v2! ; n
+; c = v3
 0 v0 "" 'strstr add load 255 and 45 eq 0 v0 "" 'strstr add load 255 and 43 eq or not not i1 if
 v1 v0 "" 'strstr add load 255 and v3! 
 c2 b3 while
@@ -39,6 +43,8 @@ v2 10 mul v3 48 sub add v2!
 v1 v1 1 add v1! consume 
 v1 v0 "" 'strstr add load 255 and v3! 
 0 ret
+; fn nl_print_num(n, w, fmt, sep) @ nl_fmt.c:23
+; params: n=v4 w=v5 fmt=v6 sep=v7
 nl_print_num:
 v4!
 v5!
@@ -64,9 +70,11 @@ i7:
 0 rv! 1 fr! 0 ret
 c5:
 0 ret
+; fn nl_seplen(s) @ nl_fmt.c:36
+; params: s=v8
 nl_seplen:
 v8!
-0 v9!
+0 v9! ; n
 c10 b11 while
 v9 rv! 1 fr! consume consume
 fr rv mul frv! 0 fr! ret frv
@@ -75,17 +83,20 @@ fr not v9 v8 "" 'strstr add load 255 and 0 eq not and ret
 b11:
 v9 v9 1 add v9! consume 
 0 ret
+; fn main() @ nl_main.c:7
 entry:
-1 v10!
-1 v11!
-6 v12!
-1 v13!
-1 v14!
-1 v15!
-1 v16!
-"\t" v17!
-1 v18!
-0 v21!
+1 v10! ; start
+1 v11! ; incr
+6 v12! ; w
+1 v13! ; fmt
+1 v14! ; body
+1 v15! ; lineno
+1 v16! ; at_line_start
+"\t" v17! ; sep
+1 v18! ; i
+; s = v19
+; c = v20
+0 v21! ; f
 c12 b13 while
 fr c42 b43 if_else
 0 'exit

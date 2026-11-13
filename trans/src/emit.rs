@@ -66,8 +66,33 @@ fn vararg_fixed_params(name: &str) -> Option<usize> {
     }
 }
 
-pub fn emit(prog: &Program) -> Result<String> {
+/// Basename of an input path — annotations name files the way the tool's
+/// own directory does (`wc_wc.c:105`), so exported `.n` stays portable.
+fn fname(name: &str) -> &str {
+    std::path::Path::new(name.trim_start_matches("./"))
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+}
+
+/// Locate a combined-source line in the input files — `wc_wc.c:105` — or
+/// `line 105` when no file spans were supplied (unit tests, stdin).
+fn locate(files: &[(String, usize, usize)], line: usize) -> String {
+    for (name, start, end) in files {
+        if line >= *start && line < *end {
+            return format!("{}:{}", fname(name), line - start + 1);
+        }
+    }
+    format!("line {line}")
+}
+
+pub fn emit(prog: &Program, files: &[(String, usize, usize)]) -> Result<String> {
     let mut e = Emitter::new();
+    e.files = files.to_vec();
+    if !files.is_empty() {
+        let names: Vec<&str> = files.iter().map(|(n, _, _)| fname(n)).collect();
+        e.out.push_str(&format!("; transpiled from {}\n", names.join(" ")));
+    }
     e.out.push_str(PRELUDE);
     // v14: declare the cross-body registers once at top level (plain names;
     // a name assigned in several label bodies must be shared). rv/fr carry
@@ -104,6 +129,9 @@ struct Emitter {
     hoisted_guards: String,
     next_label: usize,
     next_slot: usize,
+    /// Input-file spans (name, start_line, end_line) in combined-source
+    /// coordinates — powers the `; fn ... @ file:line` annotations.
+    files: Vec<(String, usize, usize)>,
 }
 
 /// Where a statement list lives — decides how a bare `return` terminates.
@@ -131,7 +159,7 @@ impl Buf {
 
 impl Emitter {
     fn new() -> Self {
-        Emitter { out: String::new(), hoisted: String::new(), hoisted_guards: String::new(), next_label: 0, next_slot: 0 }
+        Emitter { out: String::new(), hoisted: String::new(), hoisted_guards: String::new(), next_label: 0, next_slot: 0, files: Vec::new() }
     }
 
     fn fresh_label(&mut self) -> usize {
@@ -147,6 +175,11 @@ impl Emitter {
 
     fn function(&mut self, f: &Function) -> Result<()> {
         let is_main = f.name == "main";
+        // Source annotations: every emitted function carries its C identity,
+        // and non-main functions a param->slot map, so the generated vN/label
+        // soup can be read back against the C source. Comments are stripped
+        // by the Nmerkar lexer; behavior is unchanged.
+        let mut pre = format!("; fn {}({}) @ {}\n", f.name, f.params.join(", "), locate(&self.files, f.line));
         let mut header = if is_main {
             "entry:\n".to_string()
         } else {
@@ -157,12 +190,17 @@ impl Emitter {
         // main becomes `entry:` and runs with nothing on the stack: its
         // parameters (conventionally argc/argv, which the parser maps to
         // builtins anyway) are accepted but not bound.
+        let mut param_map = String::new();
         if !is_main {
             for p in &f.params {
                 let slot = self.fresh_slot();
                 ctx.slots.insert(p.clone(), slot.clone());
+                param_map.push_str(&format!(" {}={}", p, slot));
                 header.push_str(&format!("{}!\n", slot));
             }
+        }
+        if !param_map.is_empty() {
+            pre.push_str(&format!("; params:{param_map}\n"));
         }
 
         let mut body = Buf::new();
@@ -177,6 +215,7 @@ impl Emitter {
             "fr rv mul frv! 0 fr! ret frv\n"
         };
 
+        self.out.push_str(&pre);
         self.out.push_str(&header);
         self.out.push_str(&body.code);
         self.out.push_str(epilogue);
@@ -248,7 +287,12 @@ impl Emitter {
                     let slot = self.declare(ctx, d)?;
                     if let Some(init) = &d.init {
                         self.expr(buf, init, ctx)?;
-                        buf.code.push_str(&format!("{}!\n", slot));
+                        buf.code.push_str(&format!("{}! ; {}\n", slot, d.name));
+                    } else {
+                        // Comment-only: zero-initializing would change the
+                        // emitted shape (C locals are indeterminate until
+                        // first assignment).
+                        buf.code.push_str(&format!("; {} = {}\n", d.name, slot));
                     }
                 }
             }
@@ -346,7 +390,7 @@ impl Emitter {
                         let slot = self.declare(ctx, d)?;
                         if let Some(init_expr) = &d.init {
                             self.expr(buf, init_expr, ctx)?;
-                            buf.code.push_str(&format!("{}!\n", slot));
+                            buf.code.push_str(&format!("{}! ; {}\n", slot, d.name));
                         }
                     }
                     Some(ForInit::Expr(e)) => {
@@ -389,7 +433,7 @@ impl Emitter {
     }
 
     fn declare(&mut self, ctx: &mut FnCtx, d: &Declarator) -> Result<String> {
-        if matches!(d.name.as_str(), "argc" | "argv" | "__byte" | "NULL" | "EOF" | "stdout" | "stdin" | "stderr") {
+        if matches!(d.name.as_str(), "argc" | "argv" | "__byte" | "__dbg" | "__check" | "NULL" | "EOF" | "stdout" | "stdin" | "stderr") {
             return Err(Error::new(d.line, d.col, format!("cannot declare builtin '{}'", d.name)));
         }
         let slot = self.fresh_slot();
@@ -545,6 +589,18 @@ impl Emitter {
                 self.expr(buf, inner, ctx)?;
                 buf.code.push_str("load 255 and ");
             }
+            ExprKind::Dbg(inner) => {
+                // `dbg` peeks the stack top to stderr with its site and
+                // leaves it — net one cell, so __dbg composes as an identity.
+                self.expr(buf, inner, ctx)?;
+                buf.code.push_str("dbg ");
+            }
+            ExprKind::Check(inner) => {
+                // `check` consumes; dies `check failed` at the site on falsy.
+                // Statement position only (net zero cells).
+                self.expr(buf, inner, ctx)?;
+                buf.code.push_str("check ");
+            }
             ExprKind::Null => buf.code.push_str("0 "),
             ExprKind::EofLit => buf.code.push_str("-1 "),
         }
@@ -609,7 +665,7 @@ mod tests {
     fn transpile(src: &str) -> String {
         let toks = lex(src).unwrap();
         let prog = Parser::new(toks).parse_program().unwrap();
-        emit(&prog).unwrap()
+        emit(&prog, &[]).unwrap()
     }
 
     #[test]
@@ -652,5 +708,34 @@ mod tests {
         assert!(out.contains("1 df1!"), "missing df init:\n{out}");
         assert!(out.contains("0 df1!"), "missing df clear:\n{out}");
         assert!(out.contains("df1 "), "missing df cond guard:\n{out}");
+    }
+
+    #[test]
+    fn annotates_functions_params_and_locals() {
+        let src = "int add2(int a, int b) { return a + b; }\nint main() { int x = 1; return add2(x, 2); }";
+        let toks = lex(src).unwrap();
+        let prog = Parser::new(toks).parse_program().unwrap();
+        let files = vec![("in.c".to_string(), 1usize, 3usize)];
+        let out = emit(&prog, &files).unwrap();
+        assert!(out.contains("; fn add2(a, b) @ in.c:1"), "missing fn header:\n{out}");
+        assert!(out.contains("; params: a=v0 b=v1"), "missing param map:\n{out}");
+        assert!(out.contains("; fn main() @ in.c:2"), "missing main header:\n{out}");
+        assert!(out.contains("v2! ; x"), "missing decl comment:\n{out}");
+        assert!(out.contains("; transpiled from in.c"), "missing source banner:\n{out}");
+    }
+
+    #[test]
+    fn uninitialized_decl_emits_comment_only() {
+        let out = transpile("int main() { int c; c = 5; return c; }");
+        assert!(out.contains("; c = v0\n"), "missing uninitialized note:\n{out}");
+        assert!(!out.contains("0 v0!"), "uninitialized decl must not zero-init:\n{out}");
+    }
+
+    #[test]
+    fn dbg_and_check_lower_to_ops() {
+        let out = transpile("int main() { int n = 3; __dbg(n); __check(n > 0); return n; }");
+        assert!(out.contains("v0 dbg "), "missing dbg op:\n{out}");
+        assert!(out.contains("check "), "missing check op:\n{out}");
+        assert!(!out.contains("'__dbg") && !out.contains("'__check"), "builtins must not be calls:\n{out}");
     }
 }
